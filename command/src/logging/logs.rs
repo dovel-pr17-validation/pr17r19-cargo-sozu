@@ -1,0 +1,1738 @@
+use std::{
+    cell::{Cell, RefCell},
+    cmp, env,
+    fmt::Arguments,
+    fs::{File, OpenOptions},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Stdout, Write, stdout},
+    net::{SocketAddr, TcpStream, UdpSocket},
+    ops::{Deref, DerefMut},
+    path::Path,
+    str::FromStr,
+};
+
+use mio::net::UnixDatagram;
+use prost::{Message, encoding::encoded_len_varint};
+
+use crate::{
+    config::{Config, DEFAULT_LOG_TARGET},
+    logging::{LogAddress, LogDuration, LogError, LogMessage, RequestRecord},
+    proto::command::{ProtobufAccessLog, ProtobufAccessLogFormat},
+    writer::MultiLineWriter,
+};
+
+thread_local! {
+  pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
+  /// Side-channel mirror of [`InnerLogger::colored`]. Read by
+  /// [`is_logger_colored`] without borrowing the [`LOGGER`] cell, so macros
+  /// like `log_context!` can consult it while the logger is already held
+  /// mutably by the enclosing `error!`/`info!`/... emission.
+  static LOGGER_COLORED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns `true` when the thread-local [`Logger`] is configured to emit colored
+/// output. Safe to call from inside an `error!`/`info!`/… argument list — the
+/// flag mirrors [`Logger::is_colored`] (i.e. [`InnerLogger::colored`]) into a
+/// dedicated [`Cell`] at [`Logger::init`] time so we never re-borrow the main
+/// logger cell (which is already held mutably while the outer log macro is
+/// formatting its arguments). The mirror is the single source of truth for
+/// hot-path callers; `Logger::is_colored` is the single source of truth for
+/// the rest of the API. They go through the same `InnerLogger::colored`
+/// field, so they cannot diverge by construction.
+pub fn is_logger_colored() -> bool {
+    LOGGER_COLORED.with(|c| c.get())
+}
+
+/// ANSI palette used by every `log_context!` / `log_*_context!` macro in the
+/// proxy stack. Returns a 5-tuple `(open, reset, grey, gray, white)` where:
+///
+/// - `open`   = `\x1b[1;97m` (bold bright-white) — protocol label (`MUX`,
+///   `MUX-H2`, `SOCKET`, `RUSTLS`, `PIPE`, …).
+/// - `reset`  = `\x1b[0m` — ANSI reset.
+/// - `grey`   = `\x1b[37m` (light grey) — `Session` keyword.
+/// - `gray`   = `\x1b[90m` (bright black) — attribute keys (`peer=`,
+///   `local=`, `cluster=`, …).
+/// - `white`  = `\x1b[97m` (bright white) — attribute values.
+///
+/// When [`is_logger_colored`] returns `false` every slot is an empty string,
+/// so macros can unconditionally inline the tokens into `format!` without
+/// leaking escape codes into plain-text log sinks.
+///
+/// Callers that only need the label pair can destructure with wildcards:
+/// `let (open, reset, _, _, _) = ansi_palette();`.
+pub fn ansi_palette() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    if is_logger_colored() {
+        ("\x1b[1;97m", "\x1b[0m", "\x1b[37m", "\x1b[90m", "\x1b[97m")
+    } else {
+        ("", "", "", "", "")
+    }
+}
+
+// TODO: check if this error is critical:
+//     could not register compat logger: SetLoggerError(())
+// The CompatLogger may need a variable that tells wether it has been initiated already
+pub static COMPAT_LOGGER: CompatLogger = CompatLogger;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "lowercase")]
+pub enum AccessLogFormat {
+    Ascii,
+    Protobuf,
+}
+
+impl From<&ProtobufAccessLogFormat> for AccessLogFormat {
+    fn from(value: &ProtobufAccessLogFormat) -> Self {
+        match value {
+            ProtobufAccessLogFormat::Ascii => Self::Ascii,
+            ProtobufAccessLogFormat::Protobuf => Self::Protobuf,
+        }
+    }
+}
+
+impl From<&Option<AccessLogFormat>> for ProtobufAccessLogFormat {
+    fn from(value: &Option<AccessLogFormat>) -> Self {
+        match value {
+            Some(AccessLogFormat::Ascii) | None => Self::Ascii,
+            Some(AccessLogFormat::Protobuf) => Self::Protobuf,
+        }
+    }
+}
+
+pub struct InnerLogger {
+    directives: Vec<LogDirective>,
+    backend: LoggerBackend,
+    /// inherited from the config's `log_target`, used to revive the backend
+    log_target: String,
+    pub colored: bool,
+    /// target of the access logs
+    access_backend: Option<LoggerBackend>,
+    /// used to revive the backend for access logs
+    access_logs_target: Option<String>,
+    /// how to format the access logs
+    access_format: AccessLogFormat,
+    access_colored: bool,
+    buffer: LoggerBuffer,
+}
+
+pub struct Logger {
+    inner: InnerLogger,
+    /// is displayed in each log, for instance "MAIN" or worker_id
+    tag: String,
+    /// the pid of the current process (main or worker)
+    pid: i32,
+    initialized: bool,
+}
+
+impl std::ops::Deref for Logger {
+    type Target = InnerLogger;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for Logger {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Default for Logger {
+    fn default() -> Self {
+        Self {
+            inner: InnerLogger {
+                directives: vec![LogDirective {
+                    name: None,
+                    level: LogLevelFilter::Error,
+                }],
+                backend: LoggerBackend::Stdout(stdout()),
+                log_target: DEFAULT_LOG_TARGET.to_string(),
+                colored: false,
+                access_backend: None,
+                access_logs_target: None,
+                access_format: AccessLogFormat::Ascii,
+                access_colored: false,
+                buffer: LoggerBuffer(Vec::with_capacity(4096)),
+            },
+            tag: "UNINITIALIZED".to_string(),
+            pid: 0,
+            initialized: false,
+        }
+    }
+}
+
+impl Logger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn init(
+        tag: String,
+        spec: &str,
+        log_target: &str,
+        colored: bool,
+        access_logs_target: Option<&str>,
+        access_format: Option<AccessLogFormat>,
+        access_colored: Option<bool>,
+    ) -> Result<(), LogError> {
+        println!("Logs will be sent to {log_target}");
+        let backend = target_or_default(log_target);
+
+        println!("Access logs will be sent to {access_logs_target:?}");
+        let access_backend = access_logs_target.map(target_to_backend).transpose()?;
+
+        let (directives, _errors) = parse_logging_spec(spec);
+        LOGGER.with(|logger| {
+            let mut logger = logger.borrow_mut();
+            if !logger.initialized {
+                logger.set_directives(directives);
+                logger.colored = match backend {
+                    LoggerBackend::Stdout(_) => colored,
+                    _ => false,
+                };
+                // Mirror into the side-channel cell via the canonical
+                // accessor so `is_logger_colored()` can be called from
+                // inside log-macro argument formatters without re-borrowing
+                // the main `LOGGER` cell (it is held mutably here and by
+                // every subsequent `error!`/`info!`/...). Going through
+                // `Logger::is_colored` (instead of the `Deref`'d
+                // `logger.colored`) makes the single source of truth
+                // explicit at the call site.
+                LOGGER_COLORED.with(|c| c.set(logger.is_colored()));
+                logger.access_colored = match (&access_backend, &backend) {
+                    (Some(LoggerBackend::Stdout(_)), _) | (None, LoggerBackend::Stdout(_)) => {
+                        access_colored.unwrap_or(colored)
+                    }
+                    _ => false,
+                };
+                logger.backend = backend;
+                logger.log_target = log_target.to_owned();
+                logger.access_backend = access_backend;
+                logger.access_logs_target = access_logs_target.map(ToOwned::to_owned);
+                logger.access_format = access_format.unwrap_or(AccessLogFormat::Ascii);
+                logger.tag = tag;
+                // SAFETY: `libc::getpid` takes no input pointers, never
+                // fails, and returns a value type. No invariant beyond
+                // "FFI signature matches libc".
+                logger.pid = unsafe { libc::getpid() };
+                logger.initialized = true;
+
+                let _ = log::set_logger(&COMPAT_LOGGER)
+                    .map_err(|e| println!("could not register compat logger: {e:?}"));
+
+                log::set_max_level(log::LevelFilter::Info);
+            }
+        });
+        Ok(())
+    }
+
+    pub fn set_directives(&mut self, directives: Vec<LogDirective>) {
+        self.directives = directives;
+    }
+
+    pub fn split(&mut self) -> (i32, &str, &mut InnerLogger) {
+        (self.pid, &self.tag, &mut self.inner)
+    }
+
+    /// Returns `true` when the logger emits colored output on its main backend.
+    pub fn is_colored(&self) -> bool {
+        self.inner.colored
+    }
+}
+
+struct LoggerBuffer(Vec<u8>);
+
+impl Deref for LoggerBuffer {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl DerefMut for LoggerBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl LoggerBuffer {
+    fn fmt<F: FnOnce(&[u8]) -> Result<usize, IoError>>(
+        &mut self,
+        args: Arguments,
+        flush: F,
+    ) -> Result<(), IoError> {
+        self.clear();
+        self.write_fmt(args)?;
+        flush(self.as_slice())?;
+        Ok(())
+    }
+}
+
+fn log_arguments(
+    args: Arguments,
+    backend: &mut LoggerBackend,
+    buffer: &mut LoggerBuffer,
+) -> Result<(), IoError> {
+    match backend {
+        // `Stdout` is a `LineWriter`, `File` a `MultiLineWriter`: both already
+        // collapse a record's fragments, so they take `args` directly.
+        LoggerBackend::Stdout(stdout) => {
+            let _ = stdout.write_fmt(args);
+            Ok(())
+        }
+        // `Tcp` is the one backend with NO buffering of its own, so
+        // `write_fmt` sent every fragment of the formatter as its own syscall:
+        // measured on a loopback sink, one 360-byte access-log line cost 81.7
+        // `send(2)` calls, 822 of the 1634 in a 20-request run being a single
+        // byte. Formatting into the reused buffer first makes it one call, and
+        // allocates nothing per record.
+        //
+        // Unlike the datagram arms below, a stream may accept FEWER bytes than
+        // offered, so the record needs `write_all`: discarding the count here
+        // would silently truncate a log line.
+        LoggerBackend::Tcp(socket) => {
+            buffer.fmt(args, |bytes| socket.write_all(bytes).map(|()| bytes.len()))
+        }
+        LoggerBackend::File(file) => file.write_fmt(args),
+        // Datagram sinks must hand the kernel one contiguous record: there is no
+        // incremental `write_str` that yields a single datagram. This is why the
+        // buffer exists at all -- it replaced the per-record `String` these two
+        // arms used to allocate.
+        LoggerBackend::Unix(socket) => buffer.fmt(args, |bytes| socket.send(bytes)),
+        LoggerBackend::Udp(sock, addr) => buffer.fmt(args, |b| sock.send_to(b, *addr)),
+    }
+}
+
+/// Frame one protobuf access log into `buffer`: the prost length delimiter,
+/// the record, then two zero bytes. The decoder of a `tcp://` stream relies on
+/// that framing to find where each record starts.
+fn encode_protobuf_access_log(
+    binary_log: &ProtobufAccessLog,
+    buffer: &mut LoggerBuffer,
+) -> Result<(), IoError> {
+    let log_length = binary_log.encoded_len();
+    let total_length = log_length + encoded_len_varint(log_length as u64);
+    buffer.clear();
+    let current_capacity = buffer.capacity();
+    if current_capacity < total_length {
+        buffer.reserve(total_length - current_capacity);
+    }
+    binary_log
+        .encode_length_delimited(&mut buffer.0)
+        .map_err(|e| IoError::new(IoErrorKind::InvalidData, e))?;
+    buffer.extend_from_slice(&[0, 0]); // add two empty bytes after each protobuf access log
+    Ok(())
+}
+
+/// Hand one complete record to a stream sink.
+///
+/// A stream may accept FEWER bytes than offered: discarding the count of a
+/// bare `write` would truncate the record and desynchronise the framing of
+/// every record after it, so the record goes through `write_all`, as the
+/// ASCII `Tcp` arm of [`log_arguments`] does.
+fn write_stream_record<W: Write>(stream: &mut W, bytes: &[u8]) -> Result<(), IoError> {
+    stream.write_all(bytes)
+}
+
+impl InnerLogger {
+    /// Drain the buffered records of both the main and the access-log backend.
+    ///
+    /// Called once, on a worker's way out: nothing on the per-record path
+    /// flushes, which is what lets a `file://` target batch many records into
+    /// one `write(2)`. Errors are printed rather than logged, because logging
+    /// from here would re-borrow the [`LOGGER`] cell this runs under.
+    pub fn flush(&mut self) {
+        if let Err(e) = self.backend.flush() {
+            println!("Could not flush logs to {}: {e:?}", self.backend.as_ref());
+        }
+        if let Some(access_backend) = self.access_backend.as_mut()
+            && let Err(e) = access_backend.flush()
+        {
+            println!(
+                "Could not flush access logs to {}: {e:?}",
+                access_backend.as_ref()
+            );
+        }
+    }
+
+    pub fn log(&mut self, args: Arguments) {
+        if let Err(e) = log_arguments(args, &mut self.backend, &mut self.buffer) {
+            println!("Could not write log to {}: {e:?}", self.backend.as_ref());
+        }
+    }
+
+    /// write an access log to the proper logging target
+    ///
+    /// Protobuf access logs are written with a prost length delimiter before, and 2 empty bytes after
+    pub fn log_access(&mut self, log: RequestRecord) -> bool {
+        let backend = self.access_backend.as_mut().unwrap_or(&mut self.backend);
+
+        let io_result = match self.access_format {
+            AccessLogFormat::Protobuf => {
+                let binary_log = log.into_binary_access_log();
+                if let Err(e) = encode_protobuf_access_log(&binary_log, &mut self.buffer) {
+                    Err(e)
+                } else {
+                    let bytes = &self.buffer;
+                    match backend {
+                        LoggerBackend::Stdout(stdout) => {
+                            let _ = stdout.write(bytes);
+                            return true;
+                        }
+                        LoggerBackend::Tcp(socket) => {
+                            write_stream_record(socket, bytes).map(|()| bytes.len())
+                        }
+                        LoggerBackend::File(file) => file.write(bytes),
+                        LoggerBackend::Unix(socket) => socket.send(bytes),
+                        LoggerBackend::Udp(socket, address) => socket.send_to(bytes, *address),
+                    }
+                    .map(|_| ())
+                }
+            }
+            AccessLogFormat::Ascii => crate::_prompt_log! {
+                logger: |args| log_arguments(args, backend, &mut self.buffer),
+                is_access: true,
+                condition: self.access_colored,
+                prompt: [
+                    log.now,
+                    log.precise_time,
+                    log.pid,
+                    log.level,
+                    log.tag,
+                ],
+                standard: {
+                    formats: ["{} {} {} {}/{}/{}/{}/{} {} {} [{}] {:?} {} {}{}\n"],
+                    args: [
+                        log.context,
+                        LogAddress(log.session_address),
+                        LogAddress(log.backend_address),
+                        LogDuration(Some(log.request_time)),
+                        LogDuration(Some(log.service_time)),
+                        LogDuration(log.response_time),
+                        LogDuration(log.client_rtt),
+                        LogDuration(log.server_rtt),
+                        log.bytes_in,
+                        log.bytes_out,
+                        log.full_tags(),
+                        log.otel,
+                        log.protocol,
+                        log.endpoint,
+                        LogMessage(log.message),
+                    ]
+                },
+                colored: {
+                    formats: ["\x1b[;1m{}\x1b[m {} {} {}/{}/{}/{}/{} {} {} \x1b[2m[{}] {:?} \x1b[;1m{} {:#}\x1b[m{}\n"],
+                    args: @,
+                }
+            },
+        };
+
+        if let Err(e) = io_result {
+            println!("Could not write access log to {}: {e:?}", backend.as_ref());
+            println!(
+                "Trying to revive the backend of access logs to {:?}, or defaulting to {}",
+                self.access_logs_target, self.log_target
+            );
+            let log_target = self.access_logs_target.as_ref().unwrap_or(&self.log_target);
+            if let Err(err) = backend.revive(log_target) {
+                eprintln!("could not revive logger backend: {err}");
+            }
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn enabled(&self, meta: Metadata) -> bool {
+        // Search for the longest match, the vector is assumed to be pre-sorted.
+        for directive in self.directives.iter().rev() {
+            match &directive.name {
+                Some(name) if !meta.target.starts_with(name) => {}
+                Some(_) | None => return meta.level <= directive.level,
+            }
+        }
+        false
+    }
+
+    fn compat_enabled(&self, meta: &log::Metadata) -> bool {
+        // Search for the longest match, the vector is assumed to be pre-sorted.
+        for directive in self.directives.iter().rev() {
+            match &directive.name {
+                Some(name) if !meta.target().starts_with(name) => {}
+                Some(_) | None => return LogLevel::from(meta.level()) <= directive.level,
+            }
+        }
+        false
+    }
+}
+
+pub enum LoggerBackend {
+    Stdout(Stdout),
+    Unix(UnixDatagram),
+    Udp(UdpSocket, SocketAddr),
+    Tcp(TcpStream),
+    File(crate::writer::MultiLineWriter<File>),
+}
+
+impl LoggerBackend {
+    fn revive(&mut self, log_target: &str) -> Result<(), LogError> {
+        *self = target_to_backend(log_target)?;
+        Ok(())
+    }
+
+    /// Write out whatever this backend still holds in user space.
+    ///
+    /// Only `File` (a [`MultiLineWriter`] that drains whole lines once its
+    /// buffer fills) and `Stdout` (a line-buffered `Stdout`) keep bytes back;
+    /// every other backend already sent each record in its own syscall, so
+    /// there is nothing left to write. No `fsync`: this empties the process
+    /// buffer, it does not make the kernel's page cache durable.
+    fn flush(&mut self) -> Result<(), IoError> {
+        match self {
+            LoggerBackend::File(file) => file.flush(),
+            LoggerBackend::Stdout(stdout) => stdout.flush(),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy, Eq, Debug)]
+pub enum LogLevel {
+    /// The "error" level.
+    ///
+    /// Designates very serious errors.
+    Error = 1, // This way these line up with the discriminants for LogLevelFilter below
+    /// The "warn" level.
+    ///
+    /// Designates hazardous situations.
+    Warn,
+    /// The "info" level.
+    ///
+    /// Designates useful information.
+    Info,
+    /// The "debug" level.
+    ///
+    /// Designates lower priority information.
+    Debug,
+    /// The "trace" level.
+    ///
+    /// Designates very low priority, often extremely verbose, information.
+    Trace,
+}
+
+static LOG_LEVEL_NAMES: [&str; 6] = ["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
+
+impl PartialEq for LogLevel {
+    #[inline]
+    fn eq(&self, other: &LogLevel) -> bool {
+        *self as usize == *other as usize
+    }
+}
+
+impl PartialEq<LogLevelFilter> for LogLevel {
+    #[inline]
+    fn eq(&self, other: &LogLevelFilter) -> bool {
+        *self as usize == *other as usize
+    }
+}
+
+impl PartialOrd for LogLevel {
+    #[inline]
+    fn partial_cmp(&self, other: &LogLevel) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialOrd<LogLevelFilter> for LogLevel {
+    #[inline]
+    fn partial_cmp(&self, other: &LogLevelFilter) -> Option<cmp::Ordering> {
+        Some((*self as usize).cmp(&(*other as usize)))
+    }
+}
+
+impl Ord for LogLevel {
+    #[inline]
+    fn cmp(&self, other: &LogLevel) -> cmp::Ordering {
+        (*self as usize).cmp(&(*other as usize))
+    }
+}
+
+impl LogLevel {
+    fn from_usize(u: usize) -> Option<LogLevel> {
+        match u {
+            1 => Some(LogLevel::Error),
+            2 => Some(LogLevel::Warn),
+            3 => Some(LogLevel::Info),
+            4 => Some(LogLevel::Debug),
+            5 => Some(LogLevel::Trace),
+            _ => None,
+        }
+    }
+
+    /// Returns the most verbose logging level.
+    #[inline]
+    pub fn max() -> LogLevel {
+        LogLevel::Trace
+    }
+
+    /// Converts the `LogLevel` to the equivalent `LogLevelFilter`.
+    #[inline]
+    pub fn to_log_level_filter(self) -> LogLevelFilter {
+        LogLevelFilter::from_usize(self as usize).unwrap()
+    }
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy, Eq, Debug)]
+pub enum LogLevelFilter {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl PartialEq for LogLevelFilter {
+    #[inline]
+    fn eq(&self, other: &LogLevelFilter) -> bool {
+        *self as usize == *other as usize
+    }
+}
+
+impl PartialEq<LogLevel> for LogLevelFilter {
+    #[inline]
+    fn eq(&self, other: &LogLevel) -> bool {
+        other.eq(self)
+    }
+}
+
+impl PartialOrd for LogLevelFilter {
+    #[inline]
+    fn partial_cmp(&self, other: &LogLevelFilter) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialOrd<LogLevel> for LogLevelFilter {
+    #[inline]
+    fn partial_cmp(&self, other: &LogLevel) -> Option<cmp::Ordering> {
+        other.partial_cmp(self).map(|x| x.reverse())
+    }
+}
+
+impl Ord for LogLevelFilter {
+    #[inline]
+    fn cmp(&self, other: &LogLevelFilter) -> cmp::Ordering {
+        (*self as usize).cmp(&(*other as usize))
+    }
+}
+
+impl FromStr for LogLevelFilter {
+    type Err = ();
+    fn from_str(level: &str) -> Result<LogLevelFilter, ()> {
+        LOG_LEVEL_NAMES
+            .iter()
+            .position(|&name| name.eq_ignore_ascii_case(level))
+            .map(|p| LogLevelFilter::from_usize(p).unwrap())
+            .ok_or(())
+    }
+}
+
+impl LogLevelFilter {
+    fn from_usize(u: usize) -> Option<LogLevelFilter> {
+        match u {
+            0 => Some(LogLevelFilter::Off),
+            1 => Some(LogLevelFilter::Error),
+            2 => Some(LogLevelFilter::Warn),
+            3 => Some(LogLevelFilter::Info),
+            4 => Some(LogLevelFilter::Debug),
+            5 => Some(LogLevelFilter::Trace),
+            _ => None,
+        }
+    }
+    /// Returns the most verbose logging level filter.
+    #[inline]
+    pub fn max() -> LogLevelFilter {
+        LogLevelFilter::Trace
+    }
+
+    /// Converts `self` to the equivalent `LogLevel`.
+    ///
+    /// Returns `None` if `self` is `LogLevelFilter::Off`.
+    #[inline]
+    pub fn to_log_level(self) -> Option<LogLevel> {
+        LogLevel::from_usize(self as usize)
+    }
+}
+
+/// Metadata about a log message.
+#[derive(Debug)]
+pub struct Metadata {
+    pub level: LogLevel,
+    pub target: &'static str,
+}
+
+#[derive(Debug)]
+pub struct LogDirective {
+    name: Option<String>,
+    level: LogLevelFilter,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum LogSpecParseError {
+    #[error("Too many '/'s: {0}")]
+    TooManySlashes(String),
+    #[error("Too many '='s: {0}")]
+    TooManyEquals(String),
+    #[error("Invalid log level: {0}")]
+    InvalidLogLevel(String),
+}
+
+pub fn parse_logging_spec(spec: &str) -> (Vec<LogDirective>, Vec<LogSpecParseError>) {
+    let mut dirs = Vec::new();
+    let mut errors = Vec::new();
+
+    let mut parts = spec.split('/');
+    let mods = parts.next();
+    let _ = parts.next();
+    if parts.next().is_some() {
+        errors.push(LogSpecParseError::TooManySlashes(spec.to_string()));
+    }
+    if let Some(m) = mods {
+        for s in m.split(',') {
+            if s.is_empty() {
+                continue;
+            }
+            let mut parts = s.split('=');
+            let (log_level, name) =
+                match (parts.next(), parts.next().map(|s| s.trim()), parts.next()) {
+                    (Some(part0), None, None) => {
+                        // if the single argument is a log-level string or number,
+                        // treat that as a global fallback
+                        match part0.parse() {
+                            Ok(num) => (num, None),
+                            Err(_) => {
+                                errors.push(LogSpecParseError::InvalidLogLevel(s.to_string()));
+                                (LogLevelFilter::max(), None)
+                            }
+                        }
+                    }
+                    (Some(part0), Some(""), None) => (LogLevelFilter::max(), Some(part0)),
+                    (Some(part0), Some(part1), None) => match part1.parse() {
+                        Ok(num) => (num, Some(part0)),
+                        Err(_) => {
+                            errors.push(LogSpecParseError::InvalidLogLevel(s.to_string()));
+                            continue;
+                        }
+                    },
+                    _ => {
+                        errors.push(LogSpecParseError::TooManyEquals(s.to_string()));
+                        continue;
+                    }
+                };
+            dirs.push(LogDirective {
+                name: name.map(|s| s.to_string()),
+                level: log_level,
+            });
+        }
+    }
+
+    for error in &errors {
+        println!("{error:?}");
+    }
+    (dirs, errors)
+}
+
+/// start the logger with all logs and access logs on stdout
+pub fn setup_default_logging(
+    log_colored: bool,
+    log_level: &str,
+    tag: &str,
+) -> Result<(), LogError> {
+    setup_logging("stdout", log_colored, None, None, None, log_level, tag)
+}
+
+/// start the logger from config (takes RUST_LOG into account)
+pub fn setup_logging_with_config(config: &Config, tag: &str) -> Result<(), LogError> {
+    setup_logging(
+        &config.log_target,
+        config.log_colored,
+        config.access_logs_target.as_deref(),
+        config.access_logs_format.clone(),
+        config.access_logs_colored,
+        &config.log_level,
+        tag,
+    )
+}
+
+/// start the logger, after:
+///
+/// - determining logging backends
+/// - taking RUST_LOG into account
+pub fn setup_logging(
+    log_target: &str,
+    log_colored: bool,
+    access_logs_target: Option<&str>,
+    access_logs_format: Option<AccessLogFormat>,
+    access_logs_colored: Option<bool>,
+    log_level: &str,
+    tag: &str,
+) -> Result<(), LogError> {
+    Logger::init(
+        tag.to_string(),
+        env::var("RUST_LOG").as_deref().unwrap_or(log_level),
+        log_target,
+        log_colored,
+        access_logs_target,
+        access_logs_format,
+        access_logs_colored,
+    )
+}
+
+/// defaults to stdout if the log target is unparseable
+fn target_or_default(target: &str) -> LoggerBackend {
+    match target_to_backend(target) {
+        Ok(backend) => backend,
+        Err(target_error) => {
+            eprintln!("{target_error}, defaulting to stdout");
+            LoggerBackend::Stdout(stdout())
+        }
+    }
+}
+
+pub fn target_to_backend(target: &str) -> Result<LoggerBackend, LogError> {
+    if target == "stdout" {
+        return Ok(LoggerBackend::Stdout(stdout()));
+    }
+
+    if let Some(addr) = target.strip_prefix("udp://") {
+        let address = addr
+            .parse::<SocketAddr>()
+            .map_err(|e| LogError::InvalidSocketAddress(target.to_owned(), e))?;
+
+        let socket = UdpSocket::bind(("0.0.0.0", 0)).map_err(LogError::UdpBind)?;
+
+        return Ok(LoggerBackend::Udp(socket, address));
+    }
+
+    if let Some(addr) = target.strip_prefix("tcp://") {
+        let tcp_stream =
+            TcpStream::connect(addr).map_err(|e| LogError::TcpConnect(target.to_owned(), e))?;
+
+        return Ok(LoggerBackend::Tcp(tcp_stream));
+    }
+
+    if let Some(addr) = target.strip_prefix("unix://") {
+        let socket = UnixDatagram::unbound().map_err(LogError::CreateUnixSocket)?;
+
+        socket
+            .connect(addr)
+            .map_err(|e| LogError::ConnectToUnixSocket(target.to_owned(), e))?;
+
+        return Ok(LoggerBackend::Unix(socket));
+    }
+
+    if let Some(addr) = target.strip_prefix("file://") {
+        let path = Path::new(addr);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| LogError::OpenFile(target.to_owned(), e))?;
+
+        return Ok(LoggerBackend::File(MultiLineWriter::new(file)));
+    }
+
+    Err(LogError::InvalidLogTarget(
+        target.to_owned(),
+        "Log target is not parseable",
+    ))
+}
+
+#[macro_export]
+macro_rules! _prompt_log {
+    {
+        logger: $logger:expr,
+        is_access: $access:expr,
+        condition: $cond:expr,
+        prompt: [$($p:tt)*],
+        standard: {$($std:tt)*}$(,)?
+    } => {
+        $crate::_prompt_log!{
+            logger: $logger,
+            is_access: $access,
+            condition: $cond,
+            prompt: [$($p)*],
+            standard: {$($std)*},
+            colored: {$($std)*},
+        }
+    };
+    {
+        logger: $logger:expr,
+        is_access: $access:expr,
+        condition: $cond:expr,
+        prompt: [$($p:tt)*],
+        standard: {
+            formats: [$($std_fmt:tt)*],
+            args: [$($std_args:expr),*$(,)?]$(,)?
+        },
+        colored: {
+            formats: [$($col_fmt:tt)*],
+            args: @$(,)?
+        }$(,)?
+    } => {
+        $crate::_prompt_log!{
+            logger: $logger,
+            is_access: $access,
+            condition: $cond,
+            prompt: [$($p)*],
+            standard: {
+                formats: [$($std_fmt)*],
+                args: [$($std_args),*],
+            },
+            colored: {
+                formats: [$($col_fmt)*],
+                args: [$($std_args),*],
+            },
+        }
+    };
+    {
+        logger: $logger:expr,
+        is_access: $access:expr,
+        condition: $cond:expr,
+        prompt: [$now:expr, $precise_time:expr, $pid:expr, $lvl:expr, $tag:expr$(,)?],
+        standard: {
+            formats: [$($std_fmt:tt)*],
+            args: [$($std_args:expr),*$(,)?]$(,)?
+        },
+        colored: {
+            formats: [$($col_fmt:tt)*],
+            args: [$($col_args:expr),*$(,)?]$(,)?
+        }$(,)?
+    } => {
+        if $cond {
+            $crate::_prompt_log!(@bind [$logger, concat!("{} \x1b[2m{} \x1b[;2;1m{} {} \x1b[0;1m{}\x1b[m\t", $($col_fmt)*)] [$now, $precise_time, $pid, $lvl.as_str($access, true), $tag] $($col_args),*)
+        } else {
+            $crate::_prompt_log!(@bind [$logger, concat!("{} {} {} {} {}\t", $($std_fmt)*)] [$now, $precise_time, $pid, $lvl.as_str($access, false), $tag] $($std_args),*)
+        }
+    };
+    (@bind [$logger:expr, $fmt:expr] [$($bindings:expr),*] $arg:expr $(, $args:expr)*) => {{
+        let binding = &$arg;
+        $crate::_prompt_log!(@bind [$logger, $fmt] [$($bindings),* , binding] $($args),*)
+    }};
+    (@bind [$logger:expr, $fmt:expr] [$($bindings:expr),*]) => {
+        $logger(format_args!($fmt, $($bindings),*))
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LogLineCachedState(u8);
+const LOG_LINE_ENABLED: u8 = 1 << 7;
+
+impl Default for LogLineCachedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogLineCachedState {
+    pub const fn new() -> Self {
+        Self(0)
+    }
+    #[inline(always)]
+    pub fn version(&self) -> u8 {
+        self.0 & !LOG_LINE_ENABLED
+    }
+    #[inline(always)]
+    pub fn enabled(&self) -> bool {
+        self.0 & LOG_LINE_ENABLED != 0
+    }
+    #[inline(always)]
+    pub fn set(&mut self, version: u8, enabled: bool) {
+        self.0 = version;
+        if enabled {
+            self.0 |= LOG_LINE_ENABLED
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! _log_enabled {
+    ($logger:expr, $lvl:expr) => {{
+        let logger = $logger.borrow_mut();
+        if !logger.enabled($crate::logging::Metadata {
+            level: $lvl,
+            target: module_path!(),
+        }) {
+            return;
+        }
+        logger
+    }};
+}
+
+#[macro_export]
+macro_rules! _log {
+    ($lvl:expr, $format:expr $(, $args:expr)*) => {{
+        $crate::logging::LOGGER.with(|logger| {
+            let mut logger = $crate::_log_enabled!(logger, $lvl);
+            let (pid, tag, inner) = logger.split();
+            let (now, precise_time) = $crate::logging::now();
+
+            $crate::_prompt_log!{
+                logger: |args| inner.log(args),
+                is_access: false,
+                condition: inner.colored,
+                prompt: [now, precise_time, pid, $lvl, tag],
+                standard: {
+                    formats: [$format, '\n'],
+                    args: [$($args),*]
+                }
+            };
+        })
+    }};
+}
+
+#[macro_export]
+macro_rules! _log_access {
+    ($lvl:expr, $on_failure:block, $($request_record_fields:tt)*) => {{
+         $crate::logging::LOGGER.with(|logger| {
+            let success = {
+                let mut logger = $crate::_log_enabled!(logger, $lvl);
+                let (pid, tag, inner) = logger.split();
+                let (now, precise_time) = $crate::logging::now();
+
+                inner.log_access(
+                    $crate::_structured_access_log!(
+                        [$crate::logging::RequestRecord]
+                        pid, tag, now, precise_time, level: $lvl, $($request_record_fields)*
+                    )
+                )
+            }; // logger dropped here
+
+            if !success {
+                // recording this metric may borrow the logger, so we have
+                // to perform this action after the block above
+                $on_failure
+            }
+        });
+    }};
+}
+
+#[macro_export]
+macro_rules! _structured_access_log {
+    ([$($struct_name:tt)+] $($fields:tt)*) => {{
+        $($struct_name)+ {$(
+            $fields
+        )*}
+    }};
+}
+
+#[macro_export]
+/// dynamically chose between info_access and error_access
+macro_rules! log_access {
+    ($error:expr, on_failure: $on_failure:block, $($request_record_fields:tt)*) => {
+        let lvl = if $error {
+            $crate::logging::LogLevel::Error
+        } else {
+            $crate::logging::LogLevel::Info
+        };
+        _log_access!(lvl, $on_failure, $($request_record_fields)*);
+    };
+}
+
+/// log a failure concerning an HTTP or TCP request
+#[macro_export]
+macro_rules! error_access {
+    (on_failure: $on_failure:block, $($request_record_fields:tt)*) => {
+        $crate::_log_access!($crate::logging::LogLevel::Error, $on_failure, $($request_record_fields)*);
+    };
+}
+
+/// log the success of an HTTP or TCP request
+#[macro_export]
+macro_rules! info_access {
+    (on_failure: $on_failure:block, $($request_record_fields:tt)*) => {
+        $crate::_log_access!($crate::logging::LogLevel::Info, $on_failure, $($request_record_fields)*);
+    };
+}
+
+/// log an error with Sōzu's custom log stack
+#[macro_export]
+macro_rules! error {
+    ($format:expr $(, $args:expr)* $(,)?) => {
+        $crate::_log!($crate::logging::LogLevel::Error, $format $(, $args)*)
+    };
+}
+
+/// log a warning with Sōzu’s custom log stack
+#[macro_export]
+macro_rules! warn {
+    ($format:expr $(, $args:expr)* $(,)?) => {
+        $crate::_log!($crate::logging::LogLevel::Warn, $format $(, $args)*)
+    };
+}
+
+/// log an info with Sōzu’s custom log stack
+#[macro_export]
+macro_rules! info {
+    ($format:expr $(, $args:expr)* $(,)?) => {
+        $crate::_log!($crate::logging::LogLevel::Info, $format $(, $args)*)
+    };
+}
+
+/// log a debug with Sōzu’s custom log stack
+#[macro_export]
+macro_rules! debug {
+    ($format:expr $(, $args:expr)* $(,)?) => {{
+        #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
+        $crate::_log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format), module_path!() $(, $args)*);
+        // Dead-code arm silences `unused_variables` warnings on
+        // `--no-default-features` builds where the emit arm is stripped.
+        // Must gate on the SAME set of features as the emit arm above, or
+        // else both arms compile in and double-move the caller's arguments
+        // (observed on `release + logs-debug` builds where the emit arm
+        // fires and the no-op arm also fires, each consuming `$args` once).
+        #[cfg(not(any(debug_assertions, feature = "logs-debug", feature = "logs-trace")))]
+        if false {$( let _ = $args; )*}
+    }};
+}
+
+/// log a trace with Sōzu’s custom log stack
+#[macro_export]
+macro_rules! trace {
+    ($format:expr $(, $args:expr)* $(,)?) => {{
+        #[cfg(any(debug_assertions, feature = "logs-trace"))]
+        $crate::_log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format), module_path!() $(, $args)*);
+        #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
+        if false {$( let _ = $args; )*}
+    }};
+}
+
+/// write a log with a "FIXME" prefix on an info level
+#[macro_export]
+macro_rules! fixme {
+    ($(, $args:expr)* $(,)?) => {
+        $crate::_log!($crate::logging::LogLevel::Info, "FIXME: {}:{} in {}: {}", file!(), line!(), module_path!() $(, $args)*)
+    };
+}
+
+pub struct CompatLogger;
+
+impl From<log::Level> for LogLevel {
+    fn from(lvl: log::Level) -> Self {
+        match lvl {
+            log::Level::Error => LogLevel::Error,
+            log::Level::Warn => LogLevel::Warn,
+            log::Level::Info => LogLevel::Info,
+            log::Level::Debug => LogLevel::Debug,
+            log::Level::Trace => LogLevel::Trace,
+        }
+    }
+}
+
+impl log::Log for CompatLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        LOGGER.with(|logger| {
+            let mut logger = logger.borrow_mut();
+            if !logger.compat_enabled(record.metadata()) {
+                return;
+            }
+            let (pid, tag, inner) = logger.split();
+            let (now, precise_time) = now();
+            crate::_prompt_log! {
+                logger: |args| inner.log(args),
+                is_access: false,
+                condition: inner.colored,
+                prompt: [
+                    now, precise_time, pid, LogLevel::from(record.level()), tag
+                ],
+                standard: {
+                    formats: ["{}\n"],
+                    args: [record.args()]
+                }
+            };
+        })
+    }
+
+    /// Drain the thread's [`LOGGER`]. A no-op when that cell is already
+    /// borrowed, which only happens if `flush` is reached from inside a log
+    /// call on the same thread.
+    fn flush(&self) {
+        LOGGER.with(|logger| {
+            if let Ok(mut logger) = logger.try_borrow_mut() {
+                logger.flush();
+            }
+        })
+    }
+}
+
+/// start a logger used in test environment
+#[macro_export]
+macro_rules! setup_test_logger {
+    () => {
+        let _ = $crate::logging::Logger::init(
+            module_path!().to_string(),
+            "error",
+            sozu_command_lib::config::DEFAULT_LOG_TARGET,
+            false,
+            None,
+            None,
+            None,
+        );
+    };
+}
+
+pub struct Rfc3339Time {
+    pub inner: ::time::OffsetDateTime,
+}
+
+/// yields (Rfc3339Time, unix_epoch)
+pub fn now() -> (Rfc3339Time, i128) {
+    let t = time::OffsetDateTime::now_utc();
+    (
+        Rfc3339Time { inner: t },
+        (t - time::OffsetDateTime::UNIX_EPOCH).whole_nanoseconds(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    //! The property the `tcp://` access-log backend depends on: a record is
+    //! handed to the sink in ONE call, whatever its formatter fragment count.
+    //!
+    //! To SEE THESE RED (regression proof), restore the pre-fix `Tcp` arm of
+    //! [`super::log_arguments`] — `LoggerBackend::Tcp(socket) =>
+    //! socket.write_fmt(args)` — and change the two `buffer.fmt(...)` calls
+    //! below to `sink.write_fmt(...)`, which is what that arm does. Both
+    //! one-call expectations then fail with the fragment count in the message
+    //! (`39`, not `1`), and `a_short_write_does_not_truncate_a_record` reports a
+    //! truncated record. 39 is a FLOOR for the live record: this fixture omits
+    //! the tag map and the OpenTelemetry field, and the proxy was measured at 82
+    //! fragments per record.
+    //!
+    //! `short_writes_keep_consecutive_protobuf_records_framed` covers the
+    //! protobuf `Tcp` arm of [`super::InnerLogger::log_access`], which goes
+    //! through [`super::write_stream_record`]. To see it red, make that helper
+    //! `stream.write(bytes).map(|_| ())`, the pre-fix arm: the first record is
+    //! truncated after `limit` bytes and decoding reports `BufferUnderflow`.
+    //!
+    //! `cargo test` cannot count the `write(2)` syscalls the real
+    //! `LoggerBackend::Tcp(TcpStream)` arm performs: the variant holds a
+    //! concrete `TcpStream`, so no counting sink can be substituted, and the
+    //! only in-process syscall counter (`/proc/self/io`'s `syscw`) is
+    //! process-wide and would race every other test in the binary. That arm's
+    //! syscall count is proven outside the suite, by tracing the running proxy
+    //! (81.7 `send(2)` per access-log line before, 1 after; see the
+    //! `perf(logging)` CHANGELOG entry).
+    use super::{
+        AccessLogFormat, InnerLogger, LogLevel, LoggerBackend, LoggerBuffer,
+        encode_protobuf_access_log, now, write_stream_record,
+    };
+    use crate::{
+        logging::{EndpointRecord, LogContext, RequestRecord},
+        proto::command::ProtobufAccessLog,
+    };
+    use nix::sys::socket::{setsockopt, sockopt::SndBuf};
+    use prost::Message;
+    use rusty_ulid::Ulid;
+    use std::{
+        io::{Error as IoError, ErrorKind, Read, Write},
+        net::{Shutdown, TcpListener},
+        time::Duration,
+    };
+
+    /// Counts the calls a record arrives in, and records every chunk.
+    #[derive(Default)]
+    struct CountingSink {
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+            self.calls += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> Result<(), IoError> {
+            Ok(())
+        }
+    }
+
+    /// A stream sink that accepts at most `limit` bytes per call, the way a
+    /// `TcpStream` with a full send buffer does.
+    struct ShortWriteSink {
+        limit: usize,
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for ShortWriteSink {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+            self.calls += 1;
+            let n = buf.len().min(self.limit);
+            self.bytes.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> Result<(), IoError> {
+            Ok(())
+        }
+    }
+
+    /// The runtime field values of an access-log record.
+    ///
+    /// These must come from a NON-literal source. `format_args!` flattens
+    /// literal arguments into its template at compile time
+    /// (rustc's `flatten_format_args`), so a fixture built from literals
+    /// collapses to a single static piece and would measure nothing: the
+    /// fragment count this test exists to pin only appears for runtime values,
+    /// which is what `InnerLogger::log_access` actually passes.
+    struct Fields {
+        timestamp: &'static str,
+        nanos: u64,
+        pid: i32,
+        level: &'static str,
+        tag: &'static str,
+        context: &'static str,
+        session: &'static str,
+        backend: &'static str,
+        request_time: &'static str,
+        service_time: &'static str,
+        response_time: &'static str,
+        client_rtt: &'static str,
+        server_rtt: &'static str,
+        bytes_in: u64,
+        bytes_out: u64,
+        protocol: &'static str,
+        endpoint: &'static str,
+        request: &'static str,
+        status: u16,
+        message: &'static str,
+    }
+
+    #[inline(never)]
+    fn fields() -> Fields {
+        Fields {
+            timestamp: "2026-09-26T08:30:17.644122Z",
+            nanos: 1_790_411_417_644_122_623,
+            pid: 990_961,
+            level: "INFO-ACCESS",
+            tag: "WRK-00",
+            context: "01M3EDCA4D8KTDBGT0C64M50R1 PyBackend py",
+            session: "127.0.0.1:54610",
+            backend: "127.0.0.1:21080",
+            request_time: "1102\u{3bc}s",
+            service_time: "415\u{3bc}s",
+            response_time: "661\u{3bc}s",
+            client_rtt: "18\u{3bc}s",
+            server_rtt: "34\u{3bc}s",
+            bytes_in: 91,
+            bytes_out: 253,
+            protocol: "http",
+            endpoint: "lolcatho.st:21081",
+            request: "GET /index.html",
+            status: 200,
+            message: " | H1::Complete",
+        }
+    }
+
+    /// The live `AccessLogFormat::Ascii` template of `InnerLogger::log_access`,
+    /// prompt included: 20 runtime arguments, so 20 formatter fragments plus the
+    /// literal pieces between them.
+    macro_rules! access_log_shaped {
+        ($sink:expr, $buffer:expr, $f:expr) => {
+            $buffer.fmt(
+                format_args!(
+                    "{} {} {} {} {}\t[{}] {} {} {}/{}/{}/{}/{} {} {} {} {} {} {}{}\n",
+                    $f.timestamp,
+                    $f.nanos,
+                    $f.pid,
+                    $f.level,
+                    $f.tag,
+                    $f.context,
+                    $f.session,
+                    $f.backend,
+                    $f.request_time,
+                    $f.service_time,
+                    $f.response_time,
+                    $f.client_rtt,
+                    $f.server_rtt,
+                    $f.bytes_in,
+                    $f.bytes_out,
+                    $f.protocol,
+                    $f.endpoint,
+                    $f.request,
+                    $f.status,
+                    $f.message,
+                ),
+                |bytes| $sink.write(bytes),
+            )
+        };
+    }
+
+    #[test]
+    fn a_fragmented_record_reaches_the_sink_in_exactly_one_call() {
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let mut sink = CountingSink::default();
+
+        let f = fields();
+        access_log_shaped!(sink, buffer, f).expect("the record is written");
+
+        assert_eq!(
+            sink.calls, 1,
+            "an access-log record must reach a stream sink in ONE call, not one \
+             per formatter fragment -- the `tcp://` backend has no buffering of \
+             its own, so a call here is a syscall there"
+        );
+        assert!(
+            sink.bytes.ends_with(b" | H1::Complete\n"),
+            "the single call must carry the COMPLETE record, terminator included"
+        );
+        assert!(
+            sink.bytes.starts_with(b"2026-09-26T08:30:17.644122Z "),
+            "...and start at the beginning of the record"
+        );
+    }
+
+    #[test]
+    fn the_buffer_is_reused_so_a_record_costs_no_allocation() {
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let capacity_before = buffer.capacity();
+
+        let mut first = CountingSink::default();
+        let f = fields();
+        access_log_shaped!(first, buffer, f).expect("first record written");
+        let mut second = CountingSink::default();
+        access_log_shaped!(second, buffer, f).expect("second record written");
+
+        assert_eq!(
+            buffer.capacity(),
+            capacity_before,
+            "a record must not grow the buffer: the zero-allocation property of \
+             this path is what makes buffering acceptable on the hot path"
+        );
+        assert_eq!(second.calls, 1, "the second record is still a single call");
+        assert_eq!(
+            first.bytes, second.bytes,
+            "`fmt` clears the buffer, so a record must not carry the previous one's tail"
+        );
+    }
+
+    #[test]
+    fn a_short_write_does_not_truncate_a_record() {
+        // A datagram sink is all-or-nothing, so the `Unix`/`Udp` arms may discard
+        // the returned count. A stream may accept fewer bytes than offered, which
+        // is why the `Tcp` arm wraps `write_all` rather than `write`.
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let mut sink = ShortWriteSink {
+            limit: 7,
+            calls: 0,
+            bytes: Vec::new(),
+        };
+
+        let written = buffer
+            .fmt(
+                format_args!("{} {} {}\n", "first", "second", "third"),
+                |bytes| sink.write_all(bytes).map(|()| bytes.len()),
+            )
+            .map(|()| sink.bytes.clone());
+
+        let bytes = written.expect("the record is written despite short writes");
+        assert_eq!(
+            bytes, b"first second third\n",
+            "`write_all` must keep going until the whole record is consumed; \
+             a bare `write` would have stopped after {} bytes",
+            sink.limit
+        );
+        assert!(
+            sink.calls > 1,
+            "the fixture must actually exercise the short-write path"
+        );
+    }
+
+    /// A protobuf access log whose `tag` and `bytes_in` tell records apart.
+    fn protobuf_record(tag: &str, bytes_in: u64) -> ProtobufAccessLog {
+        ProtobufAccessLog {
+            message: Some("an error message long enough to need several short writes".into()),
+            protocol: "HTTP".into(),
+            tag: tag.into(),
+            bytes_in,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn short_writes_keep_consecutive_protobuf_records_framed() {
+        // Issue #1830: the protobuf `Tcp` arm of `InnerLogger::log_access` used
+        // a bare `write` and discarded its count, so a stream that accepted a
+        // prefix truncated the record, and the next record's bytes were read as
+        // the remainder of the first.
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let mut sink = ShortWriteSink {
+            limit: 7,
+            calls: 0,
+            bytes: Vec::new(),
+        };
+        let records = [
+            protobuf_record("WRK-00", 91),
+            protobuf_record("WRK-01", 253),
+        ];
+
+        for record in &records {
+            encode_protobuf_access_log(record, &mut buffer).expect("the record is framed");
+            assert!(
+                buffer.len() > sink.limit,
+                "the fixture must actually exercise the short-write path"
+            );
+            write_stream_record(&mut sink, &buffer)
+                .expect("the record is written despite short writes");
+        }
+
+        let mut stream = sink.bytes.as_slice();
+        for expected in &records {
+            let decoded = ProtobufAccessLog::decode_length_delimited(&mut stream)
+                .expect("every record decodes from the stream, in order");
+            assert_eq!(
+                &decoded, expected,
+                "a short write must not truncate a record or shift the next one"
+            );
+            assert_eq!(
+                stream.get(..2),
+                Some(&[0u8, 0][..]),
+                "each record is followed by its two zero bytes"
+            );
+            stream = &stream[2..];
+        }
+        assert!(stream.is_empty(), "nothing follows the last record");
+    }
+
+    #[test]
+    fn a_stream_record_error_is_propagated() {
+        struct FailingSink;
+        impl Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> Result<usize, IoError> {
+                Err(IoError::new(ErrorKind::BrokenPipe, "peer went away"))
+            }
+            fn flush(&mut self) -> Result<(), IoError> {
+                Ok(())
+            }
+        }
+
+        let error = write_stream_record(&mut FailingSink, b"a protobuf record")
+            .expect_err("a dead sink must surface, so `log_access` can revive the backend");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn a_sink_error_is_propagated() {
+        struct FailingSink;
+        impl Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> Result<usize, IoError> {
+                Err(IoError::new(ErrorKind::BrokenPipe, "peer went away"))
+            }
+            fn flush(&mut self) -> Result<(), IoError> {
+                Ok(())
+            }
+        }
+
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let mut sink = FailingSink;
+        let error = buffer
+            .fmt(format_args!("a {} record\n", "failing"), |bytes| {
+                sink.write_all(bytes).map(|()| bytes.len())
+            })
+            .expect_err("a dead sink must surface, so `log_access` can revive the backend");
+
+        assert_eq!(
+            error.kind(),
+            ErrorKind::BrokenPipe,
+            "the sink's error kind must survive: `log_access` reports it and \
+             calls `LoggerBackend::revive`"
+        );
+    }
+
+    /// Build the exact record type that [`InnerLogger::log_access`] converts
+    /// and frames before selecting the concrete `LoggerBackend::Tcp` arm.
+    fn protobuf_access_record<'a>(message: &'a str, tag: &'a str, id: u128) -> RequestRecord<'a> {
+        let (now, precise_time) = now();
+        RequestRecord {
+            message: Some(message),
+            context: LogContext {
+                session_id: Ulid::from(id),
+                request_id: Some(Ulid::from(id + 1)),
+                cluster_id: Some("short-write-cluster"),
+                backend_id: Some("short-write-backend"),
+            },
+            session_address: None,
+            backend_address: None,
+            protocol: "tcp",
+            endpoint: EndpointRecord::Tcp,
+            tags: None,
+            client_rtt: None,
+            server_rtt: None,
+            user_agent: None,
+            x_request_id: None,
+            tls_version: None,
+            tls_cipher: None,
+            tls_sni: None,
+            tls_alpn: None,
+            xff_chain: None,
+            service_time: Duration::ZERO,
+            response_time: None,
+            request_time: Duration::ZERO,
+            start_time_ns: None,
+            bytes_in: id as usize,
+            bytes_out: (id + 1) as usize,
+            otel: None,
+            pid: 1,
+            tag,
+            level: LogLevel::Info,
+            now,
+            precise_time,
+        }
+    }
+
+    fn encode_protobuf_frame(record: RequestRecord<'_>) -> Vec<u8> {
+        let protobuf = record.into_binary_access_log();
+        let mut frame = Vec::new();
+        protobuf
+            .encode_length_delimited(&mut frame)
+            .expect("the protobuf access-log fixture must encode");
+        frame.extend_from_slice(&[0, 0]);
+        frame
+    }
+
+    fn drain_until_idle(peer: &mut std::net::TcpStream, captured: &mut Vec<u8>) -> usize {
+        let before = captured.len();
+        let mut bytes = [0u8; 64 * 1024];
+        loop {
+            match peer.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(read) => captured.extend_from_slice(&bytes[..read]),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("could not drain the loopback peer: {error}"),
+            }
+        }
+        captured.len() - before
+    }
+
+    fn decode_protobuf_tags(mut stream: &[u8]) -> Result<Vec<String>, String> {
+        let mut tags = Vec::new();
+        for record_index in 0..2 {
+            let record = ProtobufAccessLog::decode_length_delimited(&mut stream)
+                .map_err(|error| format!("record {record_index} did not decode: {error}"))?;
+            if !stream.starts_with(&[0, 0]) {
+                return Err(format!(
+                    "record {record_index} was not followed by its two zero bytes"
+                ));
+            }
+            stream = &stream[2..];
+            tags.push(record.tag);
+        }
+        if !stream.is_empty() {
+            return Err(format!(
+                "{} unframed bytes follow the records",
+                stream.len()
+            ));
+        }
+        Ok(tags)
+    }
+
+    #[test]
+    fn protobuf_tcp_short_write_completes_or_surfaces_error() {
+        // Contract (sozu-proxy/sozu#1830): a successful protobuf TCP access-log
+        // write covers the complete frame. Two successful records must remain
+        // independently decodable, including the two zero-byte separators.
+        // The refuting observation is `true` from `log_access` after the real
+        // socket accepted only a prefix and shifted the following frame.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the loopback log sink");
+        let address = listener.local_addr().expect("read the log sink address");
+        let sender = std::net::TcpStream::connect(address).expect("connect the log backend");
+        let (mut peer, _) = listener.accept().expect("accept the log backend");
+
+        // A blocking production TcpStream may return a successful prefix when
+        // its send timeout fires after making progress. Shrinking SO_SNDBUF and
+        // withholding reads during each call makes that boundary deterministic.
+        setsockopt(&sender, SndBuf, &4096usize).expect("shrink the sender queue");
+        sender
+            .set_write_timeout(Some(Duration::from_millis(250)))
+            .expect("bound a blocked log write");
+        peer.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("bound capture reads");
+
+        let log_target = format!("tcp://{address}");
+        let mut logger = InnerLogger {
+            directives: Vec::new(),
+            backend: LoggerBackend::Tcp(sender),
+            log_target,
+            colored: false,
+            access_backend: None,
+            access_logs_target: None,
+            access_format: AccessLogFormat::Protobuf,
+            access_colored: false,
+            buffer: LoggerBuffer(Vec::with_capacity(4096)),
+        };
+
+        let first_message = "A".repeat(1024 * 1024);
+        let second_message = "B".repeat(1024 * 1024);
+        let first_expected =
+            encode_protobuf_frame(protobuf_access_record(&first_message, "WRK-SHORT-00", 10));
+        let second_expected =
+            encode_protobuf_frame(protobuf_access_record(&second_message, "WRK-SHORT-01", 20));
+
+        let first_ok =
+            logger.log_access(protobuf_access_record(&first_message, "WRK-SHORT-00", 10));
+        if !first_ok {
+            // Surfacing the short write is an accepted implementation of the
+            // contract: the caller can revive the backend and no truncated
+            // record was reported as delivered.
+            return;
+        }
+
+        let mut captured = Vec::new();
+        let first_written = drain_until_idle(&mut peer, &mut captured);
+        assert!(
+            first_written > 0 && first_written < first_expected.len(),
+            "the harness must induce a real short write: captured {first_written} of {} bytes",
+            first_expected.len()
+        );
+
+        let second_ok =
+            logger.log_access(protobuf_access_record(&second_message, "WRK-SHORT-01", 20));
+        let second_written = drain_until_idle(&mut peer, &mut captured);
+
+        if let LoggerBackend::Tcp(sender) = &logger.backend {
+            sender
+                .shutdown(Shutdown::Write)
+                .expect("half-close the owned log socket");
+        }
+        let _ = drain_until_idle(&mut peer, &mut captured);
+
+        let mut expected = first_expected;
+        expected.extend_from_slice(&second_expected);
+        let decoded = decode_protobuf_tags(&captured);
+        assert!(
+            second_ok
+                && second_written > 0
+                && captured == expected
+                && decoded == Ok(vec!["WRK-SHORT-00".to_owned(), "WRK-SHORT-01".to_owned()]),
+            "two successful protobuf TCP writes must preserve progress and framing: \
+             first_ok={first_ok}, second_ok={second_ok}, first_written={first_written}, \
+             second_written={second_written}, captured={}, expected={}, decoded={decoded:?}",
+            captured.len(),
+            expected.len(),
+        );
+    }
+}

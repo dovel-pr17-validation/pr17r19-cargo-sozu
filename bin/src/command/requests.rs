@@ -1,0 +1,9063 @@
+//! Master command-verb dispatcher and audit envelope.
+//!
+//! Receives decoded `Request` protos from connected CLI clients, applies
+//! `command_allowed_uids` admission, validates and fans out cluster /
+//! listener / certificate / runtime mutations to workers, and emits the
+//! audit-log envelope (`sanitize_for_audit`-protected JSON sink) for every
+//! mutating verb. Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    env,
+    fs::File,
+    io::{ErrorKind, Read},
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+use mio::Token;
+use nom::{HexDisplay, Offset};
+use prost::Message as _;
+use rusty_ulid::Ulid;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sozu_command_lib::{
+    buffer::fixed::Buffer,
+    certificate::{Fingerprint, parse_pem, parse_x509},
+    config::Config,
+    logging,
+    parser::parse_several_requests,
+    proto::command::{
+        AddCertificate, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
+        CertificatesWithFingerprints, CloseSessions, ClusterHashes, ClusterInformations, Event,
+        EventKind, FilteredMetrics, FrontendFilters, HardStop, MetricDetail, MetricDetailStatus,
+        MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions,
+        Request, ResponseContent, ResponseStatus, RunState, SetMetricDetail, SoftStop, Status,
+        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
+        UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponse,
+        WorkerResponses, request::RequestType, response_content::ContentType,
+    },
+    proto::display::forwarded_headers_label,
+    sd_notify,
+    state::{ConfigState, rollback_request},
+};
+use sozu_lib::{
+    ListenerError,
+    metrics::METRICS,
+    protocol::kawa_h1::answers::HttpAnswers,
+    router::{MAX_HOSTNAME_LENGTH, pattern_trie::TrieNode},
+    tls::build_validated_certificate,
+};
+
+use crate::command::{
+    server::{
+        DefaultGatherer, ElapsedSnapshot, Gatherer, GatheringTask, MessageClient, Server,
+        ServerState, TaskRestoreTiming, TaskSnapshot, TaskSnapshotError, TaskSnapshotTiming,
+        Timeout, WorkerId, parse_scatter_request_id,
+    },
+    sessions::{ClientSession, OptionalClient, sanitize_for_audit, sanitize_for_audit_kv},
+    upgrade::upgrade_worker,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClientRequestOutcome {
+    Continue,
+    UpgradeMain,
+}
+
+macro_rules! task_audit_tags {
+    ($( $variant:ident => $verb:literal ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+        enum TaskAuditTag {
+            $( $variant, )+
+        }
+
+        impl TaskAuditTag {
+            fn capture(verb: &'static str, counter: &'static str) -> Result<Self, TaskSnapshotError> {
+                match (verb, counter) {
+                    $( ($verb, concat!("config.", $verb)) => Ok(Self::$variant), )+
+                    _ => Err(TaskSnapshotError::UnknownAuditTag {
+                        verb: verb.to_owned(),
+                        counter: counter.to_owned(),
+                    }),
+                }
+            }
+
+            fn restore(self) -> (&'static str, &'static str) {
+                match self {
+                    $( Self::$variant => ($verb, concat!("config.", $verb)), )+
+                }
+            }
+        }
+    };
+}
+
+task_audit_tags! {
+    ClusterAdded => "cluster_added",
+    ClusterRemoved => "cluster_removed",
+    HttpFrontendAdded => "http_frontend_added",
+    HttpsFrontendAdded => "https_frontend_added",
+    TcpFrontendAdded => "tcp_frontend_added",
+    HttpFrontendRemoved => "http_frontend_removed",
+    HttpsFrontendRemoved => "https_frontend_removed",
+    TcpFrontendRemoved => "tcp_frontend_removed",
+    UdpFrontendAdded => "udp_frontend_added",
+    UdpFrontendRemoved => "udp_frontend_removed",
+    CertificateAdded => "certificate_added",
+    CertificateRemoved => "certificate_removed",
+    CertificateReplaced => "certificate_replaced",
+    ListenerActivated => "listener_activated",
+    ListenerDeactivated => "listener_deactivated",
+    HttpListenerUpdated => "http_listener_updated",
+    HttpsListenerUpdated => "https_listener_updated",
+    TcpListenerUpdated => "tcp_listener_updated",
+    UdpListenerUpdated => "udp_listener_updated",
+    HttpListenerAdded => "http_listener_added",
+    HttpsListenerAdded => "https_listener_added",
+    TcpListenerAdded => "tcp_listener_added",
+    UdpListenerAdded => "udp_listener_added",
+    ListenerRemoved => "listener_removed",
+    MetricsConfigured => "metrics_configured",
+    MetricDetailChanged => "metric_detail_changed",
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AuditEntrySnapshot {
+    kind: EventKind,
+    tag: TaskAuditTag,
+    cluster_id: Option<String>,
+    backend_id: Option<String>,
+    address: Option<sozu_command_lib::proto::command::SocketAddress>,
+    target: String,
+    extras: AuditExtras,
+}
+
+impl AuditEntrySnapshot {
+    fn capture(entry: &AuditEntry) -> Result<Self, TaskSnapshotError> {
+        Ok(Self {
+            kind: entry.kind,
+            tag: TaskAuditTag::capture(entry.verb, entry.counter)?,
+            cluster_id: entry.cluster_id.clone(),
+            backend_id: entry.backend_id.clone(),
+            address: entry.address,
+            target: entry.target.clone(),
+            extras: entry.extras.clone(),
+        })
+    }
+
+    fn restore(self) -> AuditEntry {
+        let (verb, counter) = self.tag.restore();
+        AuditEntry {
+            kind: self.kind,
+            verb,
+            counter,
+            cluster_id: self.cluster_id,
+            backend_id: self.backend_id,
+            address: self.address,
+            target: self.target,
+            extras: self.extras,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct InlineAuditTargetSnapshot {
+    kind: EventKind,
+    tag: TaskAuditTag,
+    target: String,
+}
+
+impl InlineAuditTargetSnapshot {
+    fn capture(target: &InlineAuditTarget) -> Result<Self, TaskSnapshotError> {
+        Ok(Self {
+            kind: target.kind,
+            tag: TaskAuditTag::capture(target.verb, target.counter)?,
+            target: target.target.clone(),
+        })
+    }
+
+    fn restore(self) -> InlineAuditTarget {
+        let (verb, counter) = self.tag.restore();
+        InlineAuditTarget {
+            kind: self.kind,
+            verb,
+            counter,
+            target: self.target,
+        }
+    }
+}
+
+/// Serializable state of the eight command tasks implemented in this module.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum RequestTaskSnapshot {
+    QueryClusters {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+        main_process_response: Option<ResponseContent>,
+    },
+    CloseSessions {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+    },
+    LoadStaticConfig {
+        gatherer: PerEntryGatherer,
+        client_token: Option<usize>,
+    },
+    Worker(Box<WorkerTaskSnapshot>),
+    SetMetricDetail {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+        started_at: ElapsedSnapshot,
+        master_configured: MetricDetail,
+        master_previous_effective: MetricDetail,
+        inline_audit: InlineAuditTargetSnapshot,
+        metric_detail_audit: MetricDetailAuditFields,
+    },
+    QueryMetrics {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+        options: QueryMetricsOptions,
+        main_process_metrics: BTreeMap<String, FilteredMetrics>,
+    },
+    LoadState {
+        client_token: Option<usize>,
+        gatherer: PerEntryGatherer,
+        path: String,
+    },
+    Status {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+        worker_infos: HashMap<WorkerId, WorkerInfo>,
+    },
+    Stop {
+        client_token: Option<usize>,
+        gatherer: DefaultGatherer,
+        hardness: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct WorkerTaskSnapshot {
+    pub(crate) client_token: usize,
+    pub(crate) gatherer: DefaultGatherer,
+    pub(crate) started_at: ElapsedSnapshot,
+    pub(crate) audit: Option<AuditEntrySnapshot>,
+    pub(crate) inline_audit: Option<InlineAuditTargetSnapshot>,
+    pub(crate) metric_detail_audit: Option<MetricDetailAuditFields>,
+    pub(crate) clear_master_metrics_on_finish: bool,
+    pub(crate) rollback: Option<Request>,
+}
+
+#[cfg(test)]
+impl WorkerTaskSnapshot {
+    pub(crate) fn started_at(&self) -> ElapsedSnapshot {
+        self.started_at
+    }
+}
+
+impl RequestTaskSnapshot {
+    pub(crate) fn is_stop(&self) -> bool {
+        matches!(self, Self::Stop { .. })
+    }
+
+    pub(crate) fn restore(
+        self,
+        timing: TaskRestoreTiming,
+    ) -> Result<Box<dyn GatheringTask>, TaskSnapshotError> {
+        Ok(match self {
+            Self::QueryClusters {
+                client_token,
+                gatherer,
+                main_process_response,
+            } => Box::new(QueryClustersTask {
+                client_token: Token(client_token),
+                gatherer,
+                main_process_response,
+            }),
+            Self::CloseSessions {
+                client_token,
+                gatherer,
+            } => Box::new(CloseSessionsTask {
+                client_token: Token(client_token),
+                gatherer,
+            }),
+            Self::LoadStaticConfig {
+                gatherer,
+                client_token,
+            } => Box::new(LoadStaticConfigTask {
+                gatherer,
+                client_token: client_token.map(Token),
+                reload: None,
+                notify_ready: false,
+            }),
+            Self::Worker(snapshot) => {
+                let WorkerTaskSnapshot {
+                    client_token,
+                    gatherer,
+                    started_at,
+                    audit,
+                    inline_audit,
+                    metric_detail_audit,
+                    clear_master_metrics_on_finish,
+                    rollback,
+                } = *snapshot;
+                Box::new(WorkerTask {
+                    client_token: Token(client_token),
+                    gatherer,
+                    started_at: started_at.restore(timing)?,
+                    audit: audit.map(AuditEntrySnapshot::restore),
+                    inline_audit: inline_audit.map(InlineAuditTargetSnapshot::restore),
+                    metric_detail_audit,
+                    clear_master_metrics_on_finish,
+                    rollback,
+                })
+            }
+            Self::SetMetricDetail {
+                client_token,
+                gatherer,
+                started_at,
+                master_configured,
+                master_previous_effective,
+                inline_audit,
+                metric_detail_audit,
+            } => Box::new(SetMetricDetailTask {
+                client_token: Token(client_token),
+                gatherer,
+                started_at: started_at.restore(timing)?,
+                master_configured,
+                master_previous_effective,
+                inline_audit: inline_audit.restore(),
+                metric_detail_audit,
+            }),
+            Self::QueryMetrics {
+                client_token,
+                gatherer,
+                options,
+                main_process_metrics,
+            } => Box::new(QueryMetricsTask {
+                client_token: Token(client_token),
+                gatherer,
+                options,
+                main_process_metrics: Some(main_process_metrics),
+            }),
+            Self::LoadState {
+                client_token,
+                gatherer,
+                path,
+            } => Box::new(LoadStateTask {
+                client_token: client_token.map(Token),
+                gatherer,
+                path,
+            }),
+            Self::Status {
+                client_token,
+                gatherer,
+                worker_infos,
+            } => Box::new(StatusTask {
+                client_token: Token(client_token),
+                gatherer,
+                worker_infos,
+            }),
+            Self::Stop {
+                client_token,
+                gatherer,
+                hardness,
+            } => Box::new(StopTask {
+                client_token: client_token.map(Token),
+                gatherer,
+                hardness,
+            }),
+        })
+    }
+}
+
+/// Pair a verb tag with its `config.<verb>` counter key in a single place so
+/// the two strings cannot drift. Both must be string literals because the
+/// metric drain stores `&'static str` keys.
+///
+/// Defined at the top of the module so that in-file macros expand before any
+/// call site (Rust `macro_rules!` macros are textually scoped — definition
+/// must precede use within a module).
+macro_rules! audit_verb {
+    ($verb:literal) => {
+        ($verb, concat!("config.", $verb))
+    };
+}
+
+/// Render the structured audit log line in the MUX-family layout.
+///
+/// Expands to a `format!` producing
+/// `[session_ulid request_ulid cluster_id|- backend_id|-]\tAUDIT\tCommand(verb=..., actor_uid=..., actor_gid=..., actor_pid=..., actor_comm=..., client_id=..., target=..., result=..., [error_code=..., reason=..., elapsed_ms=..., fanout=..., workers=<ok>/<err>/<expected>,] sozu_version=...)`
+/// with ANSI colours when the logger is colour-enabled (empty strings
+/// otherwise — see [`sozu_command_lib::logging::ansi_palette`]). Bracketed
+/// fields are emitted only when set on [`AuditEntry`] / the caller.
+///
+/// Bracket layout mirrors `log_context!` (`lib/src/protocol/mux/mod.rs`) so
+/// operators can grep `AUDIT` alongside `MUX` / `RUSTLS` / `PIPE` / `TCP`.
+/// Uses the `Command(...)` keyword (vs. `Session(...)` in MUX lines) because
+/// the payload describes a control-plane command, not a proxy session. The
+/// line is self-contained — no `\t >>>` continuation marker since nothing
+/// follows the closing paren.
+///
+/// Every string field — `verb` is a `&'static str` and therefore trusted,
+/// but `target`, `cluster_id`, `backend_id`, `actor_comm`, `reason` can
+/// originate from attacker-influenced input (cluster IDs from sozu CLI
+/// arguments, hostnames from frontend configs, error messages from
+/// `state.dispatch`). All of them go through
+/// [`sozu_command_lib::sessions::sanitize_for_audit`] at render time to
+/// neutralise `\n`/`\t`/`\x1b` injection that would otherwise forge a
+/// second audit line.
+macro_rules! audit_log_context {
+    ($server:expr, $client:expr, $request_id:expr, $entry:expr, $result:expr) => {{
+        use $crate::command::sessions::{sanitize_for_audit, sanitize_for_audit_kv};
+        let (open, reset, grey, gray, white) = ::sozu_command_lib::logging::ansi_palette();
+        let log_ctx = ::sozu_command_lib::logging::LogContext {
+            session_id: $client.session_ulid,
+            request_id: Some(*$request_id),
+            cluster_id: $entry.cluster_id.as_deref(),
+            backend_id: $entry.backend_id.as_deref(),
+        };
+        let mut extras = String::new();
+        if let Some(code) = $entry.extras.error_code {
+            extras.push_str(&format!(
+                ", {gray}error_code{reset}={white}{code}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                code = code,
+            ));
+        }
+        if let Some(reason) = $entry.extras.reason.as_deref() {
+            let sanitized = sanitize_for_audit(reason);
+            let truncated = if sanitized.chars().count() > AUDIT_REASON_MAX_CHARS {
+                let cut: String = sanitized.chars().take(AUDIT_REASON_MAX_CHARS).collect();
+                format!("{cut}…")
+            } else {
+                sanitized
+            };
+            extras.push_str(&format!(
+                ", {gray}reason{reset}={white}{reason}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                reason = truncated,
+            ));
+        }
+        if let Some(elapsed) = $entry.extras.elapsed_ms {
+            extras.push_str(&format!(
+                ", {gray}elapsed_ms{reset}={white}{elapsed}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                elapsed = elapsed,
+            ));
+        }
+        if let Some(fanout) = $entry.extras.fanout {
+            extras.push_str(&format!(
+                ", {gray}fanout{reset}={white}{status}{reset}, {gray}workers{reset}={white}{ok}/{err}/{expected}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                status = fanout.status,
+                ok = fanout.workers_ok,
+                err = fanout.workers_err,
+                expected = fanout.workers_expected,
+            ));
+        }
+        if let Some(hash) = $entry.extras.request_sha256.as_deref() {
+            extras.push_str(&format!(
+                ", {gray}request_sha256{reset}={white}{hash}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                hash = hash,
+            ));
+        }
+        if let Some(lease_id) = $entry.extras.metric_detail_lease_id.as_deref() {
+            let sanitized = sanitize_for_audit_kv(lease_id);
+            let truncated = if sanitized.chars().count() > AUDIT_LEASE_ID_MAX_CHARS {
+                let cut: String = sanitized.chars().take(AUDIT_LEASE_ID_MAX_CHARS).collect();
+                format!("{cut}…")
+            } else {
+                sanitized
+            };
+            extras.push_str(&format!(
+                ", {gray}lease_id{reset}={white}{value}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                value = truncated,
+            ));
+        }
+        if let Some(detail_reason) = $entry.extras.metric_detail_reason.as_deref() {
+            let sanitized = sanitize_for_audit_kv(detail_reason);
+            let truncated = if sanitized.chars().count() > AUDIT_REASON_MAX_CHARS {
+                let cut: String = sanitized.chars().take(AUDIT_REASON_MAX_CHARS).collect();
+                format!("{cut}…")
+            } else {
+                sanitized
+            };
+            extras.push_str(&format!(
+                ", {gray}metric_detail_reason{reset}={white}{value}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                value = truncated,
+            ));
+        }
+        let now_ts = rfc3339_utc(std::time::SystemTime::now());
+        let connect_ts = $client.connect_ts_display();
+        format!(
+            "{gray}{ctx}{reset}\t{open}AUDIT{reset}\t{grey}Command{reset}({gray}ts{reset}={white}{ts}{reset}, {gray}verb{reset}={white}{verb}{reset}, {gray}actor_uid{reset}={white}{actor_uid}{reset}, {gray}actor_gid{reset}={white}{actor_gid}{reset}, {gray}actor_pid{reset}={white}{actor_pid}{reset}, {gray}actor_role{reset}={white}{actor_role}{reset}, {gray}actor_user{reset}={white}{actor_user}{reset}, {gray}actor_comm{reset}={white}{actor_comm}{reset}, {gray}client_id{reset}={white}{client_id}{reset}, {gray}connect_ts{reset}={white}{connect_ts}{reset}, {gray}socket{reset}={white}{socket_path}{reset}, {gray}target{reset}={white}{target}{reset}, {gray}result{reset}={white}{result}{reset}{extras}, {gray}sozu_version{reset}={white}{sozu_version}{reset}, {gray}build_git_sha{reset}={white}{build_git_sha}{reset}, {gray}boot_generation{reset}={white}{boot_generation}{reset})",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ctx = log_ctx,
+            ts = now_ts,
+            verb = $entry.verb,
+            actor_uid = $client.actor_uid_display(),
+            actor_gid = $client.actor_gid_display(),
+            actor_pid = $client.actor_pid_display(),
+            actor_role = actor_role($client.actor_uid),
+            actor_user = $client.actor_user_display(),
+            actor_comm = $client.actor_comm_display(),
+            client_id = $client.id,
+            connect_ts = connect_ts,
+            socket_path = sanitize_for_audit(&$client.socket_path),
+            target = sanitize_for_audit(&$entry.target),
+            result = $result,
+            extras = extras,
+            sozu_version = SOZU_VERSION,
+            build_git_sha = SOZU_BUILD_GIT_SHA,
+            boot_generation = $server.boot_generation,
+        )
+    }};
+}
+
+/// Fail-closed response used when `PROTECTED_HEALTH_CHECK_PUBLIC` disables the
+/// public verb. Static: it never echoes a header name or value.
+pub(crate) const PROTECTED_HEALTH_CHECK_REFUSAL: &str =
+    "SetProtectedHealthCheck is disabled in this main process; nothing was applied or kept";
+
+/// Operator-issued verbs that change cluster / listener / certificate
+/// state, the saved state file, or the master/worker fleet topology.
+/// `true` here brackets the dispatch with `RELOADING=1` / `READY=1`
+/// systemd notifications so unit-state-watching tooling can serialise
+/// against the change. Read-only verbs (Status / List* / Query* /
+/// CountRequests / SubscribeEvents / QueryMaxConnectionsPerIp) return
+/// `false` because they're dashboard polls, not transitions.
+///
+/// `SetMetricDetail` is deliberately excluded: it is a runtime
+/// observability knob, not a state transition, and the `sozu top` TUI
+/// renews its lease every `ttl/2` seconds (≈ 30 s by default). Including
+/// it in this set would flap the systemd unit through `reloading`
+/// every renewal for the whole TUI session lifetime. The audit trail
+/// for the verb still flows through the special-case inline emission
+/// (`EventKind::MetricDetailChanged`, proto tag 30) so SOC visibility
+/// is preserved without flapping the unit state.
+///
+/// `CloseSessions` is excluded too: it closes live sessions and changes
+/// neither the configuration nor the fleet.
+pub(crate) fn is_mutating_verb(req: &RequestType) -> bool {
+    matches!(
+        req,
+        RequestType::SaveState(_)
+            | RequestType::LoadState(_)
+            | RequestType::ReloadConfiguration(_)
+            | RequestType::UpgradeMain(_)
+            | RequestType::UpgradeWorker(_)
+            | RequestType::AddCluster(_)
+            | RequestType::ActivateListener(_)
+            | RequestType::AddBackend(_)
+            | RequestType::AddUnixBackend(_)
+            | RequestType::AddCertificate(_)
+            | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpFrontendWithSilentClose(_)
+            | RequestType::AddHttpListener(_)
+            | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithSilentClose(_)
+            | RequestType::AddHttpsListener(_)
+            | RequestType::AddHttpsListenerWithClientAuth(_)
+            | RequestType::AddTcpFrontend(_)
+            | RequestType::AddTcpListener(_)
+            | RequestType::AddUdpFrontend(_)
+            | RequestType::AddUdpListener(_)
+            | RequestType::ConfigureMetrics(_)
+            | RequestType::DeactivateListener(_)
+            | RequestType::RemoveBackend(_)
+            | RequestType::RemoveCertificate(_)
+            | RequestType::RemoveCluster(_)
+            | RequestType::RemoveHttpFrontend(_)
+            | RequestType::RemoveHttpsFrontend(_)
+            | RequestType::RemoveListener(_)
+            | RequestType::RemoveTcpFrontend(_)
+            | RequestType::RemoveUdpFrontend(_)
+            | RequestType::ReplaceCertificate(_)
+            | RequestType::UpdateHttpListener(_)
+            | RequestType::UpdateHttpsListener(_)
+            | RequestType::UpdateHttpsListenerWithClientAuth(_)
+            | RequestType::UpdateTcpListener(_)
+            | RequestType::UpdateUdpListener(_)
+            | RequestType::SetHealthCheck(_)
+            | RequestType::RemoveHealthCheck(_)
+            | RequestType::SoftStop(_)
+            | RequestType::HardStop(_)
+            | RequestType::Logging(_)
+            | RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::SetMaxConnectionsPerSubnet(_)
+            | RequestType::SetMaxConnectionAttempts(_)
+    )
+}
+
+impl Server {
+    pub(crate) fn handle_client_request(
+        &mut self,
+        client: &mut ClientSession,
+        request: Request,
+    ) -> ClientRequestOutcome {
+        let request_type = match request.request_type {
+            Some(req) => req,
+            None => {
+                error!("empty request sent by client {:?}", client);
+                return ClientRequestOutcome::Continue;
+            }
+        };
+        // Optional UID allowlist. `None` preserves the historical
+        // behaviour (same-UID local process can do anything).
+        // When set, requests from UIDs outside the list are rejected
+        // before dispatch — both read and write — and the rejection
+        // appears in the audit trail via `client.finish_failure`.
+        if let Some(allowed) = self.config.command_allowed_uids.as_ref() {
+            let actor_uid = client.actor_uid;
+            let permitted = actor_uid.is_some_and(|u| allowed.contains(&u));
+            if !permitted {
+                warn!(
+                    "rejecting command-socket request from non-allowlisted UID: actor_uid={} allowed={:?} verb={:?}",
+                    actor_uid
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    allowed,
+                    std::mem::discriminant(&request_type)
+                );
+                client.finish_failure(format!(
+                    "unauthorized: actor UID {} not in command_allowed_uids",
+                    actor_uid
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned())
+                ));
+                return ClientRequestOutcome::Continue;
+            }
+        }
+
+        if matches!(request_type, RequestType::UpgradeMain(_)) {
+            return ClientRequestOutcome::UpgradeMain;
+        }
+
+        // A protected health check change in flight owns its cluster: no
+        // direct order may rewrite it, and no bulk replay may race it.
+        if super::protected::refuse_while_busy(self, client, &request_type) {
+            return ClientRequestOutcome::Continue;
+        }
+
+        // #228: bracket every operator-issued command with
+        // `RELOADING=1` / `READY=1`. Mutating verbs (LoadState,
+        // ReloadConfiguration, AddCluster / Backend / Certificate /
+        // Frontend / Listener, Remove*, Replace*, Update*,
+        // SetHealthCheck, SetMaxConnectionsPerIp, UpgradeMain,
+        // UpgradeWorker) move the master through a brief reload
+        // window where downstream tooling watching the unit state
+        // can serialise against in-flight changes. Read-only verbs
+        // (Status, ListWorkers, ListListeners, ListFrontends,
+        // QueryClusters*, QueryMetrics, QueryCertificates*,
+        // CountRequests, QueryHealthChecks, SubscribeEvents,
+        // QueryMaxConnectionsPerIp) skip the bracketing — those are
+        // dashboard polls, not state transitions.
+        //
+        // Helper is a no-op when `$NOTIFY_SOCKET` is unset, so the
+        // cost is one env-var lookup per command in non-systemd
+        // deployments.
+        let mutating = is_mutating_verb(&request_type);
+        // INVARIANT: the systemd bracket is symmetric. `mutating` is the
+        // sole gate for BOTH the RELOADING=1 (entry) and READY=1 (exit)
+        // notifications below, so it must be captured exactly once into this
+        // local and reused — never recomputed against a moved/mutated verb —
+        // otherwise a verb that opened the reload window could skip closing
+        // it (leaving the unit stuck in `reloading`) or vice versa.
+        debug_assert_eq!(
+            mutating,
+            is_mutating_verb(&request_type),
+            "is_mutating_verb must be a pure function of the verb (RELOADING/READY bracket gate)"
+        );
+        // INVARIANT: read-only verbs are never bracketed. The pure dashboard
+        // polls (Status / Query* / List* / Count) are dispatched WITHOUT
+        // touching `ConfigState` or the fleet, so flapping the systemd unit
+        // through `reloading` for them would be a correctness bug for any
+        // unit-state-watching tooling. SetMetricDetail is also excluded by
+        // design (runtime lease, not a transition — see the doc on the fn).
+        debug_assert!(
+            !mutating
+                || !matches!(
+                    request_type,
+                    RequestType::Status(_)
+                        | RequestType::ListWorkers(_)
+                        | RequestType::ListFrontends(_)
+                        | RequestType::ListListeners(_)
+                        | RequestType::QueryClustersHashes(_)
+                        | RequestType::QueryClustersByDomain(_)
+                        | RequestType::QueryClusterById(_)
+                        | RequestType::QueryCertificatesFromWorkers(_)
+                        | RequestType::QueryCertificatesFromTheState(_)
+                        | RequestType::QueryMetrics(_)
+                        | RequestType::QueryHealthChecks(_)
+                        | RequestType::CountRequests(_)
+                        | RequestType::SubscribeEvents(_)
+                        | RequestType::QueryMaxConnectionsPerIp(_)
+                        | RequestType::QueryMaxConnectionsPerSubnet(_)
+                        | RequestType::SetMetricDetail(_)
+                ),
+            "read-only / non-transition verbs must not open the systemd reload window"
+        );
+        if mutating && let Err(e) = sd_notify::notify(sd_notify::STATE_RELOADING) {
+            warn!("could not notify systemd RELOADING=1: {}", e);
+        }
+
+        // A configuration reload answers, and closes its systemd window, when
+        // its protected header changes are decided, not when it is dispatched.
+        let mut ready_deferred = false;
+
+        match request_type {
+            RequestType::SaveState(path) => save_state(self, client, &path),
+            RequestType::LoadState(path) => load_state(self, Some(client), &path),
+            RequestType::ListWorkers(_) => list_workers(self, client),
+            RequestType::ListFrontends(inner) => list_frontend_command(self, client, inner),
+            RequestType::ListListeners(_) => list_listeners(self, client),
+            RequestType::UpgradeMain(_) => unreachable!("handled before Server dispatch"),
+            RequestType::UpgradeWorker(worker_id) => upgrade_worker(self, client, worker_id),
+            RequestType::SubscribeEvents(_) => subscribe_client_to_events(self, client),
+            RequestType::ReloadConfiguration(path) => {
+                ready_deferred = load_static_config(self, Some(client), Some(&path));
+            }
+            RequestType::Status(_) => status(self, client),
+            RequestType::AddCluster(_)
+            | RequestType::ActivateListener(_)
+            | RequestType::AddBackend(_)
+            | RequestType::AddUnixBackend(_)
+            | RequestType::AddCertificate(_)
+            | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpFrontendWithSilentClose(_)
+            | RequestType::AddHttpListener(_)
+            | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithSilentClose(_)
+            | RequestType::AddHttpsListener(_)
+            | RequestType::AddHttpsListenerWithClientAuth(_)
+            | RequestType::AddTcpFrontend(_)
+            | RequestType::AddTcpListener(_)
+            | RequestType::AddUdpFrontend(_)
+            | RequestType::AddUdpListener(_)
+            | RequestType::ConfigureMetrics(_)
+            | RequestType::DeactivateListener(_)
+            | RequestType::RemoveBackend(_)
+            | RequestType::RemoveCertificate(_)
+            | RequestType::RemoveCluster(_)
+            | RequestType::RemoveHttpFrontend(_)
+            | RequestType::RemoveHttpsFrontend(_)
+            | RequestType::RemoveListener(_)
+            | RequestType::RemoveTcpFrontend(_)
+            | RequestType::RemoveUdpFrontend(_)
+            | RequestType::ReplaceCertificate(_)
+            | RequestType::UpdateHttpListener(_)
+            | RequestType::UpdateHttpsListener(_)
+            | RequestType::UpdateHttpsListenerWithClientAuth(_)
+            | RequestType::UpdateTcpListener(_)
+            | RequestType::UpdateUdpListener(_)
+            | RequestType::SetHealthCheck(_)
+            | RequestType::RemoveHealthCheck(_) => {
+                worker_request(self, client, request_type);
+            }
+            RequestType::QueryClustersHashes(_)
+            | RequestType::QueryClustersByDomain(_)
+            | RequestType::QueryCertificatesFromWorkers(_)
+            | RequestType::QueryClusterById(_) => {
+                query_clusters(self, client, request_type);
+            }
+            RequestType::QueryMetrics(inner) => query_metrics(self, client, inner),
+            RequestType::SoftStop(_) => stop(self, client, false),
+            RequestType::HardStop(_) => stop(self, client, true),
+            RequestType::Logging(logging_filter) => set_logging_level(self, client, logging_filter),
+            RequestType::QueryCertificatesFromTheState(filters) => {
+                query_certificates_from_main(self, client, filters)
+            }
+            RequestType::CountRequests(_) => count_requests(self, client),
+            RequestType::QueryHealthChecks(query) => list_health_checks(self, client, query),
+            // INVARIANT: `PROTECTED_HEALTH_CHECK_PUBLIC` is the one gate for
+            // this verb and the capability query. While it is true the order
+            // enters the acknowledged path (`protected.rs`): it is validated
+            // before any mutation and succeeds only once every worker
+            // acknowledged it. Were it false, the order would be refused and
+            // dropped unread, with no `ConfigState` dispatch, journal,
+            // counter, worker scatter, encode or clone of the value carriers.
+            RequestType::SetProtectedHealthCheck(order) => {
+                if super::protected::PROTECTED_HEALTH_CHECK_PUBLIC {
+                    super::protected::begin_protected_health_check(self, client, order);
+                } else {
+                    client.finish_failure(PROTECTED_HEALTH_CHECK_REFUSAL);
+                }
+            }
+            // The read-only capability query is gated by the very constant
+            // that gates the order: it is positive only when every worker
+            // acknowledged it, and it changes nothing. Were the constant
+            // false, both verbs would answer alike and no worker be asked.
+            RequestType::QueryProtectedHealthCheckSupport(_) => {
+                if super::protected::PROTECTED_HEALTH_CHECK_PUBLIC {
+                    super::protected::begin_capability_query(self, client);
+                } else {
+                    client.finish_failure(PROTECTED_HEALTH_CHECK_REFUSAL);
+                }
+            }
+            RequestType::ProtectedHealthCheckOrder(_) => {
+                super::protected::refuse_internal_verb(client);
+            }
+
+            RequestType::LaunchWorker(_) => {} // not yet implemented, nor used, anywhere
+            RequestType::ReturnListenSockets(_) => {} // This is only implemented by workers,
+            // Per-(cluster, source-IP) connection-limit runtime hooks. Both
+            // the setter and the query are pure worker-side operations
+            // (the live counter lives in `SessionManager`, not in the
+            // master's `ConfigState`), so we hand them off to the
+            // generic worker fan-out path.
+            RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::QueryMaxConnectionsPerIp(_)
+            // The per-(cluster, source-SUBNET) twin. Same reasoning: the
+            // live counter and the prefixes both live in `SessionManager`,
+            // not in the master's `ConfigState`.
+            | RequestType::SetMaxConnectionsPerSubnet(_)
+            | RequestType::QueryMaxConnectionsPerSubnet(_)
+            // The global backend connection attempt budget lives in each
+            // worker's `SessionManager` too.
+            | RequestType::SetMaxConnectionAttempts(_) => {
+                worker_request(self, client, request_type);
+            }
+            // `sozu top`'s runtime cardinality lease verb. Each worker maintains
+            // its own lease table and recomputes the effective `MetricDetail` as
+            // `max(configured, max(active leases))`. The master fans the verb out
+            // through a dedicated dispatcher that synthesises the aggregate
+            // `MetricDetailStatus` reply, captures the master's own
+            // configured/effective view, and emits the attempt-time + completion
+            // audit rows alongside the per-worker fan-out.
+            RequestType::SetMetricDetail(req) => {
+                set_metric_detail_request(self, client, req);
+            }
+            RequestType::CloseSessions(request) => close_sessions(self, client, request),
+        }
+
+        if mutating && !ready_deferred {
+            notify_ready();
+        }
+        ClientRequestOutcome::Continue
+    }
+
+    /// get infos from the state of the main process
+    fn query_main(&self, request: RequestType) -> Option<ResponseContent> {
+        match request {
+            RequestType::QueryClusterById(cluster_id) => Some(
+                ContentType::Clusters(ClusterInformations {
+                    vec: self.state.cluster_state(&cluster_id).into_iter().collect(),
+                })
+                .into(),
+            ),
+            RequestType::QueryClustersByDomain(domain) => {
+                let cluster_ids = self
+                    .state
+                    .get_cluster_ids_by_domain(domain.hostname, domain.path);
+                let vec: Vec<_> = cluster_ids
+                    .iter()
+                    .filter_map(|cluster_id| self.state.cluster_state(cluster_id))
+                    .collect();
+                // INVARIANT: `filter_map` can only drop entries, so the
+                // resolved cluster-info vec never exceeds the matched id set.
+                // A larger vec would mean we synthesised a cluster the domain
+                // index never resolved.
+                debug_assert!(
+                    vec.len() <= cluster_ids.len(),
+                    "QueryClustersByDomain result must not exceed the matched cluster-id set"
+                );
+                Some(ContentType::Clusters(ClusterInformations { vec }).into())
+            }
+            RequestType::QueryClustersHashes(_) => Some(
+                ContentType::ClusterHashes(ClusterHashes {
+                    map: self
+                        .state
+                        .hash_state()
+                        .into_iter()
+                        .map(|(cluster_id, hash)| (cluster_id.to_string(), hash))
+                        .collect(),
+                })
+                .into(),
+            ),
+            RequestType::ListFrontends(filters) => {
+                Some(ContentType::FrontendList(self.state.list_frontends(filters)).into())
+            }
+            _ => None,
+        }
+    }
+}
+
+//===============================================
+// non-scattered commands
+
+pub fn query_certificates_from_main(
+    server: &mut Server,
+    client: &mut ClientSession,
+    mut filters: QueryCertificatesFilters,
+) {
+    debug!(
+        "querying certificates in the state with filters {:?}",
+        filters
+    );
+
+    // sozu#1383: `--domain` asks "which certificate would Sōzu present for
+    // this host?", so it is resolved through the same SNI trie the resolver
+    // uses rather than by exact SAN equality. `take` leaves `filters.domain`
+    // at `None` so the fall-through below cannot reach the exact-equality arm
+    // of `ConfigState::get_certificates` with a domain still set.
+    let certs = match filters.domain.take() {
+        Some(domain) => certificates_serving_domain(&server.state, &domain),
+        None => server.state.get_certificates(filters),
+    };
+
+    client.finish_ok_with_content(
+        ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs }).into(),
+        "Successfully queried certificates from the state of main process",
+    );
+}
+
+/// Which certificate would Sōzu present for `domain`, on each HTTPS listener
+/// that has one — the question `sozu certificate list --domain <host>` reads
+/// as, answered against the main process's own `ConfigState`.
+///
+/// `ConfigState::get_certificates` filters `--domain` with `Vec::contains`,
+/// i.e. exact SAN equality, while the certificate that actually serves a
+/// handshake is chosen by `CertificateResolver::domain_lookup`
+/// (`lib/src/tls.rs`) — a [`TrieNode`] lookup resolving `*.` wildcard and
+/// regex labels. The two disagreed for every certificate not bound by an
+/// exact name, so `--domain foo.example.com` reported nothing while TLS for
+/// that host succeeded on a `*.example.com` certificate (sozu#1383).
+///
+/// The fix lives here rather than in `ConfigState` because `TrieNode` is in
+/// `sozu-lib`, which already depends on `sozu-command-lib`: the reverse edge
+/// is a cargo cycle, moving the trie into `command/` would grow a `regex`
+/// production dependency it does not have, and reimplementing the match there
+/// would duplicate hostname matching and drift from the resolver — which is
+/// this bug. `bin/` already depends on both crates, and this is the only
+/// `--domain` consumer of `get_certificates`.
+///
+/// Three properties are deliberate:
+///
+/// - **One trie per listener address, unioned.** `ConfigState::certificates`
+///   is keyed by listener and each worker listener owns its own resolver, so
+///   a single global trie would silently drop a second listener's certificate
+///   for the same name: `TrieNode::insert` answers
+///   `InsertResult::Existing` and keeps the incumbent.
+/// - **Both sides are ASCII-lowercased.** Name derivation does not otherwise
+///   drift — `ConfigState::add_certificate` resolves the SAN/CN set exactly as
+///   `CertifiedKeyWrapper::try_from` does — but the resolver lowercases that
+///   set and `ConfigState` does not, so the query and the stored names are
+///   folded here instead. `lib/src/https.rs`'s `query_certificate_for_domain`
+///   folds the query the same way.
+/// - **At most one certificate per listener**, because a trie lookup resolves
+///   to one entry. The exact-equality filter could answer with several, so a
+///   `--domain` query returns fewer certificates than it used to whenever more
+///   than one carried the requested name verbatim; see `doc/configure_cli.md`.
+fn certificates_serving_domain(
+    state: &ConfigState,
+    domain: &str,
+) -> BTreeMap<String, CertificateAndKey> {
+    let queried = domain.to_ascii_lowercase();
+    let mut serving = BTreeMap::new();
+
+    for address in state.certificates.keys() {
+        let mut domains: TrieNode<Fingerprint> = TrieNode::root();
+
+        // `domain_insert` keeps the incumbent on a collision. Insert the
+        // worker's winner first: highest effective expiration, then latest
+        // insertion ordinal for an equal-expiration tie. A malformed legacy
+        // certificate is skipped because no worker resolver can serve it.
+        let mut certificates: Vec<_> = state
+            .ordered_certificate_entries(*address)
+            .into_iter()
+            .filter_map(|(fingerprint, certificate, metadata)| {
+                // Parse first even when an explicit override exists. The
+                // worker cannot load malformed certificate material, so an
+                // override must never make an unservable legacy entry appear
+                // in the main-process answer.
+                let pem = parse_pem(certificate.certificate.as_bytes()).ok()?;
+                let x509 = parse_x509(&pem.contents).ok()?;
+                let expiration = metadata
+                    .expired_at
+                    .unwrap_or_else(|| x509.validity().not_after.timestamp());
+                Some((
+                    fingerprint,
+                    certificate,
+                    metadata.insertion_order,
+                    expiration,
+                ))
+            })
+            .collect();
+        certificates.sort_by(|left, right| {
+            right
+                .3
+                .cmp(&left.3)
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        for (fingerprint, certificate, _, _) in certificates {
+            for name in &certificate.names {
+                // `CertificateResolver::add_certificate` bounds every name the
+                // same way, because the trie recurses once per label, and
+                // refuses a certificate carrying a name the trie cannot host.
+                // `ConfigState` enforces neither, so a name a saved state file
+                // carried past it is skipped here rather than indexed: no
+                // handshake can reach it either. A name the trie refuses
+                // outright makes `domain_insert` a no-op, which is the same
+                // outcome.
+                if name.len() > MAX_HOSTNAME_LENGTH {
+                    continue;
+                }
+                domains.domain_insert(
+                    name.to_ascii_lowercase().into_bytes(),
+                    fingerprint.to_owned(),
+                );
+            }
+        }
+
+        if let Some((_, fingerprint)) = domains.domain_lookup(queried.as_bytes(), true)
+            && let Some(certificate) = state
+                .certificates
+                .get(address)
+                .and_then(|certificates| certificates.get(fingerprint))
+        {
+            serving.insert(fingerprint.to_string(), certificate.to_owned());
+        }
+    }
+
+    serving
+}
+
+fn list_health_checks(server: &mut Server, client: &mut ClientSession, query: QueryHealthChecks) {
+    let health_checks = server.state.list_health_checks(query.cluster_id.as_deref());
+    client.finish_ok_with_content(
+        ContentType::HealthChecksList(health_checks).into(),
+        "Successfully listed health check configurations",
+    );
+}
+
+/// return how many requests were received by Sōzu since startup
+fn count_requests(server: &mut Server, client: &mut ClientSession) {
+    let request_counts = server.state.get_request_counts();
+
+    client.finish_ok_with_content(
+        ContentType::RequestCounts(request_counts).into(),
+        "Successfully counted requests received by the state",
+    );
+}
+
+pub fn list_frontend_command(
+    server: &mut Server,
+    client: &mut ClientSession,
+    filters: FrontendFilters,
+) {
+    match server.query_main(RequestType::ListFrontends(filters)) {
+        Some(response) => client.finish_ok_with_content(response, "Successfully listed frontends"),
+        None => client.finish_failure("main process could not list frontends"),
+    }
+}
+
+fn list_workers(server: &mut Server, client: &mut ClientSession) {
+    let vec = server
+        .workers
+        .values()
+        .map(|worker| WorkerInfo {
+            id: worker.id,
+            pid: worker.pid,
+            run_state: worker.run_state as i32,
+        })
+        .collect();
+
+    debug!("workers: {:?}", vec);
+    client.finish_ok_with_content(
+        ContentType::Workers(WorkerInfos { vec }).into(),
+        "Successfully listed workers",
+    );
+}
+
+fn list_listeners(server: &mut Server, client: &mut ClientSession) {
+    let vec = server.state.list_listeners();
+    client.finish_ok_with_content(
+        ContentType::ListenersList(vec).into(),
+        "Successfully listed listeners",
+    );
+}
+
+fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
+    let mut path = PathBuf::from(path);
+    if path.is_relative() {
+        match std::env::current_dir() {
+            Ok(cwd) => path = cwd.join(path),
+            Err(error) => {
+                let (verb, counter) = audit_verb!("state_saved");
+                audit_emit_inline(
+                    server,
+                    client,
+                    EventKind::StateSaved,
+                    verb,
+                    counter,
+                    format!("file:{}", path.display()),
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+                client.finish_failure(format!("Cannot get Sōzu working directory: {error}",));
+                return;
+            }
+        }
+    }
+
+    debug!("saving state to file {}", &path.display());
+    let mut file = match File::create(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            let (verb, counter) = audit_verb!("state_saved");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::StateSaved,
+                verb,
+                counter,
+                format!("file:{}", path.display()),
+                AuditResult::Err,
+                AuditExtras {
+                    error_code: Some(AuditErrorCode::IoError),
+                    ..Default::default()
+                },
+            );
+            client.finish_failure(format!(
+                "Cannot create file at path {}: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+
+    match server.state.write_requests_to_file(&mut file) {
+        Ok(count) => {
+            let (verb, counter) = audit_verb!("state_saved");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::StateSaved,
+                verb,
+                counter,
+                format!("file:{} messages:{count}", path.display()),
+                AuditResult::Ok,
+                AuditExtras::default(),
+            );
+            client.finish_ok(format!(
+                "Saved {count} config messages to {}",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            let (verb, counter) = audit_verb!("state_saved");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::StateSaved,
+                verb,
+                counter,
+                format!("file:{}", path.display()),
+                AuditResult::Err,
+                AuditExtras {
+                    error_code: Some(AuditErrorCode::IoError),
+                    ..Default::default()
+                },
+            );
+            client.finish_failure(format!("Failed writing state to file: {error}"));
+        }
+    }
+}
+
+/// change logging level on the main process, and on all workers
+fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_filter: String) {
+    debug!("Changing main process log level to {}", logging_filter);
+    let (directives, errors) = logging::parse_logging_spec(&logging_filter);
+    if !errors.is_empty() {
+        let (verb, counter) = audit_verb!("logging_level_changed");
+        let reason = errors
+            .iter()
+            .map(logging::LogSpecParseError::to_string)
+            .collect::<Vec<String>>()
+            .join("; ");
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::LoggingLevelChanged,
+            verb,
+            counter,
+            format!("logging:{logging_filter}"),
+            AuditResult::Err,
+            AuditExtras {
+                error_code: Some(AuditErrorCode::InvalidInput),
+                reason: Some(reason.clone()),
+                ..Default::default()
+            },
+        );
+        client.finish_failure(format!("Error parsing logging filter:\n- {reason}"));
+        return;
+    }
+    logging::LOGGER.with(|logger| {
+        logger.borrow_mut().set_directives(directives);
+    });
+
+    // also change / set the content of RUST_LOG so future workers / main thread
+    // will have the new logging filter value
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    // SAFETY: `env::set_var` in Rust 2024 is unsafe because it is not
+    // thread-safe. The supervisor that handles `LoggingFilter` requests is
+    // single-threaded (mio event loop on the command socket), and workers
+    // are separate processes that re-read RUST_LOG after fork-and-exec —
+    // so the racy read it would otherwise fight with does not exist here.
+    unsafe { env::set_var("RUST_LOG", &logging_filter) };
+    debug!(
+        "Logging level now: {}",
+        env::var("RUST_LOG").unwrap_or("could get RUST_LOG from env".to_string())
+    );
+
+    let (verb, counter) = audit_verb!("logging_level_changed");
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::LoggingLevelChanged,
+        verb,
+        counter,
+        format!("logging:{logging_filter}"),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
+
+    worker_request(server, client, RequestType::Logging(logging_filter));
+}
+
+fn subscribe_client_to_events(server: &mut Server, client: &mut ClientSession) {
+    info!("Subscribing client {:?} to listen to events", client.token);
+    server.event_subscribers.insert(client.token);
+    let (verb, counter) = audit_verb!("events_subscribed");
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::EventsSubscribed,
+        verb,
+        counter,
+        format!("subscribe:client_id:{}", client.id),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
+}
+
+//===============================================
+// Query clusters
+
+#[derive(Debug)]
+pub struct QueryClustersTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+    main_process_response: Option<ResponseContent>,
+}
+
+pub fn query_clusters(
+    server: &mut Server,
+    client: &mut ClientSession,
+    request_content: RequestType,
+) {
+    client.return_processing("Querying cluster...");
+
+    server.scatter(
+        request_content.clone().into(),
+        Box::new(QueryClustersTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+            main_process_response: server.query_main(request_content.clone()),
+        }),
+        Timeout::Default,
+        None,
+    )
+}
+
+impl GatheringTask for QueryClustersTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::QueryClusters {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                main_process_response: self.main_process_response.clone(),
+            },
+        )))
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        _server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        // Success only when the deadline did not fire, no worker failed, every
+        // expected worker answered Ok with usable content, and the terminal
+        // accounting is complete. Processing replies are progress, not answers.
+        // The first concrete reason is reported; a failure never carries a
+        // partial payload. This checks response completeness only, not
+        // fleet-wide state atomicity.
+        let mut failure: Option<String> =
+            timed_out.then(|| "timed out waiting for every worker".to_owned());
+        let mut worker_responses: BTreeMap<String, ResponseContent> = BTreeMap::new();
+
+        for (worker_id, response) in self.gatherer.responses {
+            match ResponseStatus::try_from(response.status) {
+                Ok(ResponseStatus::Ok) => match response.content {
+                    Some(content) if content.content_type.is_some() => {
+                        if worker_responses
+                            .insert(worker_id.to_string(), content)
+                            .is_some()
+                        {
+                            failure.get_or_insert_with(|| {
+                                format!("worker {worker_id} answered more than once")
+                            });
+                        }
+                    }
+                    _ => {
+                        failure.get_or_insert_with(|| {
+                            format!("worker {worker_id} answered Ok without cluster content")
+                        });
+                    }
+                },
+                Ok(ResponseStatus::Failure) => {
+                    failure
+                        .get_or_insert_with(|| format!("worker {worker_id}: {}", response.message));
+                }
+                // Progress archived before the terminal replies; not an answer.
+                Ok(ResponseStatus::Processing) => {}
+                Err(_) => {
+                    failure.get_or_insert_with(|| {
+                        format!("worker {worker_id} sent an undecodable status")
+                    });
+                }
+            }
+        }
+
+        let errors = self.gatherer.errors;
+        if errors > 0 {
+            failure.get_or_insert_with(|| format!("{errors} worker(s) answered Failure"));
+        }
+
+        let ok = self.gatherer.ok;
+        let expected_responses = self.gatherer.expected_responses;
+        if ok != expected_responses {
+            failure.get_or_insert_with(|| {
+                format!("incomplete worker responses: {ok} ok of {expected_responses} expected")
+            });
+        }
+
+        // The main payload is optional: QueryCertificatesFromWorkers has none.
+        if let Some(main_response) = self.main_process_response
+            && worker_responses
+                .insert(String::from("main"), main_response)
+                .is_some()
+        {
+            failure.get_or_insert_with(|| "the worker map already holds a main entry".to_owned());
+        }
+
+        match failure {
+            Some(reason) => client.finish_failure(format!("Failed to query clusters: {reason}")),
+            None => client.finish_ok_with_content(
+                ContentType::WorkerResponses(WorkerResponses {
+                    map: worker_responses,
+                })
+                .into(),
+                "Successfully queried clusters",
+            ),
+        }
+    }
+}
+
+//===============================================
+// Close sessions
+
+/// Gathers each worker's `ClosedSessions` for a `CloseSessions` request.
+#[derive(Debug)]
+pub struct CloseSessionsTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+}
+
+/// Fan a `CloseSessions` request out to every worker. Nothing touches the
+/// main process state: the request acts on live sessions only, so it is
+/// neither saved nor replayed by `load_state` or an upgrade.
+pub fn close_sessions(server: &mut Server, client: &mut ClientSession, request: CloseSessions) {
+    info!(
+        "closing the sessions of cluster {} (backend id {:?}, address {:?})",
+        request.cluster_id, request.backend_id, request.address
+    );
+    client.return_processing("Closing sessions...");
+
+    server.scatter(
+        RequestType::CloseSessions(request).into(),
+        Box::new(CloseSessionsTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+        }),
+        Timeout::Default,
+        None,
+    )
+}
+
+impl GatheringTask for CloseSessionsTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::CloseSessions {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+            },
+        )))
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        _server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        match close_sessions_outcome(self.gatherer.responses, timed_out) {
+            Ok(worker_responses) => client.finish_ok_with_content(
+                ContentType::WorkerResponses(WorkerResponses {
+                    map: worker_responses,
+                })
+                .into(),
+                "Closed the selected sessions on every worker",
+            ),
+            Err(message) => client.finish_failure(message),
+        }
+    }
+}
+
+/// Success only when every worker answered `Ok` before the timeout. A failure
+/// message keeps the counts of the workers that did answer: their sessions are
+/// closed or closing, whatever the others did.
+fn close_sessions_outcome(
+    responses: Vec<(WorkerId, WorkerResponse)>,
+    timed_out: bool,
+) -> Result<BTreeMap<String, ResponseContent>, String> {
+    let mut failures = Vec::new();
+    let mut worker_responses = BTreeMap::new();
+    for (worker_id, response) in responses {
+        match ResponseStatus::try_from(response.status) {
+            Ok(ResponseStatus::Ok) => {
+                if let Some(content) = response.content {
+                    worker_responses.insert(worker_id.to_string(), content);
+                }
+            }
+            Ok(ResponseStatus::Failure) | Ok(ResponseStatus::Processing) | Err(_) => {
+                failures.push(format!("{worker_id}: {}", response.message));
+            }
+        }
+    }
+    if timed_out {
+        failures.push("timed out waiting for every worker".to_owned());
+    }
+
+    if failures.is_empty() {
+        return Ok(worker_responses);
+    }
+    for (worker_id, content) in worker_responses {
+        if let Some(ContentType::ClosedSessions(closed)) = content.content_type {
+            failures.push(format!(
+                "{worker_id}: {} sessions closed, {} draining",
+                closed.closed, closed.draining
+            ));
+        }
+    }
+    Err(failures.join(", "))
+}
+
+/// `AddCluster` requests a live `ConfigState` refuses for now because the
+/// cluster still owns a UNIX backend that a later request in the same batch
+/// replaces with an IP backend: a health check `port` and a UNIX backend never
+/// coexist, so such a cluster is applied after the batch's backends.
+#[derive(Default)]
+struct PortConflictDeferral {
+    held: Vec<Request>,
+}
+
+impl PortConflictDeferral {
+    /// The request to apply now, or `None` once it is held back.
+    fn admit(&mut self, state: &ConfigState, request: Request) -> Option<Request> {
+        let refused_for_now = matches!(request.request_type, Some(RequestType::AddCluster(_)))
+            && request.request_type.as_ref().is_some_and(|request_type| {
+                state
+                    .health_check_port_unix_conflict(request_type)
+                    .is_some()
+            });
+        if refused_for_now {
+            self.held.push(request);
+            return None;
+        }
+        Some(request)
+    }
+
+    fn into_held(self) -> Vec<Request> {
+        self.held
+    }
+}
+
+#[cfg(test)]
+mod query_clusters_completion_tests {
+    //! `QueryClustersTask::on_finish` must answer Success only for a complete,
+    //! usable set of worker payloads. Every case drives the production
+    //! `on_finish` and decodes the terminal client response.
+    //!
+    //! To SEE THESE RED: restore the pre-fix `on_finish` (ignore `timed_out`,
+    //! filter whatever arrived, insert `main`, always `finish_ok_with_content`).
+    //! The timeout, worker-failure, incomplete-accounting, no-content and
+    //! duplicate-worker cases then fail; the success cases keep passing.
+    use sozu_command_lib::proto::command::{ClusterInformation, Response};
+
+    use super::{
+        load_state_rollback_tests::{create_test_hub, queued_responses, test_client},
+        *,
+    };
+
+    fn cluster_payload() -> ResponseContent {
+        ContentType::Clusters(ClusterInformations {
+            vec: vec![ClusterInformation::default()],
+        })
+        .into()
+    }
+
+    fn empty_payload() -> ResponseContent {
+        ContentType::Clusters(ClusterInformations { vec: Vec::new() }).into()
+    }
+
+    fn reply(
+        status: ResponseStatus,
+        message: &str,
+        content: Option<ResponseContent>,
+    ) -> WorkerResponse {
+        WorkerResponse {
+            id: "test".to_owned(),
+            status: status as i32,
+            message: message.to_owned(),
+            content,
+        }
+    }
+
+    fn ok_reply(content: ResponseContent) -> WorkerResponse {
+        reply(ResponseStatus::Ok, "", Some(content))
+    }
+
+    /// Build the gatherer through the production `Gatherer` API, run the real
+    /// `on_finish`, and return the single terminal client response.
+    fn finish(
+        expected: usize,
+        replies: Vec<(WorkerId, WorkerResponse)>,
+        main: Option<ResponseContent>,
+        timed_out: bool,
+    ) -> Response {
+        let (mut hub, _dir) = create_test_hub();
+        let (mut client, _peer) = test_client();
+        let mut gatherer = DefaultGatherer::default();
+        gatherer.inc_expected_responses(expected);
+        for (worker_id, response) in replies {
+            gatherer.on_message(&mut hub.server, &mut None, worker_id, response);
+        }
+        let task = Box::new(QueryClustersTask {
+            client_token: client.token,
+            gatherer,
+            main_process_response: main,
+        });
+        task.on_finish(&mut hub.server, &mut Some(&mut client), timed_out);
+        let mut responses = queued_responses(&client);
+        assert_eq!(
+            responses.len(),
+            1,
+            "exactly one terminal client response: {responses:?}"
+        );
+        responses.remove(0)
+    }
+
+    fn success_keys(response: &Response) -> Vec<&str> {
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "expected Success, got {response:?}"
+        );
+        let Some(ContentType::WorkerResponses(processes)) = response
+            .content
+            .as_ref()
+            .and_then(|content| content.content_type.as_ref())
+        else {
+            panic!("a Success must carry WorkerResponses: {response:?}");
+        };
+        processes.map.keys().map(String::as_str).collect()
+    }
+
+    fn assert_failed(response: &Response, needle: &str) {
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "expected Failure, got {response:?}"
+        );
+        assert!(
+            response.content.is_none(),
+            "a Failure must not carry a partial payload: {response:?}"
+        );
+        assert!(
+            response.message.contains(needle),
+            "message must mention {needle:?}: {}",
+            response.message
+        );
+    }
+
+    #[test]
+    fn complete_two_worker_set_with_main_is_a_success_with_exact_keys() {
+        let response = finish(
+            2,
+            vec![
+                (0, ok_reply(cluster_payload())),
+                (1, ok_reply(cluster_payload())),
+            ],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_eq!(success_keys(&response), ["0", "1", "main"]);
+    }
+
+    #[test]
+    fn zero_workers_with_cached_main_is_a_complete_success() {
+        let response = finish(0, vec![], Some(cluster_payload()), false);
+        assert_eq!(success_keys(&response), ["main"]);
+    }
+
+    #[test]
+    fn a_timeout_after_one_of_two_workers_answered_ok_is_a_failure() {
+        let response = finish(
+            2,
+            vec![(1, ok_reply(cluster_payload()))],
+            Some(cluster_payload()),
+            true,
+        );
+        assert_failed(&response, "timed out");
+    }
+
+    #[test]
+    fn a_worker_failure_is_a_failure() {
+        let response = finish(
+            2,
+            vec![
+                (0, ok_reply(cluster_payload())),
+                (1, reply(ResponseStatus::Failure, "boom", None)),
+            ],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&response, "boom");
+    }
+
+    #[test]
+    fn incomplete_terminal_accounting_is_a_failure_without_a_timeout() {
+        let response = finish(
+            2,
+            vec![(0, ok_reply(cluster_payload()))],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&response, "incomplete");
+    }
+
+    #[test]
+    fn ok_without_content_is_a_failure() {
+        let missing = finish(
+            1,
+            vec![(0, reply(ResponseStatus::Ok, "", None))],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&missing, "without cluster content");
+
+        let typeless = finish(
+            1,
+            vec![(0, ok_reply(ResponseContent::default()))],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&typeless, "without cluster content");
+    }
+
+    #[test]
+    fn a_worker_that_cannot_be_represented_twice_in_the_map_is_a_failure() {
+        let response = finish(
+            2,
+            vec![
+                (0, ok_reply(cluster_payload())),
+                (0, ok_reply(cluster_payload())),
+            ],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&response, "more than once");
+    }
+
+    #[test]
+    fn absent_cluster_empty_payloads_from_main_and_every_worker_are_a_success() {
+        let response = finish(
+            2,
+            vec![
+                (0, ok_reply(empty_payload())),
+                (1, ok_reply(empty_payload())),
+            ],
+            Some(empty_payload()),
+            false,
+        );
+        assert_eq!(success_keys(&response), ["0", "1", "main"]);
+        let Some(ContentType::WorkerResponses(processes)) = response
+            .content
+            .as_ref()
+            .and_then(|content| content.content_type.as_ref())
+        else {
+            panic!("a Success must carry WorkerResponses");
+        };
+        for (process, content) in &processes.map {
+            let Some(ContentType::Clusters(clusters)) = content.content_type.as_ref() else {
+                panic!("{process} must return a Clusters payload");
+            };
+            assert!(clusters.vec.is_empty(), "{process} must stay empty");
+        }
+    }
+
+    #[test]
+    fn archived_processing_replies_do_not_reject_a_complete_terminal_set() {
+        let processing = || reply(ResponseStatus::Processing, "working", None);
+        let response = finish(
+            2,
+            vec![
+                (0, processing()),
+                (0, ok_reply(cluster_payload())),
+                (1, processing()),
+                (1, ok_reply(cluster_payload())),
+            ],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_eq!(success_keys(&response), ["0", "1", "main"]);
+    }
+}
+
+#[cfg(test)]
+mod close_sessions_outcome_tests {
+    use sozu_command_lib::proto::command::ClosedSessions;
+
+    use super::*;
+
+    fn answered(closed: u64, draining: u64) -> WorkerResponse {
+        WorkerResponse {
+            id: "test".to_owned(),
+            status: ResponseStatus::Ok as i32,
+            message: String::new(),
+            content: Some(ContentType::ClosedSessions(ClosedSessions { closed, draining }).into()),
+        }
+    }
+
+    fn failed(status: ResponseStatus, message: &str) -> WorkerResponse {
+        WorkerResponse {
+            id: "test".to_owned(),
+            status: status as i32,
+            message: message.to_owned(),
+            content: None,
+        }
+    }
+
+    #[test]
+    fn every_worker_ok_is_a_success_carrying_each_worker_counts() {
+        let map = close_sessions_outcome(vec![(0, answered(2, 1)), (1, answered(0, 3))], false)
+            .expect("every worker answered Ok");
+        assert_eq!(map.len(), 2, "one entry per worker: {map:?}");
+        assert!(map.contains_key("0") && map.contains_key("1"));
+    }
+
+    /// To SEE THIS RED: make `close_sessions_outcome` return `Ok` whenever
+    /// one worker answered `Ok` -- the failing worker is then reported as a
+    /// success.
+    #[test]
+    fn one_failed_worker_fails_the_request_and_keeps_the_partial_counts() {
+        let message = close_sessions_outcome(
+            vec![
+                (0, answered(4, 2)),
+                (1, failed(ResponseStatus::Failure, "boom")),
+            ],
+            false,
+        )
+        .expect_err("a worker failure must never be reported as success");
+        assert!(message.contains("1: boom"), "{message}");
+        assert!(
+            message.contains("0: 4 sessions closed, 2 draining"),
+            "the counts of the worker that answered must survive: {message}"
+        );
+    }
+
+    /// A worker still `Processing` when the gatherer ends has not answered
+    /// successfully, and a timeout alone fails the request even when every
+    /// received answer was `Ok`.
+    #[test]
+    fn a_timeout_fails_the_request_even_when_every_answer_was_ok() {
+        let message = close_sessions_outcome(vec![(0, answered(1, 0))], true)
+            .expect_err("a timeout must never be reported as success");
+        assert!(
+            message.contains("timed out waiting for every worker"),
+            "{message}"
+        );
+        assert!(
+            message.contains("0: 1 sessions closed, 0 draining"),
+            "{message}"
+        );
+
+        let message = close_sessions_outcome(
+            vec![(0, failed(ResponseStatus::Processing, "still working"))],
+            false,
+        )
+        .expect_err("a Processing worker has not succeeded");
+        assert!(message.contains("0: still working"), "{message}");
+    }
+}
+
+//===============================================
+// Load static configuration
+
+#[derive(Debug)]
+struct LoadStaticConfigTask {
+    /// sozu#1313: per-entry accounting, so an entry no worker acknowledged is
+    /// reverted instead of staying in the main-process state.
+    gatherer: PerEntryGatherer,
+    client_token: Option<Token>,
+    /// The protected header changes to make once the generic part succeeded.
+    reload: Option<Box<super::protected::ReloadProtected>>,
+    /// Whether this task owes systemd the `READY=1` that closes the window the
+    /// reload opened.
+    notify_ready: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many `READY=1` this thread asked for, which a test cannot read from
+    /// a `NOTIFY_SOCKET` without racing every other test.
+    pub(crate) static READY_NOTIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Tell systemd the reload window opened by a mutating verb is closed.
+pub(crate) fn notify_ready() {
+    #[cfg(test)]
+    READY_NOTIFICATIONS.with(|count| count.set(count.get() + 1));
+    if let Err(e) = sd_notify::notify(sd_notify::STATE_READY) {
+        warn!("could not notify systemd READY=1: {}", e);
+    }
+}
+
+/// `config` without the health check headers that come from files. A cold
+/// start also drops the health check of those clusters: no probe may exist
+/// before the protected change gives it its metadata and its values together.
+fn without_header_files(config: &Config, cold: bool) -> Config {
+    let mut stripped = config.clone();
+    for cluster in stripped.clusters.values_mut() {
+        let (health_check, files) = match cluster {
+            sozu_command_lib::config::ClusterConfig::Http(http) => {
+                (&mut http.health_check, &mut http.health_check_header_files)
+            }
+            sozu_command_lib::config::ClusterConfig::Tcp(tcp) => {
+                (&mut tcp.health_check, &mut tcp.health_check_header_files)
+            }
+        };
+        if cold && !files.is_empty() {
+            *health_check = None;
+        }
+        files.clear();
+    }
+    stripped
+}
+
+/// Reload the static configuration, from `path` or from the one in use.
+///
+/// Returns whether a task now owns the answer: the client, and the systemd
+/// `READY=1` of a client-driven reload, are then answered when it finishes.
+/// `false` means everything was answered before returning.
+pub fn load_static_config(
+    server: &mut Server,
+    mut client: OptionalClient,
+    path: Option<&str>,
+) -> bool {
+    let new_config;
+
+    let config = match path {
+        Some(path) if !path.is_empty() => {
+            info!("loading static configuration at path {}", path);
+            match Config::load_from_path(path) {
+                Ok(loaded) => {
+                    new_config = loaded;
+                    &new_config
+                }
+                Err(config_err) => {
+                    // The path comes from `sozu reload --file <path>`, i.e. from
+                    // the client. Panicking on it took the MAIN process down and
+                    // orphaned every worker over an unreadable or malformed file.
+                    // Report it the way the `generate_config_messages` failure
+                    // below already does: audit the attempt when a client made
+                    // it, then fail that client and leave the fleet untouched.
+                    let reason = format!("cannot load configuration from '{path}': {config_err}");
+                    error!("{}", reason);
+                    if let Some(client_ref) = client.as_deref() {
+                        let (verb, counter) = audit_verb!("configuration_reloaded");
+                        audit_emit_inline(
+                            server,
+                            client_ref,
+                            EventKind::ConfigurationReloaded,
+                            verb,
+                            counter,
+                            format!("config:{path}"),
+                            AuditResult::Err,
+                            AuditExtras::default(),
+                        );
+                    }
+                    client.finish_failure(reason);
+                    return false;
+                }
+            }
+        }
+        _ => {
+            info!("reloading static configuration");
+            &server.config
+        }
+    };
+
+    client.return_processing(format!(
+        "Reloading static configuration at path {}",
+        config.config_path
+    ));
+
+    let audit_target = format!("config:{}", config.config_path);
+
+    // A configuration may name `value_file` headers: their values are read
+    // now, before anything is applied, and sent only by the protected path once
+    // every worker acknowledged the capability query. A client-driven reload
+    // runs that path as soon as its generic part succeeded. A cold start
+    // (`client == None`) keeps the values in the protected runtime until the
+    // startup tasks are over; the saved state may take a cluster over before.
+    let cold = client.is_none();
+    let mut reload_protected = None;
+    let mut value_free_config = None;
+    match super::protected::read_reload_orders(config) {
+        Ok(orders) if orders.is_empty() => {}
+        Ok(orders) => {
+            reload_protected = Some(orders);
+            value_free_config = Some(without_header_files(config, cold));
+        }
+        Err(reason) if cold => {
+            // Nothing secret-bearing is sent, the cold `READY=1` never fires,
+            // and the rest of the configuration applies as a headerless start.
+            error!(
+                "could not read the health check header values, startup cannot become ready: {}",
+                reason
+            );
+            server.protected.fail_cold_start();
+            value_free_config = Some(without_header_files(config, cold));
+        }
+        Err(reason) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("configuration_reloaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::ConfigurationReloaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras::default(),
+                );
+            }
+            client.finish_failure(format!(
+                "could not read the health check header values: {reason}"
+            ));
+            return false;
+        }
+    }
+    let file_backed: std::collections::HashSet<String> = reload_protected
+        .iter()
+        .flatten()
+        .map(|order| order.cluster_id.to_owned())
+        .collect();
+    // A client-driven reload carries its orders in the task that applies the
+    // generic part; a cold start hands them to the protected runtime.
+    let mut reload = None;
+    match (reload_protected, client.as_ref().map(|c| c.token)) {
+        (Some(orders), Some(token)) => {
+            reload = Some(Box::new(super::protected::ReloadProtected::new(
+                token,
+                orders,
+                config.clone(),
+            )));
+        }
+        (Some(orders), None) => server.protected.hold_cold_orders(orders),
+        (None, _) => {}
+    }
+
+    let config_messages = match value_free_config
+        .as_ref()
+        .unwrap_or(config)
+        .generate_config_messages()
+    {
+        Ok(messages) => messages,
+        Err(config_err) => {
+            // No task is created before this point on purpose: a task created
+            // and never scattered to would be released on the next tick with
+            // `expected_responses == 0` and answer the client a second time,
+            // contradicting the failure below.
+
+            // Only attribute the audit event when a client triggered the
+            // reload — at startup (`client == None`) there is no actor.
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("configuration_reloaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::ConfigurationReloaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras::default(),
+                );
+            }
+            client.finish_failure(format!("could not generate new config: {config_err}"));
+            return false;
+        }
+    };
+
+    // sozu#1313: bounded deadline, scaled to the number of entries this reload
+    // is about to scatter. `Timeout::None` left the task — and the client —
+    // waiting forever on an answer a killed worker could never send.
+    let timeout = bulk_replay_timeout(server.config.worker_timeout, config_messages.len());
+    let task_id = server.new_task(
+        Box::new(LoadStaticConfigTask {
+            gatherer: PerEntryGatherer::default(),
+            client_token: client.as_ref().map(|c| c.token),
+            reload,
+            notify_ready: client.is_some(),
+        }),
+        timeout,
+    );
+
+    // Requests the loop applies, in order, then the clusters it held back.
+    let mut deferral = PortConflictDeferral::default();
+    let mut next_request_index = config_messages.len();
+    let mut pending: std::collections::VecDeque<(usize, Request)> = config_messages
+        .into_iter()
+        .enumerate()
+        .map(|(request_index, message)| (request_index, message.content))
+        .collect();
+    let mut released = false;
+    loop {
+        let Some((request_index, mut request)) = pending.pop_front() else {
+            if released {
+                break;
+            }
+            released = true;
+            for held in std::mem::take(&mut deferral).into_held() {
+                pending.push_back((next_request_index, held));
+                next_request_index += 1;
+            }
+            continue;
+        };
+        // The probes and the held values of a cluster whose headers come from
+        // files stay what they are, whole, until its protected change is
+        // confirmed; the new headers never travel in a generic order.
+        if let Some(RequestType::AddCluster(cluster)) = request.request_type.as_mut()
+            && file_backed.contains(cluster.cluster_id.as_str())
+        {
+            cluster.health_check = server
+                .state
+                .clusters
+                .get(cluster.cluster_id.as_str())
+                .and_then(|current| current.health_check.to_owned());
+        }
+        if !released {
+            match deferral.admit(&server.state, request) {
+                Some(admitted) => request = admitted,
+                None => continue,
+            }
+        }
+        // A listener the state already holds is refused below as existing,
+        // which leaves every other change to it unapplied. Its client
+        // authentication policy is the exception: a CRL or CA bundle must be
+        // refreshable by a reload, so it goes out as a patch instead.
+        if let Some(
+            RequestType::AddHttpsListener(listener)
+            | RequestType::AddHttpsListenerWithClientAuth(listener),
+        ) = &request.request_type
+            && let Some(patch) = server.state.client_auth_refresh(listener)
+        {
+            info!(
+                "reload refreshes the client authentication policy of HTTPS listener {}",
+                listener.address
+            );
+            request = RequestType::update_https_listener(patch).into();
+        }
+        // sozu#1301: skip an unbuildable listener at boot without reserving its
+        // address, so a corrected reload can still add it. sozu#1313: skip a
+        // frontend the workers' router refuses, so it never enters the state
+        // the master persists and replays. Fail-open — one bad entry does not
+        // stop the others (matches the dispatch-error skip below), it just
+        // never enters ConfigState. The `warn!` is not redundant with the
+        // `return_processing`: at startup there is no client (`client == None`,
+        // see the audit comment above) and the processing line goes nowhere.
+        if let Some(reason) = request
+            .request_type
+            .as_ref()
+            .and_then(|request_type| validate_request(request_type, RequestOrigin::Authored).err())
+        {
+            warn!("Skipping invalid config entry: {}", reason);
+            client.return_processing(format!("Skipping invalid config entry: {reason}"));
+            continue;
+        }
+        if let Err(error) = server.state.dispatch(&request) {
+            // `warn!` as well as `return_processing`: at startup there is no
+            // client, so the log line is the only trace of the skipped entry.
+            warn!("Skipping a config entry the state refused: {:#}", error);
+            client.return_processing(format!("Could not execute request on state: {error:#}"));
+            continue;
+        }
+        // The values held for a cluster follow the metadata the state now
+        // holds, exactly as for a live order.
+        align_protected_journal(server, &request);
+
+        if let &Some(RequestType::AddCertificate(_)) = &request.request_type {
+            debug!("config generated AddCertificate( ... )");
+        } else {
+            debug!("config generated {:?}", request);
+        }
+
+        server.scatter_on(request, task_id, request_index, None);
+    }
+
+    if let Some(client_ref) = client.as_deref() {
+        let (verb, counter) = audit_verb!("configuration_reloaded");
+        audit_emit_inline(
+            server,
+            client_ref,
+            EventKind::ConfigurationReloaded,
+            verb,
+            counter,
+            audit_target,
+            AuditResult::Ok,
+            AuditExtras::default(),
+        );
+    }
+    true
+}
+
+impl GatheringTask for LoadStaticConfigTask {
+    fn client_token(&self) -> Option<Token> {
+        self.client_token
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        // The clear values of a reload have no wire form: a main upgrade waits.
+        if self.reload.is_some() {
+            return Err(TaskSnapshotError::ProtectedTransactionInFlight);
+        }
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::LoadStaticConfig {
+                gatherer: self.gatherer.clone(),
+                client_token: self.client_token.map(|token| token.0),
+            },
+        )))
+    }
+
+    fn on_finish(
+        mut self: Box<Self>,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        // PRECONDITION: the gatherer ran to completion — either every expected
+        // worker answered, or the bounded deadline of `bulk_replay_timeout`
+        // fired.
+        debug_assert!(
+            timed_out || self.gatherer.has_finished(),
+            "LoadStaticConfigTask::on_finish: must be finished (ok+errors >= expected) unless timed out"
+        );
+        // sozu#1313: revert every entry NO worker acknowledged before reporting.
+        // The reload path had the same hole as the replay path — an entry the
+        // whole fleet rejected stayed in the main-process state and was
+        // re-persisted by the next `SaveState`.
+        let reverted = self.gatherer.revert_unacknowledged(server, timed_out);
+        // Snapshot the failure tally before the loop consumes `responses`; the
+        // failure-message list built below must contain exactly one entry per
+        // counted error. Read only inside the post-loop assert (ungated, E0425).
+        let errors_before = self.gatherer.inner.errors;
+        let mut messages = vec![];
+        for (worker_id, response) in self.gatherer.inner.responses {
+            match ResponseStatus::try_from(response.status) {
+                Ok(ResponseStatus::Failure) => {
+                    messages.push(format!("worker {worker_id}: {}", response.message))
+                }
+                Ok(ResponseStatus::Ok) | Ok(ResponseStatus::Processing) => {}
+                Err(e) => warn!("error decoding response status: {}", e),
+            }
+        }
+        // INVARIANT: the gatherer's `errors` counter (incremented in
+        // `on_message` for every Failure status) must match the number of
+        // failure lines we just collected from the same `Failure` responses.
+        // A mismatch means the counter and the response log disagree on how
+        // many workers rejected the config.
+        debug_assert_eq!(
+            messages.len(),
+            errors_before,
+            "LoadStaticConfig failure-message count must equal the gatherer error tally"
+        );
+
+        // A timeout is a failure, never a success: some workers were never
+        // heard from, so the reload did not provably apply everywhere.
+        if self.gatherer.inner.errors > 0 || timed_out {
+            client.finish_failure(format!(
+                "\nloading static configuration failed: {} OK, {} errors, timed_out: {}, \
+                 reverted entries: {}:\n- {}",
+                self.gatherer.inner.ok,
+                self.gatherer.inner.errors,
+                timed_out,
+                reverted,
+                messages.join("\n- ")
+            ));
+        } else {
+            let tally = format!(
+                "{} ok, {} errors",
+                self.gatherer.inner.ok, self.gatherer.inner.errors,
+            );
+            if let Some(mut reload) = self.reload.take() {
+                // The client and systemd hear nothing until every protected
+                // change is decided.
+                reload.set_summary(tally);
+                server.update_counts();
+                super::protected::begin_reload_protected(server, client, reload);
+                return;
+            }
+            client.finish_ok(format!("Successfully loaded the config: {tally}"));
+        }
+
+        server.update_counts();
+        if self.notify_ready {
+            notify_ready();
+        }
+    }
+}
+
+// =========================================================
+// Audit trail (control-plane mutations)
+
+/// Outcome of a control-plane mutation, formatted into the structured
+/// audit log line.
+#[derive(Clone, Copy)]
+pub(crate) enum AuditResult {
+    Ok,
+    Err,
+}
+
+impl AuditResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuditResult::Ok => "ok",
+            AuditResult::Err => "err",
+        }
+    }
+}
+
+impl std::fmt::Display for AuditResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Structured failure reason. Exists so SIEM alerts can group-by without
+/// grepping free-form error strings. Paired with `result=err` in the
+/// audit line; omitted for `result=ok`.
+///
+/// `PeerCredUnavailable` and `Other` are reserved — they fire once the
+/// callers that need them land (SO_PEERCRED failure audit, catch-all
+/// emit path). Suppressing dead-code warnings keeps the taxonomy stable
+/// as we wire them up.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) enum AuditErrorCode {
+    /// `state.dispatch` rejected the request on the main process.
+    DispatchError,
+    /// One or more workers returned `Failure` during fan-out.
+    WorkerFailure,
+    /// Fan-out timed out before every worker responded.
+    WorkerTimeout,
+    /// `SO_PEERCRED` returned no credentials; actor attribution missing.
+    PeerCredUnavailable,
+    /// Operator supplied invalid input (e.g. malformed logging filter).
+    InvalidInput,
+    /// I/O error on state save/load (disk full, permission denied, parse).
+    IoError,
+    /// Generic bucket for anything that doesn't fit the above. Prefer
+    /// adding a new variant over reusing this.
+    Other,
+}
+
+impl AuditErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuditErrorCode::DispatchError => "dispatch_error",
+            AuditErrorCode::WorkerFailure => "worker_failure",
+            AuditErrorCode::WorkerTimeout => "worker_timeout",
+            AuditErrorCode::PeerCredUnavailable => "peer_cred_unavailable",
+            AuditErrorCode::InvalidInput => "invalid_input",
+            AuditErrorCode::IoError => "io_error",
+            AuditErrorCode::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for AuditErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Worker fan-out outcome, rendered in the completion audit line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) enum FanoutStatus {
+    /// Every expected worker acknowledged with Ok.
+    Ok,
+    /// Some workers reported Failure; others were Ok.
+    Partial,
+    /// Fan-out didn't reach all workers within the deadline.
+    Timeout,
+    /// No workers expected (local-main-only request).
+    LocalOnly,
+}
+
+impl FanoutStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            FanoutStatus::Ok => "ok",
+            FanoutStatus::Partial => "partial",
+            FanoutStatus::Timeout => "timeout",
+            FanoutStatus::LocalOnly => "local_only",
+        }
+    }
+}
+
+impl std::fmt::Display for FanoutStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Worker fan-out summary attached to completion-time audit emissions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct FanoutSummary {
+    status: FanoutStatus,
+    workers_ok: u32,
+    workers_err: u32,
+    workers_expected: u32,
+}
+
+/// Optional audit-line fields populated at completion time or when a
+/// failure reason is known. Defaulted to all-`None` at `AuditEntry`
+/// construction so the existing build sites don't all need to set them;
+/// emitters that know these values fill them in via helper constructors
+/// before calling [`audit_emit`] / [`audit_emit_inline`].
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub(crate) struct AuditExtras {
+    /// Wall-clock milliseconds between request acceptance and audit emission.
+    pub(crate) elapsed_ms: Option<u64>,
+    /// Structured failure reason. Set only on `AuditResult::Err` paths.
+    pub(crate) error_code: Option<AuditErrorCode>,
+    /// Worker fan-out outcome. Set on completion-time emissions.
+    pub(crate) fanout: Option<FanoutSummary>,
+    /// Short truncated failure detail — mirrors `finish_failure` message.
+    pub(crate) reason: Option<String>,
+    /// Truncated hex-encoded SHA-256 fingerprint of the proto `Request`
+    /// bytes, for dedupe / replay detection. First 16 hex chars (64 bits).
+    /// Set for verbs that flow through `worker_request`; `None` for inline
+    /// verbs that don't carry a payload worth hashing.
+    pub(crate) request_sha256: Option<String>,
+    /// Operator-supplied `SetMetricDetail.client_id` (the lease key). Set
+    /// only for the `MetricDetailChanged` audit verb. Distinct from the
+    /// connection-scoped `ClientSession.id` rendered in the outer audit
+    /// envelope: this one identifies the lease, that one identifies the
+    /// command-socket caller. Rendered as a dedicated `lease_id=…` field
+    /// so attacker-supplied `:` / `=` cannot smuggle a fake column.
+    pub(crate) metric_detail_lease_id: Option<String>,
+    /// Operator-supplied `SetMetricDetail.reason`. Free-form human note.
+    /// Sanitised via [`sanitize_for_audit_kv`] (control bytes + `,` + `=`
+    /// stripped) and truncated to [`AUDIT_REASON_MAX_CHARS`].
+    pub(crate) metric_detail_reason: Option<String>,
+}
+
+/// A control-plane mutation, broken down into the pieces the audit trail
+/// needs (event kind, verb name for the log, the matching counter key, and
+/// the optional target identifiers populated on the emitted [Event]).
+#[derive(Debug)]
+struct AuditEntry {
+    kind: EventKind,
+    /// Stable verb tag rendered inside the audit `Command(verb=...)` block.
+    /// Always a static string.
+    verb: &'static str,
+    /// Pre-built `config.<verb>` counter key. Stored as a `&'static str` so
+    /// `count!` can route it through statsd without a verb→key dispatch
+    /// table — the construction sites pair `verb` and `counter` at a single
+    /// site, eliminating drift.
+    counter: &'static str,
+    cluster_id: Option<String>,
+    backend_id: Option<String>,
+    address: Option<sozu_command_lib::proto::command::SocketAddress>,
+    /// Free-form target descriptor for the audit log, e.g. `"address:127.0.0.1:8080"`
+    /// or `"cluster:my-cluster"`. Captures whichever identifier is meaningful
+    /// for the verb.
+    target: String,
+    /// Optional timing / error_code / fanout / reason fields. Defaulted at
+    /// construction; populated via [`AuditEntry::with_extras`] on the hot
+    /// paths that care.
+    extras: AuditExtras,
+}
+
+/// Truncated SHA-256 request fingerprint for dedupe / correlation.
+/// Render-only helper; see [`audit_log_context!`] for inclusion.
+const AUDIT_REASON_MAX_CHARS: usize = 256;
+
+/// Hard cap on the rendered length of `lease_id` (operator-supplied
+/// `SetMetricDetail.client_id`) in the audit log. The legitimate TUI
+/// format is `top:<pid>:<8-hex>` ≤ 24 bytes; 64 leaves headroom for
+/// other operator-side scrapers while keeping the audit line bounded.
+const AUDIT_LEASE_ID_MAX_CHARS: usize = 64;
+
+/// Compile-time sozu version tag — rendered in every audit line so
+/// operators correlate which binary emitted which log during upgrades.
+const SOZU_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Build-time short git SHA, embedded by `bin/build.rs`. Falls back to
+/// `"unknown"` on builds outside a git tree (vendored tarballs, sysroots).
+/// Together with `sozu_version` it pins which exact commit emitted a
+/// given audit line — useful when a regression lands between the same
+/// semver tag.
+const SOZU_BUILD_GIT_SHA: &str = env!("SOZU_BUILD_GIT_SHA");
+
+/// Render an actor role hint for SOC scanning. Rule:
+/// - `uid == 0`         → `root`     (super-user, P1 alert)
+/// - `1 <= uid < 1000`  → `system`   (service account, expected daemons)
+/// - `uid >= 1000`      → `user`     (normal interactive operator)
+/// - missing            → `unknown`  (SO_PEERCRED unavailable)
+///
+/// `1000` is the conventional Linux NSS uid floor for human accounts.
+/// Operators on systems with a different convention (BSD, macOS) get the
+/// same buckets — the labels are advisory, the raw `actor_uid` is still
+/// authoritative.
+pub(crate) fn actor_role(uid: Option<u32>) -> &'static str {
+    match uid {
+        None => "unknown",
+        Some(0) => "root",
+        Some(u) if u < 1000 => "system",
+        Some(_) => "user",
+    }
+}
+
+/// Render a `SystemTime` as an RFC 3339 / ISO 8601 timestamp at UTC
+/// (`YYYY-MM-DDTHH:MM:SS.ffffffZ`). std-only — uses Howard Hinnant's
+/// `civil_from_days` algorithm so we don't pull in `chrono` / `time`.
+///
+/// Six-digit fractional seconds (microseconds) — matches what most SIEM
+/// stacks expect and avoids the precision overhead of nanoseconds.
+pub(crate) fn rfc3339_utc(t: std::time::SystemTime) -> String {
+    let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let micros = dur.subsec_micros();
+
+    let days = secs.div_euclid(86_400);
+    let sec_of_day = secs.rem_euclid(86_400) as u32;
+    let hh = sec_of_day / 3600;
+    let mm = (sec_of_day / 60) % 60;
+    let ss = sec_of_day % 60;
+
+    // Hinnant's civil_from_days — `days` is days since 1970-01-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{micros:06}Z")
+}
+
+/// The listener an `Update*Listener` patch resolves to: the only one on
+/// `address`, whatever its interface, or `None` when several share it.
+fn sole_listener_at<V>(
+    listeners: &std::collections::BTreeMap<sozu_command_lib::listener_key::ListenerKey, V>,
+    address: sozu_command_lib::proto::command::SocketAddress,
+) -> Option<&V> {
+    let address = std::net::SocketAddr::from(address);
+    let mut matching = listeners
+        .iter()
+        .filter(|(key, _)| key.address == address)
+        .map(|(_, listener)| listener);
+    let first = matching.next();
+    if matching.next().is_some() {
+        return None;
+    }
+    first
+}
+
+/// Build the [AuditEntry] for a control-plane request, or `None` for
+/// non-mutating verbs (the caller skips them — they have no audit footprint).
+///
+/// `state` is used to snapshot the pre-change listener config for
+/// `UpdateHttp/Https/TcpListener` so the audit line can show
+/// `field=old→new` pairs. Passing the `ConfigState` by reference stays
+/// cheap because only the UpdateListener arms look anything up.
+fn audit_entry_for(
+    request: &RequestType,
+    state: &sozu_command_lib::state::ConfigState,
+) -> Option<AuditEntry> {
+    match request {
+        RequestType::AddCluster(cluster) => {
+            let (verb, counter) = audit_verb!("cluster_added");
+            Some(AuditEntry {
+                kind: EventKind::ClusterAdded,
+                verb,
+                counter,
+                target: format!("cluster:{}", cluster.cluster_id),
+                cluster_id: Some(cluster.cluster_id.to_owned()),
+                backend_id: None,
+                address: None,
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveCluster(cluster_id) => {
+            let (verb, counter) = audit_verb!("cluster_removed");
+            Some(AuditEntry {
+                kind: EventKind::ClusterRemoved,
+                verb,
+                counter,
+                target: format!("cluster:{cluster_id}"),
+                cluster_id: Some(cluster_id.to_owned()),
+                backend_id: None,
+                address: None,
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpFrontend(frontend)
+        | RequestType::AddHttpFrontendWithSilentClose(frontend)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(frontend) => {
+            let (verb, counter) = audit_verb!("http_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:http:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpsFrontend(frontend)
+        | RequestType::AddHttpsFrontendWithSilentClose(frontend)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(frontend) => {
+            let (verb, counter) = audit_verb!("https_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:https:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddTcpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("tcp_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:tcp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveHttpFrontend(frontend)
+        | RequestType::RemoveHttpFrontendWithHeaderPredicates(frontend) => {
+            let (verb, counter) = audit_verb!("http_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:http:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveHttpsFrontend(frontend)
+        | RequestType::RemoveHttpsFrontendWithHeaderPredicates(frontend) => {
+            let (verb, counter) = audit_verb!("https_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:https:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveTcpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("tcp_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:tcp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddUdpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("udp_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:udp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveUdpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("udp_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:udp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddCertificate(add) => {
+            let (verb, counter) = audit_verb!("certificate_added");
+            Some(AuditEntry {
+                kind: EventKind::CertificateAdded,
+                verb,
+                counter,
+                target: format!("certificate:{}", add.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(add.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveCertificate(remove) => {
+            let (verb, counter) = audit_verb!("certificate_removed");
+            Some(AuditEntry {
+                kind: EventKind::CertificateRemoved,
+                verb,
+                counter,
+                target: format!("certificate:{}:{}", remove.address, remove.fingerprint),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(remove.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::ReplaceCertificate(replace) => {
+            let (verb, counter) = audit_verb!("certificate_replaced");
+            // Compute the new cert's fingerprint from its PEM so the audit
+            // trail records both the cert being removed AND the cert
+            // replacing it. Forensic value: rotation pattern + detection of
+            // substituted-cert attacks. Best-effort: on parse failure the
+            // new fingerprint falls back to `"unknown"` rather than
+            // aborting the audit emission.
+            let new_fp =
+                compute_certificate_fingerprint(replace.new_certificate.certificate.as_bytes())
+                    .unwrap_or_else(|| "unknown".to_owned());
+            Some(AuditEntry {
+                kind: EventKind::CertificateReplaced,
+                verb,
+                counter,
+                target: format!(
+                    "certificate:{}:old={}:new={}",
+                    replace.address, replace.old_fingerprint, new_fp
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(replace.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::ActivateListener(listener) => {
+            let (verb, counter) = audit_verb!("listener_activated");
+            Some(AuditEntry {
+                kind: EventKind::ListenerActivated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:{:?}:{}",
+                    listener.proxy(),
+                    listener.listener_key()
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::DeactivateListener(listener) => {
+            let (verb, counter) = audit_verb!("listener_deactivated");
+            Some(AuditEntry {
+                kind: EventKind::ListenerDeactivated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:{:?}:{}",
+                    listener.proxy(),
+                    listener.listener_key()
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::UpdateHttpListener(patch) => {
+            let (verb, counter) = audit_verb!("http_listener_updated");
+            // The listener the patch resolves to: the one on its address, or
+            // none when several share it (the state refuses that patch).
+            let current = sole_listener_at(&state.http_listeners, patch.address);
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:http:{}:{}",
+                    patch.address,
+                    format_patch_diff_http(patch, current),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::UpdateHttpsListener(patch)
+        | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
+            let (verb, counter) = audit_verb!("https_listener_updated");
+            // The listener the patch resolves to: the one on its address, or
+            // none when several share it (the state refuses that patch).
+            let current = sole_listener_at(&state.https_listeners, patch.address);
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:https:{}:{}",
+                    patch.address,
+                    format_patch_diff_https(patch, current),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::UpdateTcpListener(patch) => {
+            let (verb, counter) = audit_verb!("tcp_listener_updated");
+            // The listener the patch resolves to: the one on its address, or
+            // none when several share it (the state refuses that patch).
+            let current = sole_listener_at(&state.tcp_listeners, patch.address);
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:tcp:{}:{}",
+                    patch.address,
+                    format_patch_diff_tcp(patch, current),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::UpdateUdpListener(patch) => {
+            let (verb, counter) = audit_verb!("udp_listener_updated");
+            // The listener the patch resolves to: the one on its address, or
+            // none when several share it (the state refuses that patch).
+            let current = sole_listener_at(&state.udp_listeners, patch.address);
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:udp:{}:{}",
+                    patch.address,
+                    format_patch_diff_udp(patch, current),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpListener(listener) => {
+            let (verb, counter) = audit_verb!("http_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:http:{}", listener.listener_key()),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpsListener(listener)
+        | RequestType::AddHttpsListenerWithClientAuth(listener) => {
+            let (verb, counter) = audit_verb!("https_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:https:{}", listener.listener_key()),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddTcpListener(listener) => {
+            let (verb, counter) = audit_verb!("tcp_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:tcp:{}", listener.listener_key()),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddUdpListener(listener) => {
+            let (verb, counter) = audit_verb!("udp_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:udp:{}", listener.listener_key()),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveListener(remove) => {
+            let (verb, counter) = audit_verb!("listener_removed");
+            Some(AuditEntry {
+                kind: EventKind::ListenerRemoved,
+                verb,
+                counter,
+                target: format!("listener:{:?}:{}", remove.proxy(), remove.listener_key()),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(remove.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        // AddBackend / RemoveBackend are intentionally not audited via this
+        // taxonomy — they are already covered by the BACKEND_DOWN / BACKEND_UP
+        // events emitted by the workers when traffic reaches them.
+        _ => None,
+    }
+}
+
+/// Bump the per-verb counter, queue the [Event] for fan-out to subscribed
+/// clients, and write the structured audit log line at `info!` level. Used
+/// by every control-plane mutation handler.
+fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, result: AuditResult) {
+    // PRECONDITION: the verb tag and its counter key are non-empty. Both come
+    // from `audit_verb!` string literals; an empty `counter` would silently
+    // collapse every audited verb onto one metric series, and an empty `verb`
+    // would render an unattributable audit line. Bumping the counter exactly
+    // once per emission is the metric contract dashboards rely on.
+    debug_assert!(
+        !entry.counter.is_empty() && !entry.verb.is_empty(),
+        "audit entry must carry a non-empty verb tag and counter key"
+    );
+    let request_id = Ulid::generate();
+    // `entry.counter` is the pre-built `config.<verb>` static-str key
+    // chosen at the construction site (paired with `verb` via
+    // `audit_verb!`), so dashboards see one counter per verb without a
+    // verb→key dispatch table.
+    count!(entry.counter, 1);
+
+    let rendered = audit_log_context!(server, client, &request_id, &entry, result);
+    info!("{}", rendered);
+    // Mirror to the dedicated tamper-resistant sink when configured
+    // (`config.audit_logs_target`). Best-effort; failures fall back to the
+    // standard `info!` route above. Strip ANSI escapes before writing so
+    // the dedicated file stays ASCII and SIEM-parseable even when colour
+    // is enabled on stdout.
+    server.append_audit_line(&strip_ansi(&rendered));
+
+    // JSON-structured sink (`config.audit_logs_json_target`) — one
+    // self-contained record per line, ready for Wazuh / Elastic / Loki
+    // ingest without bespoke parser code.
+    if server.audit_log_json_writer.is_some() {
+        let json = audit_record_to_json(server, client, &request_id, &entry, result);
+        server.append_audit_json(&json);
+    }
+
+    // Subscribers only see the proto Event; the verb / actor / request_id are
+    // captured in the audit log line above (which is already structured).
+    server.push_audit_event(Event {
+        kind: entry.kind as i32,
+        cluster_id: entry.cluster_id,
+        backend_id: entry.backend_id,
+        address: entry.address,
+        // Master-emitted audit events do not carry the
+        // `metric_detail` transition; that field is populated by
+        // workers via `WorkerResponse::Event` on lease-tick / worker-
+        // arm transitions only. See `command.proto`'s `Event` and
+        // `MetricDetailTransition` comments.
+        metric_detail: None,
+    });
+}
+
+/// Audit a worker-local `METRIC_DETAIL_CHANGED` transition. Workers emit
+/// these via the `Event` channel when the polled lease janitor retires a
+/// lease, or when the worker arm of `SetMetricDetail` applies / clears a
+/// lease. The master folds them into the same audit log used for
+/// operator-initiated transitions so SOC tooling sees a complete picture
+/// of cardinality changes regardless of origin.
+///
+/// Distinct from [`audit_emit`] / [`audit_emit_inline`] because there is
+/// no `ClientSession` behind the event: the actor is the worker itself.
+/// The line uses a `worker_id=<id>` field in place of the
+/// `actor_uid` / `actor_pid` / `client_id` block; everything else
+/// (timestamps, sozu_version, fan-out to subscribers) matches the
+/// canonical envelope. Both the text sink and the JSON sink receive a
+/// record so SIEM ingest stays unified.
+pub fn audit_worker_metric_detail_transition(
+    server: &mut Server,
+    worker_id: crate::command::server::WorkerId,
+    transition: &sozu_command_lib::proto::command::MetricDetailTransition,
+) {
+    use sozu_command_lib::proto::command::MetricDetail;
+
+    let (verb, counter) = audit_verb!("metric_detail_changed_worker_local");
+    count!(counter, 1);
+
+    let prev_label = MetricDetail::try_from(transition.previous_effective)
+        .map(|m| format!("{m:?}"))
+        .unwrap_or_else(|_| "<invalid>".into());
+    let eff_label = MetricDetail::try_from(transition.effective)
+        .map(|m| format!("{m:?}"))
+        .unwrap_or_else(|_| "<invalid>".into());
+    let kind_sanitized = sanitize_for_audit_kv(&transition.transition_kind);
+    let target = format!("metric_detail:{prev_label}->{eff_label}");
+    let now_ts = rfc3339_utc(std::time::SystemTime::now());
+
+    // Truncate the optional lease client_id with the same cap used in the
+    // operator-initiated audit line so SIEM consumers see a consistent
+    // upper bound.
+    let lease_id = transition.client_id.as_deref().map(|c| {
+        let sanitized = sanitize_for_audit_kv(c);
+        let truncated: String = sanitized.chars().take(AUDIT_LEASE_ID_MAX_CHARS).collect();
+        truncated
+    });
+    // POSTCONDITION: the audit lease_id never exceeds the SIEM-visible cap.
+    // The operator-initiated path applies the same `take(AUDIT_LEASE_ID_MAX_CHARS)`
+    // bound; a worker-local line that slipped past it would give SOC tooling
+    // an inconsistent upper bound across the two emission sites.
+    debug_assert!(
+        lease_id
+            .as_deref()
+            .is_none_or(|id| id.chars().count() <= AUDIT_LEASE_ID_MAX_CHARS),
+        "worker-local audit lease_id must respect AUDIT_LEASE_ID_MAX_CHARS"
+    );
+    // The counter for this verb is bumped exactly once at entry (above).
+    debug_assert!(
+        !verb.is_empty() && !counter.is_empty(),
+        "worker-local metric-detail audit must carry a non-empty verb/counter"
+    );
+
+    // Render the text-sink line. Match the operator-initiated envelope's
+    // KV shape so a SOC analyst can correlate worker-local and operator
+    // lines with a single regex. `worker_id` stands in for the
+    // `client_id=<connection_id>` block since the worker is its own
+    // actor.
+    let mut text = format!(
+        "[worker:{worker_id} request:- cluster:- backend:-]\tAUDIT\tCommand(ts={now_ts}, verb={verb}, \
+         actor_uid=-, actor_gid=-, actor_pid=-, actor_role=worker, actor_user=sozu-worker, \
+         actor_comm=sozu-worker, worker_id={worker_id}, socket=(worker-ipc), \
+         target={target}, result=ok, transition_kind={kind_sanitized}",
+    );
+    if let Some(id) = lease_id.as_deref() {
+        text.push_str(&format!(", lease_id={id}"));
+    }
+    text.push_str(&format!(
+        ", sozu_version={SOZU_VERSION}, build_git_sha={SOZU_BUILD_GIT_SHA}, boot_generation={})",
+        server.boot_generation,
+    ));
+    info!("{}", text);
+    server.append_audit_line(&text);
+
+    if server.audit_log_json_writer.is_some() {
+        let mut record = serde_json::Map::new();
+        record.insert("ts".to_owned(), serde_json::Value::String(now_ts.clone()));
+        record.insert(
+            "boot_generation".to_owned(),
+            serde_json::json!(server.boot_generation),
+        );
+        record.insert(
+            "verb".to_owned(),
+            serde_json::Value::String(verb.to_owned()),
+        );
+        record.insert(
+            "worker_id".to_owned(),
+            serde_json::json!(worker_id.to_string()),
+        );
+        record.insert(
+            "actor".to_owned(),
+            serde_json::json!({
+                "role": "worker",
+                "comm": "sozu-worker",
+            }),
+        );
+        record.insert(
+            "target".to_owned(),
+            serde_json::Value::String(target.clone()),
+        );
+        record.insert(
+            "result".to_owned(),
+            serde_json::Value::String("ok".to_owned()),
+        );
+        record.insert(
+            "transition_kind".to_owned(),
+            serde_json::Value::String(kind_sanitized.clone()),
+        );
+        record.insert(
+            "previous_effective".to_owned(),
+            serde_json::Value::String(prev_label.clone()),
+        );
+        record.insert(
+            "effective".to_owned(),
+            serde_json::Value::String(eff_label.clone()),
+        );
+        if let Some(id) = lease_id {
+            record.insert("lease_id".to_owned(), serde_json::Value::String(id));
+        }
+        record.insert(
+            "sozu_version".to_owned(),
+            serde_json::Value::String(SOZU_VERSION.to_owned()),
+        );
+        record.insert(
+            "build_git_sha".to_owned(),
+            serde_json::Value::String(SOZU_BUILD_GIT_SHA.to_owned()),
+        );
+        server.append_audit_json(&serde_json::Value::Object(record).to_string());
+    }
+}
+
+/// Build a single-line JSON record mirroring the audit line. Schema is
+/// stable: every key always present, missing values rendered as JSON
+/// `null`. Used by the dedicated JSON sink (`audit_logs_json_target`).
+///
+/// Schema sketch:
+/// ```json
+/// {
+///   "ts": "<RFC3339 UTC>",
+///   "boot_generation": <u32>,
+///   "session_ulid": "...",
+///   "request_ulid": "...",
+///   "actor": {"uid": ..., "gid": ..., "pid": ..., "user": "...", "comm": "...", "role": "..."},
+///   "client_id": ...,
+///   "connect_ts": "<RFC3339 UTC>",
+///   "socket": "...",
+///   "verb": "...",
+///   "target": "...",
+///   "result": "ok|err",
+///   "cluster_id": "..." or null,
+///   "backend_id": "..." or null,
+///   "extras": {...}
+/// }
+/// ```
+fn audit_record_to_json(
+    server: &Server,
+    client: &ClientSession,
+    request_id: &Ulid,
+    entry: &AuditEntry,
+    result: AuditResult,
+) -> String {
+    use serde_json::{Value, json};
+    let extras = {
+        let mut map = serde_json::Map::new();
+        if let Some(code) = entry.extras.error_code {
+            map.insert("error_code".to_owned(), Value::String(code.to_string()));
+        }
+        if let Some(reason) = entry.extras.reason.as_deref() {
+            // INFO-1: every untrusted free-form field that ships to the
+            // JSON sink runs through `sanitize_for_audit` to match the
+            // text-sink contract. `serde_json` would JSON-escape control
+            // bytes correctly, but a SIEM that re-emits JSON to TSV/CSV
+            // can resurrect literal `\t` / `\n` and a SOC analyst
+            // grepping the flat egress would see forged columns.
+            map.insert(
+                "reason".to_owned(),
+                Value::String(sanitize_for_audit(reason)),
+            );
+        }
+        if let Some(elapsed) = entry.extras.elapsed_ms {
+            map.insert("elapsed_ms".to_owned(), json!(elapsed));
+        }
+        if let Some(fanout) = entry.extras.fanout {
+            map.insert(
+                "fanout".to_owned(),
+                json!({
+                    "status": fanout.status.to_string(),
+                    "workers_ok": fanout.workers_ok,
+                    "workers_err": fanout.workers_err,
+                    "workers_expected": fanout.workers_expected,
+                }),
+            );
+        }
+        if let Some(hash) = entry.extras.request_sha256.as_deref() {
+            map.insert("request_sha256".to_owned(), Value::String(hash.to_owned()));
+        }
+        if let Some(lease_id) = entry.extras.metric_detail_lease_id.as_deref() {
+            // Operator-controlled. Sanitise with the strict KV helper and
+            // truncate so JSON consumers that re-emit flat (TSV/CSV) cannot
+            // forge an adjacent column.
+            let sanitized = sanitize_for_audit_kv(lease_id);
+            let truncated: String = sanitized.chars().take(AUDIT_LEASE_ID_MAX_CHARS).collect();
+            map.insert("lease_id".to_owned(), Value::String(truncated));
+        }
+        if let Some(detail_reason) = entry.extras.metric_detail_reason.as_deref() {
+            let sanitized = sanitize_for_audit_kv(detail_reason);
+            let truncated: String = sanitized.chars().take(AUDIT_REASON_MAX_CHARS).collect();
+            map.insert("metric_detail_reason".to_owned(), Value::String(truncated));
+        }
+        Value::Object(map)
+    };
+    // INFO-1: free-form attacker-influenced fields go through
+    // `sanitize_for_audit` here even though `serde_json` would already
+    // escape control bytes — defense in depth against SIEM pipelines
+    // that decode JSON and re-emit flat (TSV/CSV/syslog), which
+    // resurrects the literal control byte and re-opens the column-
+    // smuggling primitive the text sink already defends against.
+    let actor_user_sanitized = client.actor_user.as_deref().map(sanitize_for_audit);
+    let actor_comm_sanitized = client.actor_comm.as_deref().map(sanitize_for_audit);
+    let socket_sanitized = sanitize_for_audit(client.socket_path.as_ref());
+    let target_sanitized = sanitize_for_audit(&entry.target);
+    let verb_sanitized = sanitize_for_audit(entry.verb);
+    let record = json!({
+        "ts": rfc3339_utc(std::time::SystemTime::now()),
+        "boot_generation": server.boot_generation,
+        "session_ulid": client.session_ulid.to_string(),
+        "request_ulid": request_id.to_string(),
+        "actor": {
+            "uid": client.actor_uid,
+            "gid": client.actor_gid,
+            "pid": client.actor_pid,
+            "user": actor_user_sanitized,
+            "comm": actor_comm_sanitized,
+            "role": actor_role(client.actor_uid),
+        },
+        "client_id": client.id,
+        "connect_ts": client.connect_ts_display(),
+        "socket": socket_sanitized,
+        "verb": verb_sanitized,
+        "target": target_sanitized,
+        "result": result.to_string(),
+        "cluster_id": entry.cluster_id,
+        "backend_id": entry.backend_id,
+        "sozu_version": SOZU_VERSION,
+        "build_git_sha": SOZU_BUILD_GIT_SHA,
+        "extras": extras,
+    });
+    record.to_string()
+}
+
+/// Strip ANSI CSI escape sequences from `s`. Cheap single-pass parser —
+/// recognises `\x1b[ ... m` (colour) and any other `\x1b[ ... <final>`
+/// sequence. Returns `s.to_owned()` when no ESC byte is found so the common
+/// no-colour path doesn't reallocate.
+fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // Swallow the `[`...final-byte CSI, or drop the lone ESC.
+        if let Some('[') = chars.next() {
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Same as [audit_emit] but synthesises the [AuditEntry] inline for verbs
+/// whose request payload does not carry the relevant identifiers (e.g.
+/// `Logging`, `ConfigureMetrics`, `ReloadConfiguration`). Caller MUST pair
+/// `verb` and `counter` via `audit_verb!` so the two strings cannot drift.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn audit_emit_inline(
+    server: &mut Server,
+    client: &ClientSession,
+    kind: EventKind,
+    verb: &'static str,
+    counter: &'static str,
+    target: String,
+    result: AuditResult,
+    extras: AuditExtras,
+) {
+    audit_emit(
+        server,
+        client,
+        AuditEntry {
+            kind,
+            verb,
+            counter,
+            target,
+            cluster_id: None,
+            backend_id: None,
+            address: None,
+            extras,
+        },
+        result,
+    );
+}
+
+// =========================================================
+// Worker request
+
+#[derive(Debug)]
+struct WorkerTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+    /// Wall-clock reference captured at `worker_request` entry. Used by
+    /// [`WorkerTask::on_finish`] to compute `elapsed_ms` for the
+    /// completion-time audit emission.
+    started_at: Instant,
+    /// Snapshot of the audit entry built from the request. Carried through
+    /// the task so the completion-time audit line can attribute the verb
+    /// and target. `None` for non-audited verbs (same filter as
+    /// `audit_entry_for`).
+    audit: Option<AuditEntry>,
+    /// Inline-audit target for verbs whose audit factory does not produce
+    /// a full `AuditEntry` (`ConfigureMetrics`, `SetMetricDetail`). The
+    /// completion handler emits a second `audit_emit_inline` line with
+    /// fan-out outcome attached. `None` for verbs that already carry an
+    /// `AuditEntry` in `audit`.
+    inline_audit: Option<InlineAuditTarget>,
+    /// Operator-controlled SetMetricDetail audit fields (lease_id,
+    /// reason) folded into the completion-time `AuditExtras` so the
+    /// post-fanout audit row also carries the operator-supplied lease key
+    /// and human note in their dedicated columns rather than smuggling
+    /// them through `target`. `None` for any verb that is not
+    /// `SetMetricDetail`.
+    metric_detail_audit: Option<MetricDetailAuditFields>,
+    /// `MetricsConfiguration::Clear` deferred-clear flag. When `true`, the
+    /// completion handler wipes the master-side `METRICS` aggregator AFTER
+    /// the audit row has been emitted. Done post-audit so the
+    /// `count!(metrics_configured, 1)` increment driven by the audit row
+    /// itself is not what the operator sees in `sozu metrics` immediately
+    /// after `sozu metrics clear` — otherwise the master would be wiped,
+    /// the audit would repopulate one counter, and the "wipes everything"
+    /// contract would silently drift by exactly one row per clear.
+    clear_master_metrics_on_finish: bool,
+    /// Inverse of the request (sozu#1301/sozu#1314 rollback safety-net),
+    /// computed by [`compute_rollback`] before fan-out. When NO worker
+    /// acknowledges the request — see [`should_rollback_fanout`] for the two
+    /// triggers — [`WorkerTask::on_finish`] applies this to the main process's
+    /// `ConfigState` to revert the committed change. `None` for requests
+    /// without a defined inverse (they keep today's best-effort behavior).
+    rollback: Option<Request>,
+}
+
+/// Carry the per-verb metadata needed to emit a completion-time audit
+/// row for verbs that don't go through `audit_entry_for`. Mirrors the
+/// shape `audit_emit_inline` expects (both `verb` and `counter` are
+/// `&'static str` produced together by the `audit_verb!` macro so they
+/// can never drift).
+#[derive(Debug)]
+struct InlineAuditTarget {
+    kind: EventKind,
+    verb: &'static str,
+    counter: &'static str,
+    target: String,
+}
+
+/// Captured audit fields for `SetMetricDetail` whose operator-controlled
+/// values flow into dedicated audit extras (NOT into `target`) so that
+/// `:` / `=` / `,` smuggled by an attacker cannot forge an adjacent
+/// audit column. `target` itself is kept master-controlled
+/// (`metric_detail:<level>` only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MetricDetailAuditFields {
+    /// `metric_detail:<level>` — fully master-controlled (level is an enum).
+    target: String,
+    /// Operator-supplied `SetMetricDetail.client_id`. Sanitised at render
+    /// time via [`sanitize_for_audit_kv`] and truncated to
+    /// [`AUDIT_LEASE_ID_MAX_CHARS`].
+    lease_id: String,
+    /// Operator-supplied `SetMetricDetail.reason` (free-form human note).
+    /// Sanitised + truncated at render time.
+    reason: Option<String>,
+}
+
+impl MetricDetailAuditFields {
+    /// Build an `AuditExtras` skeleton carrying the operator fields. The
+    /// caller layers `elapsed_ms` / `error_code` / `reason` (failure
+    /// reason — distinct from `metric_detail_reason`) on top as needed.
+    fn into_extras(self) -> AuditExtras {
+        AuditExtras {
+            metric_detail_lease_id: Some(self.lease_id),
+            metric_detail_reason: self.reason,
+            ..Default::default()
+        }
+    }
+}
+
+/// Master-side pre-validation for listener-add requests (sozu#1301).
+///
+/// A worker rejects an unbuildable listener configuration only when it
+/// constructs the listener (building the rustls context / parsing the answer
+/// templates) — but by then the main process has already committed the listener
+/// to its `ConfigState` and reserved the address, so a corrected reload is
+/// refused with `StateError::Exists` and never reaches the workers. Running the
+/// worker's OWN construction check here, BEFORE `ConfigState::dispatch`, keeps
+/// the two in lockstep (same binary, same crypto provider) and lets an invalid
+/// listener be rejected without ever reserving its address. This mirrors the
+/// existing `SetMetricDetail` pre-validation in [`worker_request`]: fail fast
+/// before fan-out rather than amplifying a bad input across every worker.
+///
+/// Listener-add requests are validated, and so are the answer templates an
+/// `UpdateHttpListener` / `UpdateHttpsListener` patch carries
+/// (sozu-proxy/sozu#1703): `ConfigState` cannot parse a template (`command`
+/// does not depend on `lib`), so without this arm the main process recorded a
+/// patch every worker refused. The worker runs the very same
+/// `HttpAnswers::validate_patch_templates` before its first write; every other
+/// patch check lives in `ConfigState::update_http_listener` /
+/// `update_https_listener`, which the worker mirrors, so the main process and
+/// the workers refuse the same patches. Every other request returns `Ok`.
+/// TCP/UDP construction has no fallible config today (see their
+/// `validate_config`), so those arms currently always succeed. This is one half
+/// of the shared pre-dispatch gate — call [`validate_request`], not this
+/// function, from an apply path.
+fn validate_listener_request(request: &RequestType) -> Result<(), String> {
+    let patch_templates = |legacy, answers| {
+        HttpAnswers::validate_patch_templates(legacy, answers)
+            .map_err(|(name, error)| ListenerError::TemplateParse(name, error))
+    };
+    match request {
+        RequestType::AddHttpListener(config) => {
+            sozu_lib::http::HttpListener::validate_config(config)
+        }
+        RequestType::AddHttpsListener(config)
+        | RequestType::AddHttpsListenerWithClientAuth(config) => {
+            sozu_lib::https::HttpsListener::validate_config(config)
+        }
+        RequestType::AddTcpListener(config) => sozu_lib::tcp::TcpListener::validate_config(config),
+        RequestType::AddUdpListener(config) => sozu_lib::udp::UdpListener::validate_config(config),
+        RequestType::UpdateHttpListener(patch) => {
+            patch_templates(patch.http_answers.as_ref(), &patch.answers)
+        }
+        RequestType::UpdateHttpsListener(patch)
+        | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
+            patch_templates(patch.http_answers.as_ref(), &patch.answers).and_then(|()| {
+                patch.client_auth_policy.as_ref().map_or(
+                    Ok(()),
+                    sozu_lib::https::HttpsListener::validate_client_auth_policy,
+                )
+            })
+        }
+        _ => return Ok(()),
+    }
+    .map_err(|listener_error| listener_error.to_string())
+}
+
+/// Master-side pre-validation for HTTP/HTTPS frontend-add requests (sozu#1313).
+///
+/// `ConfigState` has no route-grammar check: `add_http_frontend` only converts
+/// the request (the sole failure being an out-of-range `position`), so a
+/// frontend whose hostname every worker's router refuses is still recorded by
+/// the main process. Once recorded it is authoritative — `SaveState` re-
+/// serialises it and every state replay re-injects it, and the replay path has
+/// no rollback at all. Running the worker's OWN insertion path here, against a
+/// disposable empty [`sozu_lib::router::Router`] and BEFORE
+/// `ConfigState::dispatch`, keeps the two in lockstep by construction (same
+/// binary, same code) and stops the poisoned entry at the door. This mirrors
+/// [`validate_listener_request`] (sozu#1301).
+///
+/// The probe costs a `Router::new()` — two empty `Vec`s and a `TrieNode::root()`
+/// — plus exactly the work each worker would have done anyway, bounded by
+/// `MAX_HOSTNAME_LENGTH`. One probe per `Add{Http,Https}Frontend` on the
+/// control plane buys back N rejected fan-outs and N audit lines.
+///
+/// It covers, in the worker's own order: the hostname length bound before any
+/// parse, the path rule, the `DomainRule` parse, the route-table trie grammar
+/// (`RouterError::AddRoute` — trailing `/` with no openable regex segment,
+/// empty labels, non-`.`-anchored regex segments), and the rewrite/header
+/// policy built by `Frontend::new`. Every other request returns `Ok`.
+///
+/// The returned string is a `RouterError` / `RequestError` `Display`, both of
+/// which report byte LENGTHS rather than operator values — never format the
+/// frontend itself into it: `RequestHttpFrontend`'s `Display` (the state map
+/// key) carries the hostname in clear.
+fn validate_frontend_request(request: &RequestType) -> Result<(), String> {
+    let front = match request {
+        RequestType::AddHttpFrontend(front)
+        | RequestType::AddHttpFrontendWithSilentClose(front)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(front)
+        | RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpsFrontendWithSilentClose(front)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => front,
+        _ => return Ok(()),
+    };
+    let front = front
+        .to_owned()
+        .to_frontend()
+        .map_err(|request_error| request_error.to_string())?;
+    let mut probe = sozu_lib::router::Router::new();
+    probe
+        .add_http_front(&front)
+        .map_err(|router_error| router_error.to_string())
+}
+
+/// Which door a request arrived at. The buildability and route-grammar gates
+/// are the same at both; the H2 knob floors are not (sozu#1418).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestOrigin {
+    /// Somebody is stating this value right now — a `sozu ctl` invocation, a
+    /// raw protobuf request on the command socket, the boot configuration.
+    /// An out-of-range knob is a typo, and an error names the key to fix.
+    Authored,
+    /// Replay of state the main process already accepted and is already
+    /// serving — `LoadState`, and the hot-upgrade handover it backs. The
+    /// operator is upgrading, not authoring.
+    Replayed,
+}
+
+/// Master-side pre-validation of the H2 listener knobs (sozu#1418).
+///
+/// Separate from [`validate_listener_request`] because it is the one gate
+/// whose verdict depends on [`RequestOrigin`]: a worker *can* build a listener
+/// whose threshold is out of range — `H2FloodConfig::from_optional` clamps it
+/// to the floor — so this is a policy about what may be stated, not a
+/// buildability check. Every other request returns `Ok`.
+fn validate_h2_knob_floors(request: &RequestType) -> Result<(), String> {
+    match request {
+        RequestType::AddHttpListener(config) => {
+            sozu_command_lib::state::validate_h2_flood_knobs_http_listener(config)
+        }
+        RequestType::AddHttpsListener(config)
+        | RequestType::AddHttpsListenerWithClientAuth(config) => {
+            sozu_command_lib::state::validate_h2_flood_knobs_https_listener(config)
+        }
+        _ => return Ok(()),
+    }
+    .map_err(|state_error| state_error.to_string())
+}
+
+/// Validate the full certificate and its private key before the main process
+/// commits the request to `ConfigState`.
+///
+/// `ConfigState` intentionally stores the PEM material and does not build a
+/// signing key. The worker resolver does. Without this shared preflight, an
+/// `AddCertificate` or `ReplaceCertificate` with a valid certificate and an
+/// invalid private key is committed by the main process, rejected by every
+/// worker, and then persisted by `SaveState`. Running the same conversion the
+/// resolver uses keeps authored commands and state replay on one buildability
+/// contract without duplicating certificate parsing or key-provider policy.
+fn validate_certificate_request(request: &RequestType) -> Result<(), String> {
+    let validate = |certificate: &AddCertificate| {
+        build_validated_certificate(certificate)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
+
+    match request {
+        RequestType::AddCertificate(certificate) => validate(certificate),
+        RequestType::ReplaceCertificate(replacement) => validate(&AddCertificate {
+            address: replacement.address,
+            certificate: replacement.new_certificate.to_owned(),
+            expired_at: replacement.new_expired_at,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Parse every per-cluster HTTP answer before an `AddCluster` reaches
+/// `ConfigState`.
+///
+/// The HTTP and HTTPS workers merge the legacy `answer_503` field into the
+/// `answers` map, with the map winning on a `503` collision, immediately
+/// before publishing the templates in their live registries. Keep that exact
+/// precedence here and compile the result with the same [`HttpAnswers`]
+/// builder. Otherwise a rejected cluster upsert has already replaced the
+/// cluster in main and worker configuration state when the runtime discovers
+/// the malformed template.
+fn validate_cluster_request(request: &RequestType) -> Result<(), String> {
+    let RequestType::AddCluster(cluster) = request else {
+        return Ok(());
+    };
+
+    let mut answers = cluster.answers.to_owned();
+    if let Some(answer_503) = cluster.answer_503.as_ref() {
+        answers
+            .entry("503".to_owned())
+            .or_insert_with(|| answer_503.to_owned());
+    }
+    HttpAnswers::templates(&answers)
+        .map(|_| ())
+        .map_err(|(name, error)| ListenerError::TemplateParse(name, error).to_string())
+}
+
+/// sozu#1301 + sozu#1313 + sozu#1418: the single pre-dispatch validation every
+/// master apply path — [`worker_request`], [`load_state`] and
+/// [`load_static_config`] — runs before mutating `ConfigState`.
+///
+/// [`validate_h2_knob_floors`] runs only for [`RequestOrigin::Authored`], and
+/// that asymmetry is deliberate. The other gates reject configurations that
+/// CANNOT function: an answer template that will not parse, a hostname the
+/// router refuses, or a certificate the active crypto provider cannot build.
+/// An H2 threshold of `0` is a perfectly buildable listener that the workers
+/// clamp to the floor and then serve from. Applying the same skip to a replayed
+/// entry would turn degraded-but-serving into absent — on an HTTPS listener, a
+/// full outage for every frontend behind it, at upgrade time, to prevent a
+/// single silently-corrected threshold.
+///
+/// Be exact about what the clamp does, because it does NOT tighten anything:
+/// `check_flood`'s `flag` is `count > threshold`, so a threshold of `0` trips
+/// on the FIRST counted event and the clamped `1` trips on the second. Every
+/// clamped knob is loosened, by exactly one event. That is still the right
+/// trade, because `0` is not "no limit" and not a protection level anyone
+/// tuned — it is a typo whose only effect is to trip immediately, and the
+/// clamp moves it one event. Refusing on replay spends an outage to buy that
+/// one event back. `load_state` therefore admits the entry and warns, loudly,
+/// with the key to fix.
+fn validate_request(request: &RequestType, origin: RequestOrigin) -> Result<(), String> {
+    validate_cluster_request(request)?;
+    validate_listener_request(request)?;
+    validate_certificate_request(request)?;
+    if origin == RequestOrigin::Authored {
+        validate_h2_knob_floors(request)?;
+        validate_client_crls_current(request, unix_now())?;
+    }
+    validate_frontend_request(request)
+}
+
+/// Refuse a client authentication CRL already past its `nextUpdate` in a
+/// listener or policy an operator states.
+///
+/// Like [`validate_h2_knob_floors`], a policy about what may be stated, not a
+/// buildability check: workers build a listener whose CRL has lapsed (and
+/// reject its clients at handshake), so a state replay or a restarted worker
+/// keeps the listener a later reload can patch with a current CRL. Every
+/// other request returns `Ok`.
+fn validate_client_crls_current(request: &RequestType, now: i64) -> Result<(), String> {
+    let crls = match request {
+        RequestType::AddHttpsListener(config)
+        | RequestType::AddHttpsListenerWithClientAuth(config) => &config.client_ca_crls,
+        RequestType::UpdateHttpsListener(patch)
+        | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
+            match &patch.client_auth_policy {
+                Some(policy) => &policy.client_ca_crls,
+                None => return Ok(()),
+            }
+        }
+        _ => return Ok(()),
+    };
+    sozu_lib::https::HttpsListener::check_crls_current(crls, now)
+        .map_err(|listener_error| listener_error.to_string())
+}
+
+/// Seconds since the Unix epoch, saturating instead of failing on a clock
+/// set before 1970 or past the `i64` range.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The shared inverse from [`rollback_request`], used by the main-process
+/// fan-out rollback safety-net (sozu#1301/sozu#1314).
+///
+/// When the main process commits a request to its `ConfigState` and fans it
+/// out, but **no** worker acknowledges it, [`WorkerTask::on_finish`] applies
+/// this inverse to revert the main process's own state — so its authoritative
+/// `ConfigState` (the source of truth replayed into restarted or upgraded
+/// workers) never permanently holds an `Add` no worker confirmed.
+/// [`should_rollback_fanout`] owns the exact triggers and the one residual
+/// divergence they accept.
+///
+/// Only requests whose inverse is unambiguous WITHOUT capturing the prior value
+/// are covered: the non-upsert `Add` verbs — every listener type (inverse
+/// `RemoveListener`) and HTTP/HTTPS/TCP/UDP frontends (inverse is the same
+/// payload under the `Remove` variant). Upsert verbs (`AddCluster`, `AddBackend`, which
+/// replace a prior value in place) and certificates would need the prior value
+/// captured to revert correctly, so they are deliberately NOT covered and keep
+/// today's best-effort behavior; every other request returns `None`.
+///
+/// `ReplaceCertificate` (sozu-proxy/sozu#1404) is one of those certificate
+/// verbs, named explicitly here because it is easy to mistake for an `Add`:
+/// its only identity for the certificate it displaces is `old_fingerprint`, a
+/// one-way SHA-256 hash, never the displaced certificate's PEM/key bytes. An
+/// inverse would have to reconstruct "put the old certificate back", which is
+/// not computable from the hash — unlike `RemoveListener`/`Remove*Frontend`,
+/// whose covered `Add` requests already carry everything the inverse needs.
+/// Recovering that content would mean capturing it out-of-band, before
+/// `worker_request` calls `state.dispatch`, and changing this function's
+/// request-only signature to accept that snapshot — a materially bigger
+/// change than this function's other entries, and out of scope here.
+///
+/// `ConfigState::replace_certificate` (`command/src/state.rs`) was fixed
+/// alongside this comment to add the new certificate before removing the
+/// old one, so a rejected dispatch (e.g. malformed PEM) is now a true no-op
+/// on `ConfigState`. That no-op property is NOT the one [`worker_request`]'s
+/// `state_hash_before` check already asserted: `ConfigState::hash_state`
+/// folds only `self.clusters`, `self.backends`, `self.tcp_fronts`,
+/// `self.http_fronts` and `self.https_fronts` — never `self.certificates` —
+/// so that check could not see a certificate-map corruption before this fix
+/// and still cannot see one after it. Nothing in either debug or release
+/// builds covered `self.certificates` before this changeset; that is
+/// precisely why #1404 could ship and sit there undetected.
+/// `ConfigState::check_invariants` (the OTHER debug-only postcondition,
+/// run inside `dispatch` itself) gained the missing coverage in the same
+/// changeset instead: every `self.certificates[address]` bucket must be
+/// non-empty, which in turn required fixing two further dangling-empty-
+/// bucket paths this coverage surfaced — `remove_certificate` (did not
+/// evict the address key when its last certificate was removed) and
+/// `add_certificate` (could leave a bucket behind for a previously-absent
+/// address on a rejected add). See `command/src/state.rs`'s
+/// `check_invariants` and its certificate regression tests.
+/// This closes the internal partial-failure hazard #1404 was filed for. It
+/// does NOT touch the separate hazard this function guards against — a
+/// successful dispatch that zero workers ever acknowledge — which
+/// `ReplaceCertificate` still carries, same as `AddCertificate`/
+/// `RemoveCertificate` above.
+fn compute_rollback(request: &RequestType) -> Option<Request> {
+    rollback_request(request)
+}
+
+/// sozu#1301 / sozu#1314: does the fan-out outcome justify reverting the
+/// main-process `ConfigState` with the precomputed inverse of [`compute_rollback`]?
+///
+/// Two triggers, both requiring ZERO `Ok` answers — an entry a single worker
+/// acknowledged might be good, and is NEVER rolled back:
+///
+/// - unanimous rejection (`!timed_out`): every worker the request was scattered
+///   to answered `Failure`. The original sozu#1301 trigger, unchanged.
+/// - timeout with zero acknowledgements (`timed_out`): not one of the answers
+///   received before the deadline was an `Ok`, and there may have been no
+///   answer at all. A worker that PANICS produces no synthetic `Failure` and
+///   no `expected_responses` decrement, so
+///   `has_finished` (`ok + errors >= expected`) never fires and the task only
+///   ends through the event loop's timeout path; `errors > 0` alone therefore
+///   cannot express "the fleet refused this". Skipping the revert here left the
+///   main process permanently holding — and `SaveState` re-persisting — an entry
+///   no worker ever acknowledged, which is exactly how one unpatched worker
+///   panicking during a rolling upgrade commits a malformed frontend for good
+///   (sozu#1314). The client is already told `Failure` on this same path, so
+///   reverting keeps the authoritative state consistent with the reported
+///   outcome.
+///
+/// `expected == 0` (a local-only fan-out) is never a verdict about anything and
+/// never reverts; it is unreachable through the timeout path anyway, since
+/// `has_finished` is already true at `0 >= 0`.
+///
+/// ACCEPTED RESIDUAL: a slow-but-healthy worker that applies the request and
+/// answers `Ok` AFTER the deadline is invisible — the task is off the in-flight
+/// queue and its late answer is dropped. The main process reverts while that
+/// worker keeps the frontend until its next restart or state replay: a bounded
+/// divergence that self-heals on replay and matches the `Failure` the client
+/// already received. The alternative — today's behavior — permanently commits an
+/// entry no worker confirmed, which is strictly worse for this incident class.
+fn should_rollback_fanout(timed_out: bool, expected: usize, ok: usize, errors: usize) -> bool {
+    expected > 0 && ok == 0 && (errors > 0 || timed_out)
+}
+
+/// Extra deadline granted per scattered entry by [`bulk_replay_timeout`].
+const BULK_TIMEOUT_PER_ENTRY: Duration = Duration::from_millis(10);
+
+/// Ceiling of [`bulk_replay_timeout`], expressed in `worker_timeout` units.
+const BULK_TIMEOUT_MAX_MULTIPLIER: u32 = 10;
+
+/// sozu#1313: the bounded deadline of a BULK apply path — [`load_state`] and
+/// [`load_static_config`].
+///
+/// Both used to scatter with [`Timeout::None`], so their task ended only once
+/// every expected worker had answered. One answer that never comes — a worker
+/// killed mid-replay, a request that could not be queued on a saturated
+/// channel — left the task in flight forever, and the client waiting on it with
+/// no answer at all. `Timeout::None` also made [`should_rollback_fanout`]'s
+/// timeout trigger unreachable on these paths.
+///
+/// `Timeout::Default` (one `worker_timeout`) is the budget for ONE request, not
+/// for a replay that queues N entries onto every worker, each to be serialised,
+/// written, parsed and applied. The budget is therefore one `worker_timeout` of
+/// fan-out slack plus [`BULK_TIMEOUT_PER_ENTRY`] per scattered entry, capped at
+/// [`BULK_TIMEOUT_MAX_MULTIPLIER`] × `worker_timeout` so an unresponsive fleet
+/// can never hold the client longer than a bounded, documented window. With the
+/// default 10 s `worker_timeout`: 10 s for a small state file, at most 100 s for
+/// any file at all.
+fn bulk_replay_timeout(worker_timeout_secs: u32, entries: usize) -> Timeout {
+    // `Config::default()` leaves `worker_timeout` at zero (tests, upgrade
+    // fixtures); a zero-second deadline would expire the task before the first
+    // worker could answer.
+    let base = Duration::from_secs(worker_timeout_secs.max(1) as u64);
+    let cap = base.saturating_mul(BULK_TIMEOUT_MAX_MULTIPLIER);
+    let scaled = base.saturating_add(
+        BULK_TIMEOUT_PER_ENTRY.saturating_mul(u32::try_from(entries).unwrap_or(u32::MAX)),
+    );
+    // POSTCONDITION: bounded above by the cap and never below one
+    // `worker_timeout` — the two properties `load_state` relies on.
+    let timeout = scaled.min(cap);
+    debug_assert!(
+        timeout <= cap && timeout >= base,
+        "a bulk replay deadline must stay within [worker_timeout, cap]"
+    );
+    Timeout::Custom(timeout)
+}
+
+/// sozu#1313: response accounting for the two BULK apply paths.
+///
+/// [`load_state`] and [`load_static_config`] scatter hundreds of INDEPENDENT
+/// entries onto a SINGLE task, so the fleet-wide `ok`/`errors` tally of a
+/// [`DefaultGatherer`] says nothing about any particular entry: one entry every
+/// worker rejected is invisible behind a hundred entries they accepted. The
+/// main process therefore kept — and `SaveState` re-persisted — entries no
+/// worker ever acknowledged, and the poisoned file re-injected them on the next
+/// replay.
+///
+/// This gatherer keeps the `DefaultGatherer` behaviour verbatim (it owns one)
+/// and adds a per-entry breakdown keyed by the scatter `request_id`, plus the
+/// inverse request from [`compute_rollback`] captured while the request is
+/// still in hand. [`Self::revert_unacknowledged`] then applies the very
+/// predicate the live fan-out uses, [`should_rollback_fanout`], to each entry
+/// on its own.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct PerEntryGatherer {
+    /// fleet-wide tally, `has_finished` and the response log
+    inner: DefaultGatherer,
+    /// per scatter `request_id` breakdown
+    entries: BTreeMap<usize, ScatteredEntry>,
+}
+
+/// What one entry of a bulk apply path scattered, and what came back for it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ScatteredEntry {
+    expected: usize,
+    ok: usize,
+    errors: usize,
+    /// inverse of the scattered request; `None` when it has no unambiguous one
+    /// (see [`compute_rollback`])
+    rollback: Option<Request>,
+}
+
+impl PerEntryGatherer {
+    /// Revert every entry NO worker acknowledged, and return how many were
+    /// reverted from the main-process `ConfigState`.
+    ///
+    /// Same safety bound as the live fan-out: an entry at least one worker
+    /// applied is never reverted, and an entry whose verb has no unambiguous
+    /// inverse keeps today's best-effort behaviour.
+    fn revert_unacknowledged(&self, server: &mut Server, timed_out: bool) -> usize {
+        let mut reverted = 0usize;
+        for entry in self.entries.values() {
+            if !should_rollback_fanout(timed_out, entry.expected, entry.ok, entry.errors) {
+                continue;
+            }
+            let Some(rollback) = entry.rollback.as_ref() else {
+                continue;
+            };
+            // Counts only, never request content: a `RequestHttpFrontend`
+            // rendering carries the operator-supplied hostname.
+            match server.state.dispatch(rollback) {
+                Ok(()) => {
+                    reverted += 1;
+                    align_protected_journal(server, rollback);
+                }
+                Err(revert_error) => error!(
+                    "sozu#1313 rollback: could not revert an unacknowledged replay entry \
+                     (ok=0, errors={}, expected={}, timed_out={}): {}",
+                    entry.errors, entry.expected, timed_out, revert_error
+                ),
+            }
+        }
+        if reverted > 0 {
+            warn!(
+                "sozu#1313 rollback: reverted {} replay entries no worker acknowledged \
+                 (of {} scattered, timed_out={})",
+                reverted,
+                self.entries.len(),
+                timed_out
+            );
+        }
+        reverted
+    }
+}
+
+impl Gatherer for PerEntryGatherer {
+    fn inc_expected_responses(&mut self, count: usize) {
+        self.inner.inc_expected_responses(count);
+    }
+
+    fn has_finished(&self) -> bool {
+        self.inner.has_finished()
+    }
+
+    fn on_scatter(&mut self, request_id: usize, worker_count: usize, request: &Request) {
+        let entry = self.entries.entry(request_id).or_default();
+        let expected_before = entry.expected;
+        entry.expected += worker_count;
+        // The bulk paths allocate a fresh `request_id` per entry, so the first
+        // scatter is the one that carries the request. Keeping the first
+        // inverse also keeps this idempotent if an entry is ever re-scattered.
+        if entry.rollback.is_none() {
+            entry.rollback = request.request_type.as_ref().and_then(compute_rollback);
+        }
+        // INVARIANT: the per-entry budget advances by exactly `worker_count`,
+        // in lockstep with the fleet-wide one. A drift either way would make
+        // `should_rollback_fanout` read a fan-out that never happened.
+        debug_assert_eq!(
+            self.entries[&request_id].expected,
+            expected_before + worker_count,
+            "on_scatter must grow the per-entry budget by exactly worker_count"
+        );
+        self.inner.inc_expected_responses(worker_count);
+    }
+
+    fn on_message(
+        &mut self,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        worker_id: WorkerId,
+        message: WorkerResponse,
+    ) {
+        // Attribute BEFORE handing the message to the inner gatherer, which
+        // consumes it. The id is the one `scatter_on` built, so its last
+        // segment is the entry index.
+        match parse_scatter_request_id(&message.id) {
+            Some((_, _, request_index)) => {
+                let entry = self.entries.entry(request_index).or_default();
+                match ResponseStatus::try_from(message.status) {
+                    Ok(ResponseStatus::Ok) => entry.ok += 1,
+                    Ok(ResponseStatus::Failure) => {
+                        entry.errors += 1;
+                        // One line per rejection, before the tally decides
+                        // the rollback: the worker message is already
+                        // redacted on its side, so it is safe to relay.
+                        warn!(
+                            "worker {} rejected replay entry {}: {}",
+                            worker_id, request_index, message.message
+                        );
+                    }
+                    // Processing is not terminal, an undecodable status is
+                    // reported by the inner gatherer.
+                    Ok(ResponseStatus::Processing) | Err(_) => {}
+                }
+            }
+            // Never reached for a response to a scattered request; an
+            // unattributable answer still counts fleet-wide below, it just
+            // cannot protect its entry from the rollback.
+            None => warn!("could not attribute a worker response to a replay entry"),
+        }
+        self.inner.on_message(server, client, worker_id, message);
+    }
+}
+
+pub fn worker_request(
+    server: &mut Server,
+    client: &mut ClientSession,
+    mut request_content: RequestType,
+) {
+    // Master-only enrichment: populate `SetMetricDetail`'s peer binding
+    // from the connecting `ClientSession` so the worker can authorise
+    // subsequent `clear` requests against the apply-time owner. Clients
+    // never set these fields themselves — see the proto comment on
+    // `SetMetricDetail.peer_pid` / `peer_session_ulid` for the trust
+    // model. A `None` actor_pid (non-Linux build, missing SO_PEERCRED)
+    // degrades to "binding unknown" on the worker side, which accepts
+    // any clear for backward compat.
+    if let RequestType::SetMetricDetail(req) = &mut request_content {
+        req.peer_pid = client.actor_pid;
+        req.peer_session_ulid = Some(client.session_ulid.to_string());
+        // Master-side pre-validation: reject obviously bogus inputs
+        // BEFORE fan-out so a malicious or buggy caller cannot fan its
+        // mistake across every worker (N rejected fan-outs + N audit
+        // lines per request). The worker dispatch path still enforces
+        // these limits as defence-in-depth, but failing fast here saves
+        // the audit-noise amplifier and gives the operator a single
+        // clear error rather than N.
+        if req.client_id.len() > sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES {
+            client.finish_failure(format!(
+                "SetMetricDetail: client_id length {} exceeds {} bytes",
+                req.client_id.len(),
+                sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+            ));
+            return;
+        }
+        if let Some(t) = req.ttl_seconds
+            && u64::from(t) > sozu_lib::metrics::LEASE_TTL_MAX.as_secs()
+        {
+            client.finish_failure(format!(
+                "SetMetricDetail: ttl_seconds={t} exceeds LEASE_TTL_MAX={}",
+                sozu_lib::metrics::LEASE_TTL_MAX.as_secs(),
+            ));
+            return;
+        }
+    }
+    // Snapshot the audit entry before consuming `request_content` so we can
+    // emit even when `state.dispatch` rejects the request AND so the
+    // completion handler can re-emit with fanout + elapsed_ms.
+    let audit = audit_entry_for(&request_content, &server.state);
+    let started_at = Instant::now();
+
+    // Special-case ConfigureMetrics — the proto payload is an i32 enum (no
+    // dedicated message), so we synthesise the audit entry inline. The
+    // resolved enum value is reused below to clear the main-process METRICS
+    // aggregator on `MetricsConfiguration::Clear` (workers see the clear
+    // through the scatter; without this the master's own `main_metrics`
+    // returned by `dump_local_proxy_metrics` would survive the operator
+    // clear and `sozu metrics` would still report stale values).
+    let metrics_configuration = if let RequestType::ConfigureMetrics(value) = &request_content {
+        // `try_from` rejects any i32 outside the proto-known set. An
+        // unknown variant lands here only if the master has been deployed
+        // ahead of a worker schema bump (or a malformed IPC payload slips
+        // past the dispatch whitelist). Log loudly and fall back to
+        // `Disabled` — silently treating "unknown" as "disabled" would
+        // mask future enum drift, e.g. a `Clear` value the master no
+        // longer recognises would silently skip the master-side wipe.
+        match MetricsConfiguration::try_from(*value) {
+            Ok(cfg) => Some(cfg),
+            Err(err) => {
+                error!(
+                    "ConfigureMetrics IPC carries unknown enum value {} ({:?}), \
+                     falling back to MetricsConfiguration::Disabled",
+                    value, err
+                );
+                Some(MetricsConfiguration::Disabled)
+            }
+        }
+    } else {
+        None
+    };
+    let metrics_target = metrics_configuration
+        .as_ref()
+        .map(|cfg| format!("metrics:{cfg:?}"));
+
+    // Special-case SetMetricDetail — the same shape as ConfigureMetrics above
+    // (no dedicated audit factory in `audit_entry_for`), so we synthesise the
+    // entry inline against the new `EventKind::MetricDetailChanged` variant.
+    //
+    // The `target` field captures the level only (`metric_detail:Backend` /
+    // `metric_detail:clear`); the operator-supplied `client_id` (lease key)
+    // and free-form `reason` flow into dedicated audit extras
+    // (`metric_detail_lease_id`, `metric_detail_reason`) so attacker-supplied
+    // `:` / `=` / `,` cannot smuggle a forged column into the audit log.
+    let metric_detail_audit = if let RequestType::SetMetricDetail(req) = &request_content {
+        let level = if req.clear.unwrap_or(false) {
+            "clear".to_owned()
+        } else {
+            req.detail
+                .and_then(|d| MetricDetail::try_from(d).ok())
+                .map(|d| format!("{d:?}"))
+                .unwrap_or_else(|| "<invalid>".into())
+        };
+        Some(MetricDetailAuditFields {
+            target: format!("metric_detail:{level}"),
+            lease_id: req.client_id.clone(),
+            reason: req.reason.clone().filter(|s| !s.is_empty()),
+        })
+    } else {
+        None
+    };
+
+    // INVARIANT: a single verb resolves to at most ONE audit channel. The
+    // three are derived from disjoint `RequestType` matches: a full
+    // `AuditEntry` (audit_entry_for), the inline ConfigureMetrics line
+    // (metrics_target), or the inline SetMetricDetail line
+    // (metric_detail_audit). If two were ever populated together, the
+    // dispatch/error/on_finish arms below — which are `if/else if` chains —
+    // would silently drop the second, producing an un-audited mutation. The
+    // `as u8` sum counts how many channels fired; it must never exceed one.
+    debug_assert!(
+        (audit.is_some() as u8)
+            + (metrics_target.is_some() as u8)
+            + (metric_detail_audit.is_some() as u8)
+            <= 1,
+        "a verb must map to at most one audit channel (entry / metrics / metric_detail)"
+    );
+
+    let request: sozu_command_lib::proto::command::Request = request_content.into();
+    let request_sha256 = compute_request_sha256(&request);
+    // Snapshot before dispatch: frontend removal requests are selectors and
+    // do not carry all fields needed to restore the stored frontend if every
+    // worker refuses the runtime mutation.
+    let rollback = request
+        .request_type
+        .as_ref()
+        .and_then(|request_type| server.state.rollback_for(request_type));
+
+    // Snapshot the state hash so the error path can assert the rejected
+    // dispatch was a true no-op on `ConfigState` — a partially-applied
+    // mutation that then errors would leave the master's persisted state
+    // diverged from every worker (which never saw the fan-out). The state
+    // handlers guarantee this (see `ConfigState::dispatch` postcondition),
+    // and we re-check it here at the request boundary. NOTE: we deliberately
+    // do NOT assert the success path *changed* the hash — many "mutating"
+    // verbs (ConfigureMetrics, SetMetricDetail, SetMaxConnectionsPerIp,
+    // Logging) are runtime/worker-only and `ConfigState::dispatch` is
+    // `Ok(())` no-op on ConfigState for them (see its runtime-only `Ok(())`
+    // arm in `command/src/state.rs`). `hash_state()` scans the global state
+    // (every cluster), so it is not cheap; the snapshot and its matching
+    // debug_assert_eq! checks are debug-only and compiled out together in
+    // release builds.
+    #[cfg(debug_assertions)]
+    let state_hash_before = server.state.hash_state();
+
+    // sozu#1301 + sozu#1313: validate the request the way the worker will apply
+    // it BEFORE committing to ConfigState — a listener the way the worker builds
+    // it (rustls context + answer templates), a frontend the way the worker's
+    // router inserts it. Committing an unbuildable listener first reserves its
+    // address, and the corrected reload is then refused with StateError::Exists;
+    // committing a frontend whose hostname the router refuses poisons the state
+    // the master re-persists and replays. Validation is read-only on state and
+    // runs first; dispatch happens only if it passes.
+    // Tag the two failure classes distinctly for the audit taxonomy: a rejected
+    // `validate_request` is operator-invalid *input* (bad TLS versions/ciphers,
+    // an unparseable answer template, a malformed frontend hostname) →
+    // `InvalidInput` (same class as the `set_logging_level` filter check); a
+    // rejected `state.dispatch` is a genuine state conflict → `DispatchError`.
+    let apply_result = request
+        .request_type
+        .as_ref()
+        .map_or(Ok(()), |request_type| {
+            validate_request(request_type, RequestOrigin::Authored)
+        })
+        .map_err(|reason| (Some(AuditErrorCode::InvalidInput), reason))
+        .and_then(|()| {
+            server.state.dispatch(&request).map_err(|error| {
+                // The object went with its cluster (`RemoveCluster`
+                // cascades): nothing is left to remove, so the removal is
+                // answered ok below instead of "not found". Never an object
+                // of another cluster: see `ConfigState::removed_with_its_cluster`.
+                let error_code = if server.state.removed_with_its_cluster(&request, &error) {
+                    None
+                } else {
+                    Some(AuditErrorCode::DispatchError)
+                };
+                (error_code, error.to_string())
+            })
+        });
+    let (apply_result, removed_with_its_cluster) = match apply_result {
+        Err((None, reason)) => (Ok(()), Some(reason)),
+        Err((Some(error_code), reason)) => (Err((error_code, reason)), None),
+        Ok(()) => (Ok(()), None),
+    };
+
+    if let Err((error_code, reason)) = apply_result {
+        // INVARIANT: neither a rejected validation nor a rejected dispatch may
+        // mutate persisted state — validation never touches it, and a rejected
+        // dispatch is a guaranteed no-op (see ConfigState::dispatch).
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            server.state.hash_state(),
+            state_hash_before,
+            "a rejected validation or dispatch must leave ConfigState byte-identical (no partial apply)"
+        );
+        if let Some(mut entry) = audit {
+            entry.extras.error_code = Some(error_code);
+            entry.extras.reason = Some(reason.clone());
+            entry.extras.elapsed_ms = Some(elapsed_ms(started_at));
+            entry.extras.request_sha256 = Some(request_sha256.clone());
+            audit_emit(server, client, entry, AuditResult::Err);
+        } else if let Some(target) = metrics_target {
+            let (verb, counter) = audit_verb!("metrics_configured");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::MetricsConfigured,
+                verb,
+                counter,
+                target,
+                AuditResult::Err,
+                AuditExtras {
+                    elapsed_ms: Some(elapsed_ms(started_at)),
+                    error_code: Some(error_code),
+                    reason: Some(reason.clone()),
+                    ..Default::default()
+                },
+            );
+        } else if let Some(fields) = metric_detail_audit.clone() {
+            let (verb, counter) = audit_verb!("metric_detail_changed");
+            let target = fields.target.clone();
+            let mut extras = fields.into_extras();
+            extras.elapsed_ms = Some(elapsed_ms(started_at));
+            extras.error_code = Some(error_code);
+            extras.reason = Some(reason.clone());
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::MetricDetailChanged,
+                verb,
+                counter,
+                target,
+                AuditResult::Err,
+                extras,
+            );
+        }
+        client.finish_failure(format!(
+            "could not apply request on the main process state: {reason}",
+        ));
+        return;
+    }
+
+    if let Some(reason) = removed_with_its_cluster {
+        // Nothing to remove and nothing to fan out: the main process state
+        // and every worker of this release already dropped the object with
+        // its cluster.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            server.state.hash_state(),
+            state_hash_before,
+            "a removal of an object already removed with its cluster must not mutate ConfigState"
+        );
+        if let Some(mut entry) = audit {
+            entry.extras.reason = Some(reason);
+            entry.extras.elapsed_ms = Some(elapsed_ms(started_at));
+            entry.extras.request_sha256 = Some(request_sha256);
+            audit_emit(server, client, entry, AuditResult::Ok);
+        }
+        client.finish_ok(server.state.removed_with_its_cluster_message(&request));
+        return;
+    }
+
+    // Attempt-time audit — `result=ok` here only means "accepted by the
+    // main process state". The completion-time line (emitted from
+    // `WorkerTask::on_finish`) carries the fanout outcome.
+    let audit_for_task = audit.as_ref().map(|entry| {
+        let mut cloned = clone_entry(entry);
+        cloned.extras.request_sha256 = Some(request_sha256.clone());
+        cloned
+    });
+    // Stash an inline-audit target for the completion handler when the
+    // verb doesn't carry a full `AuditEntry`. The attempt-time line below
+    // emits with `AuditResult::Ok` (state.dispatch accepted); on_finish
+    // re-emits with the worker fan-out outcome.
+    let inline_audit = if let Some(target) = metrics_target.as_ref() {
+        let (verb, counter) = audit_verb!("metrics_configured");
+        Some(InlineAuditTarget {
+            kind: EventKind::MetricsConfigured,
+            verb,
+            counter,
+            target: target.clone(),
+        })
+    } else {
+        metric_detail_audit.as_ref().map(|fields| {
+            let (verb, counter) = audit_verb!("metric_detail_changed");
+            InlineAuditTarget {
+                kind: EventKind::MetricDetailChanged,
+                verb,
+                counter,
+                target: fields.target.clone(),
+            }
+        })
+    };
+    // INVARIANT: the completion-time channel threaded into `WorkerTask`
+    // mirrors the attempt-time channel exactly. `audit_for_task` carries the
+    // full-entry verbs; `inline_audit` carries the ConfigureMetrics /
+    // SetMetricDetail inline verbs. They are disjoint by construction (an
+    // entry-bearing verb has no metrics_target / metric_detail_audit) — if
+    // both were ever set, `WorkerTask::on_finish` would emit the entry arm
+    // and silently drop the inline completion line.
+    debug_assert!(
+        !(audit_for_task.is_some() && inline_audit.is_some()),
+        "WorkerTask carries at most one completion-time audit channel (entry XOR inline)"
+    );
+    // INVARIANT: the completion channel is present iff its attempt-time
+    // source was. `audit_for_task` is `audit.as_ref().map(...)` so it is Some
+    // exactly when `audit` is; losing it here would drop the completion line.
+    debug_assert_eq!(
+        audit_for_task.is_some(),
+        audit.is_some(),
+        "audit_for_task must be Some iff the attempt-time AuditEntry was Some"
+    );
+
+    // Operator-controlled SetMetricDetail fields (lease_id + reason) we
+    // need to thread into both the attempt-time Ok line below and the
+    // completion-time line in `on_finish`. Cloning once keeps the
+    // emission sites symmetric without re-deriving from `request_content`
+    // (already moved into `request: sozu_command_lib...::Request` above).
+    let metric_detail_audit_completion = metric_detail_audit.clone();
+
+    if let Some(mut entry) = audit {
+        entry.extras.request_sha256 = Some(request_sha256);
+        audit_emit(server, client, entry, AuditResult::Ok);
+    } else if let Some(target) = metrics_target {
+        let (verb, counter) = audit_verb!("metrics_configured");
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::MetricsConfigured,
+            verb,
+            counter,
+            target,
+            AuditResult::Ok,
+            AuditExtras::default(),
+        );
+    } else if let Some(fields) = metric_detail_audit {
+        let (verb, counter) = audit_verb!("metric_detail_changed");
+        let target = fields.target.clone();
+        let extras = fields.into_extras();
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::MetricDetailChanged,
+            verb,
+            counter,
+            target,
+            AuditResult::Ok,
+            extras,
+        );
+    }
+
+    // Master-side clear: deferred to `WorkerTask::on_finish` AFTER the
+    // audit emission so the `count!(metrics_configured, 1)` driven by the
+    // completion-time audit row does not immediately repopulate the
+    // freshly-cleared `main_metrics`. Without this deferral, the documented
+    // "wipes everything" contract drifts by exactly one row per clear and
+    // `sozu metrics` snapshot taken right after `sozu metrics clear` would
+    // report `config.metrics_configured = 1`.
+    let clear_master_metrics_on_finish = metrics_configuration == Some(MetricsConfiguration::Clear);
+
+    // The values the main process holds follow the same rule as the workers':
+    // an ordinary rewrite of the health check keeps them only for the exact
+    // headers they were issued for.
+    align_protected_journal(server, &request);
+
+    client.return_processing("Processing worker request...");
+
+    server.scatter(
+        request,
+        Box::new(WorkerTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+            started_at,
+            audit: audit_for_task,
+            inline_audit,
+            metric_detail_audit: metric_detail_audit_completion,
+            clear_master_metrics_on_finish,
+            rollback,
+        }),
+        Timeout::Default,
+        None,
+    )
+}
+
+impl GatheringTask for WorkerTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::Worker(Box::new(WorkerTaskSnapshot {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                started_at: ElapsedSnapshot::capture(self.started_at, timing)?,
+                audit: self
+                    .audit
+                    .as_ref()
+                    .map(AuditEntrySnapshot::capture)
+                    .transpose()?,
+                inline_audit: self
+                    .inline_audit
+                    .as_ref()
+                    .map(InlineAuditTargetSnapshot::capture)
+                    .transpose()?,
+                metric_detail_audit: self.metric_detail_audit.clone(),
+                clear_master_metrics_on_finish: self.clear_master_metrics_on_finish,
+                rollback: self.rollback.clone(),
+            })),
+        )))
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        // PRECONDITION: the gatherer ran to completion. Either every expected
+        // worker answered (`ok + errors >= expected`, the `has_finished`
+        // predicate that drives the task off the in-flight queue) or the task
+        // tripped its timeout. A handler that fires with neither would be a
+        // dispatcher accounting bug (a response counted twice, or the task
+        // released before its workers replied). Read-only snapshots feed the
+        // debug_asserts only → dead code in release, but must stay ungated.
+        debug_assert!(
+            timed_out
+                || self.gatherer.ok + self.gatherer.errors >= self.gatherer.expected_responses,
+            "WorkerTask::on_finish: must be finished (ok+errors >= expected) unless timed out"
+        );
+        // INVARIANT: every accounted ok/err corresponds to a stored response.
+        // `on_message` pushes to `responses` for every ok/err/processing, so
+        // the response log can never be shorter than the ok+err tally.
+        debug_assert!(
+            self.gatherer.responses.len() >= self.gatherer.ok + self.gatherer.errors,
+            "responses log must hold at least one entry per accounted ok/err"
+        );
+
+        let mut messages = vec![];
+
+        for (worker_id, response) in self.gatherer.responses {
+            match ResponseStatus::try_from(response.status) {
+                Ok(ResponseStatus::Ok) => messages.push(format!("{worker_id}: OK")),
+                Ok(ResponseStatus::Failure) | Ok(ResponseStatus::Processing) | Err(_) => {
+                    // Worker error strings are partially operator-
+                    // influenced (request-derived fields, IPC payloads).
+                    // Run them through the column-boundary-aware
+                    // sanitiser before joining into `extras.reason` so
+                    // a `,` / `=` inside one worker's message cannot
+                    // forge an additional audit-row column when a SIEM
+                    // splits on `, ` / `=`. The strict variant also
+                    // strips the bidi class so a Trojan-Source-flavoured
+                    // payload cannot visually reorder the reason field.
+                    messages.push(format!(
+                        "{worker_id}: {}",
+                        sanitize_for_audit_kv(&response.message)
+                    ))
+                }
+            }
+        }
+
+        let errors = self.gatherer.errors;
+        let ok = self.gatherer.ok;
+        let expected = self.gatherer.expected_responses;
+        let result = if errors > 0 || timed_out {
+            AuditResult::Err
+        } else {
+            AuditResult::Ok
+        };
+
+        let fanout_status = if timed_out {
+            FanoutStatus::Timeout
+        } else if errors > 0 {
+            FanoutStatus::Partial
+        } else if expected == 0 {
+            FanoutStatus::LocalOnly
+        } else {
+            FanoutStatus::Ok
+        };
+        let fanout_summary = FanoutSummary {
+            status: fanout_status,
+            workers_ok: u32::try_from(ok).unwrap_or(u32::MAX),
+            workers_err: u32::try_from(errors).unwrap_or(u32::MAX),
+            workers_expected: u32::try_from(expected).unwrap_or(u32::MAX),
+        };
+
+        // INVARIANT: the audit result mirrors the fanout status. A row tagged
+        // `result=ok` must never carry a Timeout/Partial fanout, and an
+        // `result=err` row must never claim a clean Ok/LocalOnly fanout —
+        // a SIEM correlating the two columns would otherwise see a row that
+        // contradicts itself.
+        debug_assert_eq!(
+            matches!(result, AuditResult::Err),
+            matches!(fanout_status, FanoutStatus::Timeout | FanoutStatus::Partial),
+            "AuditResult and FanoutStatus must agree on success vs failure"
+        );
+        // INVARIANT: `LocalOnly` means no worker was scattered to, so there
+        // can be no per-worker tallies. If a worker answered while the status
+        // says local-only, the expected-count accounting drifted.
+        debug_assert!(
+            !matches!(fanout_status, FanoutStatus::LocalOnly) || (ok == 0 && errors == 0),
+            "LocalOnly fanout must have zero worker ok/err tallies"
+        );
+
+        // Completion-time audit: attributes the same verb as the attempt-time
+        // line but with fanout / worker counts / elapsed_ms filled in. Skip
+        // when the client disconnected or the verb is not audited.
+        if let (Some(client_ref), Some(mut entry)) = (client.as_deref(), self.audit) {
+            entry.extras.elapsed_ms = Some(elapsed_ms(self.started_at));
+            entry.extras.fanout = Some(fanout_summary);
+            if matches!(result, AuditResult::Err) {
+                entry.extras.error_code = Some(if timed_out {
+                    AuditErrorCode::WorkerTimeout
+                } else {
+                    AuditErrorCode::WorkerFailure
+                });
+                entry.extras.reason = Some(messages.join(", "));
+            }
+            audit_emit(server, client_ref, entry, result);
+        } else if let (Some(client_ref), Some(inline)) = (client.as_deref(), self.inline_audit) {
+            // Completion-time inline audit for ConfigureMetrics +
+            // SetMetricDetail. Same shape as the entry-bearing arm above
+            // but routed through `audit_emit_inline` since these verbs
+            // don't synthesise a full `AuditEntry` at attempt time. The
+            // operator-supplied `SetMetricDetail` lease_id / reason live
+            // in their own audit columns (see `MetricDetailAuditFields`);
+            // pre-fill them when present, then layer the completion
+            // metadata on top.
+            let mut extras = self
+                .metric_detail_audit
+                .map(MetricDetailAuditFields::into_extras)
+                .unwrap_or_default();
+            extras.elapsed_ms = Some(elapsed_ms(self.started_at));
+            extras.fanout = Some(fanout_summary);
+            if matches!(result, AuditResult::Err) {
+                extras.error_code = Some(if timed_out {
+                    AuditErrorCode::WorkerTimeout
+                } else {
+                    AuditErrorCode::WorkerFailure
+                });
+                extras.reason = Some(messages.join(", "));
+            }
+            audit_emit_inline(
+                server,
+                client_ref,
+                inline.kind,
+                inline.verb,
+                inline.counter,
+                inline.target,
+                result,
+                extras,
+            );
+        }
+
+        // Deferred master-side `MetricsConfiguration::Clear`. Runs AFTER
+        // the audit emission above so the `count!(metrics_configured, 1)`
+        // increment driven by that audit row is wiped here. Operators
+        // running `sozu metrics clear; sozu metrics` see an empty master
+        // dump, matching the PR contract.
+        if self.clear_master_metrics_on_finish {
+            METRICS.with(|metrics| {
+                (*metrics.borrow_mut()).clear_local();
+            });
+        }
+
+        // sozu#1301 / sozu#1314 rollback safety-net: when NO worker acknowledged
+        // the change committed to ConfigState — every scattered worker rejected
+        // it, or the scatter timed out with zero `Ok` (a panicking worker
+        // answers nothing at all) — revert the main process's own state with the
+        // precomputed inverse. A mixed result (`ok > 0`) is deliberately left
+        // as-is to avoid diverging the main process from the workers that did
+        // accept. See [`should_rollback_fanout`] for both triggers and for the
+        // accepted late-`Ok` residual on the timeout path.
+        if should_rollback_fanout(timed_out, expected, ok, errors)
+            && let Some(rollback) = self.rollback.as_ref()
+        {
+            match server.state.dispatch(rollback) {
+                // Counts only, never request content: a `RequestHttpFrontend`
+                // rendering carries the operator-supplied hostname.
+                Ok(()) => warn!(
+                    "sozu#1301/sozu#1314 rollback: reverted a change from main-process state \
+                     (ok=0, errors={}, expected={}, timed_out={})",
+                    errors, expected, timed_out
+                ),
+                Err(revert_error) => error!(
+                    "sozu#1301/sozu#1314 rollback: could not revert main-process state after an \
+                     unacknowledged fan-out (ok=0, errors={}, expected={}, timed_out={}): {}",
+                    errors, expected, timed_out, revert_error
+                ),
+            }
+        }
+
+        if errors > 0 || timed_out {
+            client.finish_failure(messages.join(", "));
+        } else {
+            client.finish_ok("Successfully applied request to all workers");
+        }
+
+        server.update_counts();
+    }
+}
+
+/// Elapsed milliseconds since `started_at`, saturating on overflow.
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// SHA-256 of the proto `Request` wire-encoding, hex-truncated to 16 chars
+/// (64 bits) so the audit line stays greppable without blowing up line
+/// width. Cheap: single prost `encode_to_vec` + one `Sha256::digest` on
+/// a control-plane path (one call per worker request, not per packet).
+fn compute_request_sha256(request: &sozu_command_lib::proto::command::Request) -> String {
+    let bytes = request.encode_to_vec();
+    let digest = Sha256::digest(&bytes);
+    // INVARIANT: SHA-256 always yields 32 bytes; we render the first 8 as
+    // 2-hex-digit pairs, so the audit prefix is always exactly 16 chars.
+    debug_assert_eq!(digest.len(), 32, "SHA-256 digest must be 32 bytes");
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    // POSTCONDITION: greppable fixed-width 16-char (64-bit) audit prefix.
+    debug_assert_eq!(
+        hex.len(),
+        16,
+        "request sha256 audit prefix must be 16 hex chars"
+    );
+    hex
+}
+
+/// SHA-256 fingerprint of a PEM certificate, hex-encoded and truncated to
+/// 16 hex chars (64 bits) for audit brevity. `None` when the input is not
+/// parseable as PEM. Mirrors the full fingerprint workflow in
+/// `sozu_command_lib::certificate::calculate_fingerprint` but truncates
+/// for log terseness — operators correlate via the 64-bit prefix.
+fn compute_certificate_fingerprint(certificate_pem: &[u8]) -> Option<String> {
+    let fp = sozu_command_lib::certificate::calculate_fingerprint(certificate_pem).ok()?;
+    // INVARIANT: a SHA-256 fingerprint is 32 bytes; we render the first 8.
+    debug_assert!(
+        fp.len() >= 8,
+        "certificate fingerprint must hold at least the 8 bytes we truncate to"
+    );
+    let mut hex = String::with_capacity(16);
+    for byte in fp.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    // POSTCONDITION: fixed-width 16-char (64-bit) fingerprint prefix.
+    debug_assert_eq!(
+        hex.len(),
+        16,
+        "certificate fingerprint prefix must be 16 hex chars"
+    );
+    Some(hex)
+}
+
+/// Shallow clone of [`AuditEntry`] so the completion handler can re-emit a
+/// second line with the same taxonomy as the attempt-time line but enriched
+/// with fanout + elapsed_ms. Manual implementation because `AuditEntry`
+/// does not derive `Clone` by default (it owns `String`s that the
+/// attempt-time line consumes by value).
+fn clone_entry(entry: &AuditEntry) -> AuditEntry {
+    AuditEntry {
+        kind: entry.kind,
+        verb: entry.verb,
+        counter: entry.counter,
+        cluster_id: entry.cluster_id.clone(),
+        backend_id: entry.backend_id.clone(),
+        address: entry.address,
+        target: entry.target.clone(),
+        extras: entry.extras.clone(),
+    }
+}
+
+// =========================================================
+// SetMetricDetail — dedicated dispatcher.
+//
+// Performs master-side length / TTL pre-validation that mirrors
+// `worker_request`, populates the peer binding from the connecting
+// `ClientSession`, emits the attempt-time audit row, and fans the
+// request out to every worker via the standard scatter path. Workers
+// that pre-date this verb return `WorkerResponse::error("unknown
+// request type")` which folds into the standard fan-out error tally
+// (`extras.fanout.workers_err`); operators see "succeeded with errors"
+// rather than a dedicated capability-skip list. Production keeps
+// master + workers in sync via `UpgradeMain`, so the mixed-version
+// state is transient.
+
+/// Gathers per-worker `SetMetricDetail` responses, synthesises a
+/// `MetricDetailStatus` reply for the client, and audits the
+/// completion alongside operator-initiated transitions. Wraps the
+/// generic worker-task fields (`audit`, `inline_audit`,
+/// `metric_detail_audit`) so the existing audit pipeline keeps
+/// emitting the same shape it does for any other audited verb.
+#[derive(Debug)]
+struct SetMetricDetailTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+    started_at: Instant,
+    /// Master-side `(configured, effective_before)` captured pre-apply
+    /// so the response can carry the `previous_effective` field that
+    /// `MetricDetailStatus` advertises. The master has no lease table: its
+    /// effective level is the configured floor, while workers own runtime
+    /// leases independently.
+    master_configured: MetricDetail,
+    master_previous_effective: MetricDetail,
+    /// Completion-time inline-audit target so the post-fanout audit
+    /// row carries the same `target` / verb shape as the attempt-time
+    /// line. Cloned from the `inline_audit` slot the generic
+    /// `worker_request` path uses.
+    inline_audit: InlineAuditTarget,
+    /// Operator-controlled audit fields (lease_id + reason) carried
+    /// into the completion-time `AuditExtras` so the post-fan-out
+    /// audit row also surfaces the lease key + free-form note in
+    /// their dedicated columns.
+    metric_detail_audit: MetricDetailAuditFields,
+}
+
+/// Dispatch a `SetMetricDetail` request. Performs the same length /
+/// TTL pre-validation that `worker_request` does, populates the peer
+/// binding from the connecting `ClientSession`, emits the attempt-time
+/// audit row, and fans out unconditionally to every worker through the
+/// standard scatter path.
+pub fn set_metric_detail_request(
+    server: &mut Server,
+    client: &mut ClientSession,
+    mut req: SetMetricDetail,
+) {
+    // Master-side enrichment + pre-validation (mirrors `worker_request`).
+    req.peer_pid = client.actor_pid;
+    req.peer_session_ulid = Some(client.session_ulid.to_string());
+    if req.client_id.len() > sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES {
+        client.finish_failure(format!(
+            "SetMetricDetail: client_id length {} exceeds {} bytes",
+            req.client_id.len(),
+            sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+        ));
+        return;
+    }
+    if let Some(t) = req.ttl_seconds
+        && u64::from(t) > sozu_lib::metrics::LEASE_TTL_MAX.as_secs()
+    {
+        client.finish_failure(format!(
+            "SetMetricDetail: ttl_seconds={t} exceeds LEASE_TTL_MAX={}",
+            sozu_lib::metrics::LEASE_TTL_MAX.as_secs(),
+        ));
+        return;
+    }
+
+    // Capture master-side cardinality view BEFORE we touch anything.
+    let (master_configured, master_previous_effective) = METRICS.with(|m| {
+        let m = m.borrow();
+        (
+            MetricDetail::from(m.detail_configured()),
+            MetricDetail::from(m.detail_effective()),
+        )
+    });
+
+    // Build the audit-field skeleton used by both the attempt-time and
+    // completion-time emissions. Mirrors `worker_request`.
+    let level_label = if req.clear.unwrap_or(false) {
+        "clear".to_owned()
+    } else {
+        req.detail
+            .and_then(|d| MetricDetail::try_from(d).ok())
+            .map(|d| format!("{d:?}"))
+            .unwrap_or_else(|| "<invalid>".into())
+    };
+    let metric_detail_audit = MetricDetailAuditFields {
+        target: format!("metric_detail:{level_label}"),
+        lease_id: req.client_id.clone(),
+        reason: req.reason.clone().filter(|s| !s.is_empty()),
+    };
+
+    // POSTCONDITION of the master-side pre-validation above: by the time we
+    // reach fan-out, the request honours both lease bounds (the two guards
+    // returned early otherwise). The worker enforces these again as
+    // defence-in-depth, but a request that slipped past here would amplify a
+    // bad input across every worker (N rejections + N audit lines).
+    debug_assert!(
+        req.client_id.len() <= sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+        "SetMetricDetail must be length-validated before fan-out"
+    );
+    debug_assert!(
+        req.ttl_seconds
+            .is_none_or(|t| u64::from(t) <= sozu_lib::metrics::LEASE_TTL_MAX.as_secs()),
+        "SetMetricDetail must be TTL-validated before fan-out"
+    );
+
+    let started_at = Instant::now();
+    // Snapshot the cluster-hash so we can confirm SetMetricDetail is a
+    // ConfigState no-op (it is runtime-only — `ConfigState::dispatch`
+    // returns `Ok(())` without touching persisted state; see its
+    // runtime-only `Ok(())` arm in `command/src/state.rs`). The snapshot and
+    // its matching asserts are debug-only and compiled out together in release builds.
+    #[cfg(debug_assertions)]
+    let state_hash_before = server.state.hash_state();
+    let request: Request = RequestType::SetMetricDetail(req).into();
+
+    // Attempt-time dispatch gate (mirrors `state.dispatch` in worker_request).
+    if let Err(error) = server.state.dispatch(&request) {
+        // INVARIANT: a rejected runtime-only dispatch leaves ConfigState
+        // untouched (it never mutates it in the first place).
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            server.state.hash_state(),
+            state_hash_before,
+            "SetMetricDetail dispatch must not mutate ConfigState"
+        );
+        let reason = error.to_string();
+        let (verb, counter) = audit_verb!("metric_detail_changed");
+        let target = metric_detail_audit.target.clone();
+        let mut extras = metric_detail_audit.into_extras();
+        extras.elapsed_ms = Some(elapsed_ms(started_at));
+        extras.error_code = Some(AuditErrorCode::DispatchError);
+        extras.reason = Some(reason.clone());
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::MetricDetailChanged,
+            verb,
+            counter,
+            target,
+            AuditResult::Err,
+            extras,
+        );
+        client.finish_failure(format!(
+            "could not dispatch request on the main process state: {error}",
+        ));
+        return;
+    }
+
+    // INVARIANT: even on the success path, SetMetricDetail is a ConfigState
+    // no-op — the runtime lease lives in each worker's `Aggregator`, never in
+    // the master's persisted `ConfigState`. If the hash changed, a future
+    // edit accidentally wired a runtime knob into persisted state.
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        server.state.hash_state(),
+        state_hash_before,
+        "SetMetricDetail must not mutate ConfigState even on success"
+    );
+
+    // Attempt-time audit Ok.
+    let (verb, counter) = audit_verb!("metric_detail_changed");
+    {
+        let target = metric_detail_audit.target.clone();
+        let extras = metric_detail_audit.clone().into_extras();
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::MetricDetailChanged,
+            verb,
+            counter,
+            target,
+            AuditResult::Ok,
+            extras,
+        );
+    }
+
+    client.return_processing("Processing SetMetricDetail...");
+
+    let inline_audit = InlineAuditTarget {
+        kind: EventKind::MetricDetailChanged,
+        verb,
+        counter,
+        target: metric_detail_audit.target.clone(),
+    };
+
+    // Fan out unconditionally to every worker through the standard
+    // scatter path. Workers that pre-date `SetMetricDetail` reply with
+    // `WorkerResponse::error("unknown request type")` which folds into
+    // the standard fan-out error tally; `on_finish` surfaces them via
+    // the existing fanout summary rather than a dedicated skip list.
+    let task = Box::new(SetMetricDetailTask {
+        client_token: client.token,
+        gatherer: DefaultGatherer::default(),
+        started_at,
+        master_configured,
+        master_previous_effective,
+        inline_audit,
+        metric_detail_audit,
+    });
+    server.scatter(request, task, Timeout::Default, None);
+}
+
+impl GatheringTask for SetMetricDetailTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::SetMetricDetail {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                started_at: ElapsedSnapshot::capture(self.started_at, timing)?,
+                master_configured: self.master_configured,
+                master_previous_effective: self.master_previous_effective,
+                inline_audit: InlineAuditTargetSnapshot::capture(&self.inline_audit)?,
+                metric_detail_audit: self.metric_detail_audit.clone(),
+            },
+        )))
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        // PRECONDITION: the scatter ran to completion (or timed out). Mirrors
+        // the generic `WorkerTask::on_finish` finished-or-timeout guard so a
+        // SetMetricDetail task released before its workers replied trips here.
+        debug_assert!(
+            timed_out
+                || self.gatherer.ok + self.gatherer.errors >= self.gatherer.expected_responses,
+            "SetMetricDetailTask::on_finish: must be finished (ok+errors >= expected) unless timed out"
+        );
+
+        // Per-worker status: each worker now returns its own
+        // `WorkerMetricDetailStatus` payload via
+        // `ContentType::WorkerMetricDetailStatus` in the SetMetricDetail
+        // ok-with-content response (lib/src/server.rs::notify). Pull
+        // each worker's actual quartet — workers hold independent
+        // `Aggregator`s, so the master's view is NOT a reliable
+        // stand-in for the per-worker state. Workers that returned an
+        // error (e.g. peer-binding refusal) get skipped; the operator
+        // sees `MetricDetailStatus.workers` populated only for the
+        // ACK'd subset.
+        let mut workers_map = BTreeMap::new();
+        for (worker_id, response) in &self.gatherer.responses {
+            if !matches!(
+                ResponseStatus::try_from(response.status),
+                Ok(ResponseStatus::Ok)
+            ) {
+                continue;
+            }
+            if let Some(ResponseContent {
+                content_type: Some(ContentType::WorkerMetricDetailStatus(status)),
+            }) = response.content.as_ref()
+            {
+                // `WorkerMetricDetailStatus` is `Copy` (four `i32`s +
+                // one `u32`); dereferencing avoids the `clippy::clone_on_copy`
+                // lint that CI's `-D warnings` rejects.
+                workers_map.insert(worker_id.to_string(), *status);
+            }
+        }
+
+        let master_effective =
+            METRICS.with(|metrics| MetricDetail::from(metrics.borrow().detail_effective()));
+        let status = MetricDetailStatus {
+            configured: self.master_configured as i32,
+            effective: master_effective as i32,
+            previous_effective: self.master_previous_effective as i32,
+            workers: workers_map,
+        };
+
+        // Completion-time audit row. Same shape as the generic WorkerTask
+        // completion path; reuses `metric_detail_audit` for the
+        // `lease_id` / `metric_detail_reason` columns and folds the
+        // fan-out summary on top.
+        let errors = self.gatherer.errors;
+        let ok = self.gatherer.ok;
+        let expected = self.gatherer.expected_responses;
+        let result = if errors > 0 || timed_out {
+            AuditResult::Err
+        } else {
+            AuditResult::Ok
+        };
+        let fanout_status = if timed_out {
+            FanoutStatus::Timeout
+        } else if errors > 0 {
+            FanoutStatus::Partial
+        } else if expected == 0 {
+            FanoutStatus::LocalOnly
+        } else {
+            FanoutStatus::Ok
+        };
+        let fanout_summary = FanoutSummary {
+            status: fanout_status,
+            workers_ok: u32::try_from(ok).unwrap_or(u32::MAX),
+            workers_err: u32::try_from(errors).unwrap_or(u32::MAX),
+            workers_expected: u32::try_from(expected).unwrap_or(u32::MAX),
+        };
+        // INVARIANT: the per-worker status map holds only successfully-ACK'd
+        // workers (the loop above skips non-Ok responses), so it can never be
+        // larger than the OK tally. A larger map would mean a non-Ok worker
+        // leaked into the operator-visible `MetricDetailStatus.workers`.
+        debug_assert!(
+            status.workers.len() <= ok,
+            "MetricDetailStatus.workers must not exceed the OK worker tally"
+        );
+        // INVARIANT: audit result agrees with fanout status (same as the
+        // generic WorkerTask path).
+        debug_assert_eq!(
+            matches!(result, AuditResult::Err),
+            matches!(fanout_status, FanoutStatus::Timeout | FanoutStatus::Partial),
+            "AuditResult and FanoutStatus must agree on success vs failure"
+        );
+        if let Some(client_ref) = client.as_deref() {
+            let mut extras = self.metric_detail_audit.into_extras();
+            extras.elapsed_ms = Some(elapsed_ms(self.started_at));
+            extras.fanout = Some(fanout_summary);
+            if matches!(result, AuditResult::Err) {
+                extras.error_code = Some(if timed_out {
+                    AuditErrorCode::WorkerTimeout
+                } else {
+                    AuditErrorCode::WorkerFailure
+                });
+                let mut msgs = Vec::new();
+                for (worker_id, response) in &self.gatherer.responses {
+                    // Same column-boundary sanitisation as
+                    // `WorkerTask::on_finish` above.
+                    // `SetMetricDetail` is itself the
+                    // operator-controlled verb most likely to be probed
+                    // for SIEM column smuggling, so this site is the
+                    // higher-leverage of the two reason-join paths.
+                    msgs.push(format!(
+                        "{worker_id}: {}",
+                        sanitize_for_audit_kv(&response.message)
+                    ));
+                }
+                extras.reason = Some(msgs.join(", "));
+            }
+            audit_emit_inline(
+                server,
+                client_ref,
+                self.inline_audit.kind,
+                self.inline_audit.verb,
+                self.inline_audit.counter,
+                self.inline_audit.target,
+                result,
+                extras,
+            );
+        }
+
+        client.finish_ok_with_content(
+            ContentType::MetricDetailStatus(status).into(),
+            if errors > 0 || timed_out {
+                "SetMetricDetail completed with worker errors"
+            } else {
+                "Successfully applied SetMetricDetail to all workers"
+            },
+        );
+    }
+}
+
+// =========================================================
+// Query Metrics
+
+#[derive(Debug)]
+struct QueryMetricsTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+    options: QueryMetricsOptions,
+    /// Main-process contribution captured during an upgrade snapshot.
+    /// Fresh tasks leave this empty and read the current aggregator at finish.
+    main_process_metrics: Option<BTreeMap<String, FilteredMetrics>>,
+}
+
+fn query_metrics(server: &mut Server, client: &mut ClientSession, options: QueryMetricsOptions) {
+    client.return_processing("Querrying metrics...");
+
+    server.scatter(
+        RequestType::QueryMetrics(options.clone()).into(),
+        Box::new(QueryMetricsTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+            options,
+            main_process_metrics: None,
+        }),
+        Timeout::Default,
+        None,
+    );
+}
+
+impl GatheringTask for QueryMetricsTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        let main_process_metrics = self.main_process_metrics.clone().unwrap_or_else(|| {
+            METRICS.with(|metrics| (*metrics.borrow_mut()).dump_local_proxy_metrics())
+        });
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::QueryMetrics {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                options: self.options.clone(),
+                main_process_metrics,
+            },
+        )))
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        _server: &mut Server,
+        client: &mut OptionalClient,
+        _timed_out: bool,
+    ) {
+        let main_metrics = self.main_process_metrics.unwrap_or_else(|| {
+            METRICS.with(|metrics| (*metrics.borrow_mut()).dump_local_proxy_metrics())
+        });
+
+        if self.options.list {
+            let mut summed_proxy_metrics = Vec::new();
+            let mut summed_cluster_metrics = Vec::new();
+            for (_, response) in self.gatherer.responses {
+                if let Some(ResponseContent {
+                    content_type:
+                        Some(ContentType::AvailableMetrics(AvailableMetrics {
+                            proxy_metrics: listed_proxy_metrics,
+                            cluster_metrics: listed_cluster_metrics,
+                        })),
+                }) = response.content
+                {
+                    summed_proxy_metrics.append(&mut listed_proxy_metrics.clone());
+                    summed_cluster_metrics.append(&mut listed_cluster_metrics.clone());
+                }
+            }
+            summed_proxy_metrics.sort();
+            summed_cluster_metrics.sort();
+            summed_proxy_metrics.dedup();
+            summed_cluster_metrics.dedup();
+
+            return client.finish_ok_with_content(
+                ContentType::AvailableMetrics(AvailableMetrics {
+                    proxy_metrics: summed_proxy_metrics,
+                    cluster_metrics: summed_cluster_metrics,
+                })
+                .into(),
+                "Successfully listed available metrics",
+            );
+        }
+
+        let workers_metrics = self
+            .gatherer
+            .responses
+            .into_iter()
+            .filter_map(
+                |(worker_id, worker_response)| match worker_response.content {
+                    Some(ResponseContent {
+                        content_type: Some(ContentType::WorkerMetrics(worker_metrics)),
+                    }) => Some((worker_id.to_string(), worker_metrics)),
+                    _ => None,
+                },
+            )
+            .collect();
+
+        let mut aggregated_metrics = AggregatedMetrics {
+            main: main_metrics,
+            clusters: BTreeMap::new(),
+            workers: workers_metrics,
+            proxying: BTreeMap::new(),
+        };
+
+        // Always fold when the caller asked for merged data, regardless of
+        // worker count. `merge_metrics` relocates each worker's `clusters`
+        // and `proxying` into the top-level maps via `std::mem::take`; the
+        // previous `> 1` guard left single-worker fleets with empty
+        // top-level maps and stranded the per-worker data in `workers`,
+        // which silently zeroed every CLI/TUI consumer that reads
+        // `m.clusters` / `m.proxying`.
+        if !self.options.workers {
+            aggregated_metrics.merge_metrics();
+        }
+
+        client.finish_ok_with_content(
+            ContentType::Metrics(aggregated_metrics).into(),
+            "Successfully aggregated all metrics",
+        );
+    }
+}
+
+// =========================================================
+// Load state
+
+#[derive(Debug)]
+struct LoadStateTask {
+    /// this task may be called by the main process, without a client
+    pub client_token: Option<Token>,
+    /// sozu#1313: per-entry accounting, so an entry no worker acknowledged is
+    /// reverted from the main-process state instead of being re-persisted by
+    /// the next `SaveState` and re-injected by every later replay.
+    pub gatherer: PerEntryGatherer,
+    path: String,
+}
+
+pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
+    info!("loading state at path {}", path);
+
+    let audit_target = format!("file:{path}");
+
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("state_loaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::StateLoaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+            }
+            client.finish_failure(format!("Cannot find file at path {path}"));
+            return;
+        }
+        Err(error) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("state_loaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::StateLoaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+            }
+            client.finish_failure(format!("Cannot open file at path {path}: {error}"));
+            return;
+        }
+    };
+
+    client.return_processing(format!("Parsing state file from {path}..."));
+
+    // sozu#1313: a bounded deadline from the start — the entry count is only
+    // known once the file is parsed, so this initial budget covers the
+    // degenerate cases (empty or unparseable file) and is re-armed below with
+    // the real count, which also restarts the countdown at the END of the
+    // fan-out rather than at the beginning of a long parse.
+    let worker_timeout = server.config.worker_timeout;
+    let task_id = server.new_task(
+        Box::new(LoadStateTask {
+            client_token: client.as_ref().map(|c| c.token),
+            gatherer: PerEntryGatherer::default(),
+            path: path.to_owned(),
+        }),
+        bulk_replay_timeout(worker_timeout, 0),
+    );
+
+    // One record must fit whole in the buffer, or parsing stops there and
+    // every record after it is lost. A listener's record carries its client
+    // CA and CRL contents, so it can grow as large as a request the worker
+    // channels accept: size the buffer for that, never below the historical
+    // 200 kB.
+    let capacity = usize::try_from(server.config.max_command_buffer_size)
+        .unwrap_or(usize::MAX)
+        .max(200_000);
+    let mut buffer = Buffer::with_capacity(capacity);
+    let mut scatter_request_counter = 0usize;
+    // sozu#1313: entries the pre-dispatch validation refused. Counted here
+    // rather than on `LoadStateTask` because the task is already owned by the
+    // server's queue and `Server` exposes no handle to mutate it afterwards —
+    // the tally only needs to reach the operator, which the `return_processing`
+    // below does.
+    let mut skipped_invalid = 0usize;
+    let mut deferral = PortConflictDeferral::default();
+
+    let status = loop {
+        let previous = buffer.available_data();
+
+        match file.read(buffer.space()) {
+            Ok(bytes_read) => buffer.fill(bytes_read),
+            Err(error) => break Err(format!("Error reading the saved state file: {error}")),
+        };
+
+        if buffer.available_data() == 0 {
+            trace!("load_state: empty buffer");
+            break Ok(());
+        }
+
+        let mut offset = 0usize;
+        match parse_several_requests::<WorkerRequest>(buffer.data()) {
+            Ok((i, requests)) => {
+                if !i.is_empty() {
+                    debug!("load_state: could not parse {} bytes", i.len());
+                    if previous == buffer.available_data() {
+                        break Err("Error consuming load state message".into());
+                    }
+                }
+                offset = buffer.data().offset(i);
+
+                for request in requests {
+                    // sozu#1301: skip an unbuildable listener from the saved
+                    // state without reserving its address, so a corrected
+                    // reload can add it (mirrors the dispatch-failure skip).
+                    // sozu#1313: skip a frontend the workers' router refuses —
+                    // this replay path has NO rollback, so an entry dispatched
+                    // here stays in the main-process state for good and is re-
+                    // persisted by the next `SaveState`. `warn!`, not `debug!`:
+                    // an entry silently dropped from the state the operator
+                    // saved must be visible at the default log level.
+                    if let Some(request_type) = &request.content.request_type {
+                        if let Err(reason) = validate_request(request_type, RequestOrigin::Replayed)
+                        {
+                            warn!(
+                                "load_state: skipping an entry rejected by pre-dispatch validation: {}",
+                                reason
+                            );
+                            count!("config.load_skipped_invalid", 1);
+                            skipped_invalid += 1;
+                            continue;
+                        }
+                        // sozu#1418: an out-of-range H2 knob is NOT a reason to
+                        // drop a replayed listener. The entry was accepted
+                        // before the gate existed and is serving today; the
+                        // workers clamp the threshold to the floor. That clamp
+                        // LOOSENS the knob by exactly one event — `count >
+                        // threshold` trips on the first counted event at `0`
+                        // and on the second at `1` — but `0` is not "no limit"
+                        // and not a protection level anyone tuned. Dropping
+                        // the listener instead would unbind it and take every
+                        // frontend behind it offline — a far larger blast
+                        // radius than that one event. Keep it, and say so at
+                        // `warn!` so the operator can fix the source rather
+                        // than discovering it at the next upgrade.
+                        if let Err(reason) = validate_h2_knob_floors(request_type) {
+                            warn!(
+                                "load_state: keeping a listener whose H2 knob is out of range — \
+                                 the workers clamp it to the floor: {}. Correct it with \
+                                 `sozu ctl listener http|https update` (or in the configuration \
+                                 file) and save the state again.",
+                                reason
+                            );
+                            count!("config.load_h2_knob_clamped", 1);
+                        }
+                    }
+                    // A cluster gaining a probe port while the state still
+                    // holds its unix backend waits for the backends that
+                    // replace it, applied once the whole file is read.
+                    let Some(request) = deferral.admit(&server.state, request.content) else {
+                        continue;
+                    };
+                    apply_saved_entry(
+                        server,
+                        request,
+                        task_id,
+                        &mut scatter_request_counter,
+                        &mut skipped_invalid,
+                    );
+                }
+            }
+            Err(nom::Err::Incomplete(_)) => {
+                if buffer.available_data() == buffer.capacity() {
+                    break Err(format!(
+                        "message too big, stopping parsing:\n{}",
+                        buffer.data().to_hex(16)
+                    ));
+                }
+            }
+            Err(parse_error) => {
+                break Err(format!("saved state parse error: {parse_error:?}"));
+            }
+        }
+        buffer.consume(offset);
+    };
+
+    if status.is_ok() {
+        for request in deferral.into_held() {
+            apply_saved_entry(
+                server,
+                request,
+                task_id,
+                &mut scatter_request_counter,
+                &mut skipped_invalid,
+            );
+        }
+    }
+
+    match status {
+        Ok(()) => {
+            server.rearm_task_timeout(
+                task_id,
+                bulk_replay_timeout(worker_timeout, scatter_request_counter),
+            );
+            if skipped_invalid > 0 {
+                // sozu#1313: the load is deliberately NOT aborted — every valid
+                // entry still applies — but the operator must learn that the
+                // state they reloaded is not the state they saved.
+                client.return_processing(format!(
+                    "load_state: skipped {skipped_invalid} invalid entries — see the main process warnings"
+                ));
+            }
+            client.return_processing("Applying state file...");
+            // Success audit is emitted from `LoadStateTask::on_finish` once
+            // every worker has acknowledged — that's where we know the final
+            // ok/err split.
+        }
+        Err(message) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("state_loaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::StateLoaded,
+                    verb,
+                    counter,
+                    audit_target,
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+            }
+            client.finish_failure(message);
+            server.cancel_task(task_id);
+        }
+    }
+}
+
+/// Align the protected journal with a request the main state has just
+/// accepted (or an inverse it has just applied): the held values survive an
+/// ordinary rewrite of a cluster's health check only for the exact headers
+/// they were issued for. Requests that touch no health check change nothing.
+fn align_protected_journal(server: &mut Server, request: &Request) {
+    if let Some((cluster, headers)) = request
+        .request_type
+        .as_ref()
+        .and_then(super::protected::ordinary_health_check_change)
+    {
+        server.protected.ordinary_change(cluster, headers);
+    }
+}
+
+/// Applies one entry of a saved state to the main state, then scatters it to
+/// the workers; an entry the state refuses never enters `ConfigState` and is
+/// never scattered.
+fn apply_saved_entry(
+    server: &mut Server,
+    request: Request,
+    task_id: usize,
+    scatter_request_counter: &mut usize,
+    skipped_invalid: &mut usize,
+) {
+    if let Err(error) = server.state.dispatch(&request) {
+        // Say so, because at startup there is no client to carry the reason.
+        warn!("load_state: skipping an entry the state refused: {}", error);
+        count!("config.load_skipped_invalid", 1);
+        // The tally the operator is shown covers BOTH skip branches: an entry
+        // the state refused is just as absent from the loaded state as one
+        // validation refused.
+        *skipped_invalid += 1;
+    } else {
+        // The state file decides the clusters it adds, removes or rewrites the
+        // health check of: a file-backed order of a cold start never replaces
+        // them.
+        if let Some(request_type) = &request.request_type {
+            server.protected.saved_entry_dispatched(request_type);
+        }
+        // The values held for a cluster follow the metadata the state now
+        // holds, exactly as for a live order.
+        align_protected_journal(server, &request);
+        // INVARIANT: the scatter request_id advances by exactly one per
+        // dispatched request. `scatter_on` embeds it in the per-worker request
+        // id, so a stale or repeated counter would collide two in-flight ids
+        // and silently drop a worker's response, hanging the task. Snapshot is
+        // read only inside the assert → ungated for the release (E0425) build.
+        let counter_before = *scatter_request_counter;
+        *scatter_request_counter += 1;
+        debug_assert_eq!(
+            *scatter_request_counter,
+            counter_before + 1,
+            "load_state must advance the scatter request_id by exactly one per dispatch"
+        );
+        server.scatter_on(request, task_id, *scatter_request_counter, None);
+    }
+}
+
+impl GatheringTask for LoadStateTask {
+    fn client_token(&self) -> Option<Token> {
+        self.client_token
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::LoadState {
+                client_token: self.client_token.map(|token| token.0),
+                gatherer: self.gatherer.clone(),
+                path: self.path.clone(),
+            },
+        )))
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        let Self { gatherer, path, .. } = *self;
+        let ok = gatherer.inner.ok;
+        let errors = gatherer.inner.errors;
+        // PRECONDITION: the gatherer ran to completion — either every expected
+        // worker answered, or the bounded deadline of `bulk_replay_timeout`
+        // fired. Before sozu#1313 this path scattered with `Timeout::None` and
+        // could only end the first way, which is exactly why a worker killed
+        // mid-replay hung `sozu state load` with no answer at all.
+        debug_assert!(
+            timed_out || gatherer.has_finished(),
+            "LoadStateTask::on_finish: must be finished (ok+errors >= expected) unless timed out"
+        );
+        // sozu#1313: revert every replayed entry NO worker acknowledged, so the
+        // main process does not keep — and `SaveState` does not re-persist — an
+        // entry the whole fleet refused. Runs before `update_counts` so the
+        // frontend/backend gauges reflect the reverted state.
+        let reverted = gatherer.revert_unacknowledged(server, timed_out);
+        server.update_counts();
+        // A timeout is a failure, never a success: entries were left
+        // unacknowledged, and the reverts above already assume as much.
+        let failed = errors > 0 || timed_out;
+        let result = if failed {
+            AuditResult::Err
+        } else {
+            AuditResult::Ok
+        };
+        // INVARIANT: the audit result matches the outcome — an `ok:N errors:0`
+        // line that did not time out must be tagged Ok, anything else Err.
+        debug_assert_eq!(
+            matches!(result, AuditResult::Ok),
+            errors == 0 && !timed_out,
+            "LoadStateTask audit result must agree with the worker error tally and the deadline"
+        );
+        if let Some(client_ref) = client.as_deref() {
+            let (verb, counter) = audit_verb!("state_loaded");
+            audit_emit_inline(
+                server,
+                client_ref,
+                EventKind::StateLoaded,
+                verb,
+                counter,
+                format!("file:{path} ok:{ok} errors:{errors} reverted:{reverted}"),
+                result,
+                AuditExtras {
+                    error_code: failed.then_some(if timed_out {
+                        AuditErrorCode::WorkerTimeout
+                    } else {
+                        AuditErrorCode::WorkerFailure
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        if !failed {
+            client.finish_ok(format!(
+                "Successfully loaded state from path {path}, {ok} ok messages, {errors} errors"
+            ));
+            return;
+        }
+        client.finish_failure(format!(
+            "loading state: {ok} ok messages, {errors} errors, timed out: {timed_out}, \
+             reverted entries: {reverted}"
+        ));
+    }
+}
+
+// ==========================================================
+// status
+
+#[derive(Debug)]
+struct StatusTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+    worker_infos: HashMap<WorkerId, WorkerInfo>,
+}
+
+fn status(server: &mut Server, client: &mut ClientSession) {
+    client.return_processing("Querying status of workers...");
+
+    let worker_infos = server
+        .workers
+        .values()
+        .map(|worker| (worker.id, worker.querying_info()))
+        .collect();
+
+    server.scatter(
+        RequestType::Status(Status {}).into(),
+        Box::new(StatusTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+            worker_infos,
+        }),
+        Timeout::Default,
+        None,
+    );
+}
+
+impl GatheringTask for StatusTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::Status {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                worker_infos: self.worker_infos.clone(),
+            },
+        )))
+    }
+
+    fn on_finish(
+        mut self: Box<Self>,
+        _server: &mut Server,
+        client: &mut OptionalClient,
+        _timed_out: bool,
+    ) {
+        for (worker_id, response) in self.gatherer.responses {
+            let new_run_state = match ResponseStatus::try_from(response.status) {
+                Ok(ResponseStatus::Ok) => RunState::Running,
+                Ok(ResponseStatus::Processing) => continue,
+                Ok(ResponseStatus::Failure) => RunState::NotAnswering,
+                Err(e) => {
+                    warn!("error decoding response status: {}", e);
+                    continue;
+                }
+            };
+
+            // The probe only resolves the `NotAnswering` placeholder that
+            // `querying_info` gives a running worker. A `Stopping` worker still
+            // answers while it drains, and its answer must not report it as
+            // running (sozu#1672); a `Stopped` one is never probed.
+            self.worker_infos
+                .entry(worker_id)
+                .and_modify(|worker_info| {
+                    if worker_info.run_state == RunState::NotAnswering as i32 {
+                        worker_info.run_state = new_run_state as i32;
+                    }
+                });
+        }
+
+        let worker_info_vec = WorkerInfos {
+            vec: self.worker_infos.into_values().collect(),
+        };
+
+        client.finish_ok_with_content(
+            ContentType::Workers(worker_info_vec).into(),
+            "Successfully collected the status of workers",
+        );
+    }
+}
+
+// ==========================================================
+// Soft stop and hard stop
+
+#[derive(Debug)]
+struct StopTask {
+    /// `None` when the stop comes from `SIGTERM` rather than a client
+    pub client_token: Option<Token>,
+    pub gatherer: DefaultGatherer,
+    pub hardness: bool,
+}
+
+/// stop the main process and workers, true for hard stop
+fn stop(server: &mut Server, client: &mut ClientSession, hardness: bool) {
+    let (verb, counter) = audit_verb!("sozu_stop_requested");
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::SozuStopRequested,
+        verb,
+        counter,
+        format!("stop:{}", if hardness { "hard" } else { "soft" }),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
+
+    if hardness {
+        client.return_processing("Performing hard stop...");
+    } else {
+        client.return_processing("Performing soft stop...");
+    }
+    begin_stop(server, Some(client.token), hardness);
+}
+
+/// Open the shutdown sequence: fan `SoftStop` or `HardStop` out to the workers,
+/// then stop the main process once they answered. Shared by the `SoftStop` /
+/// `HardStop` verbs and by `SIGTERM` (`CommandHub::on_sigterm`), which has no
+/// client to answer.
+pub(super) fn begin_stop(server: &mut Server, client_token: Option<Token>, hardness: bool) {
+    let task = Box::new(StopTask {
+        client_token,
+        gatherer: DefaultGatherer::default(),
+        hardness,
+    });
+
+    server.run_state = ServerState::WorkersStopping;
+    // POSTCONDITION: the stop request has opened the shutdown sequence. The
+    // matching `StopTask::on_finish` will later advance to `Stopping`. We do
+    // NOT assert the prior state was `Running` — an operator may legitimately
+    // re-issue stop while a soft-stop is already draining.
+    debug_assert_eq!(
+        server.run_state,
+        ServerState::WorkersStopping,
+        "stop() must move the master into WorkersStopping before fan-out"
+    );
+    if hardness {
+        server.scatter(
+            RequestType::HardStop(HardStop {}).into(),
+            task,
+            Timeout::Default,
+            None,
+        );
+    } else {
+        server.scatter(
+            RequestType::SoftStop(SoftStop {}).into(),
+            task,
+            Timeout::None,
+            None,
+        );
+    }
+}
+
+impl GatheringTask for StopTask {
+    fn client_token(&self) -> Option<Token> {
+        self.client_token
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(RequestTaskSnapshot::Stop {
+            client_token: self.client_token.map(|token| token.0),
+            gatherer: self.gatherer.clone(),
+            hardness: self.hardness,
+        })))
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        // PRECONDITION: a StopTask is only created by `stop()`, which moves
+        // the master to `WorkersStopping` BEFORE scattering. The server must
+        // therefore never still be `Running` when a stop task finishes —
+        // that would mean the run-state transition that brackets shutdown
+        // was skipped. (`Stopping` is also acceptable: a prior stop task may
+        // already have advanced it.)
+        debug_assert_ne!(
+            server.run_state,
+            ServerState::Running,
+            "StopTask::on_finish must observe a shutdown run-state, never Running"
+        );
+        if timed_out && self.hardness {
+            client.finish_failure(format!(
+                "Workers take too long to stop ({} ok, {} errors), stopping the main process to sever the link",
+                self.gatherer.ok, self.gatherer.errors
+            ));
+        }
+        server.run_state = ServerState::Stopping;
+        // POSTCONDITION: shutdown is now committed.
+        debug_assert_eq!(
+            server.run_state,
+            ServerState::Stopping,
+            "StopTask::on_finish must leave the master in the Stopping state"
+        );
+        client.finish_ok(format!(
+            "Successfully closed {} workers, {} errors, stopping the main process...",
+            self.gatherer.ok, self.gatherer.errors
+        ));
+    }
+}
+
+// =========================================================
+// Patch diff formatters — for the audit `target=` field.
+// Walk each Option field of the patch and, when a pre-patch listener
+// snapshot is available, emit `field=old→new` so operators see both the
+// prior and the replacement value. Falls back to `field=new` (no arrow)
+// when no current listener is known (e.g. patch arriving before the
+// listener is registered) so the audit line never swallows a change.
+//
+// Helpers live inline as macros instead of functions so `stringify!($field)`
+// picks up each field name without runtime formatting.
+
+fn format_patch_diff_http(
+    p: &UpdateHttpListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::HttpListenerConfig>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // Patch field is `Option<T>`, current field is `T` (required on the
+    // stored listener): `to_string()` directly.
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_req_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .map(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    // Patch field is `Option<T>`, current field is `Option<T>` (optional on
+    // the stored listener): flatten current via `and_then`.
+    macro_rules! diff_opt_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .and_then(|c| c.$field)
+                    .map(|o| o.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_opt_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .and_then(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    if let Some(v) = p.public_address.as_ref() {
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
+    }
+    diff_req_copy!(expect_proxy);
+    diff_req_str!(sticky_name);
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(connect_timeout);
+    diff_req_copy!(request_timeout);
+    if p.http_answers.is_some() {
+        parts.push("http_answers=<patched>".to_owned());
+    }
+    diff_opt_copy!(h2_max_rst_stream_per_window);
+    diff_opt_copy!(h2_max_ping_per_window);
+    diff_opt_copy!(h2_max_settings_per_window);
+    diff_opt_copy!(h2_max_empty_data_per_window);
+    diff_opt_copy!(h2_max_continuation_frames);
+    diff_opt_copy!(h2_max_glitch_count);
+    diff_opt_copy!(h2_initial_connection_window);
+    diff_opt_copy!(h2_max_concurrent_streams);
+    diff_opt_copy!(h2_stream_shrink_ratio);
+    diff_opt_copy!(h2_max_rst_stream_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_abusive_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_emitted_lifetime);
+    diff_opt_copy!(h2_max_header_list_size);
+    diff_opt_copy!(h2_max_header_table_size);
+    diff_opt_copy!(h2_max_header_fields);
+    diff_opt_copy!(h2_stream_refusal_percent);
+    diff_opt_copy!(h2_stream_idle_timeout_seconds);
+    diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
+    diff_opt_copy!(h2_max_window_update_stream0_per_window);
+    diff_opt_str!(sozu_id_header);
+    if let Some(v) = p.forwarded_headers {
+        let old = current
+            .and_then(|c| c.forwarded_headers)
+            .map(forwarded_headers_label)
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!(
+            "forwarded_headers={old}→{}",
+            forwarded_headers_label(v)
+        ));
+    }
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn format_patch_diff_https(
+    p: &UpdateHttpsListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::HttpsListenerConfig>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_req_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .map(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_opt_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .and_then(|c| c.$field)
+                    .map(|o| o.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_opt_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .and_then(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    if let Some(v) = p.public_address.as_ref() {
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
+    }
+    diff_req_copy!(expect_proxy);
+    diff_req_str!(sticky_name);
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(connect_timeout);
+    diff_req_copy!(request_timeout);
+    if p.http_answers.is_some() {
+        parts.push("http_answers=<patched>".to_owned());
+    }
+    if let Some(ref alpn) = p.alpn_protocols {
+        let old = current
+            .map(|c| c.alpn_protocols.join(","))
+            .unwrap_or_else(|| "?".to_owned());
+        let new = if alpn.values.is_empty() {
+            "<reset>".to_owned()
+        } else {
+            alpn.values.join(",")
+        };
+        parts.push(format!("alpn_protocols={old}→{new}"));
+    }
+    if let Some(ref policy) = p.client_auth_policy {
+        // Mode and counts only: the CA and CRL entries are PEM bodies.
+        let summary = |policy: &sozu_command_lib::proto::command::ClientAuthPolicy| {
+            format!(
+                "{}/{}ca/{}crl",
+                policy.client_auth.unwrap_or_default(),
+                policy.client_ca_certificates.len(),
+                policy.client_ca_crls.len()
+            )
+        };
+        let old = current
+            .map(|c| summary(&c.client_auth_policy()))
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("client_auth_policy={old}→{}", summary(policy)));
+    }
+    diff_opt_copy!(strict_sni_binding);
+    diff_opt_copy!(disable_http11);
+    diff_opt_copy!(h2_max_rst_stream_per_window);
+    diff_opt_copy!(h2_max_ping_per_window);
+    diff_opt_copy!(h2_max_settings_per_window);
+    diff_opt_copy!(h2_max_empty_data_per_window);
+    diff_opt_copy!(h2_max_continuation_frames);
+    diff_opt_copy!(h2_max_glitch_count);
+    diff_opt_copy!(h2_initial_connection_window);
+    diff_opt_copy!(h2_max_concurrent_streams);
+    diff_opt_copy!(h2_stream_shrink_ratio);
+    diff_opt_copy!(h2_max_rst_stream_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_abusive_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_emitted_lifetime);
+    diff_opt_copy!(h2_max_header_list_size);
+    diff_opt_copy!(h2_max_header_table_size);
+    diff_opt_copy!(h2_max_header_fields);
+    diff_opt_copy!(h2_stream_refusal_percent);
+    diff_opt_copy!(h2_stream_idle_timeout_seconds);
+    diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
+    diff_opt_copy!(h2_max_window_update_stream0_per_window);
+    diff_opt_str!(sozu_id_header);
+    if let Some(v) = p.forwarded_headers {
+        let old = current
+            .and_then(|c| c.forwarded_headers)
+            .map(forwarded_headers_label)
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!(
+            "forwarded_headers={old}→{}",
+            forwarded_headers_label(v)
+        ));
+    }
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn format_patch_diff_tcp(
+    p: &UpdateTcpListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::TcpListenerConfig>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    if let Some(v) = p.public_address.as_ref() {
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
+    }
+    diff_req_copy!(expect_proxy);
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(connect_timeout);
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// Render a UDP listener patch as a compact `field=old→new` diff for the audit
+/// trail, mirroring [`format_patch_diff_tcp`]. UDP has no `expect_proxy` /
+/// `connect_timeout`; its distinguishing knobs are `max_rx_datagram_size` and
+/// `max_flows`.
+fn format_patch_diff_udp(
+    p: &UpdateUdpListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::UdpListenerConfig>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    if let Some(v) = p.public_address.as_ref() {
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
+    }
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(max_rx_datagram_size);
+    diff_req_copy!(max_flows);
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+#[cfg(test)]
+mod audit_format_tests {
+    //! Drift-guard for the audit log line. Rejects any accidental change to
+    //! the MUX `Session(...)` layout that would break downstream grep-based
+    //! consumers (SIEM pipelines, operator shell recipes).
+    //!
+    //! The default thread-local logger reports `is_logger_colored() == false`
+    //! (see `LOGGER_COLORED` in `command/src/logging/logs.rs`), so
+    //! `ansi_palette()` returns empty strings and the rendered line is
+    //! ANSI-free — stable to match with a plain regex.
+    use super::{
+        AUDIT_LEASE_ID_MAX_CHARS, AUDIT_REASON_MAX_CHARS, AuditEntry, AuditErrorCode, AuditExtras,
+        AuditResult, FanoutStatus, FanoutSummary, SOZU_BUILD_GIT_SHA, SOZU_VERSION, actor_role,
+        rfc3339_utc,
+    };
+    use regex::Regex;
+    use rusty_ulid::Ulid;
+    use sozu_command_lib::{ObjectKind, proto::command::EventKind, state::StateError};
+    use std::time::SystemTime;
+
+    /// Minimal stand-in exposing only the `ClientSession` fields and methods
+    /// that `audit_log_context!` reads. Avoids constructing the full
+    /// `Channel<Response, Request>` that `ClientSession::new` requires.
+    struct TestClient {
+        session_ulid: Ulid,
+        id: u32,
+        actor_uid: Option<u32>,
+        actor_gid: Option<u32>,
+        actor_pid: Option<i32>,
+        actor_comm: Option<String>,
+        actor_user: Option<String>,
+        socket_path: std::sync::Arc<str>,
+        connect_ts: SystemTime,
+    }
+
+    /// Minimal stand-in for `Server` exposing only `boot_generation`, the
+    /// only field the macro reads off of `$server`. Avoids the full Server
+    /// (Poll, listener, workers map, …) ceremony.
+    struct TestServer {
+        boot_generation: u32,
+    }
+
+    impl TestClient {
+        fn actor_uid_display(&self) -> String {
+            self.actor_uid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_gid_display(&self) -> String {
+            self.actor_gid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_pid_display(&self) -> String {
+            self.actor_pid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_comm_display(&self) -> String {
+            self.actor_comm
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_user_display(&self) -> String {
+            self.actor_user
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn connect_ts_display(&self) -> String {
+            rfc3339_utc(self.connect_ts)
+        }
+    }
+
+    fn sample_entry(cluster_id: Option<&str>) -> AuditEntry {
+        AuditEntry {
+            kind: EventKind::ClusterAdded,
+            verb: "cluster_added",
+            counter: "config.cluster_added",
+            cluster_id: cluster_id.map(str::to_owned),
+            backend_id: None,
+            address: None,
+            target: "cluster:my_app".to_owned(),
+            extras: AuditExtras::default(),
+        }
+    }
+
+    fn sample_client(uid: Option<u32>) -> TestClient {
+        TestClient {
+            session_ulid: Ulid::generate(),
+            id: 42,
+            actor_uid: uid,
+            actor_gid: uid,
+            actor_pid: uid.map(|v| v as i32),
+            actor_comm: uid.map(|_| "sozu".to_owned()),
+            actor_user: uid.map(|_| "florentin".to_owned()),
+            socket_path: std::sync::Arc::from("/run/sozu/sock"),
+            connect_ts: SystemTime::now(),
+        }
+    }
+
+    fn sample_server(boot_generation: u32) -> TestServer {
+        TestServer { boot_generation }
+    }
+
+    fn pattern() -> Regex {
+        // Anchored; covers bracket + `AUDIT\tCommand(...)` + every mandatory
+        // field in order. Optional fields (error_code, reason, elapsed_ms,
+        // fanout, workers, request_sha256) may appear between `result=...`
+        // and `sozu_version=...`. Crockford base32 ULIDs are 26 chars
+        // over [0-9A-Z]. Timestamps are RFC 3339 UTC with microsecond
+        // precision; build_git_sha is 12 hex chars or `unknown`.
+        Regex::new(concat!(
+            r"^\[[0-9A-Z]{26} [0-9A-Z]{26} (?:[A-Za-z0-9_:.-]+|-) (?:[A-Za-z0-9_:.-]+|-)\]",
+            r"\tAUDIT\tCommand\(",
+            r"ts=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z, ",
+            r"verb=[a-z_]+, ",
+            r"actor_uid=(?:\d+|unknown), ",
+            r"actor_gid=(?:\d+|unknown), ",
+            r"actor_pid=(?:\d+|unknown), ",
+            r"actor_role=(?:root|system|user|unknown), ",
+            r"actor_user=\S+, ",
+            r"actor_comm=\S+, ",
+            r"client_id=\d+, ",
+            r"connect_ts=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z, ",
+            r"socket=\S+, ",
+            r"target=[^,]+, ",
+            r"result=(?:ok|err)",
+            // Optional extras block.
+            r"(?:, (?:error_code=\S+|reason=[^,)]+|elapsed_ms=\d+|fanout=\S+|workers=\d+/\d+/\d+|request_sha256=[0-9a-f]+))*",
+            r", sozu_version=[^,]+",
+            r", build_git_sha=\S+",
+            r", boot_generation=\d+",
+            r"\)$",
+        ))
+        .expect("audit-format regex must compile")
+    }
+
+    #[test]
+    fn layout_with_cluster_id_matches() {
+        let server = sample_server(0);
+        let client = sample_client(Some(1000));
+        let request_id = Ulid::generate();
+        let entry = sample_entry(Some("my_app"));
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Ok);
+        assert!(
+            pattern().is_match(&rendered),
+            "rendered line did not match audit-log pattern.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn layout_with_dashed_cluster_and_backend_matches() {
+        let server = sample_server(3);
+        let client = sample_client(None);
+        let request_id = Ulid::generate();
+        let entry = sample_entry(None);
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Err);
+        assert!(
+            pattern().is_match(&rendered),
+            "rendered line did not match audit-log pattern.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn layout_with_extras_matches() {
+        let server = sample_server(0);
+        let client = sample_client(Some(42));
+        let request_id = Ulid::generate();
+        let mut entry = sample_entry(Some("my_app"));
+        entry.extras.elapsed_ms = Some(17);
+        entry.extras.error_code = Some(AuditErrorCode::WorkerFailure);
+        entry.extras.reason = Some("worker 1: failed".to_owned());
+        entry.extras.fanout = Some(FanoutSummary {
+            status: FanoutStatus::Partial,
+            workers_ok: 1,
+            workers_err: 1,
+            workers_expected: 2,
+        });
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Err);
+        assert!(
+            pattern().is_match(&rendered),
+            "rendered line with extras did not match.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn state_error_reason_is_bounded_before_entering_the_audit_envelope() {
+        const ERROR_SECRET: &str = "AUDIT_STATE_ERROR_SECRET_SENTINEL";
+
+        let server = sample_server(0);
+        let client = sample_client(Some(42));
+        let request_id = Ulid::generate();
+        let id = format!("{ERROR_SECRET}{}", "x".repeat(4096));
+        let id_len = id.len();
+        let error = StateError::Exists {
+            kind: ObjectKind::Cluster,
+            id,
+        };
+        let mut entry = sample_entry(None);
+        entry.extras.error_code = Some(AuditErrorCode::DispatchError);
+        entry.extras.reason = Some(error.to_string());
+
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Err);
+
+        assert!(
+            !rendered.contains(ERROR_SECRET),
+            "audit reason leaked the StateError payload: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("id_bytes={id_len}")),
+            "audit reason omitted bounded StateError metadata: {rendered}"
+        );
+        assert!(
+            rendered.len() <= 1024,
+            "audit line is not bounded: {} bytes",
+            rendered.len()
+        );
+    }
+
+    #[test]
+    fn sanitizer_strips_tab_and_escape_in_target() {
+        let server = sample_server(0);
+        let client = sample_client(Some(0));
+        let request_id = Ulid::generate();
+        let mut entry = sample_entry(None);
+        entry.target = "cluster:\tforge\x1b[Kghost".to_owned();
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Ok);
+        assert!(
+            !rendered.contains('\t') || rendered.matches('\t').count() == 2,
+            "target field must not introduce additional tabs (only the three structural tabs allowed): {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\x1b'),
+            "target field must not carry ANSI escape codes: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn actor_role_buckets() {
+        assert_eq!(actor_role(None), "unknown");
+        assert_eq!(actor_role(Some(0)), "root");
+        assert_eq!(actor_role(Some(99)), "system");
+        assert_eq!(actor_role(Some(999)), "system");
+        assert_eq!(actor_role(Some(1000)), "user");
+        assert_eq!(actor_role(Some(65534)), "user");
+    }
+
+    #[test]
+    fn rfc3339_utc_round_numbers() {
+        // Unix epoch.
+        assert_eq!(
+            rfc3339_utc(SystemTime::UNIX_EPOCH),
+            "1970-01-01T00:00:00.000000Z"
+        );
+        // Y2K + 1 day, with microseconds.
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::new(946_771_200, 123_456_000);
+        assert_eq!(rfc3339_utc(t), "2000-01-02T00:00:00.123456Z");
+    }
+
+    #[test]
+    fn build_git_sha_format() {
+        // Either 12 hex chars (set by build.rs) or the literal "unknown"
+        // fallback for builds outside a git tree.
+        let s = SOZU_BUILD_GIT_SHA;
+        assert!(
+            s == "unknown" || (s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            "unexpected SOZU_BUILD_GIT_SHA: {s:?}"
+        );
+    }
+
+    #[test]
+    fn worker_message_join_sanitises_smuggled_kv_pair() {
+        // Both `WorkerTask::on_finish` and `SetMetricDetailTask::on_finish`
+        // route each worker's `response.message` through
+        // `sanitize_for_audit_kv` before joining into `extras.reason`.
+        // Verify the call-site shape catches the canonical SIEM-column-
+        // smuggling attempt — `,` and `=` inside the operator-influenced
+        // worker payload — without relying on a full Server / Gatherer
+        // ceremony to drive the on_finish path end-to-end.
+        let worker_id = 7u32;
+        let attacker_payload = "x,actor_user=mallory,sozu_version=hijacked";
+        let formatted = format!(
+            "{worker_id}: {}",
+            super::sanitize_for_audit_kv(attacker_payload)
+        );
+        assert!(
+            !formatted.contains("actor_user=mallory"),
+            "sanitised worker message must not propagate `=` into the \
+             reason column (column-boundary forge defence)"
+        );
+        assert!(
+            !formatted.contains(",actor_user"),
+            "sanitised worker message must not propagate `,` into the \
+             reason column (column-boundary forge defence)"
+        );
+        // The replacement character does survive — operators still see
+        // SOMETHING in the slot so the failure mode is visible.
+        assert!(formatted.contains('?'));
+    }
+}
+
+#[cfg(test)]
+mod mutating_verb_policy_tests {
+    //! Regression guard for the systemd `RELOADING=1` bracket policy:
+    //! `is_mutating_verb` must NOT include `SetMetricDetail`. The TUI
+    //! auto-renews its cardinality lease every `ttl/2` seconds, and a
+    //! mutating-verb bracket on each renewal would flap the systemd
+    //! unit state every 30 s for the whole TUI session lifetime.
+    use super::is_mutating_verb;
+    use sozu_command_lib::proto::command::{MetricDetail, SetMetricDetail, request::RequestType};
+
+    #[test]
+    fn set_metric_detail_is_not_mutating() {
+        let req = RequestType::SetMetricDetail(SetMetricDetail {
+            client_id: "top:1:abcdef01".to_owned(),
+            detail: Some(MetricDetail::DetailBackend as i32),
+            ttl_seconds: Some(60),
+            reason: Some("operator dashboard".to_owned()),
+            clear: Some(false),
+            peer_pid: None,
+            peer_session_ulid: None,
+        });
+        assert!(
+            !is_mutating_verb(&req),
+            "SetMetricDetail is an observability knob, not a state transition; \
+             keeping it out of is_mutating_verb prevents RELOADING flap on lease renewal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rollback_predicate_tests {
+    //! sozu#1314: the sozu#1301 rollback safety-net must also fire when the
+    //! scatter TIMES OUT with zero worker acknowledgements — a worker that
+    //! panics answers nothing at all, so `errors` alone never proves the
+    //! fleet refused the change.
+    //!
+    //! `WorkerTask::on_finish` needs a real `&mut Server` and the timeout
+    //! itself lives in the event loop, so the guarantee is composed of two
+    //! locked properties: `handle_finishing_task_forwards_timed_out_flag`
+    //! (bin/src/command/server.rs) pins the propagation of `timed_out` down
+    //! to `on_finish`, and the exhaustive cases below pin the decision the
+    //! flag feeds. Same pattern as sozu#1301, where only `compute_rollback`
+    //! is unit-tested.
+    //!
+    //! To SEE THESE RED (regression proof): restore the pre-fix body of
+    //! [`super::should_rollback_fanout`],
+    //! `!timed_out && expected > 0 && ok == 0 && errors > 0` — the two
+    //! rolls-back-on-timeout expectations below then fail.
+    use super::should_rollback_fanout;
+
+    #[test]
+    fn unanimous_rejection_still_rolls_back() {
+        // sozu#1301, unchanged: every scattered worker answered Failure.
+        assert!(
+            should_rollback_fanout(false, 3, 0, 3),
+            "a unanimous rejection must still revert the main-process commit"
+        );
+    }
+
+    #[test]
+    fn timeout_with_no_answer_at_all_rolls_back() {
+        // The incident shape: a single worker panics on the malformed
+        // hostname, produces no synthetic Failure and no expected_responses
+        // decrement, and the task ends through the timeout path.
+        assert!(
+            should_rollback_fanout(true, 1, 0, 0),
+            "a scatter that timed out with zero answers must revert the commit"
+        );
+    }
+
+    #[test]
+    fn timeout_with_only_failures_rolls_back() {
+        // The rolling-upgrade shape of sozu#1314: the patched workers answer
+        // Failure, the unpatched one panics and stays silent until timeout.
+        assert!(
+            should_rollback_fanout(true, 3, 0, 2),
+            "a timeout whose received answers are all failures must revert the commit"
+        );
+    }
+
+    #[test]
+    fn any_acknowledgement_prevents_a_rollback() {
+        // `ok == 0` is the safety bound: an entry at least one worker applied
+        // is never reverted, timeout or not — reverting it would diverge the
+        // main process from the workers that accepted it.
+        for (timed_out, expected, ok, errors) in
+            [(false, 3, 1, 2), (true, 3, 1, 0), (true, 3, 1, 2)]
+        {
+            assert!(
+                !should_rollback_fanout(timed_out, expected, ok, errors),
+                "an entry acknowledged by a worker must never be rolled back \
+                 (timed_out={timed_out}, expected={expected}, ok={ok}, errors={errors})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clean_fanout_never_rolls_back() {
+        assert!(
+            !should_rollback_fanout(false, 3, 0, 0),
+            "a fan-out that neither failed nor timed out must not be reverted"
+        );
+    }
+
+    #[test]
+    fn a_local_only_fanout_never_rolls_back() {
+        // expected == 0 means nothing was scattered; there is no fleet verdict
+        // to act on. Unreachable through the timeout path anyway (has_finished
+        // is true at 0 >= 0), but the predicate stays safe on its own.
+        for timed_out in [false, true] {
+            assert!(
+                !should_rollback_fanout(timed_out, 0, 0, 0),
+                "a local-only fan-out must not be reverted (timed_out={timed_out})"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod listener_validation_tests {
+    //! sozu#1301: an invalid listener config must be rejected by the main
+    //! process BEFORE it is committed to `ConfigState`, so it never reserves
+    //! its address and blocks a corrected reload with `StateError::Exists`.
+    //! These exercise the production [`validate_listener_request`] guard that
+    //! all three master apply paths (`worker_request`, `load_static_config`,
+    //! `load_state`) share.
+    //!
+    //! To SEE THESE RED (regression proof): make `validate_listener_request`
+    //! return `Ok(())` unconditionally — the pre-fix behavior where the main
+    //! process committed listener configs without validating them. The
+    //! `is_err()` assertions below then fail.
+    use super::{
+        RequestOrigin, validate_cluster_request, validate_h2_knob_floors,
+        validate_listener_request, validate_request,
+    };
+    use sozu_command_lib::{
+        config::ListenerBuilder,
+        proto::command::{
+            CertificateAndKey, Cluster, HttpsListenerConfig, ReplaceCertificate,
+            RequestTcpFrontend, RequestUdpFrontend, SocketAddress, request::RequestType,
+        },
+        state::{ConfigState, StateError},
+    };
+    use std::collections::BTreeMap;
+
+    /// A default HTTPS listener config for `address`. When `valid` is false, a
+    /// malformed answer template is injected so the worker's construction
+    /// (`HttpsListener::validate_config` → `HttpAnswers::new`) rejects it. That
+    /// trigger is deterministic AND crypto-provider independent, unlike a
+    /// `BuildRustls` "no usable cipher suites" message which varies across the
+    /// ring / aws-lc-rs / openssl / fips CI cells.
+    fn https_config(address: SocketAddress, valid: bool) -> HttpsListenerConfig {
+        let mut cfg = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("default HTTPS listener config");
+        if !valid {
+            cfg.answers
+                .insert("404".to_owned(), "not a valid http response".to_owned());
+        }
+        cfg
+    }
+
+    #[test]
+    fn invalid_https_listener_rejected_before_commit_unblocks_corrected_reload() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        // The pathology this guard defends against: `ConfigState` itself has no
+        // buildability check — it records an unbuildable listener and reserves
+        // its address, after which a corrected reload is refused with
+        // `StateError::Exists`. Prove it at the state layer so the master-side
+        // guard below is demonstrably load-bearing.
+        {
+            let mut state = ConfigState::new();
+            let bad = RequestType::AddHttpsListener(https_config(address, false));
+            state
+                .dispatch(&bad.into())
+                .expect("ConfigState records the bad listener — it has no buildability check");
+            let good = RequestType::AddHttpsListener(https_config(address, true));
+            let err = state
+                .dispatch(&good.into())
+                .expect_err("a reserved address blocks the corrected reload");
+            assert!(
+                matches!(err, StateError::Exists { .. }),
+                "expected StateError::Exists, got {err:?}"
+            );
+        }
+
+        // The fix: the main process validates a listener-add the way the worker
+        // will build it BEFORE dispatch, so the unbuildable config is rejected
+        // and never reaches `ConfigState`.
+        let bad = RequestType::AddHttpsListener(https_config(address, false));
+        assert!(
+            validate_listener_request(&bad).is_err(),
+            "an unbuildable HTTPS listener must be rejected before commit"
+        );
+
+        // With the bad listener correctly never committed, the corrected reload
+        // validates and applies cleanly — no `StateError::Exists` blocker.
+        let mut state = ConfigState::new();
+        let good = RequestType::AddHttpsListener(https_config(address, true));
+        assert!(
+            validate_listener_request(&good).is_ok(),
+            "a valid HTTPS listener must pass validation"
+        );
+        state
+            .dispatch(&good.into())
+            .expect("corrected reload applies when the bad listener never reserved the address");
+    }
+
+    /// sozu-proxy/sozu#1703: the main process — the pre-dispatch gate, then
+    /// `ConfigState::dispatch` — refuses an `Update{Http,Https}Listener` patch
+    /// exactly when a worker's `update_config` refuses it, and a refused
+    /// patch leaves what `sozu listener list` reports
+    /// (`ConfigState::list_listeners`) unchanged. Every patch carries fields
+    /// that validate, so a partial apply shows up in the listing.
+    ///
+    /// To SEE THIS RED: drop the `UpdateHttpListener` / `UpdateHttpsListener`
+    /// arms of `validate_listener_request` (the main process then records a
+    /// patch whose template every worker refuses), or the `hsts` check of
+    /// `ConfigState::update_https_listener`.
+    #[test]
+    fn listener_patches_are_refused_by_the_main_process_exactly_when_a_worker_refuses_them() {
+        use mio::Token;
+        use sozu_command_lib::proto::command::{
+            AlpnProtocols, CustomHttpAnswers, HstsConfig, UpdateHttpListenerConfig,
+            UpdateHttpsListenerConfig,
+        };
+
+        const BAD: &str = "not a valid http response";
+        const GOOD: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+
+        /// Run `request` through the main process's apply path; true if refused.
+        fn main_refuses(state: &mut ConfigState, request: RequestType) -> bool {
+            let listed_before = state.list_listeners();
+            let refused = validate_request(&request, RequestOrigin::Authored).is_err()
+                || state.dispatch(&request.into()).is_err();
+            if refused {
+                assert_eq!(
+                    state.list_listeners(),
+                    listed_before,
+                    "a refused patch must leave the listed listeners unchanged"
+                );
+            }
+            refused
+        }
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, 8090);
+        let http_config = ListenerBuilder::new_http(http_address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        let http_prefix = UpdateHttpListenerConfig {
+            address: http_address,
+            front_timeout: Some(99),
+            sticky_name: Some("PATCHED".to_owned()),
+            ..Default::default()
+        };
+        let legacy_404 = |body: &str| {
+            Some(CustomHttpAnswers {
+                answer_404: Some(body.to_owned()),
+                ..Default::default()
+            })
+        };
+        let http_cases = [
+            ("valid", false, http_prefix.clone()),
+            (
+                "sozu_id_header",
+                true,
+                UpdateHttpListenerConfig {
+                    sozu_id_header: Some("bad: name".to_owned()),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "forwarded_headers",
+                true,
+                UpdateHttpListenerConfig {
+                    forwarded_headers: Some(42),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "flood knob",
+                true,
+                UpdateHttpListenerConfig {
+                    h2_max_ping_per_window: Some(0),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "answers template",
+                true,
+                UpdateHttpListenerConfig {
+                    answers: BTreeMap::from([("503".to_owned(), BAD.to_owned())]),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "legacy template",
+                true,
+                UpdateHttpListenerConfig {
+                    http_answers: legacy_404(BAD),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "empty answers body (ignored)",
+                false,
+                UpdateHttpListenerConfig {
+                    answers: BTreeMap::from([("503".to_owned(), String::new())]),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "legacy template shadowed by the same patch's map",
+                false,
+                UpdateHttpListenerConfig {
+                    answers: BTreeMap::from([("404".to_owned(), GOOD.to_owned())]),
+                    http_answers: legacy_404(BAD),
+                    ..http_prefix.clone()
+                },
+            ),
+        ];
+        for (label, expected, patch) in http_cases {
+            let mut state = ConfigState::new();
+            state
+                .dispatch(&RequestType::AddHttpListener(http_config.clone()).into())
+                .expect("add the HTTP listener");
+            let mut worker = sozu_lib::http::HttpListener::new(http_config.clone(), Token(0))
+                .expect("build the HTTP listener");
+            let worker_refused = worker.update_config(&patch).is_err();
+            let main_refused = main_refuses(&mut state, RequestType::UpdateHttpListener(patch));
+            assert_eq!(worker_refused, expected, "HTTP {label}: worker verdict");
+            assert_eq!(main_refused, expected, "HTTP {label}: main-process verdict");
+        }
+
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, 8091);
+        let https_config = https_config(https_address, true);
+        let https_prefix = UpdateHttpsListenerConfig {
+            address: https_address,
+            front_timeout: Some(99),
+            alpn_protocols: Some(AlpnProtocols {
+                values: vec!["http/1.1".to_owned()],
+            }),
+            ..Default::default()
+        };
+        let https_cases = [
+            ("valid", false, https_prefix.clone()),
+            (
+                "alpn_protocols",
+                true,
+                UpdateHttpsListenerConfig {
+                    alpn_protocols: Some(AlpnProtocols {
+                        values: vec!["h3".to_owned()],
+                    }),
+                    ..https_prefix.clone()
+                },
+            ),
+            (
+                "hsts without enabled",
+                true,
+                UpdateHttpsListenerConfig {
+                    hsts: Some(HstsConfig {
+                        max_age: Some(60),
+                        ..Default::default()
+                    }),
+                    ..https_prefix.clone()
+                },
+            ),
+            (
+                "hsts disabled",
+                false,
+                UpdateHttpsListenerConfig {
+                    hsts: Some(HstsConfig {
+                        enabled: Some(false),
+                        ..Default::default()
+                    }),
+                    ..https_prefix.clone()
+                },
+            ),
+            (
+                "answers template",
+                true,
+                UpdateHttpsListenerConfig {
+                    answers: BTreeMap::from([("404".to_owned(), BAD.to_owned())]),
+                    ..https_prefix.clone()
+                },
+            ),
+        ];
+        for (label, expected, patch) in https_cases {
+            let mut state = ConfigState::new();
+            state
+                .dispatch(&RequestType::AddHttpsListener(https_config.clone()).into())
+                .expect("add the HTTPS listener");
+            let mut worker =
+                sozu_lib::https::HttpsListener::try_new(https_config.clone(), Token(0))
+                    .expect("build the HTTPS listener");
+            let worker_refused = worker.update_config(&patch).is_err();
+            let main_refused = main_refuses(&mut state, RequestType::UpdateHttpsListener(patch));
+            assert_eq!(worker_refused, expected, "HTTPS {label}: worker verdict");
+            assert_eq!(
+                main_refused, expected,
+                "HTTPS {label}: main-process verdict"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_listener_adds_of_every_type_pass_validation() {
+        let http = RequestType::AddHttpListener(
+            ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8080))
+                .to_http(None)
+                .expect("default HTTP listener config"),
+        );
+        let https = RequestType::AddHttpsListener(https_config(
+            SocketAddress::new_v4(127, 0, 0, 1, 8081),
+            true,
+        ));
+        let tcp = RequestType::AddTcpListener(
+            ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, 8082))
+                .to_tcp(None)
+                .expect("default TCP listener config"),
+        );
+        let udp = RequestType::AddUdpListener(
+            ListenerBuilder::new_udp(SocketAddress::new_v4(127, 0, 0, 1, 8083))
+                .to_udp(None)
+                .expect("default UDP listener config"),
+        );
+        for request in [http, https, tcp, udp] {
+            assert!(
+                validate_listener_request(&request).is_ok(),
+                "a valid listener add must pass validation: {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_http_listener_is_rejected_before_commit() {
+        // The HTTP path is fallible through answer-template parsing too.
+        let mut cfg = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8084))
+            .to_http(None)
+            .expect("default HTTP listener config");
+        cfg.answers
+            .insert("404".to_owned(), "not a valid http response".to_owned());
+        let request = RequestType::AddHttpListener(cfg);
+        assert!(
+            validate_listener_request(&request).is_err(),
+            "an unbuildable HTTP listener must be rejected before commit"
+        );
+    }
+
+    #[test]
+    fn cluster_answers_use_worker_precedence_and_are_rejected_before_commit() {
+        let invalid = "not a valid HTTP response template";
+        let valid = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+
+        let map_wins = RequestType::AddCluster(Cluster {
+            cluster_id: "map-wins".to_owned(),
+            answer_503: Some(invalid.to_owned()),
+            answers: BTreeMap::from([("503".to_owned(), valid.to_owned())]),
+            ..Default::default()
+        });
+        assert!(
+            validate_cluster_request(&map_wins).is_ok(),
+            "the answers map must shadow the legacy answer_503 like worker runtime does"
+        );
+
+        let invalid_legacy = RequestType::AddCluster(Cluster {
+            cluster_id: "invalid-legacy".to_owned(),
+            answer_503: Some(invalid.to_owned()),
+            ..Default::default()
+        });
+        let invalid_map = RequestType::AddCluster(Cluster {
+            cluster_id: "invalid-map".to_owned(),
+            answer_503: Some(valid.to_owned()),
+            answers: BTreeMap::from([("503".to_owned(), invalid.to_owned())]),
+            ..Default::default()
+        });
+        for request in [&invalid_legacy, &invalid_map] {
+            assert!(validate_cluster_request(request).is_err());
+            assert!(validate_request(request, RequestOrigin::Authored).is_err());
+            assert!(validate_request(request, RequestOrigin::Replayed).is_err());
+        }
+
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&invalid_map.to_owned().into())
+            .expect("ConfigState alone accepts an unbuildable cluster answer");
+        assert!(
+            validate_request(&invalid_map, RequestOrigin::Authored).is_err(),
+            "the pre-dispatch gate must stop both initial adds and upserts before state mutation"
+        );
+    }
+
+    /// Regression for sozu-proxy/sozu#1418: the H2 knob floors were enforced
+    /// on `UpdateHttp(s)Listener` (`validate_h2_flood_knobs_http`/`_https`)
+    /// and, since that issue, at config load (`ListenerBuilder::to_http`/
+    /// `to_tls`) — but a raw protobuf `Add{Http,Https}Listener` straight to
+    /// the command socket reached neither. `ConfigState::add_http_listener`
+    /// clones the config in with no validation, so the value became
+    /// authoritative, `SaveState` re-serialised it, every replay re-injected
+    /// it, and each worker then rewrote the operator's `0` to `1` with
+    /// `H2FloodConfig::from_optional`'s clamp — the silent rewrite the whole
+    /// fix exists to avoid, surviving on the one path nothing gated.
+    ///
+    /// To SEE THIS RED: drop the `validate_h2_knob_floors(request)?` call from
+    /// `validate_request`. Both `is_err()` assertions then fail.
+    #[test]
+    fn raw_protobuf_listener_add_with_an_out_of_range_h2_knob_is_rejected_before_commit() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8085);
+        let mut http = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        // `ListenerBuilder::to_http` refuses this value; a raw protobuf
+        // request never went through it.
+        http.h2_max_rst_stream_per_window = Some(0);
+
+        // The pathology: `ConfigState` has no knob validation of its own — it
+        // records the zero and makes it authoritative. Prove it at the state
+        // layer so the master-side guard below is demonstrably load-bearing.
+        {
+            let mut state = ConfigState::new();
+            state
+                .dispatch(&RequestType::AddHttpListener(http.clone()).into())
+                .expect("ConfigState records the zero — add_http_listener does not validate");
+        }
+
+        assert!(
+            validate_request(&RequestType::AddHttpListener(http), RequestOrigin::Authored).is_err(),
+            "a raw protobuf AddHttpListener carrying h2_max_rst_stream_per_window = 0 must be \
+             rejected before commit instead of being clamped by every worker"
+        );
+
+        // The HTTPS twin, on the one knob whose floor is 2 rather than 1.
+        let mut https = https_config(SocketAddress::new_v4(127, 0, 0, 1, 8086), true);
+        https.h2_stream_shrink_ratio = Some(1);
+        assert!(
+            validate_request(
+                &RequestType::AddHttpsListener(https),
+                RequestOrigin::Authored
+            )
+            .is_err(),
+            "a raw protobuf AddHttpsListener carrying h2_stream_shrink_ratio = 1 must be \
+             rejected before commit"
+        );
+    }
+
+    /// sozu#1418: the knob floors must NOT drop a replayed listener.
+    ///
+    /// `load_state` shares `validate_request` with the authoring paths, and an
+    /// entry it rejects is skipped — the listener never enters `ConfigState`,
+    /// never binds, and every frontend behind it is offline. For an entry that
+    /// cannot function (sozu#1301's unparseable answer template, sozu#1313's
+    /// unroutable hostname) that is the right trade. For an H2 threshold of
+    /// `0` it is not: the listener builds, the workers clamp the threshold to
+    /// the floor, and it serves. The clamp LOOSENS that knob by exactly one
+    /// event — `count > threshold` trips on the first counted event at `0` and
+    /// on the second at `1` — on a `0` nobody chose as a protection level.
+    /// Dropping the listener would instead convert degraded-but-serving into a
+    /// full outage for its frontends, at upgrade time, and an HTTPS listener
+    /// takes its whole TLS surface with it.
+    ///
+    /// To SEE THIS RED: make `validate_request` run `validate_h2_knob_floors`
+    /// unconditionally (drop the `origin == RequestOrigin::Authored` guard).
+    /// The `Replayed` assertion then fails — which is exactly the state file
+    /// being dropped.
+    #[test]
+    fn a_replayed_listener_with_an_out_of_range_h2_knob_is_kept_not_dropped() {
+        let mut http = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8088))
+            .to_http(None)
+            .expect("default HTTP listener config");
+        http.h2_max_rst_stream_per_window = Some(0);
+        let request = RequestType::AddHttpListener(http);
+
+        assert!(
+            validate_request(&request, RequestOrigin::Authored).is_err(),
+            "the authoring door must still refuse an out-of-range knob"
+        );
+        assert!(
+            validate_request(&request, RequestOrigin::Replayed).is_ok(),
+            "a replayed listener whose only fault is an out-of-range H2 knob must be kept — \
+             the workers clamp it; dropping it unbinds the listener and takes its frontends down"
+        );
+        assert!(
+            validate_h2_knob_floors(&request).is_err(),
+            "the replay path must still be able to see the fault, to warn with the key to fix"
+        );
+
+        // A replayed entry that genuinely cannot function is still dropped:
+        // the asymmetry is about buildable-but-degraded, not about replay.
+        let mut unbuildable = https_config(SocketAddress::new_v4(127, 0, 0, 1, 8089), false);
+        unbuildable.h2_max_rst_stream_per_window = Some(0);
+        assert!(
+            validate_request(
+                &RequestType::AddHttpsListener(unbuildable),
+                RequestOrigin::Replayed
+            )
+            .is_err(),
+            "an unbuildable replayed listener must still be skipped (sozu#1301)"
+        );
+    }
+
+    /// The floors must not reject a listener that merely leaves the knobs
+    /// unset or sets them at their minimum — `valid_listener_adds_of_every_type_pass_validation`
+    /// covers the unset case; this covers the boundary.
+    #[test]
+    fn listener_add_with_h2_knobs_at_their_minimum_passes_validation() {
+        let mut http = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8087))
+            .to_http(None)
+            .expect("default HTTP listener config");
+        http.h2_max_rst_stream_per_window = Some(1);
+        http.h2_max_rst_stream_abusive_lifetime = Some(1);
+        http.h2_max_header_fields = Some(1);
+        http.h2_stream_shrink_ratio = Some(2);
+        assert!(
+            validate_request(&RequestType::AddHttpListener(http), RequestOrigin::Authored).is_ok(),
+            "H2 knobs at their documented minimum must be accepted"
+        );
+    }
+
+    /// The rollback of a listener add removes that very listener: with an
+    /// `interface`, the inverse names it too, or it would remove the listener
+    /// on the same address without an interface instead (sozu-proxy/sozu#719).
+    #[test]
+    fn rollback_inverse_of_a_listener_add_carries_its_interface() {
+        use sozu_command_lib::proto::command::{
+            HttpListenerConfig, TcpListenerConfig, UdpListenerConfig,
+        };
+
+        let address = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let interface = Some("wg0".to_owned());
+        let adds = [
+            RequestType::AddHttpListener(HttpListenerConfig {
+                address,
+                interface: interface.clone(),
+                ..Default::default()
+            }),
+            RequestType::AddHttpsListener(HttpsListenerConfig {
+                address,
+                interface: interface.clone(),
+                ..Default::default()
+            }),
+            RequestType::AddTcpListener(TcpListenerConfig {
+                address,
+                interface: interface.clone(),
+                ..Default::default()
+            }),
+            RequestType::AddUdpListener(UdpListenerConfig {
+                address,
+                interface: interface.clone(),
+                ..Default::default()
+            }),
+        ];
+        for add in adds {
+            match super::compute_rollback(&add).map(|inverse| inverse.request_type) {
+                Some(Some(RequestType::RemoveListener(remove))) => {
+                    assert_eq!(remove.address, address);
+                    assert_eq!(remove.interface, interface, "inverse of {add:?}");
+                }
+                other => panic!("expected a RemoveListener inverse, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rollback_inverse_targets_the_same_listener_and_skips_uncovered_verbs() {
+        use sozu_command_lib::proto::command::ListenerType;
+
+        // sozu#1301 rollback safety-net: a listener add inverts to a
+        // RemoveListener for the SAME address and proxy type, so a unanimous
+        // worker rejection can revert the main-process commit.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let add = RequestType::AddHttpsListener(https_config(address, true));
+        let inverse = super::compute_rollback(&add).expect("a listener add must have an inverse");
+        match inverse.request_type {
+            Some(RequestType::RemoveListener(remove)) => {
+                assert_eq!(
+                    remove.proxy,
+                    ListenerType::Https as i32,
+                    "inverse must target the HTTPS listener type"
+                );
+                assert_eq!(
+                    remove.address, address,
+                    "inverse must target the same address"
+                );
+            }
+            other => panic!("expected a RemoveListener inverse, got {other:?}"),
+        }
+
+        // sozu#1313: the TCP frontend verbs invert the same way the HTTP ones
+        // do — `remove_tcp_frontend` matches on the very (address, sni, alpn)
+        // key `add_tcp_frontend` admitted, so the inverse evicts exactly the
+        // frontend the add inserted and nothing else.
+        let tcp_front = RequestTcpFrontend {
+            cluster_id: "cluster".to_owned(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8090),
+            tags: BTreeMap::new(),
+            sni: None,
+            alpn: Vec::new(),
+        };
+        match super::compute_rollback(&RequestType::AddTcpFrontend(tcp_front.clone()))
+            .expect("a TCP frontend add must have an inverse")
+            .request_type
+        {
+            Some(RequestType::RemoveTcpFrontend(remove)) => assert_eq!(
+                remove, tcp_front,
+                "the TCP inverse must target the very frontend that was added"
+            ),
+            other => panic!("expected a RemoveTcpFrontend inverse, got {other:?}"),
+        }
+
+        // Upsert Add verbs (AddCluster/AddBackend) and non-add verbs have no
+        // simple prior-value-free inverse and are deliberately uncovered — they
+        // keep today's best-effort behavior rather than risk a wrong revert.
+        assert!(
+            super::compute_rollback(&RequestType::Logging("info".to_owned())).is_none(),
+            "a non-add verb must have no rollback inverse"
+        );
+
+        // sozu-proxy/sozu#1404: `ReplaceCertificate` is deliberately uncovered
+        // too, and for the same content-recovery reason as `AddCertificate` /
+        // `RemoveCertificate` — its only identity for the certificate it
+        // displaces is `old_fingerprint`, a one-way hash, never the displaced
+        // certificate's PEM/key bytes, so no `Request` can express "put the
+        // old certificate back" from the request's own fields alone. Now that
+        // `ConfigState::replace_certificate` is fixed to add-before-remove, a
+        // rejected dispatch is a true no-op (see `state.rs`'s regression
+        // tests); this pins that the still-open "zero worker acknowledged"
+        // divergence intentionally has no compensating request.
+        let replace = RequestType::ReplaceCertificate(ReplaceCertificate {
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            new_certificate: CertificateAndKey {
+                certificate: include_str!("../../../command/assets/certificate.pem").to_owned(),
+                key: include_str!("../../../command/assets/key.pem").to_owned(),
+                certificate_chain: Vec::new(),
+                versions: Vec::new(),
+                names: Vec::new(),
+            },
+            old_fingerprint: "aa".repeat(32),
+            new_expired_at: None,
+        });
+        assert!(
+            super::compute_rollback(&replace).is_none(),
+            "ReplaceCertificate must have no rollback inverse: the request never carries the \
+             displaced certificate's content, only its fingerprint hash"
+        );
+    }
+
+    /// `AddUdpFrontend` inverts to the `RemoveUdpFrontend` carrying the very
+    /// request the add carried, exactly as the HTTP, HTTPS and TCP adds do.
+    ///
+    /// `add_udp_frontend` (`command/src/state.rs`) stores a full
+    /// `UdpFrontend { cluster_id, address, tags }` and admits one frontend per
+    /// address across every cluster. `remove_udp_frontend` retains on that SAME
+    /// (cluster, address, tags) identity — the bucket scopes `cluster_id`, and
+    /// its own `INV:` comment plus its "drops exactly one entry" assertion pin
+    /// the mirror, just like `remove_tcp_frontend`'s (address, sni, alpn) key.
+    /// The inverse therefore evicts exactly the frontend the add inserted and
+    /// leaves every other acknowledged frontend in place, which is what kept
+    /// this verb out of `compute_rollback` while the removal key was coarser.
+    /// Leaving it out now would keep sozu#1313's poisoned-state loop open for
+    /// every UDP frontend.
+    ///
+    /// To SEE THIS RED: remove the
+    /// `RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone())`
+    /// arm from [`super::compute_rollback`]. That the inverse is collateral-free
+    /// is pinned separately by
+    /// `remove_udp_frontend_drops_exactly_the_frontend_its_tags_name` in
+    /// `command/src/state.rs`.
+    #[test]
+    fn a_udp_frontend_add_inverts_to_its_exact_removal() {
+        let udp_front = RequestUdpFrontend {
+            cluster_id: "cluster".to_owned(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8091),
+            tags: BTreeMap::from([("owner".to_owned(), "team-a".to_owned())]),
+        };
+        match super::compute_rollback(&RequestType::AddUdpFrontend(udp_front.clone()))
+            .expect("a UDP frontend add must have an inverse")
+            .request_type
+        {
+            Some(RequestType::RemoveUdpFrontend(remove)) => assert_eq!(
+                remove, udp_front,
+                "the UDP inverse must target the very frontend that was added, tags included"
+            ),
+            other => panic!("expected a RemoveUdpFrontend inverse, got {other:?}"),
+        }
+    }
+
+    /// A CRL already past its `nextUpdate` is refused in what an operator
+    /// states, a new listener or a policy patch, and only there: a replayed
+    /// state keeps the listener, so a reload with a current CRL can patch it.
+    #[test]
+    fn an_expired_client_auth_crl_is_refused_when_authored_and_kept_when_replayed() {
+        let fixture = |name: &str| {
+            std::fs::read_to_string(format!(
+                "{}/../lib/assets/mtls/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("read an mTLS fixture")
+        };
+        let policy = |crl: &str| sozu_command_lib::proto::command::ClientAuthPolicy {
+            client_auth: Some(
+                sozu_command_lib::proto::command::ClientAuthMode::ClientAuthRequired as i32,
+            ),
+            client_ca_certificates: vec![fixture("ca-cert.pem")],
+            client_ca_crls: vec![fixture(crl)],
+        };
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let listener = |crl: &str| {
+            let mut config = ListenerBuilder::new_https(address)
+                .to_tls(None)
+                .expect("an HTTPS listener config");
+            config.apply_client_auth_policy(&policy(crl));
+            RequestType::add_https_listener(config)
+        };
+        let patch = |crl: &str| {
+            RequestType::update_https_listener(
+                sozu_command_lib::proto::command::UpdateHttpsListenerConfig {
+                    address,
+                    client_auth_policy: Some(policy(crl)),
+                    ..Default::default()
+                },
+            )
+        };
+
+        for request in [listener("crl-expired.pem"), patch("crl-expired.pem")] {
+            let refused = validate_request(&request, RequestOrigin::Authored);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|reason| reason.contains("expired")),
+                "an expired CRL must be refused when stated, got {refused:?}"
+            );
+            assert_eq!(
+                validate_request(&request, RequestOrigin::Replayed),
+                Ok(()),
+                "a replayed expired CRL must be kept so a reload can patch it"
+            );
+        }
+        for request in [listener("crl-current.pem"), patch("crl-current.pem")] {
+            assert_eq!(validate_request(&request, RequestOrigin::Authored), Ok(()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod frontend_validation_tests {
+    //! sozu#1313: a frontend whose hostname the workers' router refuses must be
+    //! rejected by the main process BEFORE it is committed to `ConfigState`.
+    //! `ConfigState` has no route-grammar check, the replay path has no
+    //! rollback, and `SaveState` re-serialises whatever the state holds — so a
+    //! frontend that gets in stays in, and re-poisons every replay. These
+    //! exercise the production [`validate_frontend_request`] guard and the
+    //! [`validate_request`] entry point all three master apply paths
+    //! (`worker_request`, `load_static_config`, `load_state`) share.
+    //!
+    //! To SEE THESE RED (regression proof): make `validate_frontend_request`
+    //! return `Ok(())` unconditionally — the pre-fix behavior where the main
+    //! process committed frontends without checking the router grammar. The
+    //! `is_err()` assertions below then fail.
+    use super::{RequestOrigin, validate_frontend_request, validate_request};
+    use sozu_command_lib::{
+        config::ListenerBuilder,
+        proto::command::{
+            PathRule, PathRuleKind, RequestHttpFrontend, RulePosition, SocketAddress,
+            request::RequestType,
+        },
+        state::ConfigState,
+    };
+    use std::collections::BTreeMap;
+
+    /// The hostname that panicked every worker in production: a trailing `/`
+    /// with no openable regex segment. The router's trie grammar refuses it.
+    const INCIDENT_HOSTNAME: &str = "raat-app.cleverapps.io/";
+
+    /// A minimal `Tree`-positioned frontend add for `hostname`, valid in every
+    /// respect except what the caller intends to make invalid.
+    fn frontend(hostname: &str) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some("cluster".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            hostname: hostname.to_owned(),
+            path: PathRule {
+                kind: PathRuleKind::Prefix as i32,
+                value: "/".to_owned(),
+            },
+            method: None,
+            position: RulePosition::Tree as i32,
+            tags: BTreeMap::new(),
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: Vec::new(),
+            hsts: None,
+            header_predicates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn config_state_commits_a_frontend_the_router_refuses() {
+        // The pathology this guard defends against, proven at the state layer
+        // so the master-side guard below is demonstrably load-bearing:
+        // `ConfigState::add_http_frontend` only runs `to_frontend()`, whose
+        // sole failure is an out-of-range `position` — no hostname grammar is
+        // checked anywhere. The malformed entry is therefore recorded, and from
+        // there `SaveState` re-persists it and every replay re-injects it.
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpFrontend(frontend(INCIDENT_HOSTNAME)).into())
+            .expect("ConfigState records the malformed frontend — it has no route-grammar check");
+    }
+
+    #[test]
+    fn malformed_hostnames_are_rejected_before_commit() {
+        // Every shape the workers' router refuses — the same classes
+        // `Router::add_http_front` rejects, reached through the exact code the
+        // worker runs.
+        for hostname in [
+            // The incident: a trailing `/` opens a regex segment that never
+            // closes, so the route-table trie refuses the insert.
+            INCIDENT_HOSTNAME,
+            // Empty label.
+            ".example.com",
+            // A segment that is not a valid regex.
+            "/[/.example.com",
+            // A regex segment that is not `.`-anchored.
+            "abc/[0-9]+/.example.com",
+            // A bare trailing `.` after a completed segment — the release
+            // out-of-bounds `convert_regex_domain_rule` fixed in sozu#1312.
+            "/a/.",
+        ] {
+            let request = RequestType::AddHttpFrontend(frontend(hostname));
+            assert!(
+                validate_frontend_request(&request).is_err(),
+                "a frontend the workers' router refuses must be rejected before commit \
+                 (hostname_bytes={})",
+                hostname.len(),
+            );
+        }
+
+        // Over the pre-parse length bound (`MAX_HOSTNAME_LENGTH`): the trie
+        // recurses once per label and a `/`-segment compiles a regex, so the
+        // router bounds the hostname before parsing anything.
+        let oversized = "a".repeat(sozu_lib::router::MAX_HOSTNAME_LENGTH + 1);
+        assert!(
+            validate_frontend_request(&RequestType::AddHttpFrontend(frontend(&oversized))).is_err(),
+            "a hostname over MAX_HOSTNAME_LENGTH must be rejected before commit"
+        );
+    }
+
+    #[test]
+    fn https_frontend_arm_is_validated_too() {
+        // `AddHttpsFrontend` carries the same `RequestHttpFrontend` payload and
+        // reaches the same router insert on the worker; the guard must not
+        // cover only the plaintext arm.
+        let request = RequestType::AddHttpsFrontend(frontend(INCIDENT_HOSTNAME));
+        assert!(
+            validate_frontend_request(&request).is_err(),
+            "a malformed hostname must be rejected on the HTTPS arm too"
+        );
+    }
+
+    #[test]
+    fn rejection_message_carries_no_operator_value() {
+        // The failure string flows into the audit `reason` column and the
+        // client failure message. `RouterError`'s Display reports byte lengths
+        // only — a hostname leaking here would undo the redaction work of the
+        // Security section this release ships.
+        let request = RequestType::AddHttpFrontend(frontend(INCIDENT_HOSTNAME));
+        let reason = validate_frontend_request(&request)
+            .expect_err("the incident hostname must be rejected");
+        assert!(
+            !reason.contains(INCIDENT_HOSTNAME),
+            "the rejection reason must not carry the operator-supplied hostname: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn valid_frontends_pass_validation() {
+        for hostname in [
+            "example.com",
+            "*.example.com",
+            // A well-formed `.`-anchored regex segment.
+            "/ab+c/.example.com",
+        ] {
+            let request = RequestType::AddHttpFrontend(frontend(hostname));
+            assert!(
+                validate_frontend_request(&request).is_ok(),
+                "a frontend the workers' router accepts must pass validation \
+                 (hostname_bytes={}): {:?}",
+                hostname.len(),
+                validate_frontend_request(&request),
+            );
+        }
+
+        // The rewrite/header policy path (`Frontend::new`) is exercised too:
+        // valid capture templates pass...
+        let mut rewritten = frontend("example.com");
+        rewritten.rewrite_host = Some("$HOST[0]".to_owned());
+        rewritten.rewrite_path = Some("/prefix$PATH[0]".to_owned());
+        let request = RequestType::AddHttpFrontend(rewritten.clone());
+        assert!(
+            validate_frontend_request(&request).is_ok(),
+            "a frontend with valid rewrites must pass validation: {:?}",
+            validate_frontend_request(&request),
+        );
+
+        // ...and an out-of-range capture index (an `Exact` domain produces one
+        // capture) is refused before commit like any other invalid frontend.
+        rewritten.rewrite_host = Some("$HOST[9]".to_owned());
+        assert!(
+            validate_frontend_request(&RequestType::AddHttpFrontend(rewritten)).is_err(),
+            "a rewrite referencing a capture the router cannot fill must be rejected"
+        );
+    }
+
+    #[test]
+    fn non_frontend_verbs_pass_and_invalid_listeners_still_fail() {
+        // The frontend guard is a no-op on every other verb...
+        assert!(
+            validate_frontend_request(&RequestType::Logging("info".to_owned())).is_ok(),
+            "a non-frontend verb must not be touched by the frontend guard"
+        );
+
+        // ...and the shared entry point still enforces sozu#1301 (an
+        // unbuildable listener answer template) as well as sozu#1313.
+        let mut cfg = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8085))
+            .to_http(None)
+            .expect("default HTTP listener config");
+        cfg.answers
+            .insert("404".to_owned(), "not a valid http response".to_owned());
+        assert!(
+            validate_request(&RequestType::AddHttpListener(cfg), RequestOrigin::Authored).is_err(),
+            "validate_request must keep rejecting an unbuildable listener (sozu#1301)"
+        );
+        assert!(
+            validate_request(
+                &RequestType::AddHttpFrontend(frontend(INCIDENT_HOSTNAME)),
+                RequestOrigin::Authored
+            )
+            .is_err(),
+            "validate_request must reject a malformed frontend (sozu#1313)"
+        );
+        assert!(
+            validate_request(
+                &RequestType::AddHttpFrontend(frontend("example.com")),
+                RequestOrigin::Authored
+            )
+            .is_ok(),
+            "validate_request must accept a well-formed frontend"
+        );
+    }
+}
+
+#[cfg(test)]
+mod load_state_rollback_tests {
+    //! sozu#1313: the two BULK apply paths — [`super::load_state`] (the
+    //! saved-state replay) and [`super::load_static_config`] — must revert PER
+    //! ENTRY every entry no worker acknowledged, must end on a bounded
+    //! deadline instead of waiting forever, and must report that deadline as a
+    //! failure.
+    //!
+    //! Before the fix both tasks only tallied the fleet-wide `ok`/`errors` of a
+    //! `DefaultGatherer` and never touched `server.state`. An entry every
+    //! worker answered `Failure` to therefore stayed in the main-process
+    //! `ConfigState`, was re-persisted by the next `SaveState` and re-injected
+    //! on every later replay — the poisoned-state loop of sozu#1313. The live
+    //! single-request path (`worker_request` → `WorkerTask::on_finish`) already
+    //! reverted; the replay path is where the same guarantee was missing.
+    //!
+    //! To SEE THESE RED (regression proof), restore the pre-fix behaviour:
+    //! - delete the `revert_unacknowledged` call from
+    //!   `LoadStateTask::on_finish` / `LoadStaticConfigTask::on_finish` — every
+    //!   revert expectation below fails;
+    //! - restore `let failed = errors > 0;` (without `|| timed_out`) in
+    //!   `LoadStateTask::on_finish` — the timeout test fails on the reported
+    //!   status;
+    //! - make `bulk_replay_timeout` return `Timeout::None`, what both load
+    //!   paths passed before — the deadline test fails.
+    //! - restore `Config::load_from_path(path).unwrap_or_else(|_| panic!(...))`
+    //!   in `load_static_config` — the unloadable-path test panics instead of
+    //!   reporting a failure, exactly as the main process did.
+    //! - drop the `skipped_invalid += 1` from `load_state`'s state-refused
+    //!   branch — the skipped-tally test finds no tally line at all.
+    //! - drop the `AddTcpFrontend` arm from `compute_rollback` — the TCP replay
+    //!   test keeps the frontend no worker acknowledged, which is sozu#1313's
+    //!   poisoned-state loop for that verb
+    //!   (`rollback_inverse_targets_the_same_listener_and_skips_uncovered_verbs`
+    //!   in `listener_validation_tests` fails on the same mutation). The
+    //!   `AddUdpFrontend` arm inverts the same way now that
+    //!   `remove_udp_frontend` mirrors its add key; see
+    //!   `a_udp_frontend_add_inverts_to_its_exact_removal`.
+    //!
+    //! The response-accounting and channel-backpressure halves of the same fix
+    //! are locked in `bin/src/command/server.rs`
+    //! (`a_request_that_cannot_be_queued_is_accounted_as_a_failure`,
+    //! `closing_a_worker_only_fails_its_unanswered_requests`,
+    //! `a_bulk_scatter_larger_than_the_back_buffer_is_fully_delivered`):
+    //! `Server::queued_tasks` and `Server::in_flight` are private to that
+    //! module, so the accounting is not observable from here.
+    use std::sync::Arc;
+
+    use prost::Message as _;
+    use sozu_command_lib::{
+        channel::{Channel, delimiter_size},
+        config::ListenerBuilder,
+        proto::command::{
+            PathRule, PathRuleKind, Request, RequestHttpFrontend, RequestTcpFrontend,
+            RequestUdpFrontend, Response, ResponseStatus, RulePosition, SocketAddress,
+            request::RequestType,
+        },
+    };
+
+    use super::{
+        LoadStateTask, LoadStaticConfigTask, PerEntryGatherer, Server, Timeout,
+        bulk_replay_timeout, load_state, load_static_config,
+    };
+    use crate::command::{
+        server::{CommandHub, GatheringTask, PeerCred, parse_scatter_request_id},
+        sessions::ClientSession,
+    };
+    use mio::{Token, net::UnixListener};
+    use sozu_command_lib::config::Config;
+    use sozu_command_lib::proto::command::{HttpsListenerConfig, WorkerRequest};
+    use std::collections::BTreeMap;
+    use std::{fs::File, io::Write as _};
+
+    pub(super) fn create_test_hub() -> (CommandHub, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("Could not create temp dir");
+        let socket_path = dir.path().join("test.sock");
+        let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
+        let hub = CommandHub::new(unix_listener, Config::default(), "sozu".to_owned())
+            .expect("Could not create command hub");
+        // The TempDir is returned so the socket outlives the hub.
+        (hub, dir)
+    }
+
+    /// A minimal `Tree`-positioned frontend add for `hostname` — same fixture
+    /// shape as `frontend_validation_tests`, valid in every respect.
+    fn frontend(hostname: &str, port: u16) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some("cluster".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            hostname: hostname.to_owned(),
+            path: PathRule {
+                kind: PathRuleKind::Prefix as i32,
+                value: "/".to_owned(),
+            },
+            method: None,
+            position: RulePosition::Tree as i32,
+            tags: BTreeMap::new(),
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: Vec::new(),
+            hsts: None,
+            header_predicates: Vec::new(),
+        }
+    }
+
+    /// One entry of a fan-out: which scatter `request_id` carried it, the
+    /// request itself, how many workers it was scattered to, and how many
+    /// answered `Ok` / `Failure`.
+    struct Fanout {
+        request_id: usize,
+        request: RequestType,
+        expected: usize,
+        ok: usize,
+        errors: usize,
+    }
+
+    /// Build the gatherer state a bulk fan-out would have left behind, through
+    /// the production [`Gatherer`] API: `on_scatter` for what was asked, then
+    /// one real `WorkerResponse` per answer carrying the very id
+    /// `Server::scatter_on` builds. Hand-filling the counters would let the
+    /// fixture drift from the accounting it is meant to lock.
+    fn fan_out(server: &mut Server, entries: Vec<Fanout>) -> PerEntryGatherer {
+        use crate::command::server::Gatherer;
+        use sozu_command_lib::proto::command::WorkerResponse;
+
+        let mut gatherer = PerEntryGatherer::default();
+        for fanout in entries {
+            assert!(
+                fanout.ok + fanout.errors <= fanout.expected,
+                "a fan-out cannot gather more answers than it expects"
+            );
+            let content = Request::from(fanout.request);
+            gatherer.on_scatter(fanout.request_id, fanout.expected, &content);
+            let statuses = std::iter::repeat_n(ResponseStatus::Ok, fanout.ok)
+                .chain(std::iter::repeat_n(ResponseStatus::Failure, fanout.errors));
+            for (worker_id, status) in statuses.enumerate() {
+                let worker_id = worker_id as u32;
+                let response = WorkerResponse {
+                    id: format!("{}-0-{}", worker_id, fanout.request_id),
+                    status: status.into(),
+                    message: String::from("rejected by the worker"),
+                    content: None,
+                };
+                gatherer.on_message(server, &mut None, worker_id, response);
+            }
+        }
+        gatherer
+    }
+
+    pub(super) type ClientPair = (ClientSession, Channel<Request, Response>);
+
+    pub(super) fn test_client() -> ClientPair {
+        let (client_channel, peer) =
+            Channel::<Response, Request>::generate_nonblocking(4096, 40960)
+                .expect("could not create a channel pair");
+        let client = ClientSession::new(
+            client_channel,
+            0,
+            Token(1),
+            PeerCred {
+                uid: None,
+                gid: None,
+                pid: None,
+            },
+            None,
+            None,
+            Arc::from("test.sock"),
+        );
+        (client, peer)
+    }
+
+    /// Decode every framed `Response` queued on a client's back buffer: a
+    /// nonblocking `write_message` only fills that buffer (the event loop is
+    /// what flushes it), so this is where `finish_ok` / `finish_failure` land.
+    pub(super) fn queued_responses(client: &ClientSession) -> Vec<Response> {
+        let data = client.channel.back_buf.data();
+        let delimiter = delimiter_size();
+        let mut responses = vec![];
+        let mut offset = 0usize;
+        while offset + delimiter <= data.len() {
+            let mut length = [0u8; std::mem::size_of::<usize>()];
+            length.copy_from_slice(&data[offset..offset + delimiter]);
+            let frame_len = usize::from_le_bytes(length);
+            assert!(
+                frame_len >= delimiter && offset + frame_len <= data.len(),
+                "the client back buffer must hold whole frames"
+            );
+            responses.push(
+                Response::decode(&data[offset + delimiter..offset + frame_len])
+                    .expect("a queued client response must decode"),
+            );
+            offset += frame_len;
+        }
+        responses
+    }
+
+    #[test]
+    fn an_entry_the_state_refused_is_counted_in_the_skipped_tally() {
+        // `load_state` has two skip branches: one for an entry pre-dispatch
+        // validation refuses, one for an entry `ConfigState` itself refuses.
+        // Both `warn!` and `count!`, but only the first used to increment
+        // `skipped_invalid` — and that tally is the ONLY thing the operator is
+        // told, so a state file full of entries the state refused reported a
+        // clean load.
+        let (mut hub, _dir) = create_test_hub();
+        let (mut client, _peer) = test_client();
+
+        // The SAME frontend twice: the first dispatch commits it, the second is
+        // refused by `ConfigState` with `StateError::Exists`. Both pass
+        // pre-dispatch validation, so the other branch's increment — the one
+        // that already worked — can not account for the tally.
+        let duplicate = Request::from(RequestType::AddHttpFrontend(frontend(
+            "dup.example.com",
+            8080,
+        )));
+        let state_path = _dir.path().join("duplicate.state");
+        {
+            let mut state_file = File::create(&state_path).expect("a temporary state file");
+            for counter in 0..2 {
+                // Same framing `ConfigState::write_requests_to_file` produces.
+                let message = WorkerRequest::new(format!("SAVE-{counter}"), duplicate.clone());
+                let serialized = serde_json::to_string(&message).expect("a serializable request");
+                state_file
+                    .write_all(serialized.as_bytes())
+                    .expect("writing the state entry");
+                state_file
+                    .write_all(b"\n\0")
+                    .expect("writing the delimiter");
+            }
+        }
+
+        load_state(
+            &mut hub.server,
+            Some(&mut client),
+            state_path.to_str().expect("a UTF-8 temp path"),
+        );
+
+        let responses = queued_responses(&client);
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.message.contains("skipped 1 invalid entries")),
+            "the entry the state refused must be reported in the skipped tally, got {responses:?}"
+        );
+    }
+
+    /// A saved listener record can outgrow the historical 200 kB parse
+    /// buffer once it carries client CA or CRL contents. Parsing used to stop
+    /// at such a record and drop every record after it; it must load, and so
+    /// must what follows.
+    #[test]
+    fn a_state_record_larger_than_200_kb_loads_with_what_follows() {
+        let (mut hub, _dir) = create_test_hub();
+        // What a loaded configuration holds: `Config::default()` leaves it 0.
+        hub.server.config.max_command_buffer_size =
+            sozu_command_lib::config::DEFAULT_MAX_COMMAND_BUFFER_SIZE;
+        let (mut client, _peer) = test_client();
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let large_listener = HttpsListenerConfig {
+            // Mode none: the CA content is kept but never parsed, so the
+            // record is valid whatever it holds.
+            client_ca_certificates: vec!["A".repeat(300_000)],
+            ..ListenerBuilder::new_https(address)
+                .to_tls(None)
+                .expect("an HTTPS listener config")
+        };
+        let records = [
+            Request::from(RequestType::add_https_listener(large_listener)),
+            Request::from(RequestType::AddHttpFrontend(frontend(
+                "after.example.com",
+                8080,
+            ))),
+        ];
+        let state_path = _dir.path().join("large.state");
+        {
+            let mut state_file = File::create(&state_path).expect("a temporary state file");
+            for (counter, record) in records.iter().enumerate() {
+                let message = WorkerRequest::new(format!("SAVE-{counter}"), record.clone());
+                let serialized = serde_json::to_string(&message).expect("a serializable request");
+                state_file
+                    .write_all(serialized.as_bytes())
+                    .expect("writing the state entry");
+                state_file
+                    .write_all(b"\n\0")
+                    .expect("writing the delimiter");
+            }
+        }
+        assert!(
+            std::fs::metadata(&state_path).expect("state file").len() > 300_000,
+            "precondition: the first record is larger than the historical buffer"
+        );
+
+        load_state(
+            &mut hub.server,
+            Some(&mut client),
+            state_path.to_str().expect("a UTF-8 temp path"),
+        );
+
+        assert_eq!(hub.server.state.https_listeners.len(), 1);
+        assert_eq!(
+            hub.server.state.count_frontends(),
+            1,
+            "the record after the large one must load too"
+        );
+    }
+
+    /// A minimal no-SNI, no-ALPN TCP frontend for `cluster_id` on `port`.
+    /// Distinct ports keep two of them from colliding on the listener-wide
+    /// catch-all rule `add_tcp_frontend` enforces.
+    fn tcp_frontend(cluster_id: &str, port: u16) -> RequestTcpFrontend {
+        RequestTcpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            tags: BTreeMap::new(),
+            sni: None,
+            alpn: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_tcp_frontend_no_worker_acknowledged_is_reverted_while_an_acknowledged_one_stays() {
+        // sozu#1313 for the TCP verbs: `ConfigState` dispatches
+        // `RemoveTcpFrontend` exactly like `RemoveHttpFrontend`, so a TCP
+        // frontend no worker took had an unambiguous inverse all along — it was
+        // simply missing from `compute_rollback`, which left the poisoned-state
+        // loop open for `AddTcpFrontend`. `AddUdpFrontend` stayed open too,
+        // because `remove_udp_frontend` then keyed on the address alone while
+        // `add_udp_frontend` keyed on (cluster, address, tags), so its inverse
+        // would have evicted same-address siblings. The removal key now mirrors
+        // the add key, and the verb is covered; see
+        // `a_udp_frontend_add_inverts_to_its_exact_removal`.
+        let (mut hub, _dir) = create_test_hub();
+        let rejected = RequestType::AddTcpFrontend(tcp_frontend("rejected-cluster", 8090));
+        let accepted = RequestType::AddTcpFrontend(tcp_frontend("accepted-cluster", 8091));
+        for request in [&rejected, &accepted] {
+            hub.server
+                .state
+                .dispatch(&request.clone().into())
+                .expect("ConfigState records the TCP frontend");
+        }
+
+        // Entry 1: every worker refused it. Entry 2: one worker applied it —
+        // `ok > 0` is the safety bound, it is never reverted.
+        let task = LoadStateTask {
+            client_token: None,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![
+                    Fanout {
+                        request_id: 1,
+                        request: rejected,
+                        expected: 3,
+                        ok: 0,
+                        errors: 3,
+                    },
+                    Fanout {
+                        request_id: 2,
+                        request: accepted,
+                        expected: 3,
+                        ok: 1,
+                        errors: 2,
+                    },
+                ],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        // `remove_tcp_frontend` leaves the cluster bucket in place when it
+        // empties it, so count the frontends, not the buckets.
+        let mut surviving: Vec<&str> = hub
+            .server
+            .state
+            .tcp_fronts
+            .iter()
+            .filter(|(_, fronts)| !fronts.is_empty())
+            .map(|(cluster_id, _)| &**cluster_id)
+            .collect();
+        surviving.sort_unstable();
+        assert_eq!(
+            surviving,
+            vec!["accepted-cluster"],
+            "only the TCP frontend no worker acknowledged must be reverted"
+        );
+    }
+
+    /// A UDP frontend in a fixed cluster, distinguished by its `owner` tag and
+    /// placed at the caller's port. `add_udp_frontend` admits one frontend per
+    /// address across every cluster, so two of these must be given two ports;
+    /// the tag is what a removal key coarser than the add key used to collapse.
+    fn udp_frontend(owner: &str, port: u16) -> RequestUdpFrontend {
+        RequestUdpFrontend {
+            cluster_id: "udp-cluster".to_owned(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            tags: BTreeMap::from([("owner".to_owned(), owner.to_owned())]),
+        }
+    }
+
+    /// The UDP twin of the TCP replay revert above, and the end-to-end half
+    /// `a_udp_frontend_add_inverts_to_its_exact_removal` cannot reach: that
+    /// test asserts the SHAPE [`super::compute_rollback`] returns, this one
+    /// drives `revert_unacknowledged` against a real `ConfigState` and proves
+    /// the inverse spares the acknowledged sibling.
+    ///
+    /// The two entries share a cluster and sit at DIFFERENT addresses, the
+    /// only shape `add_udp_frontend` admits: a UDP listener address is the
+    /// whole routing key, so one frontend holds it across every cluster.
+    /// Entry 1 every worker refused and must be reverted; entry 2 one worker
+    /// applied, so `ok > 0` protects it.
+    ///
+    /// To SEE THIS RED: widen `matches_removal` in
+    /// `ConfigState::remove_udp_frontend` (`command/src/state.rs`) to the
+    /// whole bucket, `|_front| true`. In a build with `debug_assertions` the
+    /// production guard fires first, inside the revert's own `dispatch`:
+    /// `remove_udp_frontend drops exactly one entry, left: 0, right: 1`.
+    /// Strip that `debug_assert_eq!` and its companion too and the failure
+    /// lands on the assertion below instead, `left: [], right: ["team-b"]`,
+    /// with the task logging `reverted entries: 1`: one revert, both
+    /// frontends gone. That is sozu#1313's main/worker drift reintroduced by
+    /// the rollback itself, and precisely why this verb stayed out of
+    /// [`super::compute_rollback`] until the removal key mirrored the add key.
+    #[test]
+    fn a_udp_frontend_no_worker_acknowledged_is_reverted_while_its_sibling_stays() {
+        let (mut hub, _dir) = create_test_hub();
+        let rejected = RequestType::AddUdpFrontend(udp_frontend("team-a", 9100));
+        let accepted = RequestType::AddUdpFrontend(udp_frontend("team-b", 9101));
+        for request in [&rejected, &accepted] {
+            hub.server
+                .state
+                .dispatch(&request.clone().into())
+                .expect("ConfigState records the UDP frontend");
+        }
+
+        // Entry 1: every worker refused it. Entry 2: one worker applied it —
+        // `ok > 0` is the safety bound, it is never reverted.
+        let task = LoadStateTask {
+            client_token: None,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![
+                    Fanout {
+                        request_id: 1,
+                        request: rejected,
+                        expected: 3,
+                        ok: 0,
+                        errors: 3,
+                    },
+                    Fanout {
+                        request_id: 2,
+                        request: accepted,
+                        expected: 3,
+                        ok: 1,
+                        errors: 2,
+                    },
+                ],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        let surviving: Vec<&str> = hub
+            .server
+            .state
+            .udp_fronts
+            .get("udp-cluster")
+            .map(|fronts| {
+                fronts
+                    .iter()
+                    .filter_map(|front| front.tags.get("owner").map(String::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            surviving,
+            vec!["team-b"],
+            "only the UDP frontend no worker acknowledged must be reverted; its sibling in the \
+             same cluster must survive"
+        );
+    }
+
+    /// A reload is how an operator refreshes a CRL or a CA bundle, and it
+    /// replays `AddHttpsListener`, which the state refuses for a listener it
+    /// already holds. The reload must send the new policy as a patch instead,
+    /// or a CRL past its `nextUpdate` would lock every client out until a
+    /// restart.
+    #[test]
+    fn a_reload_refreshes_the_crl_of_a_running_client_auth_listener() {
+        let (mut hub, dir) = create_test_hub();
+        let asset =
+            |name: &str| format!("{}/../lib/assets/mtls/{name}", env!("CARGO_MANIFEST_DIR"));
+        let saved_state = dir.path().join("state.json");
+        File::create(&saved_state).expect("create the saved state file");
+        let write_config = |file: &str, crl: &str| {
+            let path = dir.path().join(file);
+            let mut config = File::create(&path).expect("create the config file");
+            write!(
+                config,
+                r#"
+                command_socket = "{socket}"
+                saved_state    = "{state}"
+                worker_count   = 1
+
+                [[listeners]]
+                protocol = "https"
+                address  = "127.0.0.1:8443"
+                client_auth = "required"
+                client_ca_certificates = ["{ca}"]
+                client_ca_crls = ["{crl}"]
+                "#,
+                socket = dir.path().join("test.sock").display(),
+                state = saved_state.display(),
+                ca = asset("ca-cert.pem"),
+                crl = asset(crl),
+            )
+            .expect("write the config file");
+            path.to_str().expect("a UTF-8 temp path").to_owned()
+        };
+        let crls = |hub: &CommandHub| -> Vec<String> {
+            hub.server
+                .state
+                .https_listeners
+                .values()
+                .flat_map(|listener| listener.client_ca_crls.clone())
+                .collect()
+        };
+        let read = |name: &str| std::fs::read_to_string(asset(name)).expect("read a fixture");
+
+        let (mut client, _peer) = test_client();
+        load_static_config(
+            &mut hub.server,
+            Some(&mut client),
+            Some(&write_config("before.toml", "crl-current.pem")),
+        );
+        assert_eq!(crls(&hub), vec![read("crl-current.pem")]);
+
+        load_static_config(
+            &mut hub.server,
+            None,
+            Some(&write_config("after.toml", "crl-revoked.pem")),
+        );
+        assert_eq!(
+            crls(&hub),
+            vec![read("crl-revoked.pem")],
+            "the reload must replace the CRL of the listener it already runs"
+        );
+        assert_eq!(
+            hub.server.state.https_listeners.len(),
+            1,
+            "the listener is patched in place, not added a second time"
+        );
+    }
+
+    #[test]
+    fn an_unloadable_static_config_path_fails_the_client_instead_of_the_main_process() {
+        // `sozu reload --file <bad path>` used to take the whole main process
+        // down with it — `unwrap_or_else(|_| panic!(...))` — orphaning every
+        // worker over a typo in a path only the client controls.
+        let (mut hub, _dir) = create_test_hub();
+        let (mut client, _peer) = test_client();
+        let missing = _dir.path().join("there-is-no-such-config.toml");
+        let missing = missing.to_str().expect("a UTF-8 temp path");
+
+        load_static_config(&mut hub.server, Some(&mut client), Some(missing));
+
+        let responses = queued_responses(&client);
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.status == ResponseStatus::Failure as i32
+                    && response.message.contains(missing)),
+            "an unloadable config path must be reported to the client as a failure, got {responses:?}"
+        );
+    }
+
+    #[test]
+    fn an_entry_no_worker_acknowledged_is_reverted_while_an_acknowledged_one_stays() {
+        let (mut hub, _dir) = create_test_hub();
+        let rejected = RequestType::AddHttpFrontend(frontend("rejected.example.com", 8080));
+        let partially_accepted =
+            RequestType::AddHttpFrontend(frontend("accepted.example.com", 8080));
+        for request in [&rejected, &partially_accepted] {
+            hub.server
+                .state
+                .dispatch(&request.clone().into())
+                .expect("ConfigState records the frontend");
+        }
+        assert_eq!(
+            hub.server.state.count_frontends(),
+            2,
+            "both replayed frontends must start in the main-process state"
+        );
+
+        // Entry 1: every worker refused it. Entry 2: one worker applied it —
+        // `ok > 0` is the safety bound, it is never reverted.
+        let task = LoadStateTask {
+            client_token: None,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![
+                    Fanout {
+                        request_id: 1,
+                        request: rejected,
+                        expected: 3,
+                        ok: 0,
+                        errors: 3,
+                    },
+                    Fanout {
+                        request_id: 2,
+                        request: partially_accepted,
+                        expected: 3,
+                        ok: 1,
+                        errors: 2,
+                    },
+                ],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        let hostnames: Vec<&str> = hub
+            .server
+            .state
+            .http_fronts
+            .values()
+            .map(|front| front.hostname.as_str())
+            .collect();
+        assert_eq!(
+            hostnames,
+            vec!["accepted.example.com"],
+            "only the entry no worker acknowledged must be reverted"
+        );
+        assert_eq!(hub.server.state.count_frontends(), 1);
+    }
+
+    #[test]
+    fn a_timed_out_replay_reverts_the_unacknowledged_entry_and_reports_failure() {
+        let (mut hub, _dir) = create_test_hub();
+        let unanswered = RequestType::AddHttpFrontend(frontend("silent.example.com", 8080));
+        hub.server
+            .state
+            .dispatch(&unanswered.clone().into())
+            .expect("ConfigState records the frontend");
+
+        let (mut client, _peer) = test_client();
+        // The incident shape: the deadline fired with not one answer for this
+        // entry — a worker killed mid-replay answers nothing at all, so
+        // `errors` alone can never express "the fleet never took it".
+        let task = LoadStateTask {
+            client_token: Some(client.token),
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![Fanout {
+                    request_id: 1,
+                    request: unanswered,
+                    expected: 2,
+                    ok: 0,
+                    errors: 0,
+                }],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut Some(&mut client), true);
+
+        assert_eq!(
+            hub.server.state.count_frontends(),
+            0,
+            "a replay that timed out with zero acknowledgements must revert the entry"
+        );
+        let responses = queued_responses(&client);
+        let last = responses
+            .last()
+            .expect("the client must be answered exactly once");
+        assert_eq!(
+            last.status,
+            ResponseStatus::Failure as i32,
+            "a timed-out replay must be reported as a failure, never as a success: {last:?}"
+        );
+        assert!(
+            last.message.contains("timed out: true"),
+            "the failure must name the deadline: {}",
+            last.message
+        );
+    }
+
+    #[test]
+    fn per_entry_attribution_reverts_only_the_rejected_entry() {
+        let (mut hub, _dir) = create_test_hub();
+        let listener = |port: u16| {
+            RequestType::AddHttpListener(
+                ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, port))
+                    .to_http(None)
+                    .expect("default HTTP listener config"),
+            )
+        };
+        let rejected = listener(8081);
+        let accepted = listener(8082);
+        for request in [&rejected, &accepted] {
+            hub.server
+                .state
+                .dispatch(&request.clone().into())
+                .expect("ConfigState records the listener");
+        }
+        assert_eq!(hub.server.state.list_listeners().http_listeners.len(), 2);
+
+        // Both entries are on the SAME task and the same fleet-wide tally
+        // (3 ok, 3 errors): only the per-entry breakdown can tell them apart.
+        let task = LoadStateTask {
+            client_token: None,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![
+                    Fanout {
+                        request_id: 1,
+                        request: rejected,
+                        expected: 3,
+                        ok: 0,
+                        errors: 3,
+                    },
+                    Fanout {
+                        request_id: 2,
+                        request: accepted,
+                        expected: 3,
+                        ok: 3,
+                        errors: 0,
+                    },
+                ],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        let listeners = hub.server.state.list_listeners();
+        assert_eq!(
+            listeners.http_listeners.len(),
+            1,
+            "exactly the unanimously rejected listener must be reverted"
+        );
+        assert!(
+            listeners.http_listeners.contains_key("127.0.0.1:8082"),
+            "the accepted listener must survive: {:?}",
+            listeners.http_listeners.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_static_config_reload_reverts_an_unacknowledged_entry_too() {
+        let (mut hub, _dir) = create_test_hub();
+        let rejected = RequestType::AddHttpsFrontend(frontend("rejected.example.com", 8443));
+        hub.server
+            .state
+            .dispatch(&rejected.clone().into())
+            .expect("ConfigState records the frontend");
+
+        let task = LoadStaticConfigTask {
+            client_token: None,
+            reload: None,
+            notify_ready: false,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![Fanout {
+                    request_id: 0,
+                    request: rejected,
+                    expected: 2,
+                    ok: 0,
+                    errors: 2,
+                }],
+            ),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        assert_eq!(
+            hub.server.state.count_frontends(),
+            0,
+            "the reload path must revert an entry no worker acknowledged, like the replay path"
+        );
+    }
+
+    #[test]
+    fn only_scatter_built_response_ids_are_attributed() {
+        // `scatter_on` builds exactly `{worker_id}-{task_id}-{request_id}`.
+        assert_eq!(parse_scatter_request_id("2-7-42"), Some((2, 7, 42)));
+        // Every other producer on the same channel must parse to None rather
+        // than be attributed to some entry: `launch_new_worker`'s initial
+        // status probe, and anything with a name-shaped prefix.
+        for foreign in [
+            "INITIAL-STATUS-0",
+            "AddHttpFrontend-2-7-42",
+            "Status",
+            "2-7",
+            "2-7-42-1",
+        ] {
+            assert_eq!(
+                parse_scatter_request_id(foreign),
+                None,
+                "an id that was not built by scatter_on must not be attributed: {foreign}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_entry_tallies_follow_the_scatter_request_ids() {
+        use crate::command::server::Gatherer;
+        use sozu_command_lib::proto::command::WorkerResponse;
+
+        let (mut hub, _dir) = create_test_hub();
+        let mut per_entry = PerEntryGatherer::default();
+        let first = Request::from(RequestType::AddHttpFrontend(frontend(
+            "a.example.com",
+            8080,
+        )));
+        let second = Request::from(RequestType::AddHttpFrontend(frontend(
+            "b.example.com",
+            8080,
+        )));
+        per_entry.on_scatter(1, 2, &first);
+        per_entry.on_scatter(2, 2, &second);
+
+        let answer = |id: &str, status: ResponseStatus| WorkerResponse {
+            id: id.to_owned(),
+            status: status.into(),
+            message: String::new(),
+            content: None,
+        };
+        // Entry 1 rejected by both workers, entry 2 accepted by both.
+        for (id, status) in [
+            ("0-3-1", ResponseStatus::Failure),
+            ("1-3-1", ResponseStatus::Failure),
+            ("0-3-2", ResponseStatus::Ok),
+            ("1-3-2", ResponseStatus::Ok),
+        ] {
+            per_entry.on_message(&mut hub.server, &mut None, 0, answer(id, status));
+        }
+
+        assert!(
+            per_entry.has_finished(),
+            "four answers for four expected responses must finish the task"
+        );
+        assert_eq!(
+            (per_entry.entries[&1].ok, per_entry.entries[&1].errors),
+            (0, 2)
+        );
+        assert_eq!(
+            (per_entry.entries[&2].ok, per_entry.entries[&2].errors),
+            (2, 0)
+        );
+        assert!(
+            per_entry.entries[&1].rollback.is_some(),
+            "an AddHttpFrontend entry must carry its inverse"
+        );
+    }
+
+    #[test]
+    fn a_bulk_replay_arms_a_bounded_deadline() {
+        // `Timeout::None` is what hung `sozu state load`: the task ended only
+        // when every expected worker answered, and an answer that never comes
+        // (a killed worker, a request that could not be queued) never ended it.
+        let small = bulk_replay_timeout(10, 0);
+        let large = bulk_replay_timeout(10, 100_000);
+        let (small, large) = match (small, large) {
+            (Timeout::Custom(small), Timeout::Custom(large)) => (small, large),
+            _ => panic!("a bulk replay must arm a bounded, custom deadline"),
+        };
+        assert_eq!(
+            small,
+            std::time::Duration::from_secs(10),
+            "an empty replay gets exactly one worker_timeout of slack"
+        );
+        assert_eq!(
+            large,
+            std::time::Duration::from_secs(100),
+            "a huge replay is capped at 10 x worker_timeout"
+        );
+        assert!(
+            small < large,
+            "the deadline must scale with the number of scattered entries"
+        );
+        // `Config::default()` leaves worker_timeout at 0; a zero deadline would
+        // expire the task before any worker could answer.
+        assert!(
+            matches!(bulk_replay_timeout(0, 0), Timeout::Custom(d) if d >= std::time::Duration::from_secs(1)),
+            "a zero worker_timeout must not produce a zero deadline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    //! sozu#1672: `sozu status` must report the lifecycle state the main
+    //! process knows, not RUNNING for a worker that is draining.
+    //!
+    //! `status` snapshots every worker with `querying_info`, which keeps
+    //! `Stopping` and `Stopped` and turns `Running` into the `NotAnswering`
+    //! placeholder the probe then resolves. A `Stopping` worker is still
+    //! probed — it is draining its in-flight sessions and answers — and
+    //! `StatusTask::on_finish` used to overwrite every answered entry, so a
+    //! worker left draining by `upgrade --worker` showed RUNNING while
+    //! `worker list` showed STOPPING.
+    //!
+    //! To SEE THIS RED (regression proof), drop the `NotAnswering` guard in
+    //! `StatusTask::on_finish` so every answer overwrites the snapshot again:
+    //! the draining worker comes back `Running`.
+    use std::collections::HashMap;
+
+    use sozu_command_lib::proto::command::{
+        ResponseStatus, RunState, WorkerInfo, WorkerResponse, response_content::ContentType,
+    };
+
+    use super::{
+        StatusTask,
+        load_state_rollback_tests::{create_test_hub, queued_responses, test_client},
+    };
+    use crate::command::server::{DefaultGatherer, GatheringTask};
+
+    fn info(id: u32, run_state: RunState) -> (u32, WorkerInfo) {
+        (
+            id,
+            WorkerInfo {
+                id,
+                pid: 1000 + id as i32,
+                run_state: run_state as i32,
+            },
+        )
+    }
+
+    fn answer(id: u32, status: ResponseStatus) -> (u32, WorkerResponse) {
+        (
+            id,
+            WorkerResponse {
+                id: format!("{id}-0-0"),
+                status: status as i32,
+                message: String::new(),
+                content: None,
+            },
+        )
+    }
+
+    #[test]
+    fn status_keeps_the_lifecycle_state_of_a_draining_or_stopped_worker() {
+        let (mut hub, _dir) = create_test_hub();
+        let (mut client, _peer) = test_client();
+
+        // The snapshot `status` takes: worker 0 drains after `upgrade --worker`,
+        // worker 1 runs (placeholder `NotAnswering`), worker 2 runs but its
+        // probe fails, worker 3 has exited and is never probed.
+        let task = StatusTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer {
+                responses: vec![
+                    answer(0, ResponseStatus::Ok),
+                    answer(1, ResponseStatus::Ok),
+                    answer(2, ResponseStatus::Failure),
+                ],
+                ..Default::default()
+            },
+            worker_infos: HashMap::from([
+                info(0, RunState::Stopping),
+                info(1, RunState::NotAnswering),
+                info(2, RunState::NotAnswering),
+                info(3, RunState::Stopped),
+            ]),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut Some(&mut client), false);
+
+        let responses = queued_responses(&client);
+        let last = responses
+            .last()
+            .expect("the client must be answered exactly once");
+        assert_eq!(last.status, ResponseStatus::Ok as i32, "{last:?}");
+        let Some(ContentType::Workers(workers)) = last
+            .content
+            .as_ref()
+            .and_then(|content| content.content_type.clone())
+        else {
+            panic!("status must answer with the worker list: {last:?}");
+        };
+        let mut states: Vec<(u32, RunState)> = workers
+            .vec
+            .iter()
+            .map(|worker| {
+                (
+                    worker.id,
+                    RunState::try_from(worker.run_state).expect("a known run state"),
+                )
+            })
+            .collect();
+        states.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            states,
+            vec![
+                (0, RunState::Stopping),
+                (1, RunState::Running),
+                (2, RunState::NotAnswering),
+                (3, RunState::Stopped),
+            ],
+            "a draining worker must stay Stopping and an exited one Stopped; \
+             only the probed running workers resolve to Running or NotAnswering"
+        );
+    }
+}
+
+#[cfg(test)]
+mod certificate_domain_filter_tests {
+    //! sozu#1383: `sozu certificate list --domain <host>` reads as "which
+    //! certificate would Sōzu present for this host?", but
+    //! `ConfigState::get_certificates` answered it with `Vec::contains` — exact
+    //! SAN equality — while the serving path resolves it through
+    //! `CertificateResolver::domain_lookup`, a `TrieNode` lookup. The two
+    //! disagree for every certificate not bound by an exact name, so a
+    //! `*.example.com` certificate was invisible to a query for
+    //! `foo.example.com` that TLS handshakes were succeeding on.
+    //!
+    //! To SEE THESE RED, restore the pre-fix behaviour by replacing the body of
+    //! [`super::certificates_serving_domain`] with the delegation it displaced:
+    //!
+    //! ```ignore
+    //! state.get_certificates(QueryCertificatesFilters {
+    //!     domain: Some(domain.to_owned()),
+    //!     fingerprint: None,
+    //! })
+    //! ```
+    //!
+    //! Five of the seven tests below then fail —
+    //! `a_wildcard_certificate_answers_a_query_for_a_covered_host`,
+    //! `every_listener_answers_with_its_own_certificate`,
+    //! `the_query_and_the_stored_names_are_ascii_folded`,
+    //! `one_listener_answers_with_exactly_one_certificate` each report an empty
+    //! answer, which is sozu#1383 as filed, and
+    //! `a_name_the_resolver_would_refuse_is_skipped_rather_than_indexed`
+    //! answers for a name no handshake can reach, because exact equality does
+    //! not care what the trie can host. The two remaining tests stay green under
+    //! that mutation — they guard the fix from over-reaching, not the bug.
+    //!
+    //! The worker-side half of the same question is already correct and is
+    //! pinned in `lib/src/https.rs`
+    //! (`query_certificate_for_domain_answers_any_spelling_of_the_name`).
+
+    use std::{collections::HashMap, net::SocketAddr};
+
+    use sozu_command_lib::{
+        certificate::Fingerprint,
+        proto::command::{AddCertificate, CertificateAndKey, SocketAddress, request::RequestType},
+        state::ConfigState,
+    };
+
+    use super::{MAX_HOSTNAME_LENGTH, certificates_serving_domain};
+
+    /// One certificate in a fixture: its one-byte fingerprint and its names.
+    type TestCertificate<'a> = (u8, &'a [&'a str]);
+    /// One HTTPS listener in a fixture: its address and the certificates on it.
+    type TestListener<'a> = (&'a str, &'a [TestCertificate<'a>]);
+
+    fn certificate(names: &[&str]) -> CertificateAndKey {
+        CertificateAndKey {
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// `ConfigState::add_certificate` stores the `CertificateAndKey` verbatim
+    /// once `apply_overriding_names` has resolved its `names`, and — unlike
+    /// `CertifiedKeyWrapper::try_from` — does not ASCII-lowercase them.
+    /// Populating the public `certificates` map directly keeps these tests on
+    /// the filter under test rather than on PEM parsing, and preserves that
+    /// unfolded spelling.
+    ///
+    /// Each entry is `(listener address, [(fingerprint byte, names)])`; a
+    /// one-byte fingerprint renders as its own hex, so `0xaa` keys the answer
+    /// under `"aa"`.
+    fn state_with(listeners: &[TestListener<'_>]) -> ConfigState {
+        let mut state = ConfigState::new();
+        for (address, entries) in listeners {
+            let address: SocketAddr = address.parse().expect("test listener address must parse");
+            let certificates: HashMap<Fingerprint, CertificateAndKey> = entries
+                .iter()
+                .map(|(tag, names)| {
+                    let mut certificate = certificate(names);
+                    certificate.certificate =
+                        include_str!("../../../lib/assets/tests/certificate-1y.pem").to_owned();
+                    (Fingerprint(vec![*tag]), certificate)
+                })
+                .collect();
+            state.certificates.insert(address, certificates);
+        }
+        state
+    }
+
+    fn fingerprints_for(state: &ConfigState, domain: &str) -> Vec<String> {
+        certificates_serving_domain(state, domain)
+            .into_keys()
+            .collect()
+    }
+
+    #[test]
+    fn a_wildcard_certificate_answers_a_query_for_a_covered_host() {
+        let state = state_with(&[("127.0.0.1:8443", &[(0xaa, &["*.example.com"])])]);
+
+        assert_eq!(
+            fingerprints_for(&state, "foo.example.com"),
+            vec!["aa".to_owned()],
+            "the *.example.com certificate serves foo.example.com, so the query must report it"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_certificate_stays_fail_closed_outside_the_hosts_it_serves() {
+        let state = state_with(&[("127.0.0.1:8443", &[(0xaa, &["*.example.com"])])]);
+
+        // `*` is a single-label wildcard and does not cover the apex — the same
+        // boundaries `keep_resolving_with_wildcard` (`lib/src/tls.rs`) asserts
+        // against the resolver's own trie.
+        for host in [
+            "deep.foo.example.com",
+            "example.com",
+            "example.org",
+            "fooexample.com",
+        ] {
+            assert!(
+                fingerprints_for(&state, host).is_empty(),
+                "*.example.com must not answer for {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_name_still_answers_and_an_unrelated_host_still_does_not() {
+        let state = state_with(&[(
+            "127.0.0.1:8443",
+            &[(0xaa, &["lolcatho.st", "www.lolcatho.st"])],
+        )]);
+
+        for host in ["lolcatho.st", "www.lolcatho.st"] {
+            assert_eq!(
+                fingerprints_for(&state, host),
+                vec!["aa".to_owned()],
+                "an exactly-named certificate must keep answering for {host}"
+            );
+        }
+        assert!(
+            fingerprints_for(&state, "other.st").is_empty(),
+            "resolving through the trie must not make an unrelated host match"
+        );
+    }
+
+    #[test]
+    fn every_listener_answers_with_its_own_certificate() {
+        let state = state_with(&[
+            ("127.0.0.1:8443", &[(0xaa, &["*.example.com"])]),
+            ("127.0.0.1:9443", &[(0xbb, &["*.example.com"])]),
+        ]);
+
+        assert_eq!(
+            fingerprints_for(&state, "foo.example.com"),
+            vec!["aa".to_owned(), "bb".to_owned()],
+            "each listener owns its own resolver: a single shared trie keeps the incumbent on a \
+             name collision and would drop one of these two certificates"
+        );
+    }
+
+    #[test]
+    fn the_query_and_the_stored_names_are_ascii_folded() {
+        let state = state_with(&[("127.0.0.1:8443", &[(0xaa, &["*.Example.COM"])])]);
+
+        for query in ["FOO.example.com", "foo.example.com", "Foo.Example.Com"] {
+            assert_eq!(
+                fingerprints_for(&state, query),
+                vec!["aa".to_owned()],
+                "the resolver lowercases certificate names and ConfigState does not, so both \
+                 sides are folded here: {query} must find *.Example.COM"
+            );
+        }
+    }
+
+    #[test]
+    fn one_listener_answers_with_exactly_one_certificate() {
+        // A trie lookup resolves to one entry, so a listener carrying the same
+        // name on two certificates answers with one of them — where the
+        // exact-equality filter answered with both. This legacy-shaped fixture
+        // has no certificate sidecar, so the deterministic fingerprint
+        // fallback supplies its otherwise-unrecoverable historical order.
+        for _ in 0..16 {
+            let state = state_with(&[(
+                "127.0.0.1:8443",
+                &[(0x01, &["*.example.com"]), (0x02, &["*.example.com"])],
+            )]);
+
+            assert_eq!(
+                fingerprints_for(&state, "foo.example.com"),
+                vec!["02".to_owned()],
+                "a name carried twice on one listener must resolve to one reproducible answer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_query_uses_the_same_expiration_winner_as_workers() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let certificate_a = CertificateAndKey {
+            certificate: include_str!("../../../lib/assets/tests/certificate-1y.pem").to_owned(),
+            key: include_str!("../../../lib/assets/tests/key-1y.pem").to_owned(),
+            names: vec!["*.example.com".to_owned()],
+            ..Default::default()
+        };
+        let certificate_b = CertificateAndKey {
+            certificate: include_str!("../../../lib/assets/tests/certificate-2y.pem").to_owned(),
+            key: include_str!("../../../lib/assets/tests/key-2y.pem").to_owned(),
+            names: vec!["*.example.com".to_owned()],
+            ..Default::default()
+        };
+        let winner = certificate_b
+            .fingerprint()
+            .expect("winner fingerprint")
+            .to_string();
+        let mut state = ConfigState::new();
+        for (certificate, expired_at) in [
+            (certificate_a, Some(2_100_000_000)),
+            (certificate_b, Some(2_200_000_000)),
+        ] {
+            state
+                .dispatch(
+                    &RequestType::AddCertificate(AddCertificate {
+                        address,
+                        certificate,
+                        expired_at,
+                    })
+                    .into(),
+                )
+                .expect("certificate accepted by main state");
+        }
+
+        assert_eq!(
+            fingerprints_for(&state, "foo.example.com"),
+            vec![winner],
+            "main must report the certificate workers select by effective expiration"
+        );
+    }
+
+    #[test]
+    fn an_expiration_override_does_not_make_malformed_material_servable() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../../../lib/assets/tests/certificate-1y.pem").to_owned(),
+            key: include_str!("../../../lib/assets/tests/key-1y.pem").to_owned(),
+            names: vec!["*.example.com".to_owned()],
+            ..Default::default()
+        };
+        let fingerprint = certificate.fingerprint().expect("valid fingerprint");
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCertificate(AddCertificate {
+                    address,
+                    certificate,
+                    expired_at: Some(2_200_000_000),
+                })
+                .into(),
+            )
+            .expect("valid certificate accepted before legacy corruption");
+        state
+            .certificates
+            .get_mut(&SocketAddr::from(address))
+            .and_then(|certificates| certificates.get_mut(&fingerprint))
+            .expect("stored certificate")
+            .certificate = "not a PEM certificate".to_owned();
+
+        assert!(
+            fingerprints_for(&state, "foo.example.com").is_empty(),
+            "an override cannot bypass the PEM/X.509 validation workers require"
+        );
+    }
+
+    #[test]
+    fn a_name_the_resolver_would_refuse_is_skipped_rather_than_indexed() {
+        // `CertificateResolver::add_certificate` refuses a name longer than
+        // `MAX_HOSTNAME_LENGTH` because the trie recurses once per label.
+        // `ConfigState` enforces no such bound, so a saved state file can carry
+        // one; it must not be indexed here either, while the certificate's
+        // other names keep answering.
+        let too_long = format!("{}.example.com", "x".repeat(MAX_HOSTNAME_LENGTH));
+        let state = state_with(&[(
+            "127.0.0.1:8443",
+            &[(0xaa, &[too_long.as_str(), "ok.example.com"])],
+        )]);
+
+        assert!(
+            fingerprints_for(&state, &too_long).is_empty(),
+            "a name past MAX_HOSTNAME_LENGTH reaches no handshake and must reach no query either"
+        );
+        assert_eq!(
+            fingerprints_for(&state, "ok.example.com"),
+            vec!["aa".to_owned()],
+            "skipping one unhostable name must not hide the certificate's other names"
+        );
+    }
+}
+
+#[cfg(test)]
+mod upgrade_task_snapshot_tests {
+    use super::*;
+    use crate::command::server::{TaskRestoreTiming, TaskSnapshotTiming};
+
+    #[test]
+    fn all_request_task_variants_round_trip_without_replaying_entrypoints() {
+        let now = Instant::now();
+        let timing = TaskSnapshotTiming { now };
+        let started_at = now
+            .checked_sub(Duration::from_secs(7))
+            .expect("test clock supports seven seconds of history");
+        let (audit_verb, audit_counter) = audit_verb!("cluster_added");
+        let (inline_verb, inline_counter) = audit_verb!("metric_detail_changed");
+        let metric_detail_audit = MetricDetailAuditFields {
+            target: "metric_detail:cluster".to_owned(),
+            lease_id: "upgrade-snapshot-test".to_owned(),
+            reason: Some("round trip".to_owned()),
+        };
+
+        let tasks: Vec<(&str, Box<dyn GatheringTask>)> = vec![
+            (
+                "QueryClustersTask",
+                Box::new(QueryClustersTask {
+                    client_token: Token(11),
+                    gatherer: DefaultGatherer {
+                        ok: 1,
+                        errors: 2,
+                        responses: Vec::new(),
+                        expected_responses: 4,
+                    },
+                    main_process_response: Some(ResponseContent::default()),
+                }),
+            ),
+            (
+                "LoadStaticConfigTask",
+                Box::new(LoadStaticConfigTask {
+                    gatherer: PerEntryGatherer::default(),
+                    client_token: Some(Token(12)),
+                    reload: None,
+                    notify_ready: false,
+                }),
+            ),
+            (
+                "WorkerTask",
+                Box::new(WorkerTask {
+                    client_token: Token(13),
+                    gatherer: DefaultGatherer::default(),
+                    started_at,
+                    audit: Some(AuditEntry {
+                        kind: EventKind::ClusterAdded,
+                        verb: audit_verb,
+                        counter: audit_counter,
+                        cluster_id: Some("cluster-a".to_owned()),
+                        backend_id: None,
+                        address: None,
+                        target: "cluster:cluster-a".to_owned(),
+                        extras: AuditExtras::default(),
+                    }),
+                    inline_audit: None,
+                    metric_detail_audit: None,
+                    clear_master_metrics_on_finish: false,
+                    rollback: Some(Request::default()),
+                }),
+            ),
+            (
+                "SetMetricDetailTask",
+                Box::new(SetMetricDetailTask {
+                    client_token: Token(14),
+                    gatherer: DefaultGatherer::default(),
+                    started_at,
+                    master_configured: MetricDetail::DetailCluster,
+                    master_previous_effective: MetricDetail::DetailFrontend,
+                    inline_audit: InlineAuditTarget {
+                        kind: EventKind::MetricDetailChanged,
+                        verb: inline_verb,
+                        counter: inline_counter,
+                        target: "metric_detail:cluster".to_owned(),
+                    },
+                    metric_detail_audit: metric_detail_audit.clone(),
+                }),
+            ),
+            (
+                "QueryMetricsTask",
+                Box::new(QueryMetricsTask {
+                    client_token: Token(15),
+                    gatherer: DefaultGatherer::default(),
+                    options: QueryMetricsOptions::default(),
+                    main_process_metrics: Some(BTreeMap::new()),
+                }),
+            ),
+            (
+                "LoadStateTask",
+                Box::new(LoadStateTask {
+                    client_token: Some(Token(16)),
+                    gatherer: PerEntryGatherer::default(),
+                    path: "/tmp/state.json".to_owned(),
+                }),
+            ),
+            (
+                "StatusTask",
+                Box::new(StatusTask {
+                    client_token: Token(17),
+                    gatherer: DefaultGatherer::default(),
+                    worker_infos: HashMap::from([(
+                        3,
+                        WorkerInfo {
+                            id: 3,
+                            pid: 42,
+                            run_state: RunState::Running as i32,
+                        },
+                    )]),
+                }),
+            ),
+            (
+                "StopTask",
+                Box::new(StopTask {
+                    client_token: Some(Token(18)),
+                    gatherer: DefaultGatherer::default(),
+                    hardness: true,
+                }),
+            ),
+        ];
+
+        for (expected_kind, task) in tasks {
+            let snapshot = task.snapshot(timing).expect("task should snapshot");
+            let encoded = serde_json::to_vec(&snapshot).expect("task snapshot should serialize");
+            let decoded: TaskSnapshot =
+                serde_json::from_slice(&encoded).expect("task snapshot should deserialize");
+            let restored = decoded
+                .restore(TaskRestoreTiming {
+                    now,
+                    handoff_elapsed: Duration::ZERO,
+                })
+                .expect("task snapshot should restore");
+            assert!(
+                restored.kind().ends_with(expected_kind),
+                "expected {expected_kind}, got {}",
+                restored.kind()
+            );
+            assert_eq!(restored.client_token(), task.client_token());
+        }
+    }
+}
+
+#[cfg(test)]
+mod health_check_port_transition_tests {
+    //! A cluster that gains a health check port while its backend identity
+    //! turns from a UNIX backend into an IP backend (and the reverse) must
+    //! converge through each producer that applies requests to a live state:
+    //! `ConfigState::diff` (tested in `sozu_command_lib::state`), the static
+    //! file reload, and `LoadState`.
+
+    use super::*;
+
+    fn config_with(health_check: &str, backend: &str) -> Config {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "command_socket = \"/tmp/sozu_transition_test.sock\"\n\
+                 [clusters.app]\n\
+                 protocol = \"http\"\n\
+                 frontends = [{{ address = \"127.0.0.1:8080\", hostname = \"example.org\" }}]\n\
+                 backends = [{{ address = \"127.0.0.1:9000\", backend_id = \"app-0\"{backend} }}]\n\
+                 [clusters.app.health_check]\n\
+                 mode = \"TCP\"\n\
+                 {health_check}"
+            ),
+        )
+        .expect("write config");
+        Config::load_from_path(path.to_str().expect("utf-8 path")).expect("the config must load")
+    }
+
+    /// Dispatch `requests` the way `load_static_config` and `load_state` do:
+    /// every request goes through the deferral, then the held ones follow.
+    /// Returns the cluster and backend requests the state refused.
+    fn replay(state: &mut ConfigState, requests: Vec<Request>) -> Vec<String> {
+        let mut refused = Vec::new();
+        let mut deferral = PortConflictDeferral::default();
+        let mut apply = |state: &mut ConfigState, request: Request| {
+            if let Err(error) = state.dispatch(&request)
+                && let Some(
+                    RequestType::AddCluster(_)
+                    | RequestType::AddBackend(_)
+                    | RequestType::AddUnixBackend(_),
+                ) = &request.request_type
+            {
+                refused.push(format!("{request:?}: {error}"));
+            }
+        };
+        for request in requests {
+            if let Some(request) = deferral.admit(state, request) {
+                apply(state, request);
+            }
+        }
+        for request in deferral.into_held() {
+            apply(state, request);
+        }
+        refused
+    }
+
+    fn requests_of(config: &Config) -> Vec<Request> {
+        config
+            .generate_config_messages()
+            .expect("the config must generate its orders")
+            .into_iter()
+            .map(|message| message.content)
+            .collect()
+    }
+
+    fn assert_app_probes(state: &ConfigState, port: Option<u32>, unix: bool) {
+        let cluster = &state.clusters["app"];
+        assert_eq!(cluster.health_check.as_ref().and_then(|h| h.port), port);
+        let backends = &state.backends["app"];
+        assert_eq!(backends.len(), 1, "one backend identity: {backends:?}");
+        assert_eq!(backends[0].unix_path.is_some(), unix, "{backends:?}");
+    }
+
+    const UNIX: &str = ", unix_path = \"/run/app.sock\"";
+
+    #[test]
+    fn a_static_reload_converges_when_a_probe_port_and_a_unix_backend_swap() {
+        let unix = config_with("", UNIX);
+        let ip = config_with("port = 8081\n", "");
+        for (from, to, port, unix_after) in
+            [(&unix, &ip, Some(8081), false), (&ip, &unix, None, true)]
+        {
+            let mut state = ConfigState::new();
+            assert!(replay(&mut state, requests_of(from)).is_empty());
+            let refused = replay(&mut state, requests_of(to));
+            assert!(refused.is_empty(), "the reload was refused: {refused:?}");
+            assert_app_probes(&state, port, unix_after);
+        }
+    }
+
+    #[test]
+    fn a_load_state_converges_when_a_probe_port_and_a_unix_backend_swap() {
+        let unix = config_with("", UNIX);
+        let ip = config_with("port = 8081\n", "");
+        let saved = |config: &Config| {
+            let mut state = ConfigState::new();
+            assert!(replay(&mut state, requests_of(config)).is_empty());
+            // The bytes `SaveState` writes, parsed the way `load_state` does.
+            let mut file = tempfile::tempfile().expect("tempfile");
+            state.write_requests_to_file(&mut file).expect("save");
+            let mut bytes = Vec::new();
+            std::io::Seek::rewind(&mut file).expect("rewind");
+            std::io::Read::read_to_end(&mut file, &mut bytes).expect("read");
+            let (rest, requests) =
+                parse_several_requests::<WorkerRequest>(&bytes).expect("the file must parse");
+            assert!(rest.is_empty());
+            requests.into_iter().map(|r| r.content).collect::<Vec<_>>()
+        };
+        for (from, to, port, unix_after) in
+            [(&unix, &ip, Some(8081), false), (&ip, &unix, None, true)]
+        {
+            let mut state = ConfigState::new();
+            assert!(replay(&mut state, requests_of(from)).is_empty());
+            let refused = replay(&mut state, saved(to));
+            assert!(refused.is_empty(), "the load was refused: {refused:?}");
+            assert_app_probes(&state, port, unix_after);
+        }
+    }
+
+    /// Replaying the config of an already-valid IP backend with a probe port
+    /// neither holds nor rewrites any request: the worker receives each
+    /// `AddCluster` as generated, health check included.
+    #[test]
+    fn the_deferral_passes_an_idempotent_reload_through_untouched() {
+        let ip = config_with("port = 8081\n", "");
+        let mut state = ConfigState::new();
+        assert!(replay(&mut state, requests_of(&ip)).is_empty());
+
+        let mut deferral = PortConflictDeferral::default();
+        for request in requests_of(&ip) {
+            let admitted = deferral
+                .admit(&state, request.clone())
+                .expect("an idempotent request must not be held");
+            assert_eq!(admitted, request, "the request must not be rewritten");
+            if let Some(RequestType::AddCluster(cluster)) = &admitted.request_type {
+                assert_eq!(
+                    cluster.health_check.as_ref().and_then(|h| h.port),
+                    Some(8081),
+                    "the AddCluster must keep its health check"
+                );
+            }
+        }
+        assert!(deferral.into_held().is_empty());
+    }
+
+    /// A brand-new cluster still gets its `AddCluster` before its backends,
+    /// and a port next to a UNIX backend stays refused.
+    #[test]
+    fn the_deferral_only_holds_a_cluster_the_state_would_refuse() {
+        let fresh = config_with("port = 8081\n", "");
+        let mut state = ConfigState::new();
+        let mut deferral = PortConflictDeferral::default();
+        for request in requests_of(&fresh) {
+            assert!(deferral.admit(&state, request.clone()).is_some());
+            let _ = state.dispatch(&request);
+        }
+        assert!(deferral.into_held().is_empty());
+        assert_app_probes(&state, Some(8081), false);
+
+        let mut state = ConfigState::new();
+        assert!(replay(&mut state, requests_of(&config_with("", UNIX))).is_empty());
+        let conflicting = state.dispatch(
+            &RequestType::SetHealthCheck(sozu_command_lib::proto::command::SetHealthCheck {
+                cluster_id: "app".to_owned(),
+                config: sozu_command_lib::proto::command::HealthCheckConfig {
+                    interval: 10,
+                    timeout: 5,
+                    healthy_threshold: 3,
+                    unhealthy_threshold: 3,
+                    port: Some(8081),
+                    ..Default::default()
+                },
+            })
+            .into(),
+        );
+        assert!(conflicting.is_err(), "the state guard must stay in force");
+    }
+}

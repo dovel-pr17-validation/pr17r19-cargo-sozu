@@ -1,0 +1,466 @@
+# Architecture
+
+This part is mostly for people who want to understand how sōzu works.
+
+## Main/worker model
+
+Sōzu works with one main process and multiple worker processes. This allows it to keep running if a worker encounters an issue and crashes, and upgrading workers one by one when necessary.
+
+### Single thread, shared nothing architecture
+
+Each worker runs a single thread with an epoll based event loop. To avoid synchronization issues, every worker has a copy of the entire routing configuration. Every modification of the routing comes through configuration messages. Logging and metrics are sent by each worker individually, leaving to an external service the work of aggregating and serializing the events.
+All of the listening TCP sockets are opened with the [SO_REUSEPORT](https://lwn.net/Articles/542629/) option, allowing multiple process to listen on the same address.
+
+### Configuration
+
+External tools interact with the main process through a unix socket, and configuration change messages will be dispatched to the workers by the main.
+The configuration messages are "diffs", like "add a backend server", or "remove a HTTP frontend", instead of changing the whole configuration at once. This allows sōzu to be smarter about handling the configuration changes while under traffic.
+
+The configuration messages are transmitted in protobuf binary format, and they are defined in the [command library](https://github.com/sozu-proxy/sozu/tree/main/command). There are three possible message answers: processing (meaning the message has been received but the change is not active yet), failure or ok.
+
+The main exposes a unix socket for configuration instead of a HTTP server on localhost because unix socket access can be secured through file system permissions.
+
+## Proxying
+
+### Event loop with mio
+
+Every worker runs an event looped based on epoll (on Linux) or kqueue (on OSX and BSD), using the [mio library](https://github.com/tokio-rs/mio).
+
+Mio provides a cross platform abstraction allowing callers to receive events, like a socket becoming readable (meaning it received some data).
+
+Sōzu asks mio to send all the events of a socket in [edge triggered mode](http://man7.org/linux/man-pages/man7/epoll.7.html).
+That way, it only receives an event once, and stores it in a
+[`Readiness` struct](https://github.com/sozu-proxy/sozu/blob/main/lib/src/lib.rs).
+It will then use that information and the "interest" (indicating if the current protocol state machine wants to read or write on the socket).
+
+Each socket event is returned with a `Token` indicating its index in a `Slab` data structure. A client session can have multiple sockets (typically, a front socket and a back socket).
+
+### Protocols
+
+Each proxy implementation (HTTP, HTTPS and TCP) will use in each client session a state machine describing the protocol currently in use. It is designed to allow upgrades from one protocol to the next. As an example, you could have the following progression:
+
+- start in TLS handshake protocol
+- once the handshake is done, upgrade to the HTTP protocol over the recently negotiated TLS stream
+- upgrade to websockets
+
+Each protocol will work with the `Readiness` structure to indicate if it wants to read or write on each socket. As an example, the [rustls based handshake](https://github.com/sozu-proxy/sozu/blob/main/lib/src/protocol/rustls.rs) is only interested in the frontend socket.
+
+A fourth proxy implementation, **UDP**, load-balances datagram traffic (DNS, syslog, NTP, generic UDP). It is connectionless, so it deliberately sits outside the per-session `accept()`/state-machine model above: a single listener socket serves many virtual 4-tuple *flows*, each with its own connected upstream socket for symmetric NAT return. The flow lifecycle, the userland-conntrack flow table, teardown, and the hardening rules are walked end-to-end (with symbol citations) in [`lib/src/protocol/udp/LIFECYCLE.md`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol/udp/LIFECYCLE.md). See also [`lib/src/protocol/udp`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol/udp) and the UDP sections of [`doc/configure.md`](configure.md).
+
+They are all defined in [`lib/src/protocol`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol).
+
+### HTTP/2 and the Mux layer
+
+HTTP/2 support is implemented via a unified multiplexer (`Mux`) in `lib/src/protocol/mux/`.
+The Mux layer handles both HTTP/1.1 and HTTP/2 connections through a `Connection` enum with
+`H1` and `H2` variants, enabling any combination of frontend and backend protocols.
+
+#### Protocol combinations
+
+```
+  Client             Sōzu               Backend
+  ──────           ────────            ─────────
+   H1  ──────────▶  Mux  ──────────▶   H1        (classic)
+   H1  ──────────▶  Mux  ──────────▶   H2        (H2 backend, h2c)
+   H2  ──────────▶  Mux  ──────────▶   H1        (H2 frontend, H1 backend)
+   H2  ──────────▶  Mux  ──────────▶   H2        (end-to-end H2)
+```
+
+The frontend protocol is determined by ALPN negotiation during TLS handshake (or H2 prior
+knowledge for cleartext). The backend protocol is controlled by the `cluster.http2` protobuf
+config flag.
+
+#### Mux session structure
+
+A `MuxState` session owns one frontend `Connection` and a `Router` containing zero or more
+backend `Connection`s. All connections share a `Context` holding a `Vec<Stream>`.
+
+```
+MuxState
+├── frontend: Connection<FrontRustls>     ◄── one frontend socket
+│   ├── H1(ConnectionH1)                      (either H1 or H2)
+│   └── H2(ConnectionH2)
+│
+├── router: Router
+│   └── backends: BackendConnections       (lowest token inline, the rest in a BTreeMap)
+│       ├── Token(7)  → H1(ConnectionH1)  ◄── backend to cluster "app-1"
+│       ├── Token(12) → H2(ConnectionH2)  ◄── backend to cluster "app-2" (h2c)
+│       └── ...
+│
+├── timeouts: MuxTimeouts                 ◄── the session's timer-wheel handles
+│   ├── frontend: TimeoutContainer
+│   └── backends: InlineTokenMap<TimeoutContainer>  (lowest token inline)
+│
+└── context: Context
+    ├── streams: Vec<Stream>              ◄── shared stream pool
+    │   ├── [0] Stream { state: Linked(Token(7)),  front: Kawa, back: Kawa, ... }
+    │   ├── [1] Stream { state: Linked(Token(12)), front: Kawa, back: Kawa, ... }
+    │   ├── [2] Stream { state: Recycle, ... }
+    │   └── ...
+    ├── backend_streams: InlineTokenMap<LinkedStreams>
+    │                                     ◄── backend token → linked streams
+    │                                         (lowest token and first stream inline)
+    ├── buffers: Box<dyn BufferSource>    ◄── caller-supplied buffer source
+    │                                         (PoolBufferSource over the worker Pool)
+    └── listener: Rc<RefCell<L>>
+```
+
+#### Stream lifecycle
+
+Each `Stream` transitions through states as it processes a request/response pair:
+
+```
+             ┌──────────────────────────────────────────────────┐
+             │                                                  │
+             ▼                                                  │
+          ┌──────┐   HEADERS    ┌──────┐   connect()   ┌────────┐
+  new ──▶ │ Idle │ ──────────▶ │ Link │ ────────────▶ │ Linked  │
+          └──────┘   received   └──────┘   to backend  │(Token)  │
+             ▲                                          └────┬───┘
+             │                                               │
+             │       ┌─────────┐   response    ┌─────────┐   │ backend
+             │       │ Recycle │ ◀──────────── │end_stream│ ◀─┘ done or
+             │       └────┬────┘   complete     └─────────┘    error
+             │            │                         │
+             │ reuse      │                         │ can't retry
+             └────────────┘                         ▼
+                                              ┌──────────┐
+                                              │ Unlinked │ ──▶ error response
+                                              └──────────┘
+```
+
+- **Idle**: Stream allocated but no request yet. In H2, streams in this state can be
+  recycled from a previous request.
+- **Link**: Request headers fully parsed, waiting for the `Router` to connect to a backend.
+- **Linked(Token)**: Connected to a backend identified by `Token`. Data flows bidirectionally.
+- **Unlinked**: Backend disconnected and the request cannot be retried. A default error
+  response (502/503/504) is generated.
+- **Recycle**: Response fully sent. In H2, the stream is returned to the pool for reuse.
+  In H1, the session closes or resets for keep-alive.
+
+#### StreamParts: direction-aware borrows
+
+A `Stream` contains two Kawa buffers (`front` and `back`). The `split(&position)` method
+returns a `StreamParts` struct with direction-appropriate aliases:
+
+```
+                        Stream
+             ┌─────────────────────────┐
+             │  front: Kawa (Request)  │
+             │  back:  Kawa (Response) │
+             │  front_window: i32      │
+             │  back_window: i32       │
+             │  context: HttpContext    │
+             └────────┬────────────────┘
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+   Position::Server          Position::Client
+   (frontend conn)           (backend conn)
+          │                       │
+          ▼                       ▼
+   StreamParts {             StreamParts {
+     rbuffer: &front,          rbuffer: &back,
+     wbuffer: &back,           wbuffer: &front,
+     window: &front_window,    window: &back_window,
+     context                   context
+   }                         }
+```
+
+The frontend (Server position) reads from `front` and writes to `back`.
+The backend (Client position) reads from `back` and writes to `front`.
+This inversion is the key abstraction that lets H1 and H2 connections share streams.
+
+#### H2 connection state machine
+
+Each `ConnectionH2` runs a frame-level state machine for reading. The struct is decomposed
+into logical sub-structs for maintainability:
+
+- `H2FlowControl` — connection-level window, peer window, initial window size
+- `H2ByteAccounting` — overhead bytes, zero-window count
+- `H2DrainState` — RFC 9113 §6.8 GOAWAY/graceful-drain state machine; fields private to `h2_drain.rs`
+- `H2FloodConfig` — 14 configurable flood detection thresholds (per-listener)
+- `H2Scheduler` (`h2_scheduler.rs`) — RFC 9218 urgency + incremental tracking
+  per stream, the write-pass stream order, and the round-robin cursor
+
+For detailed internals, see [h2_mux_internals.md](./h2_mux_internals.md).
+
+The H2 state machine:
+
+```
+              ┌───────────────┐
+              │ ClientPreface │   (server waits for "PRI * HTTP/2.0..." + SETTINGS)
+              └───────┬───────┘
+                      │ preface valid
+                      ▼
+              ┌───────────────┐
+              │ServerSettings │   (server sends own SETTINGS + ACK)
+              └───────┬───────┘
+                      │ settings exchanged
+                      ▼
+     ┌──────────────────────────────────┐
+     │            Header                │ ◄──────────────────────────┐
+     │  (read 9-byte frame header)      │                            │
+     └───────────────┬──────────────────┘                            │
+                     │ parsed FrameHeader                            │
+                     ▼                                               │
+     ┌──────────────────────────────────┐                            │
+     │         Frame(header)            │   expect_header()          │
+     │  (read payload_len bytes)        │ ──────────────────────────▶│
+     └───────────────┬──────────────────┘                            │
+                     │                                               │
+          ┌──────────┼───────────┐                                   │
+          │          │           │                                    │
+          ▼          ▼           ▼                                    │
+     HEADERS      DATA      SETTINGS/PING/...                        │
+     (if end_headers=0)         │                                    │
+          │                     └────────────────────────────────────▶│
+          ▼                                                          │
+     ┌──────────────────────┐                                        │
+     │ ContinuationHeader   │  (read 9-byte continuation header)     │
+     └──────────┬───────────┘                                        │
+                │                                                    │
+                ▼                                                    │
+     ┌──────────────────────┐                                        │
+     │ ContinuationFrame    │  (accumulate header block)             │
+     └──────────┬───────────┘                                        │
+                │ end_headers=1                                      │
+                └────────────────────────────────────────────────────▶│
+                                                                     │
+     ┌──────────────────────┐                                        │
+     │       GoAway         │  (drain: send GOAWAY, close)           │
+     └──────────────────────┘                                        │
+     ┌──────────────────────┐                                        │
+     │       Error          │  (protocol error detected)             │
+     └──────────────────────┘
+```
+
+For writing, the `writable()` method delegates to `write_streams()`, a drive loop over
+`poll_write_target()` / `handle_write()` that visits all streams sorted by RFC 9218
+urgency (lower urgency = higher priority), then by stream ID for FIFO within the same
+urgency level. Each stream's Kawa blocks are converted to H2 frames via
+`H2BlockConverter`, and `write_streams()` itself performs the vectored socket write the
+core asks for. Connection-level and stream-level flow control windows limit how many
+DATA bytes can be sent per iteration.
+
+#### H2 flow control
+
+Flow control operates at two levels per RFC 9113 §6.9:
+
+```
+    ConnectionH2                          Stream
+  ┌──────────────┐                    ┌──────────────┐
+  │ window: i32  │  ◄── connection    │ front_window │  ◄── stream level,
+  │              │      level         │ back_window  │      one per leg
+  └──────┬───────┘                    └──────┬───────┘
+         │                                   │
+         │  effective window = min(connection.window, this leg's stream window)
+         │
+         ▼
+  Sending DATA: decrement both windows by bytes sent.
+  Receiving DATA: track received_bytes_since_update.
+
+  When received_bytes_since_update > initial_window_size / 2:
+    → Queue connection-level WINDOW_UPDATE
+    → Queue stream-level WINDOW_UPDATE
+    → Flush during writable() before sending DATA
+```
+
+WINDOW_UPDATE frames are coalesced per stream ID in `pending_window_updates` and flushed
+inline at the start of `writable()`, avoiding extra event loop iterations.
+
+Flow control is hop-by-hop (RFC 9113 §6.9): a stream proxied from an H2 client to an H2
+backend has one send window on each connection. `Stream::front_window` is sized by the
+client's `SETTINGS_INITIAL_WINDOW_SIZE` and moved only by the frontend connection;
+`Stream::back_window` is sized by the backend's when `ConnectionH2::start_stream` opens the
+stream there, and moved only by the backend connection. `Stream::split` and
+`Stream::send_window_mut` pick the leg from the connection's `Position`.
+
+#### H2 frame processing pipeline
+
+```
+  Socket ──read──▶ zero.storage ──parse──▶ FrameHeader ──▶ Frame
+                   (connection                              │
+                    buffer)                                  │
+                                                ┌───────────┼───────────┐
+                                                ▼           ▼           ▼
+                                             HEADERS      DATA     SETTINGS
+                                                │           │        PING
+                                                │           │       GOAWAY
+                                                ▼           ▼      WINDOW_UPDATE
+                                          ┌──────────┐ ┌────────┐
+                                          │  pkawa   │ │ stream │
+                                          │  HPACK   │ │ .front │
+                                          │  decode  │ │ .push  │
+                                          │  + kawa  │ │ _block │
+                                          │  blocks  │ └────────┘
+                                          └──────────┘
+
+  stream.back ──kawa::prepare()──▶ H2BlockConverter ──▶ HPACK encode
+                                                           │
+                                   gen_frame_header() ◄────┘
+                                          │
+                                          ▼
+                                   kawa.out ──write──▶ Socket
+```
+
+- **Inbound**: `parser.rs` (nom) decodes binary frames. `pkawa.rs` decodes HPACK headers
+  into Kawa blocks. DATA payloads are zero-copy slices into the stream's storage buffer.
+- **Outbound**: `converter.rs` (`H2BlockConverter`) encodes Kawa blocks into H2 frames.
+  HPACK encoding uses the in-tree sans-io `hpack::Encoder`. Large header blocks are automatically split
+  into HEADERS + CONTINUATION frames respecting `max_frame_size`.
+
+#### Module layout
+
+```
+lib/src/protocol/mux/
+├── mod.rs                   Mux session state (SessionState impl), shared Context,
+│                            ready() loop, backend dial and registration
+├── h1.rs                    ConnectionH1: the one active H1 stream, wired into Context
+├── h2.rs                    ConnectionH2: RFC 9113 frame dispatch, settings and
+│                            connection state, edge-trigger discipline
+├── h2_close.rs              Whether a connection may close or must keep draining
+│                            under TLS backpressure
+├── h2_control_tx.rs         Proxy-emitted RST_STREAM queue and its pending bound
+├── h2_drain.rs              RFC 9113 §6.8 double-GOAWAY drain state and transitions
+├── h2_flood_detector.rs     Flood thresholds and counters: Rapid Reset, CONTINUATION
+│                            flood, MadeYouReset, PING/SETTINGS/empty-DATA rates
+├── h2_flow_control.rs       Connection-level (stream 0) send window, receive
+│                            accounting, queued WINDOW_UPDATEs
+├── h2_header_reassembly.rs  Owned accumulator for an in-progress HEADERS +
+│                            CONTINUATION field block
+├── h2_scheduler.rs          RFC 9218 priorities: which stream writes next, and
+│                            whether it may interleave
+├── h2_stream_table.rs       Wire StreamId → GlobalStreamId map, RST dedupe,
+│                            per-stream liveness and stall caches
+├── h2_transmit.rs           Vectored gather/confirm of one stream's pending output
+├── h2_write_pass.rs         Owned state and phase of one write_streams pass
+├── hpack/                   Sans-io RFC 7541 codec: decoder, encoder, dynamic table,
+│                            Huffman state machine computed at compile time
+├── hpack_state.rs           Connection HPACK codec pair (RFC 7541) and its reusable
+│                            scratch buffers
+├── parser.rs                H2 binary frame parser (nom), wire format constants
+├── serializer.rs            H2 frame header and control-frame serializer
+│                            (cookie-factory): SETTINGS, PING, GOAWAY, RST_STREAM,
+│                            WINDOW_UPDATE
+├── converter.rs             Kawa → H2 frame converter (H2BlockConverter), HPACK
+│                            encoding, HEADERS/CONTINUATION split
+├── pkawa.rs                 H2 → Kawa converter, HPACK decoding, pseudo-header
+│                            validation, RFC 9218 priority header parsing
+├── connection.rs            Connection enum dispatching H1/H2, plus the two
+│                            Endpoint adaptors
+├── router.rs                Backend connection map, reuse strategy, and
+│                            Router::plan_connect's routing decision
+├── stream.rs                Stream / StreamState / StreamParts, the front/back kawa
+│                            pair, bidirectional end-of-stream flags, replay capture
+├── buffer_source.rs         BufferSource trait and PoolBufferSource: where the core
+│                            takes its buffers, and that a source may refuse
+├── answers.rs               Materialises a configured default answer into a stream's
+│                            kawa buffers
+├── auth.rs                  HTTP Basic auth: header extraction, SHA-256
+│                            canonicalisation, constant-time comparison
+├── shared.rs                Routines both write paths share, including the TLS
+│                            close_notify drain ordering
+└── debug.rs                 Bounded per-session event ring; a no-op without
+                             debug_assertions
+```
+
+The rows above carry no line count on purpose. A size written here is a second
+copy of a number the tree already holds, nothing compares the two, and the copy
+this block used to carry had drifted on twelve of its thirteen rows
+([#1520](https://github.com/sozu-proxy/sozu/issues/1520)). Run
+`wc -l lib/src/protocol/mux/*.rs` for the sizes at any HEAD. What that command
+cannot give you is the column to its right, so adding a module to this directory
+means adding its row here — an obligation no gate enforces either.
+
+#### Key design decisions
+
+The actively maintained on-branch reference for the mux is
+`lib/src/protocol/mux/LIFECYCLE.md`, which walks every state transition
+with symbol citations (`Type::method` plus its file). What each step of a request still costs in
+system calls and allocations is in `doc/lifetime_of_a_session.md`, and how those costs were cut in
+`doc/hot_path_zero_copy.md`.
+
+- **Bidirectional end-of-stream tracking**: Separate `front_received_end_of_stream` and
+  `back_received_end_of_stream` fields on each `Stream` prevent the frontend and backend
+  connections from interfering with each other's stream state.
+- **Shared-nothing stream pool**: Streams are stored in `Vec<Stream>` indexed by
+  `GlobalStreamId`. Each `ConnectionH2` maps its H2 stream IDs to global IDs via
+  `BTreeMap<StreamId, GlobalStreamId>`. This allows H2 frontend and H2 backend to reference
+  the same stream without shared ownership.
+- **HPACK safety**: Decode callbacks (`pkawa.rs`) use fallible `write_all()` calls and
+  validate headers per RFC 9113 §8.2 (no uppercase, no connection-specific headers,
+  pseudo-header ordering). Invalid headers trigger a stream reset, not a connection error.
+- **GoAway drain**: When a GoAway frame is received, the connection enters `draining` mode.
+  New streams are rejected, but existing streams complete normally. Streams above
+  `peer_last_stream_id` are eligible for retry on a new connection.
+- **Actively driven graceful shutdown**: During worker drain, the mux layer forces
+  H2 readable and writable passes outside the normal epoll loop so it can observe
+  final peer EOF / END_STREAM events, flush GOAWAY and TLS records, and prune
+  stale stream mappings created by incomplete HEADERS blocks.
+- **H2 backend (h2c)**: Controlled by `cluster.http2` in `command/src/command.proto`.
+  Sōzu speaks cleartext H2 to backends. The `:scheme` pseudo-header is derived from
+  the frontend listener protocol (HTTP or HTTPS), not the backend connection.
+  `cluster.http2` is a backend-capability hint only — it does NOT gate frontend H2.
+  Frontend H2 is driven by TLS ALPN negotiation on the listener (`alpn_protocols`
+  containing `"h2"`); a cluster with `http2 = false` can still serve H2 clients on
+  the frontend, with H2 → H1 conversion at the backend boundary.
+- **RFC 9218 priorities**: The `Prioriser` struct (`h2_scheduler.rs`) tracks urgency
+  (0-7) and incremental flags per stream from the `priority` header. Each write pass
+  is ordered by `H2Scheduler::begin_pass`: urgency first (lower = higher priority),
+  then stream ID, then incremental streams to the tail of their bucket, rotated by a
+  round-robin cursor so same-urgency incremental downloads interleave. Default urgency
+  is 3 per RFC 9218.
+- **Configurable flood detection**: Fourteen thresholds (per-window RST_STREAM, PING,
+  SETTINGS, empty DATA, stream-0 WINDOW_UPDATE and glitch count; the three RST_STREAM
+  lifetime floors; CONTINUATION frames, header list size, HPACK table size and header
+  fields per block; and the stream-refusal percentage) are configurable per-listener via
+  protobuf, with compile-time defaults. Exceeding any cap triggers GOAWAY(ENHANCE_YOUR_CALM);
+  the stream-refusal percentage instead refuses new streams with RST_STREAM(REFUSED_STREAM)
+  before the pre-response RST_STREAM cap.
+- **Proportional overhead distribution**: Connection-level overhead bytes (SETTINGS, PING,
+  WINDOW_UPDATE) are distributed to streams proportional to their bytes transferred, not
+  equally. This ensures accurate per-stream accounting for billing and metrics.
+- **OpenTelemetry trace propagation**: Behind the `opentelemetry` feature flag,
+  `traceparent`/`tracestate` headers are extracted during H2 stream creation and
+  propagated into access log entries for distributed tracing correlation.
+
+## Logging
+
+The [logger](https://github.com/sozu-proxy/sozu/tree/main/command/src/logging) is designed to reduce allocations and string interpolations, using Rust's formatting system. It can send logs on various backends: stdout, file, TCP, UDP, Unix sockets.
+
+The logger can be invoked through a thread local storage variable accessible from anywhere with logging macros.
+
+## Metrics
+
+[Metrics](https://github.com/sozu-proxy/sozu/tree/main/lib/src/metrics) work like the logger, accessible from anywhere with macros and TLS. We support two "drains": one that sends the metrics on the networks with a statsd compatible protocol, and one aggregating metrics locally, to be queried through the configuration socket.
+
+## Load balancing
+
+For a given cluster, Sōzu keeps a list of backends to which the connection is redirected.
+Sōzu detects broken servers and redirects traffic only to healthy ones, with several available loadbalancing algorithms:
+round robin (default), random, least_loaded, power of two, HRW and Maglev.
+The last two are consistent-hashing policies that pin each client to one
+backend: on the affinity key for UDP (the source IP, or source IP and port per
+`affinity_key`), on the client source IP (or a configured
+header or cookie) for HTTP, HTTPS and TCP. Any policy can be combined with
+shuffle sharding, which restricts each client to a shard of backends drawn
+from the HRW ranking of its key. See
+`doc/configure.md` for what each one selects and how much backend load it
+reads.
+
+## TLS
+
+Sōzu is an TLS endpoint, powered by rustls.
+It decrypts the traffic using the TLS key and certificate, and forwards it, unencrypted, to the backends.
+
+## Deep dive
+
+### Buffers
+
+Sōzu is optimised for very limited memory use.
+All traffic is (briefly) stored in a pool of fix-sized (usually 16 kB), reusable buffers.
+
+### channels
+
+They are an abstraction layer over a unix socket, making chatting with a sōzu easier.

@@ -1,0 +1,5103 @@
+# Configure Sōzu
+
+> Before a deep dive in the configuration part of the proxy, you should take a
+> look at the [getting started documentation](./getting_started.md) if you
+> haven't yet.
+
+## Configuration file
+
+> The configuration file uses the [.toml](https://github.com/toml-lang/toml)
+> format.
+
+Sōzu configuration process involves 3 major sources of parameters:
+
+- The `global` section, which sets process-wide parameters.
+- The definition of the protocols like `https`, `http`, `tcp`.
+- The clusters sections under: `[clusters]`.
+
+### Global parameters
+
+Parameters in the global section allow you to define the global settings shared
+by the main process and workers (like the log level):
+
+| parameter                     | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | possible values                           |
+| ----------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `saved_state`                 | path from which sozu tries to load its state at startup                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |                                           |
+| `automatic_state_save`        | if `saved_state` is set, persists state to it whenever a command changes routing. Defaults to `false`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `true`, `false`                           |
+| `log_level`                   | possible values are                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `debug`, `trace`, `error`, `warn`, `info` |
+| `log_target`                  | possible values are                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `stdout, tcp or udp address`              |
+| `log_colored`                 | emit ANSI colour codes on the main log stream. Only honoured when `log_target` is `stdout` (tcp / udp / file sinks ignore this flag). Defaults to `false`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `true`, `false`                           |
+| `access_logs_target`          | possible values are (if activated, sends access logs to a separate target)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `stdout`, `tcp` or `udp address`          |
+| `access_logs_format`          | wire format of access logs. Defaults to `ascii`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `ascii`, `protobuf`                       |
+| `access_logs_colored`         | emit ANSI colour codes on access logs. Only honoured when the access-log target is `stdout`. If unset, inherits `log_colored`. Defaults to `false`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `true`, `false`                           |
+| `command_socket`              | path to the unix socket command                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |                                           |
+| `command_socket_mode`         | permission bits of the command socket, as an octal string: `"0660"` or `"660"`, at most `"0777"`. Setuid, setgid and sticky bits, non-octal digits, and a mode without owner read and write (such as `"0066"`, which would lock out the proxy's own user) are rejected at config load (`ConfigError::InvalidCommandSocketMode`); a TOML integer fails earlier, as a TOML type error (`ConfigError::DeserializeToml`). Defaults to `"0600"`, the proxy's own user only. Connecting requires write permission, so a group needs `rw` (`0660`). A client that can connect to the command socket can drive the proxy (routes, certificates, shutdown, upgrade): `0660` with a dedicated group limits that to chosen users, `0666` opens it to every local account. Sōzu sets the mode only; give the socket its group outside Sōzu, with a setgid parent directory or `chgrp` after each start. When `command_allowed_uids` is set, it must also list the added users. The added user also needs search (`x`) permission on every parent directory of the socket. Its `sozu` client loads the whole `-c` configuration, including every TLS certificate and key path, and fails on an unreadable one before touching the socket: give that user a minimal configuration holding only `command_socket` (plus `command_buffer_size` / `max_command_buffer_size` when not default) pointing at the same socket. Applied once, when `sozu start` binds the socket: a main upgrade and a configuration reload keep the socket and its mode, so a change takes effect at the next restart. | `"0660"` |
+| `command_buffer_size`         | initial size, in bytes, of a command channel's two buffers, and the size a grown one shrinks back to. Must not exceed `max_command_buffer_size`; config load is rejected otherwise (`ConfigError::CommandBufferSizeExceedsMax`, sozu-proxy/sozu#1416). It sizes the supervisor↔worker channels and `sozu ctl`'s end of the command socket, but **not** the main process's end: `CommandHub::register_client` passes `CLIENT_CHANNEL_INITIAL_BUFFER_SIZE` (4096 bytes) instead, which no key configures — see `doc/configure_admin_ops.md` §5.2. Only `max_command_buffer_size` applies there, and below 4096 it clamps: `Channel::new` starts the channel at that ceiling, with a warning, never above. Defaults to `1000000`              |                                           |
+| `max_command_buffer_size`     | ceiling every command channel buffer may grow to by doubling, **and** the bound a peer-declared message length is rejected against. Unlike the row above, it applies to all three channel kinds — the main process's command-socket client channels included. Defaults to `2000000`. Also the size of the buffer `sozu state load` and the boot-time `saved_state` load parse records with (never below 200 kB), so it bounds the largest saved record, an HTTPS listener with its client CA and CRL contents included.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
+| `worker_count`                | number of workers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |                                           |
+| `worker_automatic_restart`    | if activated, workers that panicked or crashed are restarted (activated by default)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
+| `worker_timeout`              | maximum time (in seconds) the main process waits for a worker reply before marking it `NotAnswering`. Defaults to `10`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | seconds                                   |
+| `disable_cluster_metrics`     | if `true`, per-cluster metrics are not registered. Defaults to `false` (cluster metrics enabled)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | `true`, `false`                           |
+| `handle_process_affinity`     | bind workers to cpu cores.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |                                           |
+| `max_connections`             | maximum number of simultaneous / opened connections                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
+| `max_buffers`                 | maximum number of buffers use to proxying. It is also the real bound on the stale-upstream replay captures: a capture lives only on a request stream and `Stream::new` performs exactly two `BufferSource::checkout` calls, each served by the worker's `Pool`, so at most `(max_buffers / 2) * buffer_size` bytes of captured request exist at once, on the global allocator, where no buffer accounting sees them. At the defaults (1000, 16393) that is ~8.2 MB carried; the obvious `max_connections * buffer_size` estimate gives ~160 MB, wrong by 20x. A worker-wide ceiling of 512 armed captures makes that heap a constant instead, ~16.8 MB allocated at worst, however high this value is raised. See "Capture budget"                                                    |                                           |
+| `min_buffers`                 | minimum number of buffers preallocated for proxying                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
+| `buffer_size`                 | size, in bytes, of requests buffer used by the workers. Must be at least 16393 for HTTP/2 (16384 max frame size + 9 byte frame header)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |                                           |
+| `slab_entries_per_connection` | how many slab entries each `max_connections` reserves. Defaults to 4 (1 frontend + up to 3 backend H2 connections). Raise for fan-out topologies that exceed 4 backends per session; clamped to [2, 32]. Slab capacity is `10 + slab_entries_per_connection * max_connections`.                                                                                                                                                                                                                                                                                                                                                                                                                                                            | integer 2-32                              |
+| `splice_pipe_capacity_bytes`  | requested kernel-pipe capacity, in bytes, per `splice(2)` direction on `Protocol::TCP` listeners (Linux only, requires the `splice` cargo feature). Omitted or `None` keeps the kernel default of 64 KiB. Applied via `fcntl(F_SETPIPE_SZ)` per pipe at session start; the kernel rounds up to a page boundary and clamps at `/proc/sys/fs/pipe-max-size` (default 1 MiB unprivileged; CAP_SYS_RESOURCE goes higher). The realised capacity is read back via `fcntl(F_GETPIPE_SZ)` and used as the per-call `len` for `splice_in`. Larger values amortise syscalls and reduce wakeups for bulk-transfer workloads at the cost of per-session pinned memory; raise `/proc/sys/fs/pipe-max-size` first if you want above 1 MiB without root. | integer (bytes), e.g. `262144`            |
+| `command_allowed_uids`        | optional allowlist of POSIX UIDs permitted to invoke command-socket requests (PR #1209). Omitted or `None` lets every process the socket mode admits (`command_socket_mode`: the same UID by default, plus the socket's group or every account with a wider mode) send any request. When set, every request from a UID outside the list is rejected, reads included — e.g. `[<operator_uid>]` even when other same-UID daemons coexist (CI runners, monitoring scrapers). Rejected requests still appear in the audit trail.                                                                                                                                                                                                                                                                                                                                                          | TOML array of integers, e.g. `[1000]`     |
+| `ctl_command_timeout`         | maximum time the command line will wait for a command to complete, `0` disables it; a soft `shutdown` ignores it and waits for the drain                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |                                           |
+| `pid_file_path`               | stores the pid in a specific file location                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |                                           |
+| `front_timeout`               | maximum time of inactivity for a front socket (seconds). Defaults to `60`. On an HTTP/1.1 frontend it also bounds a request's whole backend connection failover; see "Backend connection failover"                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |                                           |
+| `back_timeout`                | maximum time of inactivity for a backend socket (seconds). Defaults to `30`. Can be overridden per listener.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | seconds                                   |
+| `connect_timeout`             | maximum time to establish a backend connection (seconds). Defaults to `3`; on expiry an HTTP request fails over to another backend while `max_connection_attempts` lasts, a TCP session is closed |                                           |
+| `max_connection_attempts`     | how many backend connections a request may try, the first included, before it is answered `503` (HTTP) or closed (TCP). A failed connection — refused, timed out on `connect_timeout`, or reporting a socket error — is counted against its backend and the request goes to another backend while attempts remain. Defaults to `5` (the hard-coded `CONN_RETRIES` of earlier versions allowed `3`). Must lie in `1`-`255`; a value outside it is rejected at config-load time. Each cluster may override it, and `sozu connection-attempts set` changes it on running workers. See "Backend connection failover". | integer (1-255, default 5)                |
+| `accept_queue_timeout`        | maximum time (in seconds) a TCP connection stays in sozu's accept queue before being dropped. Defaults to `60`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | seconds                                   |
+| `request_timeout`             | maximum time of inactivity for a request                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |                                           |
+| `zombie_check_interval`       | duration between checks for zombie sessions                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |                                           |
+| `evict_on_queue_full`         | evict the least-recently-active sessions when `max_connections` is reached, making room for new accepts. Defaults to `false`: during a DDoS the existing connections are more likely to be legitimate clients than the queued ones, so refusing new accepts is the safer mitigation. Enable when overload is dominated by normal traffic spikes. Triggers a config-load `warn!` when `max_connections < 100` because the 1% eviction batch clamps to 1 (so the per-round share grows).                                                                                                                                                                                                                                                     | `true`, `false` (default: `false`)        |
+| `activate_listeners`          | automatically start listeners                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |                                           |
+| `max_connections_per_ip`      | global default per-(cluster, source-IP) connection limit. `0` disables the feature (default). The source IP is taken from the parsed PROXY-protocol header when present, else `peer_addr`. A PROXY-v2 header carrying the `LOCAL` command (ver/cmd `0x20`) describes a connection the upstream proxy originated itself, so its address block is discarded per the HAProxy PROXY protocol specification §2.2 — a `LOCAL` header may legally carry a populated address block, and honouring it would let any peer choose the counter it is charged against. A TCP listener then charges the connection to `peer_addr`; an HTTP or HTTPS listener with `expect_proxy = true` closes the session at the expect upgrade instead (`HttpSession::upgrade_expect` in `lib/src/http.rs`, `HttpsSession::upgrade_expect` in `lib/src/https.rs`), so it never reaches a counter at all — which was already the outcome for the `AF_UNSPEC` block HAProxy actually emits, so only a forged populated block changes behaviour. HTTP/HTTPS clients hitting the limit receive `429 Too Many Requests`; TCP clients see a graceful FIN. Each cluster may override via its own `max_connections_per_ip` field (`None` inherits, `Some(0)` is explicit unlimited, `Some(n > 0)` overrides). Counters are kept per `(cluster_id, source_ip)`, so two clusters never share a counter. This global default does not apply to UDP listeners; only a cluster's own `max_connections_per_ip` limits UDP flows (see "UDP clusters").                                                                                                                                                                                                 | integer (0 = unlimited)                   |
+| `retry_after`                 | global default `Retry-After` header value (seconds) for HTTP 429 responses. `0` omits the header — `Retry-After: 0` invites an immediate retry that defeats the limit. Each cluster may override. TCP listeners ignore this value (no HTTP envelope).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | integer (0 = omit)                        |
+| `max_connections_per_subnet`  | global default per-(cluster, source-SUBNET) connection limit. `0` disables the feature (default), which leaves the per-IP behaviour above strictly unchanged. This is a **second, independent** counter standing beside `max_connections_per_ip`, not a replacement for it: the per-IP cap serves the API-gateway case (one abusive client on one address), the per-subnet cap serves the denial-of-service case, where an attacker holding a routed prefix — an ordinary residential IPv6 `/64` — defeats a per-address counter outright by taking a fresh address for every connection ([#1270](https://github.com/sozu-proxy/sozu/issues/1270)). Both gates are consulted and **both must admit**, so `max_connections_per_ip = 10` together with `max_connections_per_subnet = 100` expresses "10 per IP **and** 100 per subnet". Source IP selection, cluster overrides, and reject behaviour (429 for HTTP/HTTPS, graceful FIN for TCP) are identical to the per-IP cap. Counters are kept per `(cluster_id, masked_source_ip)`, so two clusters never share a counter. As for the per-IP cap, this global default does not apply to UDP listeners. | integer (0 = unlimited)                   |
+| `subnet_ipv4_prefix`          | IPv4 prefix length, in bits, that defines a "subnet" for `max_connections_per_subnet`. Valid range `0`-`32`; a value outside it is **rejected at config-load time**, never silently clamped. Defaults to `32`, which masks nothing — so enabling only `max_connections_per_subnet` yields a per-address counter rather than a surprising aggregation. **`24` is the recommended starting point** for a public-facing listener. Boot-time only: changing a mask would re-key every live counter, so it takes a restart and there is no runtime setter for it. | integer (0-32, default 32)                |
+| `subnet_ipv6_prefix`          | IPv6 prefix length, in bits, for the same counter. Valid range `0`-`128`, rejected outside it. Defaults to `128`, which masks nothing. **`56` is the recommended starting point** — it is what the reporter of [#1270](https://github.com/sozu-proxy/sozu/issues/1270) recommends in the equivalent Caddy module's documentation, and it groups a residential allocation without merging unrelated subscribers the way a shorter prefix would. An IPv4-mapped IPv6 source (`::ffff:a.b.c.d`, what a dual-stack `[::]` listener reports for an IPv4 client) is canonicalised to its IPv4 form **first** and masked with `subnet_ipv4_prefix` instead, so IPv4 clients are not all collapsed into a single `::/56` bucket. Boot-time only, as above. | integer (0-128, default 128)              |
+
+_Example:_
+
+```toml
+command_socket = "./command_folder/sock"
+saved_state = "./state.json"
+log_level = "info"
+log_target = "stdout"
+command_buffer_size = 16384
+worker_count = 2
+handle_process_affinity = false
+max_connections = 500
+max_buffers = 500
+buffer_size = 16393
+activate_listeners = true
+```
+
+#### Privacy note on logs and retention
+
+`log_target` at `debug`/`trace` emits per-connection context on every protocol
+log line, including:
+
+- peer IP (client source address)
+- SNI (TLS hostname the client requested) on TLS listeners
+- a per-session ULID generated at connection accept
+- mio frontend token and cluster/backend identifiers
+
+Each of these is an identifier under most data-protection regimes (GDPR, CNIL
+guidance on proxy logs). Keep production workers at `log_level = "info"` or
+tighter unless debugging; access logs (`access_logs_target`) carry the same
+fields in a shape meant for long-term retention and should be the durable store.
+
+Retention of the live log stream depends on the sink:
+
+- `stdout`: inherited from the surrounding process supervisor (journald, the
+  init system, the container runtime). On Clever Cloud ADCs the journald cap is
+  size-bounded at ~4 GB — time coverage varies with traffic.
+- `tcp://` / `udp://`: forwarded to the remote collector; retention becomes the
+  collector's responsibility. Confirm DPA coverage before routing logs to a
+  third party.
+
+If logs egress beyond Clever Cloud infrastructure, the per-session ULID plus
+peer IP plus SNI combination is a durable cross-system correlator — treat it
+accordingly in your privacy impact assessment.
+
+### Listeners
+
+The _listener_ section describes a set of listening sockets accepting client
+connections. You can define as many listeners as you want. They follow the
+format:
+
+_General parameters:_
+
+```toml
+[[listeners]]
+# possible values are http, https, tcp or udp
+protocol = "http"
+# listening address
+address = "0.0.0.0:8080"
+# address = "[::]:8080"
+
+# specify a different IP than the one the socket sees, for logs and forwarded headers
+# public_address = "1.2.3.4:80
+
+# Configures the client socket to receive a PROXY protocol header
+# (TCP listeners only — not supported on UDP listeners)
+# expect_proxy = false
+```
+
+#### Binding a listener to a network interface
+
+`interface` binds the listening socket to one network interface
+(`SO_BINDTODEVICE`), for an interface whose address is not known ahead or not
+stable, such as a WireGuard `wg0`: listen on the wildcard address and let the
+interface select the traffic.
+
+```toml
+[[listeners]]
+protocol = "https"
+address = "0.0.0.0:443"
+interface = "wg0"
+```
+
+- Available on `http`, `https`, `tcp` and `udp` listeners. **Linux only**: on
+  any other platform the key is refused when the configuration is loaded, never
+  ignored. The name must be a valid interface name (at most 15 bytes, no `/`,
+  `:`, `%` or whitespace).
+- The interface must exist when the listener is activated. Binding a socket to
+  an interface needs the `CAP_NET_RAW` capability on Linux kernels before 5.7;
+  from 5.7 on, an unprivileged process may do it. Activation fails with an error
+  naming the listener address and the interface otherwise. The systemd units in
+  `os-build/systemd/` run Sōzu as root without a capability bounding set, so
+  they need nothing more; a unit that drops privileges (`User=`,
+  `CapabilityBoundingSet=`, `AmbientCapabilities=`) on a kernel before 5.7 must
+  keep `CAP_NET_RAW` in both sets.
+- A definitive runtime refusal of an activation restores an inactive listener
+  in both main-process and worker configuration state, and the activation can
+  be retried after correcting the bind failure. A fan-out timeout is
+  indeterminate: when no acknowledgement arrived the main process restores its
+  inactive flag, but a worker may still complete the bind and answer late.
+  Restart or reconcile the workers before retrying after such a timeout.
+- The interface is part of the listener identity: two listeners may share an
+  `address` when their interfaces differ (`0.0.0.0:443` on `wg0` and on
+  `eth1`), and a listener without `interface` is the one it always was. On the
+  command line, `sozu listener <protocol> add|remove|activate|deactivate` take
+  `--interface`, and `sozu listener list` shows it; state files and the
+  `ListListeners` answer key such a listener `<address>%<interface>`.
+- Frontends and certificates name their listener by `address` alone, so they
+  apply to every listener of their protocol sharing that address, including one
+  added later: a listener added next to one already on its address (with
+  `sozu listener <protocol> add --interface` or a configuration reload) takes
+  over that listener's frontends and certificates when it is created. In the
+  configuration file, listeners sharing an address must use the same protocol,
+  because a file frontend finds its listener's protocol from its address.
+  Per-interface routing is not supported.
+- Removing the last listener on an address does not remove its frontends or TLS
+  certificates from the configuration state. Adding a listener for that
+  protocol and address again restores those retained objects before the add is
+  acknowledged. If restoration fails, the worker discards only the new
+  listener and reports the add as failed; existing listeners are left intact.
+- `interface` cannot be patched with `sozu listener <protocol> update`: moving a
+  listener to another interface means removing it and adding it again. An update
+  names its listener by address, and is refused when several listeners share
+  that address.
+- The binding survives a worker or main-process upgrade: the socket is handed
+  over with its interface.
+- **Upgrade the main process and every worker before adding a listener with
+  `interface`.** A Sōzu that predates the key ignores it: an older worker would
+  bind such a listener on every interface, and would activate, deactivate or
+  remove listeners by address alone. Downgrading is not supported while a
+  listener names an interface: an older Sōzu cannot read the
+  `<address>%<interface>` key in a saved state or an upgrade hand-off.
+
+#### Options specific to HTTP and HTTPS listeners
+
+Since version 1.0.0, Sōzu allows custom HTTP answers defined for HTTP and HTTPS
+listeners.
+
+These answers are customizable:
+
+- 301 Moved Permanently
+- 400 Bad Request
+- 401 Unauthorized
+- 404 Not Found
+- 408 Request Timeout
+- 413 Payload Too Large
+- 502 Bad Gateway
+- 503 Service Unavailable
+- 504 Gateway Timeout
+- 507 Insufficient Storage
+
+These answers are to be provided in plain text files of whichever extension (we
+recommend `.http` for clarity) and may look like this:
+
+```html
+HTTP/1.1 404 Not Found Cache-Control: no-cache Connection: close Sozu-Id:
+%REQUEST_ID
+
+<style>
+  pre {
+    background: #eee;
+    padding: 10px;
+    border: 1px solid #aaa;
+    border-radius: 5px;
+  }
+</style>
+<h1>404 Not Found</h1>
+
+<p>
+  insert your custom text here, in fact, all HTML is changeable, including the
+  CSS.
+</p>
+
+<pre>
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+}
+</pre>
+<footer>This is an automatic answer by Sozu.</footer>
+",
+```
+
+There are a number of available template variables, like `REQUEST_ID` or
+`CLUSTER_ID`, that will be replaced by the proxying logic when producing the
+error.
+
+To create your own custom HTTP answers, we highly suggest you first copy the
+default answers present in `lib/src/protocol/kawa_h1/answers.rs`, and then
+change them to your liking. Feel free to remove the `\r` newlines of the default
+strings for clarity. Sōzu will parse your file and replace whatever newline
+symbol(s) you use.
+
+Then, for each listener, provide the absolute paths of each custom answer.
+
+```toml
+# a 404 response is sent when sozu does not know about the requested domain or path
+answer_404 = "/path/to/my-404-answer.http"
+# a 503 response is sent if there are no backend servers available
+answer_503 = "/path/to/my-503-answer.http"
+# answer_507 = ...
+```
+
+Runtime cluster additions can also carry per-cluster answer templates. Sōzu
+parses those templates in the main process before it records an `AddCluster`:
+an invalid initial addition, upsert or state replay is refused without changing
+the prior cluster state or the answer already serving traffic. When both forms
+provide status 503, the `answers["503"]` map entry overrides the legacy
+`answer_503` field, matching the HTTP and HTTPS worker registries. This
+pre-dispatch check prevents new invalid state; it does not automatically repair
+a malformed cluster entry persisted by an older Sōzu version.
+
+If a frontend has a `sticky_session`, the sticky name is defined at the listener
+level.
+
+```toml
+# defines the sticky session cookie's name, if `sticky_session` is activated format
+# a cluster. Defaults to "SOZUBALANCEID"
+sticky_name = "SOZUBALANCEID"
+```
+
+#### Options specific to HTTPS listeners
+
+> **Crypto provider**: The cryptographic backend used by Rustls is a
+> compile-time choice (feature flags `crypto-ring`, `crypto-aws-lc-rs`,
+> `crypto-openssl`, `fips`). It cannot be changed at runtime. See
+> [Getting started — Choosing a crypto provider](./getting_started.md#choosing-a-crypto-provider)
+> for build instructions.
+
+```toml
+# supported TLS versions. Possible values are "SSL_V2", "SSL_V3",
+# "TLS_V12", "TLS_V13". Defaults to "TLS_V12" and "TLS_V13"
+tls_versions = ["TLS_V12", "TLS_V13"]
+```
+
+#### HSTS — HTTP Strict Transport Security (RFC 6797)
+
+HSTS = HTTP Strict Transport Security ([RFC 6797](https://datatracker.ietf.org/doc/html/rfc6797)). When configured on an HTTPS listener or frontend, Sōzu emits the `Strict-Transport-Security` response header so conformant browsers refuse to talk to the host over plaintext HTTP for the configured `max-age` duration.
+
+A `[hsts]` block under an HTTPS listener is the operator-default; per-frontend overrides live under `[clusters.<id>.frontends.hsts]`. Per-frontend `enabled = true` overrides the listener default; per-frontend `enabled = false` explicitly suppresses an inherited listener default for that frontend.
+
+Per RFC 6797 §7.2 the `Strict-Transport-Security` header MUST NOT appear on plaintext-HTTP responses. Sōzu enforces this in three layers: (1) TOML config-load rejects `[hsts]` on a plain-HTTP listener (`ConfigError::HstsOnPlainHttp`), (2) the worker IPC entry rejects `AddHttpFrontend` carrying an enabled HSTS (`ProxyError::HstsOnPlainHttp` and the `http.hsts.suppressed_plaintext` counter), and (3) the runtime per-stream snapshot copy is gated on `context.protocol == Protocol::HTTPS` so plaintext connections never apply HSTS edits even when one slips through.
+
+##### Is the `[hsts]` block required?
+
+**No** — it is optional everywhere. Omitting the block on every listener and every frontend is a fully valid configuration: no `Strict-Transport-Security` header is ever emitted.
+
+| Surface                                                       | Required? | Notes                                                                                                                       |
+|---------------------------------------------------------------|-----------|-----------------------------------------------------------------------------------------------------------------------------|
+| `[hsts]` under a plain-HTTP listener / frontend               | **N/A**   | The field does not exist on the HTTP listener proto. Setting it on an HTTP frontend is rejected at config-load (RFC §7.2).  |
+| `[hsts]` under an HTTPS listener (operator default)           | Optional  | Omit the block and no listener-default HSTS is set. HTTPS frontends without their own block then carry no HSTS.             |
+| `[hsts]` under a per-frontend section                         | Optional  | Omit and the frontend inherits the listener default (or nothing if the listener has none).                                  |
+| `[hsts]` is **not** a cluster-level field                     | **N/A**   | HSTS lives on frontends (Caddy / Traefik shape), not on clusters.                                                           |
+| `UpdateHttpsListenerConfig.hsts` (hot-reconfig partial patch) | Optional  | Absent in the patch preserves the current listener HSTS value. Present = full-object replacement (see below).               |
+
+The only **conditional** required-field rule is inside the block itself: when the `[hsts]` block is present (TOML or partial-update patch), the `enabled` field must also be present. This disambiguates three otherwise-conflated semantics:
+
+| TOML / patch shape                          | Meaning                                                                                |
+|---------------------------------------------|----------------------------------------------------------------------------------------|
+| Block omitted                               | Inherit listener default (or no HSTS if the listener has none).                        |
+| `[hsts]` with `enabled = true`              | Explicitly enable HSTS at this scope. `max_age` defaults to `31_536_000` if omitted.   |
+| `[hsts]` with `enabled = false`             | Explicitly disable HSTS at this scope, suppressing any inherited listener default.     |
+| `[hsts]` without `enabled`                  | **Error** — `ConfigError::HstsEnabledRequired` (TOML); on a partial update, `StateError::InvalidValue` in the main process and `ListenerError::HstsEnabledRequired` on a worker. |
+
+A minimal HTTPS deployment with no HSTS is therefore just:
+
+```toml
+[[listeners]]
+protocol = "https"
+address  = "0.0.0.0:443"
+# no [hsts] block — fine
+
+[[clusters.api.frontends]]
+address  = "0.0.0.0:443"
+hostname = "api.example.com"
+# no [hsts] block — fine
+```
+
+```toml
+# Listener-level default — every HTTPS frontend on this listener
+# inherits unless it declares its own [hsts] block. The `[hsts]`
+# table nests under the enclosing `[[listeners]]` entry.
+[[listeners]]
+protocol = "https"
+address  = "0.0.0.0:443"
+
+[hsts]
+# REQUIRED whenever the [hsts] block is present. `false` is the
+# explicit-disable signal on a partial-update; new TOML deployments
+# will normally set `true`.
+enabled = true
+# `Strict-Transport-Security: max-age=<seconds>`. When omitted with
+# `enabled = true`, sozu substitutes 31_536_000 seconds (1 year — the
+# Chrome HSTS preload list minimum) at config-load.
+max_age = 31536000
+# Append `; includeSubDomains` to the rendered header.
+include_subdomains = true
+# Append `; preload` to the rendered header. Opt-in only — once
+# submitted to https://hstspreload.org/, removal is slow and partial
+# (RFC 6797 §14.2). NEVER default-true.
+preload = false
+```
+
+Per-frontend override or explicit disable:
+
+```toml
+[[clusters.api.frontends]]
+address  = "0.0.0.0:443"
+hostname = "api.example.com"
+
+# Override the listener default with a longer 2-year max-age and
+# opt the host into the preload list.
+[clusters.api.frontends.hsts]
+enabled            = true
+max_age            = 63072000
+include_subdomains = true
+preload            = true
+
+# Suppress the inherited listener default for a legacy frontend that
+# cannot commit to HSTS yet:
+[[clusters.legacy.frontends]]
+address  = "0.0.0.0:443"
+hostname = "legacy.example.com"
+
+[clusters.legacy.frontends.hsts]
+enabled = false
+```
+
+##### Validation matrix
+
+| Configuration                                                 | Outcome                                                                                                                                                  |
+|---------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `[hsts]` block without `enabled`                              | **Error** `HstsEnabledRequired` at config-load. `enabled` is the explicit-disambiguator between disable / enable on partial updates.                     |
+| `[hsts]` on a plain-HTTP listener or frontend                 | **Error** `HstsOnPlainHttp` at config-load (and `ProxyError::HstsOnPlainHttp` if it slipped through to the worker). RFC 6797 §7.2.                       |
+| `enabled = true`, `max_age` omitted                           | Substituted to `DEFAULT_HSTS_MAX_AGE = 31_536_000` (1 year). Matches the HSTS preload list minimum.                                                      |
+| `max_age = 0`                                                 | **Allowed silently** — RFC 6797 §11.4 kill switch. Conformant UAs stop treating the host as a Known HSTS Host.                                           |
+| `0 < max_age < 86_400`                                        | **Warning** at config-load (likely misconfiguration — sub-day HSTS only makes sense for testing).                                                        |
+| `preload = true` with `max_age < 31_536_000`                  | **Warning** at config-load. The Chrome HSTS preload list rejects hosts below the minimum.                                                                |
+| `preload = true` without `include_subdomains = true`          | **Warning** at config-load. Same preload-list rejection.                                                                                                 |
+| Backend emits its own `Strict-Transport-Security`             | Pass-through unchanged by default. Sōzu's HSTS edit uses `HeaderEditMode::SetIfAbsent` so a single header reaches the wire (RFC 6797 §6.1). Set `force_replace_backend = true` to override the backend value with sōzu's typed policy (`HeaderEditMode::Set` — delete-then-insert).  |
+| HTTPS-served default answer (3xx redirect, 401, 503)          | Carries the HSTS header per RFC 6797 §8.1. The per-stream snapshot copy fires before the early returns in `mux/router.rs`, gated on `Protocol::HTTPS`.    |
+
+##### Runtime CLI surface
+
+Per-frontend override (replaces the listener default for one frontend):
+
+```
+sozu frontend https add \
+  --address 0.0.0.0:443 \
+  --hostname api.example.com \
+  --hsts-max-age 31536000 \
+  --hsts-include-subdomains
+```
+
+Listener-default patch (replaces the policy for every frontend that inherits from the listener):
+
+```
+sozu listener https update \
+  -a 0.0.0.0:443 \
+  --hsts-max-age 31536000 \
+  --hsts-include-subdomains
+```
+
+Both surfaces share the same flag set: `--hsts-max-age`, `--hsts-include-subdomains`, `--hsts-preload`, `--hsts-force-replace-backend`, and the kill-switch `--hsts-disabled`. The latter is mutually exclusive with the four enabling flags on either path; combining them surfaces `CtlError::ArgsNeeded` from the shared `build_hsts_from_cli` helper rather than a silent pick.
+
+##### Hot-reconfig partial-update
+
+`UpdateHttpsListenerConfig.hsts` follows full-object replacement semantics: when present in the patch, the entire HSTS block replaces the listener's current value. `enabled` is REQUIRED whenever `hsts` is present: the main process refuses an `enabled = None` block with `StateError::InvalidValue` before it reaches the workers, which refuse it with `ListenerError::HstsEnabledRequired`, and the whole patch is refused, its other fields included. Absent `hsts` field on the patch preserves the current value. The main process records the replacement in its state as the workers apply it, so `SaveState`, `ListListeners` and the state replayed to a restarted or upgraded worker carry the patched policy. The CLI surface above (`sozu listener https update --hsts-*`) feeds this same partial-update message; supplying any `--hsts-*` flag on the command line replaces the listener's HSTS policy and supplying `--hsts-disabled` substitutes the explicit-disable block (`enabled = Some(false)`).
+
+**Inheriting frontends are refreshed automatically.** Patching the listener-default HSTS reflows the new policy onto every existing frontend that inherited from the listener (i.e. has no per-frontend `[hsts]` block at add time). `Router::refresh_inheriting_hsts` walks the routing trie via two paths:
+
+1. Existing `Route::Frontend` entries with `inherits_listener_hsts == true` have their `headers_response` rebuilt — any prior `Strict-Transport-Security` entry is stripped and a freshly rendered one appended.
+2. Lightweight `Route::ClusterId` and `Route::Deny` entries — the routing fast path stores frontends without per-frontend policy fields (no redirect, no rewrite, no headers, no auth, no HSTS) under these compact variants, NOT as `Route::Frontend` — are **promoted in place** to a minimal `Route::Frontend` carrying just the HSTS edit on `headers_response`. The promoted entry is marked `inherits_listener_hsts = true` so subsequent patches refresh it through path 1. Routing semantics are preserved (the promoted Frontend forwards / denies identically to the original variant). When the new policy resolves to "no HSTS" (None / disabled) the lightweight routes are left untouched — no allocation is created just to hold an empty edit.
+
+A frontend counts as inheriting when it declared no per-frontend `hsts` block, whether or not the listener had a default when it was added: a policy-carrying frontend added before any listener default is set still receives the default a later patch enables. The same resolution applies when a listener is added on an address another listener already serves (on another `interface`): it copies that listener's frontends, and each inheriting frontend takes the new listener's own default, so every listener on the address emits its own HSTS header.
+
+Per-frontend explicit overrides (`inherits_listener_hsts == false` on path 1) are never touched. The `http.hsts.listener_default_patched` counter fires once per patch and `http.hsts.frontend_refreshed` increments per refreshed frontend (path 1 + path 2 promotions combined), so dashboards can correlate the rate of patches with the size of the affected fleet.
+
+Path 2 was added after the initial HSTS rollout to fix a silent skip that affected fleets where most frontends are added without per-frontend policy fields (e.g. Clever Cloud `cleverapps.io` shared, where 91 k+ frontends were stored as `Route::ClusterId` and never received the listener-default HSTS edit).
+
+##### Metrics
+
+| Metric                              | Kind    | Emitted when                                                                                       |
+|-------------------------------------|---------|----------------------------------------------------------------------------------------------------|
+| `http.hsts.frontend_added`          | counter | A frontend is added with `hsts.enabled = true` and the HSTS edit is materialised in `headers_response`. |
+| `http.hsts.suppressed_plaintext`    | counter | An `AddHttpFrontend` IPC was rejected because it carried an enabled HSTS policy (RFC 6797 §7.2 defense in depth). |
+| `http.hsts.unrendered`              | counter | Defense-in-depth: a frontend reached `Frontend::new` with `hsts.enabled = true` but `render_hsts` returned `None` (max_age missing). The TOML loader and the CLI helper both substitute `DEFAULT_HSTS_MAX_AGE` so this counter only fires when a programmatic IPC sender ships an ill-formed `HstsConfig`. |
+| `http.hsts.listener_default_patched`| counter | A `UpdateHttpsListenerConfig.hsts` patch was applied. Fires once per patch. |
+| `http.hsts.frontend_refreshed`      | counter | An inheriting frontend was refreshed during a listener-default HSTS patch (one increment per refreshed entry). Sum across a patch interval = number of frontends touched by that patch. |
+
+#### mTLS — client certificate authentication
+
+Mutual TLS makes the client prove its identity during the handshake, on top of the server certificate Sōzu already presents. When enabled on an HTTPS listener, Sōzu sends a TLS `CertificateRequest` and validates the certificate the client returns against a listener-scoped bundle of trusted CAs, optionally consulting certificate revocation lists (CRLs).
+
+Three keys drive it, all under an `[[listeners]]` entry with `protocol = "https"`:
+
+```toml
+[[listeners]]
+protocol = "https"
+address  = "0.0.0.0:443"
+
+# "none" (default) | "optional" | "required"
+client_auth = "required"
+
+# Filesystem paths to PEM-encoded CA certificates a client certificate must
+# chain to. Required whenever client_auth is not "none". Each file may hold a
+# concatenated PEM chain; several files may be listed.
+client_ca_certificates = ["/etc/sozu/client-ca.pem"]
+
+# Optional: filesystem paths to PEM-encoded CRLs. When present, revocation is
+# checked across the whole client chain and fails closed — see "Revocation"
+# below before supplying a partial CRL set.
+client_ca_crls = ["/etc/sozu/client-ca.crl.pem"]
+```
+
+Both path lists are read from disk at config-load and their PEM contents inlined into the listener configuration, so the files are not re-read until the next `sozu reload` (see "Refreshing CRLs and CAs" below). Unlike `certificate` and `key`, whose read errors are logged and skipped, an unreadable CA or CRL path aborts the whole configuration: starting a listener with a reduced trust set or without the revocation data the operator asked for would weaken authentication silently.
+
+##### Modes
+
+| `client_auth` | `CertificateRequest` sent | Client presents no certificate | Client presents a certificate                          |
+|---------------|---------------------------|--------------------------------|--------------------------------------------------------|
+| `"none"` (default) | No                   | Connection proceeds            | Never requested, never inspected                       |
+| `"optional"`  | Yes                       | Connection proceeds            | Fully chain-validated; handshake aborts if it fails    |
+| `"required"`  | Yes                       | **Handshake aborts**           | Fully chain-validated; handshake aborts if it fails    |
+
+`"optional"` is not a bypass: a certificate that *is* presented gets the same validation as under `"required"`. It only tolerates clients that present none, which is the mode to use while migrating a fleet to mTLS.
+
+A state file written before mTLS existed carries none of the three keys and loads unchanged: the absent `client_auth` decodes to `"none"` and the two path lists default to empty.
+
+##### Validation matrix
+
+The configuration is rejected rather than silently degraded in every case below. mTLS that fails open is worse than mTLS that fails to start.
+
+| Configuration                                                        | Outcome                                                                                                                                     |
+|----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `client_auth` with a value other than the three above                | **Error** at config-load, from TOML parsing. A typo is never folded to `none`.                                                               |
+| `client_auth = "optional"` / `"required"` with no trusted CA         | **Error** `ListenerError::ClientAuth` when the main process validates the listener, before it reaches a worker — client auth was requested with an empty trust set, which no client could ever satisfy. |
+| A `client_ca_certificates` or `client_ca_crls` path cannot be read   | **Error** at config-materialization. A dropped CA weakens trust; a dropped CRL silently disables revocation.                                 |
+| A CA entry parses to zero certificates (empty file, wrong PEM section) | **Error**. Skipping it would start the listener with a subset of the configured trust anchors, and clients issued by the omitted CA would fail with no visible cause. |
+| A CRL entry parses to zero revocation lists                          | **Error**. Same reasoning: revocation would be silently disabled.                                                                           |
+| Two configured CRLs of one CA cover overlapping certificates (the same distribution point, or one of them has none) | **Error** `ListenerError::ClientAuth` when the listener is built. Only the first would be consulted, so the order alone would decide whether the second one's revocations apply. Partitions with distinct distribution points are accepted. |
+| `client_auth` / `client_ca_certificates` / `client_ca_crls` on an HTTP, TCP, or UDP listener | **Error** `ConfigError::ClientAuthOnNonHttps` at config-load. Those listeners have no field to carry the policy, so it would be discarded.  |
+| `client_ca_certificates` / `client_ca_crls` with no `client_auth` key | **Error** `ConfigError::ClientAuthModeMissing` at config-load. The mode would default to `none` and ignore the files, starting the listener without the client authentication they suggest. |
+| `client_auth = "none"` with stale CA/CRL paths still present         | **Allowed, with a warning** — the paths are not read at all in `none` mode, so a leftover path never blocks configuration loading.          |
+| A configured CRL already past its `nextUpdate`                       | **Error** `ListenerError::ClientAuth` when the main process accepts a listener or a policy patch an operator states (configuration load, reload, a client request): it would reject every client it covers. A CRL that lapses while the listener runs is **rejected at handshake**, since Sōzu enables `enforce_revocation_expiration()` (rustls defaults to ignoring expiration, which would keep trusting a stale CRL); workers, and the replay of a saved state, still build such a listener, so the reload that brings a current CRL can patch it. |
+
+The rejections above happen at two distinct stages, both in the main process. Reading the CA/CRL files and refusing mTLS keys on a non-HTTPS listener happen at config-load. Parsing the PEM bodies and building the verifier happen when the main process validates the listener (or a policy patch) before committing it to its state, so a listener it refuses never reaches a worker; each worker builds the verifier again when it creates the listener, as a second check. In every case the listener is never activated without its verifier: `create_rustls_context` returns an error, so there is no fallback to an unauthenticated listener.
+
+##### Revocation
+
+`client_ca_crls` is not a best-effort filter. Sōzu passes the configured CRLs to
+rustls with `with_crls(...).enforce_revocation_expiration()` and keeps rustls's
+defaults for the other two revocation knobs, so as soon as at least one CRL is
+configured a handshake is rejected in **three** distinct cases, not just one:
+
+| Situation                                                                 | Outcome                                                                                                                     |
+|---------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| A certificate in the chain is listed as revoked                            | **Rejected.** The expected case.                                                                                            |
+| Revocation status cannot be established for a certificate in the chain     | **Rejected.** rustls defaults to `UnknownStatusPolicy::Deny`; "no CRL covers this issuer" is treated as revoked, not as OK.  |
+| A CRL that does cover the chain is past its `nextUpdate`                   | **Rejected.** `enforce_revocation_expiration()` is enabled; rustls would otherwise keep trusting a stale CRL.                |
+
+Revocation is checked over the **whole chain** (rustls's default
+`RevocationCheckDepth::Chain`), not only the end-entity certificate. The
+practical consequence is that supplying CRLs is an all-or-nothing commitment:
+
+- Every issuing CA in every accepted chain — intermediates included — must be
+  covered by a configured CRL. A CRL set that covers the leaf issuer but not an
+  intermediate's issuer locks out otherwise valid clients.
+- Every configured CRL must be refreshed, with a configuration reload, before
+  its `nextUpdate`: an expired CRL rejects the clients it covers, even those it
+  never listed as revoked. See "Refreshing CRLs and CAs" below.
+- Configure **one CRL per issuing CA**, or one per distribution point when the
+  CA partitions its list (each partition carrying its own
+  `IssuingDistributionPoint`). A listener given two CRLs of one CA that cover
+  the same certificates fails to build: rustls only consults the first CRL
+  that covers a certificate, so an old CRL listed before its replacement would
+  hide every revocation the replacement adds. When rotating a CRL, replace the
+  file rather than adding the new one next to it.
+- A CRL must be signed by the CA that issued the certificates it covers, and if
+  that CA's certificate carries a KeyUsage extension it must include
+  `cRLSign`; a CRL that fails either check rejects the handshake. CRL files are
+  PEM (`-----BEGIN X509 CRL-----`); a DER file holds no PEM CRL and is refused
+  at listener creation.
+
+Before deploying a CRL, check its issuer and expiry, and that it gives the
+verdict you expect for a client certificate:
+
+```bash
+openssl crl -in client-ca.crl.pem -noout -issuer -nextupdate
+openssl verify -crl_check -CAfile client-ca.pem -CRLfile client-ca.crl.pem client.pem
+```
+
+This is a deliberate fail-closed posture: a revocation check that silently
+degrades to "allow" is indistinguishable from having no revocation at all. If
+maintaining complete, current CRL coverage for the full chain is not
+operationally feasible, leave `client_ca_crls` empty rather than configuring a
+partial set — chain validation against `client_ca_certificates` still applies.
+
+##### Refreshing CRLs and CAs
+
+Edit the CRL or CA files, or the three keys, then run `sozu reload`. For an
+HTTPS listener that is already running, the reload compares the policy it
+reads (mode, CA contents, CRL contents) with the one the listener runs, and
+when they differ it replaces the policy in place with an
+`UpdateHttpsListenerConfig` carrying `client_auth_policy`. The listener keeps
+its socket, its certificates and its frontends. Every other key of a running
+listener is still left as it is by a reload.
+
+- The replacement is complete: a CA or CRL missing from the new configuration
+  is dropped, not kept. Removing the three keys and reloading turns client
+  authentication off on the running listener.
+- It applies to new handshakes only. Connections already established keep the
+  verdict they were given.
+- The new policy is checked by the main process before anything changes; a CA
+  or CRL a worker could not use fails the reload entry and the listener keeps
+  its current policy.
+- A worker that predates this change cannot decode the patch and fails it
+  rather than keeping its old CRLs (see the note on mixed versions below).
+
+Schedule the reload ahead of each CRL's `nextUpdate`: once a CRL has lapsed,
+every client it covers is rejected until a reload brings a current one.
+
+##### Notes
+
+- The policy is per-listener, not per-frontend. Every frontend served by an HTTPS listener with `client_auth = "required"` requires a client certificate.
+- **The client identity is not passed to backends.** Sōzu sets no header with the verification result or the certificate subject, so a backend cannot tell an authenticated client from another. Client authentication is therefore only an admission control on the listener: with `required`, any client holding a certificate from a trusted CA reaches every frontend of the listener, with no per-frontend or per-identity authorization; with `optional`, a client that presents no certificate gets exactly the same access as one that does, so `optional` grants nothing that no client authentication would not.
+- A running listener's policy changes only through a full `client_auth_policy` replacement (a reload, or an `UpdateHttpsListenerConfig` sent by a client), never through the other patch fields.
+- The verifier is built with the same explicitly selected `CryptoProvider` as the server config, so it works in single-provider builds (`crypto-openssl` only) and in multi-provider builds where no process-default provider is installed.
+- A listener with `client_auth` other than `none` is sent to the workers as `AddHttpsListenerWithClientAuth`, and a policy patch as `UpdateHttpsListenerWithClientAuth`, not as the historical `AddHttpsListener` / `UpdateHttpsListener`. A worker that predates mutual TLS cannot decode them, so it never builds the listener, or never applies the patch, rather than building it without client authentication or keeping its old CRLs. Between `sozu upgrade` and the replacement of the last old worker, such a listener is therefore served only by the upgraded workers, and each old worker is counted as failed once `worker_timeout` expires, since it does not answer a request it cannot decode. Listeners without client authentication keep the historical verbs and work across versions as before.
+- **Rolling back to a version that predates mutual TLS**: such a version stops reading a saved state file at the first `AddHttpsListenerWithClientAuth` record, and every record after it is lost, not just that listener. Saved state lists listeners before clusters, frontends and certificates, so that is most of the state. Before rolling back, remove the listeners that use client authentication, along with their keys in the configuration file (an older version refuses those keys), then save the state again.
+- A listener's saved state record carries its CA and CRL contents. `sozu state load` reads records of up to `max_command_buffer_size` bytes (never less than 200 kB), the same bound the worker channels apply; keep CA bundles and CRLs below it.
+
+#### Options specific to Rustls based HTTPS listeners
+
+##### Cipher suites
+
+```toml
+# Sets the list of available cipher suites, in order of preference.
+# If omitted, the following default list is used (ANSSI-recommended order):
+cipher_list = [
+    # TLS 1.3 cipher suites
+    "TLS13_AES_256_GCM_SHA384",
+    "TLS13_AES_128_GCM_SHA256",
+    "TLS13_CHACHA20_POLY1305_SHA256",
+    # TLS 1.2 cipher suites
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+]
+```
+
+#### HTTP/2 support and ALPN protocols
+
+HTTP/2 is available on HTTPS listeners through ALPN (Application-Layer Protocol
+Negotiation). During the TLS handshake, Sōzu advertises protocols from the
+`alpn_protocols` list. The server selects the first protocol from its list that
+the client also supports.
+
+By default, Sōzu advertises both `h2` and `http/1.1`, preferring HTTP/2:
+
+```toml
+# Default: both protocols, H2 preferred
+alpn_protocols = ["h2", "http/1.1"]
+```
+
+| Value      | Protocol | Notes                                      |
+| ---------- | -------- | ------------------------------------------ |
+| `h2`       | HTTP/2   | Multiplexed, binary framing (RFC 9113)     |
+| `http/1.1` | HTTP/1.1 | Traditional text-based protocol (RFC 9112) |
+
+Invalid values are rejected at configuration load time. Order matters: the first
+entry is the most preferred protocol.
+
+**Examples:**
+
+```toml
+# HTTP/1.1 only — disables HTTP/2 on this listener
+alpn_protocols = ["http/1.1"]
+
+# HTTP/2 only — clients without H2 support will fail TLS negotiation
+alpn_protocols = ["h2"]
+
+# Prefer HTTP/1.1 over HTTP/2
+alpn_protocols = ["http/1.1", "h2"]
+```
+
+When `alpn_protocols` is omitted or empty, the default `["h2", "http/1.1"]` is
+used. Clients that do not send an ALPN extension default to HTTP/1.1.
+
+> **Note:** HTTP/2 is only supported over TLS (HTTPS listeners). Plain HTTP
+> listeners always use HTTP/1.1.
+
+> **Note**: When using the `fips` crypto provider, CHACHA20_POLY1305 cipher
+> suites are not available. Only AES-GCM suites are FIPS-approved. Sōzu's
+> `cipher_suite_by_name` filters its result through the active provider's
+> supported set so a misconfigured `cipher_list` cannot silently downgrade an
+> FIPS build.
+
+##### Key exchange groups
+
+The `groups_list` option controls which key exchange algorithms are offered
+during the TLS handshake. Groups are listed in order of preference.
+
+```toml
+# Default: ["X25519MLKEM768", "x25519", "P-256", "P-384"]
+groups_list = ["X25519MLKEM768", "x25519", "P-256", "P-384"]
+```
+
+| Group name            | Description                               | Provider support                                    |
+| --------------------- | ----------------------------------------- | --------------------------------------------------- |
+| `x25519` / `X25519`   | Curve25519 ECDHE                          | All providers                                       |
+| `secp256r1` / `P-256` | NIST P-256 ECDHE                          | All providers                                       |
+| `secp384r1` / `P-384` | NIST P-384 ECDHE                          | All providers                                       |
+| `X25519MLKEM768`      | Post-quantum hybrid (X25519 + ML-KEM 768) | `crypto-aws-lc-rs`, `crypto-openssl` (OpenSSL 3.5+) |
+
+Unknown or unsupported group names are silently skipped with a log warning. This
+allows using the same configuration across different crypto providers — for
+example, `X25519MLKEM768` is safely ignored when building with `crypto-ring`.
+
+**Examples:**
+
+```toml
+# Post-quantum enabled (default). PQ-capable clients negotiate X25519MLKEM768,
+# others fall back to classical X25519.
+groups_list = ["X25519MLKEM768", "x25519", "P-256", "P-384"]
+
+# Classical only (explicitly disable post-quantum)
+groups_list = ["x25519", "P-256", "P-384"]
+
+# FIPS 140-3 compliant (NIST curves only, no X25519)
+groups_list = ["P-256", "P-384"]
+```
+
+> **Post-quantum key exchange**: X25519MLKEM768 is a hybrid scheme that combines
+> classical X25519 with the ML-KEM 768 post-quantum algorithm. It protects
+> against future quantum computer attacks while maintaining security against
+> current classical attacks. The handshake is slightly larger (~1 KB overhead)
+> but has negligible latency impact. Clients that do not support it
+> automatically negotiate a classical group.
+
+##### Certificates
+
+TLS certificates can be configured in two ways:
+
+**1. Default certificate on the HTTPS listener** (without SNI):
+
+```toml
+[[listeners]]
+protocol = "https"
+address = "0.0.0.0:8443"
+certificate = "/path/to/certificate.pem"
+certificate_chain = "/path/to/chain.pem"
+key = "/path/to/private-key.pem"
+```
+
+**2. Per-frontend certificates** (with SNI, recommended):
+
+```toml
+[clusters.MyCluster]
+protocol = "http"
+frontends = [
+    { address = "0.0.0.0:8443", hostname = "example.com",
+      certificate = "/path/to/example.com.pem",
+      certificate_chain = "/path/to/chain.pem",
+      key = "/path/to/example.com.key" },
+]
+backends = [
+    { address = "127.0.0.1:8080" }
+]
+```
+
+Sōzu supports the following certificate and key types:
+
+| Type        | Key format           | Notes                                   |
+| ----------- | -------------------- | --------------------------------------- |
+| RSA 2048+   | PKCS#1 or PKCS#8 PEM | Most common, widely supported           |
+| ECDSA P-256 | SEC1 or PKCS#8 PEM   | Faster handshakes, smaller certificates |
+| ECDSA P-384 | SEC1 or PKCS#8 PEM   | Higher security margin                  |
+
+All certificate files must be PEM-encoded. The `certificate_chain` should
+contain intermediate CA certificates (not the root CA).
+
+Runtime `AddCertificate` and `ReplaceCertificate` commands validate the PEM,
+signing-key buildability, demonstrable certificate/key consistency and every
+normalised SNI name before the main process records the command. Workers run the
+same validator before mutating their resolver. A refusal therefore keeps saved
+state and the certificate already serving traffic unchanged. Some crypto
+providers cannot expose the public-key material needed for a consistency check;
+rustls reports `InconsistentKeys::Unknown` in that case, which Sōzu accepts to
+match rustls' `CertifiedKey::from_der` contract. This proves buildability, but it
+does not claim that such a provider preflighted certificate/key equality.
+
+`ReplaceCertificate` canonicalises an empty `names` list from the replacement
+certificate's SAN/CN before recording it, exactly like `AddCertificate`.
+Reusing the same leaf fingerprint is a strict no-op only when the canonical
+certificate material and effective expiration are also identical. A changed
+chain, key, protocol-version list, name list or expiration refreshes the worker
+resolver atomically; an identical retry preserves the existing SNI tie ordering
+and does not republish the expiration gauge.
+
+The main process records two pieces of selection metadata beside each
+certificate: the effective `expired_at` override and a per-listener insertion
+order. The certificate with the latest effective expiration serves a matching
+name; the later insertion wins when expirations are equal. `SaveState`,
+`LoadState`, main-process handoff, worker bootstrap and worker upgrade retain
+both values. Consequently, removing the last HTTPS listener and adding it back
+also rebuilds the same resolver selection, rather than replaying an unordered
+certificate map with no overrides.
+
+`ConfigState::certificate_metadata` is a serialized sidecar keyed like the
+existing public `ConfigState::certificates` map. The map and command protobufs
+remain unchanged, but adding the public field is a Rust source compatibility
+change for downstream code that constructs `ConfigState` with an exhaustive
+struct literal. Serialized JSON from older versions has no sidecar and remains
+readable. Entries missing metadata come first in fingerprint order; known
+entries follow their stored ordinal, with the fingerprint breaking equal
+ordinals. The resulting order, including any gaps, is normalized to contiguous
+ordinals on the first state-changing certificate command. A duplicate
+`AddCertificate` and a
+strictly identical `ReplaceCertificate` remain no-ops and therefore do not
+normalize by themselves. Code that mutates the public `certificates` map
+directly bypasses sidecar maintenance; use `ConfigState::dispatch` for writes.
+Appending to a canonical index is `O(1)`. `RemoveCertificate` and effective
+`ReplaceCertificate` reuse a trusted index without sorting, then compact the
+remaining ordinals in `O(N)` for that address. A reconciliation that must move
+or replace `N` certificates can consequently take `O(N²)` state work.
+
+When reconciliation sees the same certificate set in a different order, it
+keeps the longest target prefix already present as a subsequence and moves the
+remaining suffix with `RemoveCertificate` followed by `AddCertificate`. A
+fresh diff after any interrupted request converges to the target order, but the
+pair is not atomic. A name found only on the certificate being moved can fall
+back to another certificate or become temporarily unavailable. Replacing the
+whole set can temporarily leave no certificate. Operators must verify the
+served fingerprint after reconciliation rather than treating an intermediate
+acknowledgement as an all-or-nothing transaction.
+
+The first upgrade from 2.3.1 has a one-time boundary: that main process did not
+store expiration overrides or resolver insertion order. The new main accepts
+its legacy state, records `expired_at = None` and derives deterministic fallback
+order, but it cannot reconstruct the discarded values. Between `UpgradeMain`
+and replacement of every worker, an older worker can keep serving its historical
+resolver while queries against the new main report another winner. Upgrading
+the worker converges runtime selection and the expiration gauge to the new main
+and can change the certificate served. Subsequent saves, replays and upgrades
+preserve that normalized state. If explicit overrides must survive the first
+worker replacement, re-emit `ReplaceCertificate` commands from the
+authoritative certificate source after the main upgrade and before upgrading
+workers. Loading a new saved state into 2.3.1 likewise loses these values again
+inside its main process, even though its workers accept `expired_at` on the wire.
+An actual 2.3.1 SaveState file emits `AddCertificate` requests in one concrete
+but arbitrary `HashMap` iteration order. Loading that file into the new main
+records the order carried by the request stream; it does not infer the earlier
+resolver order.
+
+**Generating test certificates:**
+
+```bash
+# RSA 2048
+openssl req -newkey rsa:2048 -nodes -keyout rsa.key -x509 -days 365 \
+    -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" -out rsa.pem
+
+# ECDSA P-256
+openssl ecparam -name prime256v1 -genkey -out ecdsa.key
+openssl req -new -key ecdsa.key -x509 -days 365 \
+    -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" -out ecdsa.pem
+```
+
+> **Important**: Certificates must include a Subject Alternative Name (SAN)
+> extension matching the frontend hostname. Certificates without SANs may cause
+> TLS handshake failures.
+
+#### Options specific to TCP listeners
+
+A `protocol = "tcp"` listener forwards raw bytes to a cluster's backends
+without terminating TLS. By default one TCP listener routes to exactly one
+cluster (the legacy shape). Since [#1279](https://github.com/sozu-proxy/sozu/issues/1279)
+a TCP listener can instead fan out to **multiple** clusters on the same
+`address:port` by reading the TLS ClientHello's SNI (RFC 6066 §3) and, per
+route entry, ALPN (RFC 7301 §3.1) — all **without decrypting or terminating**
+the connection. The backend still performs its own TLS handshake with the
+unmodified client bytes.
+
+```toml
+[[listeners]]
+protocol = "tcp"
+address  = "0.0.0.0:8443"
+
+# Time allowed to receive enough bytes of the TLS ClientHello to read the SNI
+# extension, in seconds. Only meaningful once at least one SNI-scoped
+# frontend (see below) targets this listener — a listener with only
+# no-SNI (legacy) frontends never prereads and ignores this value.
+# Defaults to 5. Must not exceed this listener's front_timeout
+# (rejected at TOML config-load; see the validation matrix below).
+sni_preread_timeout = 5
+
+# Maximum bytes buffered while prereading the ClientHello looking for the SNI
+# extension. Only meaningful under the same condition as above. Clamped to
+# the global buffer_size at runtime (>= sni_preread_max_bytes is required at
+# TOML config-load; see the validation matrix below). Defaults to 16384.
+sni_preread_max_bytes = 16384
+```
+
+A TCP frontend opts into SNI-scoped routing with `hostname` (mapped to the
+wire `sni` field) and, optionally, `alpn`:
+
+```toml
+[clusters.web-a]
+protocol  = "tcp"
+frontends = [
+  { address = "0.0.0.0:8443", hostname = "a.example.com" },
+]
+
+[clusters.web-b]
+protocol  = "tcp"
+frontends = [
+  # Only matches when the client also offers "h2" in its ALPN extension.
+  { address = "0.0.0.0:8443", hostname = "b.example.com", alpn = ["h2"] },
+]
+
+[clusters.web-b-fallback]
+protocol  = "tcp"
+frontends = [
+  # Catch-all for b.example.com when the client's ALPN offer doesn't match
+  # any explicit entry above (or offers no ALPN at all). At most one
+  # catch-all (empty `alpn`) per (address, hostname) is allowed.
+  { address = "0.0.0.0:8443", hostname = "b.example.com" },
+]
+
+[clusters.legacy-passthrough]
+protocol  = "tcp"
+frontends = [
+  # No `hostname` at all: the legacy single-cluster catch-all. A listener
+  # cannot mix this shape with any SNI-scoped frontend above.
+  { address = "0.0.0.0:9443" },
+]
+```
+
+##### SNI matching
+
+`hostname` accepts either an exact host (`"example.com"`) or a single
+leading `*.` wildcard label (`"*.example.com"`, matching `a.example.com` but
+neither the apex `example.com` nor `a.b.example.com`) — the same trie the
+HTTP/HTTPS router uses (`crate::router::pattern_trie`). No other wildcard
+shape is accepted (`*.*.example.com`, an embedded `*` outside the leading
+label, and a bare `*` are all rejected at config-load). The pattern must be
+plain ASCII: on-wire SNI is always an ASCII A-label (RFC 6066 §3 / IDNA), so
+write the punycode A-label form for non-ASCII hostnames (e.g.
+`"xn--mnchen-3ya.example"` for `"münchen.example"`) rather than a Unicode
+U-label, which would load but never match.
+
+##### ALPN matching
+
+Within one `(address, hostname)` pair, route entries are tried in **client
+preference order**: the client's first offered protocol that is claimed by
+ANY entry's `alpn` list wins, regardless of route-table order. Only once no
+offered protocol matched any explicit entry does the catch-all (the one
+entry, if any, with an empty/absent `alpn`) win — including for a client that
+offers no ALPN extension at all.
+
+##### Reject policy on an SNI-enabled listener
+
+Once at least one SNI-scoped frontend targets a listener, EVERY connection on
+that listener is preread — including ones destined for a no-SNI-configured
+host. A connection is rejected (TCP FIN, no bytes forwarded) when:
+
+- the first bytes aren't a TLS ClientHello at all (plain-TCP client, health
+  check payload, ...);
+- the ClientHello is malformed, or fragments past `sni_preread_timeout`
+  without becoming complete;
+- the ClientHello fails to complete within the first `sni_preread_max_bytes`
+  bytes (the preread never reads past the cap, so a hello genuinely larger
+  than it is rejected; a hello that completes within the cap routes no
+  matter how much data the client has already coalesced after it — the
+  excess stays in the kernel socket buffer and reaches the backend intact);
+- the ClientHello carries no usable SNI (absent, empty, or hidden behind
+  Encrypted Client Hello with no outer name);
+- the SNI matches no configured `hostname` on this listener, or matches one
+  but no route entry's `alpn` accepts the client's offer.
+
+Each of these eleven rejection reasons has its own metric — see
+[TCP SNI preread](#tcp-sni-preread-passthrough-routing) below. A bare TCP
+health check (connect + close, zero bytes) is **not** counted as a
+rejection — see that section's note.
+
+##### Validation matrix (TOML config-load)
+
+| Configuration | Outcome |
+|---|---|
+| `hostname` is neither an exact host nor a single leading `*.` label | **Error** `InvalidSniPattern` |
+| `hostname` contains a non-ASCII character | **Error** `NonAsciiSniPattern` — write the punycode A-label form |
+| `alpn` is non-empty but `hostname` is absent | **Error** `AlpnWithoutSni` — a no-SNI frontend installs the raw catch-all path, which never consults `alpn`; the protocol list would silently never be enforced |
+| Two frontends on the same `(address, hostname)` share an `alpn` protocol | **Error** `TcpFrontendAlpnOverlap` — routing must be deterministic, not iteration-order-dependent |
+| More than one frontend on the same `(address, hostname)` omits `alpn` | **Error** `TcpFrontendMultipleAlpnCatchAll` — at most one catch-all per `(address, hostname)` |
+| A listener has both a no-`hostname` frontend and at least one `hostname`-scoped frontend | **Error** `TcpListenerMixesSniAndNoSni` |
+| `sni_preread_timeout` exceeds `front_timeout` on an SNI-enabled listener | **Error** `SniPrereadTimeoutExceedsFrontTimeout` — the preread phase cannot outlive the timeout that would already have closed the connection |
+| `sni_preread_max_bytes` is below 5 bytes (a full TLS record header) on an SNI-enabled listener | **Error** `SniPrereadMaxBytesTooSmall` — `0` in particular makes the shell issue reads that can never make progress, spinning until the event-loop iteration guard trips |
+| `sni_preread_max_bytes` exceeds the global `buffer_size` on an SNI-enabled listener | **Error** `SniPrereadMaxBytesExceedsBufferSize` — the preread buffer is carved out of the same per-session buffer used for relaying |
+
+> **The routing-SHAPE validations — the mixing ban (`TcpListenerMixesSniAndNoSni`),
+> ALPN-overlap / catch-all uniqueness (`TcpFrontendAlpnOverlap` /
+> `TcpFrontendMultipleAlpnCatchAll`), ALPN-without-SNI (`AlpnWithoutSni`),
+> and the pattern-SHAPE checks (`InvalidSniPattern` / `NonAsciiSniPattern` —
+> is `hostname` an exact host or one leading `*.` label, every label
+> non-empty, and pure ASCII) — are all enforced BOTH at TOML config-load
+> (`command/src/config.rs`) AND on the worker's hot path
+> (`TcpListener::validate_new_tcp_front` in `lib/src/tcp.rs`, which calls
+> the identical shared pattern validator config-load uses), so an
+> `AddTcpFrontend` sent directly over the command socket, a hot-added
+> `sozu frontend tcp add --sni`, or a replay from a hand-edited/stale
+> `LoadState` snapshot, is rejected exactly like a bad TOML file would be —
+> a malformed pattern is never silently installed. Only the listener-level
+> timeout/buffer checks (`SniPrereadTimeoutExceedsFrontTimeout` /
+> `SniPrereadMaxBytesTooSmall` / `SniPrereadMaxBytesExceedsBufferSize`) still
+> run at TOML config-load only: `sozu listener tcp add`/`update` accepts
+> out-of-range preread knobs without error. An out-of-range
+> `sni_preread_max_bytes` is at least degraded safely at the point of use —
+> the worker clamps the effective cap to the session buffer's capacity and
+> floors it at the 5-byte TLS record header, so a hot-added `0` cannot spin
+> the preread loop — but a `sni_preread_timeout` above `front_timeout` is
+> applied as-is during the preread phase. Prefer declaring TCP SNI routing
+> in the TOML file and reloading, or double-check hot-added listener knobs
+> carefully, until that remaining gap is closed.
+
+##### Runtime CLI surface
+
+```
+sozu frontend tcp add \
+  --id web-b \
+  --address 0.0.0.0:8443 \
+  --sni b.example.com \
+  --alpn h2
+
+sozu frontend tcp remove \
+  --id web-b \
+  --address 0.0.0.0:8443 \
+  --sni b.example.com \
+  --alpn h2
+
+sozu listener tcp add \
+  --address 0.0.0.0:8443 \
+  --sni-preread-timeout 5 \
+  --sni-preread-max-bytes 16384
+```
+
+`--sni`/`--alpn` are optional on both `add` and `remove` — omit both for a
+legacy no-SNI catch-all frontend. On `remove`, they must match the exact
+values the frontend was added with (same string, same wildcard shape, same
+`alpn` set): a mismatch removes nothing, silently, rather than erroring.
+
+`--sni-preread-timeout`/`--sni-preread-max-bytes` are **add-only**: the
+`UpdateTcpListenerConfig` hot-reconfig message has no fields for them, so
+`sozu listener tcp update` cannot patch either knob on a live listener —
+remove and re-add the listener (or edit the TOML and reload) to change them.
+
+#### Options specific to UDP listeners
+
+A `protocol = "udp"` listener load-balances datagram traffic (DNS, syslog, NTP,
+generic UDP) to a cluster's backends. UDP is **plaintext only** and is served by
+exactly one worker per listener (see [Limitations](#udp-limitations) below).
+
+```toml
+[[listeners]]
+protocol       = "udp"
+address        = "0.0.0.0:53"
+# public_address = "203.0.113.10:53"
+
+# client / upstream flow idle timeout, in seconds. A flow is reaped once it has
+# been idle for this long, which closes its upstream socket and frees its
+# `max_flows` slot. A client datagram pushes the flow's deadline to now +
+# `front_timeout`, a backend reply to now + `back_timeout`. These listener
+# keys are the only UDP idle timeout: `[clusters.<id>.udp]` has none, so the
+# cluster defaults never disable it. Defaults to 30.
+front_timeout  = 30
+back_timeout   = 30
+
+# maximum received datagram size, in bytes. Defaults to 1500 (one Ethernet
+# frame). Capped at the global `buffer_size` (>= 16393): a value larger than
+# `buffer_size` is clamped to it at config-load with a warning. A datagram on
+# the wire that exceeds the effective read size is truncated (MSG_TRUNC) and
+# dropped (`udp.datagrams.dropped`, reason `truncated`) — never a panic. Raise
+# it for large EDNS0 / DNS responses; keep responses within PMTU where possible.
+max_rx_datagram_size = 1500
+
+# maximum number of concurrent flows on this listener. `0` (the default)
+# auto-derives a cap from ~70% of the soft RLIMIT_NOFILE, because every flow
+# owns one connected upstream socket (one fd). An explicit value above that
+# bound is accepted but warns at config-load. New flows beyond the cap are shed
+# (dropped + `udp.flows.shed`), never crashing the worker on EMFILE/ENFILE.
+max_flows      = 0
+```
+
+> **Note:** inbound UDP PROXY-protocol decode (`expect_proxy`) is **not
+> supported** on UDP listeners — the field is rejected. (Sōzu can still *send* a
+> PROXY v2 header to UDP backends; see the cluster `send_proxy_protocol` knob
+> below.) UDP listeners also have no `connect_timeout` (there is no connect
+> handshake) and no `request_timeout`.
+
+##### UDP frontend identity
+
+**One UDP frontend per address, across every cluster.** A UDP frontend is
+stored under its **cluster id, address and tags** together, but the *address*
+alone is exclusive: `frontend udp add` refuses an address another frontend
+already holds, whatever cluster that frontend belongs to.
+
+UDP has no routing discriminator. A datagram carries no SNI, no `Host` header
+and no path, so the listener address **is** the entire routing key and no
+attribute of an incoming datagram could pick between two frontends bound to it.
+A TCP listener legitimately hosts several frontends because `(address, sni,
+alpn)` discriminates between them; UDP has no equivalent. The worker agrees by
+construction — it keeps exactly one cluster and one tag set per listener
+address — so a second frontend on one address was never a routed alternative,
+it silently replaced the first.
+
+```bash
+sozu --config /etc/sozu/config.toml frontend udp add --id dns --address 0.0.0.0:53 --tags owner=team-a
+sozu --config /etc/sozu/config.toml frontend udp remove --id dns --address 0.0.0.0:53 --tags owner=team-a
+```
+
+A second claim on `0.0.0.0:53` — from `dns` with different tags, or from any
+other cluster — is refused with `UDP frontend address <addr> is already claimed
+by another frontend`. Remove the frontend holding the address first, then add
+the new one; `sozu frontend list` shows which frontend currently holds it. (The
+message reports the contested address plus byte-length metadata rather than the
+current owner's cluster id and tags: cluster identifiers and tags are redacted
+from error text under the [sensitive-value logging
+boundary](./observability.md#sensitive-value-logging-boundary).)
+
+The tags stay part of the **removal** identity, so omitting `--tags` on the
+remove does **not** clear a frontend that was added with them: the request
+matches nothing and answers `NoChange`. It is a clean no-op — the main process
+refuses a request it cannot apply *before* fanning it out, so no worker ever
+sees it and no listener stops routing. Repeat the `--tags` the frontend was
+added with.
+
+> **Note:** UDP emits no access log today, and nothing in the UDP datapath reads
+> a frontend's tags. On a UDP frontend `--tags` is identity and metadata only —
+> it is carried by `sozu frontend list` and `sozu cluster tags`, and it names
+> which frontend a `frontend udp remove` drops.
+
+###### Upgrading from a configuration with two frontends on one UDP address
+
+Earlier versions admitted two UDP frontends on one address and left the
+datapath to collapse them. The effective cluster for such an address **can
+change** when you reload or replay a state that contains such a pair:
+
+- Before, the *last* entry applied won — each `AddUdpFrontend` overwrote the
+  listener's cluster and tags. For two entries in **different clusters** the
+  outcome was not even stable: the main process emits its saved entries by
+  iterating a hash map whose order differs per process, so which cluster ended
+  up serving the address could flip between restarts of the same saved state.
+- Now the *first* entry applied wins and every later claim on that address is
+  refused, so the address serves one defined cluster.
+
+Nothing aborts. `LoadState` and a static-configuration reload both skip an
+entry the state refuses, log
+`skipping an entry the state refused` / `Skipping a config entry the state
+refused` at `warn`, and count it — `LoadState` reports
+`load_state: skipped N invalid entries`. Every other entry still applies.
+
+**Delete the duplicate before you upgrade the main process.** A hot main-process
+upgrade (`sozu upgrade main`) does not re-validate the state: the new main
+process inherits the serialized state verbatim, so an existing pair arrives
+intact. What happens next depends on the build:
+
+- A **release** build carries it until the next reload, state replay or live
+  `frontend udp add` refuses it — the behaviour described above.
+- A build with **debug assertions** aborts the main process instead. Saving the
+  state, and forking a worker, both replay the generated requests into a fresh
+  state and assert that every one of them applies; the pair's second entry no
+  longer does, so the next `sozu state save` — or the next worker fork — fails
+  with `every request from generate_requests must replay cleanly`. The
+  assertion is right: a state holding such a pair cannot round-trip through
+  `state save` / `state load`, and it says so.
+
+So check for UDP addresses claimed more than once *before* upgrading — `sozu
+frontend list` lists every UDP frontend with its address and cluster — and
+delete the frontend you do not want to keep. The surviving cluster is then your
+choice rather than an artefact of replay order, and no inherited pair reaches
+the generated-request replay.
+
+Sōzu deliberately does not resolve an inherited pair for you. An upgrade
+re-attaches the running worker processes rather than restarting them, so the
+new main process cannot know which of the two the workers are already serving;
+picking one itself would silently resolve — and could invert — the very
+ambiguity this rule exists to reject.
+
+<a id="udp-limitations"></a>
+
+##### UDP limitations
+
+- **One worker per UDP listener.** A UDP listener is bound and served by exactly
+  one worker, so per-listener throughput is one core. Scale across cores by
+  running **multiple UDP listeners** (each owned by one worker) rather than
+  expecting a single listener to span workers.
+- **Flows reset on hot-upgrade.** On a zero-downtime upgrade the **listener
+  socket** is handed to the new worker over SCM_RIGHTS, but per-flow state (the
+  flow table and the per-flow connected upstream sockets) lives in the old
+  worker's heap and is **not migrated**. On soft-stop the old worker admits no
+  new flow and closes its existing flows at once, without waiting out their
+  idle timeout, while the new worker serves new flows. For
+  short datagram flows (DNS = one request + reply) this is near-invisible; a
+  flow caught in-flight loses at most a datagram and the client retries.
+- **Plaintext only.** No DTLS termination, no QUIC/HTTP3 CID-aware routing, no
+  UDP-over-HTTP tunnelling.
+- **Other non-goals:** Direct Server Return (DSR), io_uring / XDP / eBPF
+  datapaths, eBPF `SK_REUSEPORT` single-listener multi-core, inbound UDP
+  PROXY-protocol decode, and transparent (`IP_TRANSPARENT`) return are all out
+  of scope.
+
+### Clusters
+
+You can declare the list of your _clusters_ under the `[clusters]` section. They
+follow the format:
+
+_Mandatory parameters:_
+
+```toml
+[clusters]
+
+[clusters.NameOfYourCluster]
+# possible values are http or tcp
+# https proxies will use http here
+protocol = "http"
+
+# per cluster load balancing algorithm. The possible values are
+# "ROUND_ROBIN", "RANDOM", "LEAST_LOADED", "POWER_OF_TWO", "HRW" and
+# "MAGLEV". HRW and MAGLEV pin each client to one backend (see "Client
+# affinity" below, and "UDP clusters"). Defaults to "ROUND_ROBIN"
+# load_balancing = "ROUND_ROBIN"
+
+# with HRW or MAGLEV, key each client on a request header or cookie instead of
+# its source IP (HTTP clusters only, at most one of the two)
+# affinity_header = "X-Tenant"
+# affinity_cookie = "tenant"
+
+# force cluster to redirect http traffic to https
+# https_redirect = true
+
+frontends = [
+  { address = "0.0.0.0:8080", hostname = "lolcatho.st" },
+  { address = "0.0.0.0:8443", hostname = "lolcatho.st", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" }
+]
+# additional options for frontends: sticky_session (boolean)
+# position: "TREE" (default), "PRE" or "POST", in upper case — see
+# "Catch-all hostname" below for `hostname = "*"` with `position = "POST"`
+
+backends  = [
+  { address = "127.0.0.1:1026" }
+]
+# additional options for backends: weight, sticky_id, backup, backend_id
+```
+
+A backend `address` is either a socket address (`"127.0.0.1:1026"`,
+`"[::1]:1026"`) or a `host:port` such as `"ingress.internal:1026"`
+([#347](https://github.com/sozu-proxy/sozu/issues/347)). A name is resolved
+**once, when the configuration file is loaded** — at startup, and when
+`sozu reload --file <path>` reads a file — with the system resolver
+(`/etc/hosts`, then DNS, as `getaddrinfo` does). Sōzu does not re-resolve it
+while running, and a plain `sozu reload` replays the configuration loaded at
+startup without reading the file again, so it does not re-resolve either: a
+DNS change reaches the proxy only through `sozu reload --file <path>` or a
+restart. Workers and the command channel only ever see socket addresses;
+`sozu backend add` still takes one. The other `sozu` control commands (status,
+shutdown, `backend remove`, …) read the file for their own settings only and
+never resolve its backend names; `sozu config check` does. A host made only of
+digits and dots must be a valid IP literal: `010.0.0.1:80` and `1.2.3:80` are
+refused rather than read as `8.0.0.1` and `1.2.0.3`.
+
+Each distinct address the name resolves to becomes its own backend, in sorted
+address order, carrying the entry's `weight` and `backup`. Its id is derived
+from the entry and the address, so the same answer always yields the same ids:
+`<backend_id>-<address>` when the entry sets `backend_id`,
+`<cluster_id>-<host:port>-<address>` otherwise (for example
+`MyCluster-ingress.internal:1026-10.0.0.2:1026`). A configured `sticky_id` is
+suffixed with `-<address>` as well, so each resolved backend keeps a sticky id
+of its own that does not change when the answer grows or shrinks. A
+socket-address literal is never resolved and keeps its configured
+`backend_id`, or the positional default `<cluster_id>-<index>-<address>`, where
+`<index>` is its position in the cluster's `backends` list as written in the
+file, so a name's answer size never moves it.
+
+When the entry sets `unix_path`, every resolved address carries it too (see
+[UNIX domain socket backends](#unix-domain-socket-backends)). A name that
+resolves to N addresses therefore makes N backends, each with its own identity
+and its own load-balancing share, that all dial the same UNIX socket.
+Uniqueness of a unix backend's address is checked after resolution: a resolved
+address that collides with another backend of the cluster refuses the whole
+file, and a `sozu reload --file <path>` of it is rejected.
+
+A name that does not resolve, or an address with no port, refuses the whole
+file with an error naming the cluster and the entry, for example
+`cluster MyCluster: cannot resolve backend address "ingress.internal:1026": …`.
+A `sozu reload --file <path>` of such a file is rejected and the running
+configuration stays in place.
+
+A cluster owns the frontends and backends declared under it. Removing the
+cluster at runtime (`sozu cluster remove`, the `RemoveCluster` order) removes
+them with it, for every protocol, in the main process state and in every
+worker: a request to its hostnames gets the listener's 404 (unless another
+cluster's wildcard or catch-all route also covers the hostname, which then
+serves it), a new connection on its TCP listeners is closed, and a session
+already established drains on the backend connection it holds. A frontend with no cluster (a deny or answer
+route) is not removed. See "Remove a cluster" in `doc/configure_cli.md`.
+
+A backend belongs to its cluster, while a frontend does not: an `AddBackend`
+order (`sozu backend add`) naming a cluster that was never added, or was
+removed, is refused by the main process and by every worker, so no backend
+outlives its cluster. The configuration file always adds a cluster before its
+backends, and so does a saved state written by `SaveState`.
+
+The load balancing policies differ in what they select and in how much of the
+backend set they read on every request:
+
+| value | selection | load reads per request |
+|---|---|---|
+| `ROUND_ROBIN` | next backend in declaration order, each picked in proportion to `weight` | none |
+| `RANDOM` | one backend drawn at random, weighted by `weight` | none |
+| `LEAST_LOADED` | the backend of the whole set with the least load per unit of `weight` | `n` |
+| `POWER_OF_TWO` | two backends drawn at random, the one with less load per unit of `weight` wins | 2 |
+| `HRW` | rendezvous hashing on the client key, scaled by `weight` (see "Client affinity") | none |
+| `MAGLEV` | consistent hashing on the client key, slot share proportional to `weight` (see "Client affinity") | none |
+
+**Every policy honours `weight`.** An unset `weight` defaults to 100.
+
+- `ROUND_ROBIN` runs smooth weighted round robin (the scheme of nginx's
+  upstream module): over every `Σw` selections a backend of weight `w` is
+  picked exactly `w` times, and the picks interleave rather than bunch —
+  weights `5`, `1`, `1` select `a a b a c a a`, not `a a a a a b c`. When every
+  candidate carries the same weight, the usual case, it is the plain cursor
+  over the declaration order, so an unweighted cluster selects exactly as it
+  did before `ROUND_ROBIN` read the weight.
+- `LEAST_LOADED` and `POWER_OF_TWO` compare each candidate's load divided by
+  its weight: a backend of weight 200 carrying 10 connections is as loaded as
+  one of weight 100 carrying 5. With equal weights the comparison is the one
+  on raw loads, and ties break as before (the first in declaration order for
+  `LEAST_LOADED`, a seeded coin flip for `POWER_OF_TWO`).
+- `RANDOM` feeds it straight into its weighted draw.
+- `HRW` multiplies each backend's rendezvous score by it, and `MAGLEV` gives
+  each backend a share of lookup-table slots proportional to it. Asked for a
+  backend with no client key, each falls back to `ROUND_ROBIN`, weighted as
+  above. Every datapath supplies a key (below), so that fallback is reached
+  only by a request with no source address.
+
+A `weight` of `0` or below counts as `1` under `ROUND_ROBIN`, `LEAST_LOADED`,
+`POWER_OF_TWO`, `HRW` and `MAGLEV`: the backend keeps the smallest share and
+is never taken out of rotation. `RANDOM` alone reads the raw value: a backend
+of weight `0` among positive weights is never drawn, and a negative weight, or
+weights that are all `0`, make it draw uniformly. To stop sending traffic to a
+backend, remove it or mark it `backup` rather than setting its weight to `0`.
+
+**One address is one share.** A cluster may declare several backend ids at the
+same address (their identity is the `(backend_id, address)` pair, so removing
+or health-checking one leaves the other untouched). Every policy treats such
+an address as **one** candidate, so it receives the share of one backend, not
+one share per id: with `A` and `B` at one address, `C` at another and equal
+weights, each address takes half the traffic under every policy. Among the ids
+of an address that can take a connection, the heaviest represents it — the
+first in declaration order when their weights are equal, the usual case — and
+the address weighs what that id weighs. That id is the one selected.
+`LEAST_LOADED` and `POWER_OF_TWO` compare an address's load as the sum of the
+connection (or request) counts of all its ids, eligible or not, since they all
+reach the same server; under `CONNECTION_TIME` they read the representative's
+own average, a latency rather than a count. An id that is down, backing off or excluded by a retry never
+represents its address while a sibling there can take a connection: the
+sibling serves instead. `MAGLEV` builds its table over the full configured set,
+health aside, so an address claims the slots of one backend weighted by the
+heaviest of all its ids, healthy or not. This is the rule `HRW` has always
+applied, since it scores an address, not an id; the other policies follow it
+since 2026-10-04 (`outranks_at_address` in `lib/src/load_balancing.rs`), and
+placement still keys on the address, so renaming an id without moving it
+leaves `HRW`, `MAGLEV` and shard placement unchanged.
+
+The ids sharing an address are linked when the backend list or a backend's
+configuration changes, never per request. A cluster without a shared address
+pays nothing for this rule. One with shared addresses pays, per selection, a
+pass over the candidates plus, for each shared address of `g` ids, at most `g²`
+steps over that address's own ids (about `g²/2` in practice) — never a cost
+growing with the square of the cluster — and allocates nothing. Relinking on
+a change costs the same: linear in the cluster plus `g²` per shared address.
+
+#### UNIX domain socket backends
+
+An HTTP, HTTPS or TCP backend can be reached over a UNIX domain stream socket
+instead of TCP ([#152](https://github.com/sozu-proxy/sozu/issues/152)): set
+`unix_path` to an absolute filesystem path, or to `@name` for a socket in the
+Linux abstract namespace (no file on disk; refused on other platforms).
+
+```toml
+backends = [
+  { address = "127.0.0.1:10001", unix_path = "/run/app/http.sock" },
+  { address = "127.0.0.1:10002", unix_path = "@app-http" },
+]
+```
+
+`address` stays mandatory: sozu keeps identifying a backend by it (removal,
+retry exclusion, `HRW`/`MAGLEV`/shard placement, the "one address is one
+share" rule above, events and the `Host` of an HTTP health probe), but never
+dials it when `unix_path` is set. Give each unix backend an address used by
+no other backend of the cluster; the configuration loader refuses a shared one.
+In a file, that identity may also be a `host:port` name: `unix_path` is then
+carried by every address the name resolves to, as described with the DNS
+resolution semantics above, and the uniqueness check runs on the resolved
+addresses.
+At runtime the same field is `AddBackend.unix_path`, carried by its own
+request, `AddUnixBackend` (`Request` field 72), and
+`sozu backend add --unix-path <path>` sets it. `RequestType::add_backend`
+picks the verb: a backend with a `unix_path` is `AddUnixBackend`, any other
+stays `AddBackend`, and the main process rewrites every request it fans out to
+the workers to that verb, so an `AddBackend` that carries a `unix_path` never
+reaches a worker. A process that predates UNIX backends cannot decode field
+72: it reads the request as empty, so it never registers the backend and never
+dials `address` over TCP. An old main process logs `empty request sent by
+client` and sends the client no answer. An old worker logs `Could not execute
+order on config state` and routes the request to no proxy, so it sends no
+response either. This guarantee covers the request the CLI and
+`RequestType::add_backend` build; a third-party client that puts `unix_path` on the historical
+`AddBackend` is outside it, since an older decoder drops that field. Between
+`sozu upgrade` and the replacement of the last old worker, a UNIX backend is
+therefore served only by the upgraded workers.
+Backends without `unix_path` keep `AddBackend` and work across versions as
+before. **Rolling back** to a version that predates UNIX backends: such a
+version stops reading a saved state file at the first `AddUnixBackend` record,
+and every record after it is lost, so remove the UNIX backends (and their
+configuration keys, which an older version refuses), then save the state
+again. The main process and every worker refuse a `unix_path` that is not
+absolute, does not fit a `sockaddr_un` (107 bytes) or holds a NUL byte. UDP is
+not supported: datagrams are relayed over UDP sockets only. The configuration
+file and the main process's state both refuse a `unix_path` backend on a UDP
+cluster (a cluster with a UDP frontend or UDP settings), whichever order the
+backend and the cluster's UDP frontend arrive in.
+
+The socket is dialed nonblocking like a TCP backend, so a missing socket file
+or a full accept queue counts as a failed connection (below), and health
+checks probe it over the same socket. Every HTTP, HTTPS and TCP backend
+connection goes through that one dial, so HTTP/2 backends, WebSocket upgrades
+and `send_proxy` take the same path; the end-to-end tests cover HTTP/1.1 and
+TCP passthrough. Logs render the backend's `address`, and a failed dial's
+error names the socket path; `TCP_NODELAY` is not set and the RTT gauges stay
+empty for these connections, since a UNIX socket has neither.
+
+#### Backend connection failover
+
+A backend connection that fails to establish is retried on another backend
+of the cluster ([#1800](https://github.com/sozu-proxy/sozu/issues/1800)).
+Three outcomes count as a failed connection:
+
+- the backend refuses it;
+- it is still not established when the listener's `connect_timeout` expires —
+  the backend accepts nothing, its SYN is dropped or its accept queue is full;
+- the socket reports an error (`SO_ERROR`) when the dial completes.
+
+Each failure is counted against the backend as the refused case always was:
+`backend.connections.error` is incremented and the backend's retry policy
+puts it in its back-off window, which is what keeps the load balancer off it
+for the next requests (`backend.down` once it keeps failing). No byte of the
+request has reached that backend, so the request goes back through backend
+selection, on an HTTP/1.1 or an HTTP/2 frontend, and for a cluster with
+`http2 = true` as well: a request is encoded for an HTTP/2 backend only once
+that connection is established.
+
+**Attempts.** A request may try `max_connection_attempts` backend
+connections, the first included: `5` by default, set globally and overridable
+per cluster:
+
+```toml
+max_connection_attempts = 5       # global, 1-255
+
+[clusters.NameOfYourCluster]
+max_connection_attempts = 3       # this cluster only, 1-255
+```
+
+When they are all spent on failed connections the request is answered `503`
+(`backend.connect.retries_exhausted`), as it was with the former hard-coded
+budget of three. A `504` is answered when the backend accepted the connection
+and then sent no response within `back_timeout` (access-log message
+`backend_timeout`): the request may have reached it, so it is not sent
+elsewhere. A `504` is also answered when the frontend timeout expires while
+the request still waits on a backend, failover included (access-log message
+`client_timeout_during_response`, below).
+
+**Status change for alerting.** A request whose every attempted backend is
+unreachable — connect timeout or refused — is now answered `503`. Before
+[#1800](https://github.com/sozu-proxy/sozu/issues/1800) a connect timeout
+answered `504`. A request arriving while every backend is in its back-off
+window also fails fast with `503`, without dialling. Alerts keyed on the `504`
+rate to detect dead backends should watch `503`,
+`backend.connections.error` and `backend.connect.retries_exhausted` instead.
+
+**On an HTTP/1.1 frontend the whole failover is bounded by `front_timeout`.**
+The listener's `front_timeout` is armed when the request is first linked to a
+backend and is not pushed out when it is retried on another one. Each failed
+attempt can take up to `connect_timeout`, so the worst case of an attempt
+budget is `max_connection_attempts × connect_timeout`; when `front_timeout`
+expires first, the request is answered `504`
+(`client_timeout_during_response`). Keep `connect_timeout` well below
+`front_timeout / max_connection_attempts` — the defaults, 3 s against 60 s /
+5, leave room — so that every attempt can be spent before the client is
+answered. On an HTTP/2 frontend the timer belongs to the connection, not to
+the stream: the first link of every new stream (its `attempts` is 0) and
+ordinary frame activity on the connection re-arm it, so on a busy HTTP/2
+connection a failover is bounded only by `max_connection_attempts ×
+connect_timeout` (15 s with the defaults), not by `front_timeout`.
+
+A failing-over request is normally `Linked` to the backend being dialled when
+the frontend timer fires, so it gets the `504` above. One still in `Link` state
+— waiting to be linked, not yet dialled — gets `503` instead, with no
+access-log message (the `Link` arm of the frontend timeout).
+
+**Back-off and slow failures.** A failed backend's first back-off lasts one
+second and grows with each consecutive failure: after the `n`-th, a random wait
+of at least one second and below `2^(n-1)` seconds, with `n - 1` capped at 6. With a `connect_timeout` longer
+than the current back-off, a blackholed backend is selectable again by the
+next request, which pays one `connect_timeout` before failing over, until its
+back-off has grown or a `health_check` removes it.
+
+**Stale keep-alive replays.** The same budget bounds the replay of an
+idempotent request written to a pooled keep-alive connection the backend had
+already closed ("Stale-upstream retry" below): with the default of 5, one such
+request can be replayed to up to 4 backends (`n - 1`), against 2 before.
+
+**Each retry skips the backends that already failed for the request**,
+whatever the `load_balancing` policy: they are left out of the candidates the
+policy picks from. A failed backend is normally out of them already, held by
+its back-off; the exclusion matters when the back-off ends while the request
+is still retrying, which a `connect_timeout` as long as the back-off makes
+routine. When every backend that can take a connection has already failed for
+this request, the selection runs as if nothing had been tried, fail-open
+regime included (see [health_checks.md](./health_checks.md)), so the request
+retries one of them rather than being refused while attempts remain. A
+sticky-session cookie naming a backend that failed for the request is not
+followed.
+
+**At runtime.** The cluster budget is part of the cluster's configuration:
+set it with `sozu cluster add --max-connection-attempts <n>`, or on a running
+cluster with `sozu cluster connection-attempts set --id <id> <n>` (and
+`unset --id <id>` to inherit the global value again), which re-sends the
+cluster with that field changed; it is saved with the state like the rest of
+the cluster. `sozu connection-attempts set <n>` changes the global budget on
+every running worker. Like `connection-limit set`, that change is not saved:
+a worker started later reads `max_connection_attempts` from the configuration
+file, so mirror the change there to make it durable.
+
+TCP clusters apply the same budget, global or per cluster, to the refused
+connections they retry; a TCP backend whose connect times out still closes the
+client connection.
+
+A per-cluster `health_check` remains the way to take a dead backend out of
+rotation before any request pays a connect timeout on it; see
+[health_checks.md](./health_checks.md).
+
+#### Client affinity
+
+`HRW` and `MAGLEV` pin each client to one backend: whenever Sōzu dials a new
+backend connection for a client, the same client key lands on the same backend,
+on every worker and across restarts, for as long as that backend stays in the
+cluster and healthy. When a backend is added or removed only the keys it wins
+or held move. The key is:
+
+| datapath | client key |
+|---|---|
+| UDP | the client source IP, or source IP and port, per `[clusters.<id>.udp] affinity_key` (see "UDP clusters") |
+| TCP | the client source IP |
+| HTTP, HTTPS | the value of `affinity_header` or `affinity_cookie` when set and present in the request, else the client source IP |
+
+The client source IP is the source announced by the PROXY protocol when the
+listener (HTTP/HTTPS `expect_proxy`) or the cluster (TCP) expects one, else the
+socket peer. An IPv4 client reported by a dual-stack listener as
+`::ffff:a.b.c.d` keys as `a.b.c.d`.
+
+| key | default | description |
+|---|---|---|
+| `affinity_header` | unset | Key HTTP/HTTPS clients on the value of this request header, its name matched case-insensitively, first occurrence. A request without it, or with it empty, is keyed on its source IP. |
+| `affinity_cookie` | unset | Same, on the value of this request cookie, its name matched exactly (RFC 6265). |
+
+At most one of the two may be set, and the name must be an RFC 9110 token.
+`Host` and `Cookie` are refused as `affinity_header`: Sōzu keeps neither as a
+header (H1 folds `Host` into the request authority, H2 sends `:authority`, and
+cookies are parsed into a jar — key on one with `affinity_cookie`). An
+`affinity_cookie` named like the listener's sticky-session cookie is read from
+the value Sōzu captured before removing that cookie from the request. Values
+are hashed raw, as sent: a quoted cookie value and its unquoted spelling are
+two different keys.
+
+A cluster that names either key may not serve a TCP frontend: a TCP session
+has no request to read one from and always keys on the source IP. The main
+process refuses the combination in both orders — an `AddCluster` naming a key
+for a cluster that already has a TCP frontend, and an `AddTcpFrontend` joining a
+cluster that names one — and the configuration file refuses either key on a
+`protocol = "tcp"` cluster. Both keys are hot-updatable: re-adding the cluster
+(`AddCluster`) applies the new key source from the next dial. Every other
+policy ignores both and derives no key, so it selects exactly as before —
+unless the cluster is shuffle-sharded (see "Shuffle sharding"), which derives
+the key under every policy to draw the client's shard.
+
+A client header the listener's forwarding or anti-spoofing policy removes
+(`X-Forwarded-For` under a `forwarded_headers` mode that strips the client's
+copy, `X-Real-IP` with `elide_x_real_ip`, a malformed `Forwarded` line) is gone
+before the key is derived, so keying on it falls back to the source IP.
+
+Three behaviours to know:
+
+- **A sticky session wins.** On a frontend with `sticky_session`, a cookie
+  naming a live backend is honoured; the key decides only where a client
+  without a usable sticky cookie lands.
+- **Connection reuse wins; the key applies only when a new backend connection
+  is dialled.** A request that reuses a backend connection its session already
+  holds — an H1 keep-alive connection, an H2 multiplexed one — goes where that
+  connection goes, whatever its own key. Behind an upstream proxy or CDN that
+  multiplexes several tenants over warm keep-alive or H2 connections, the
+  tenants of one such connection therefore follow that connection's backend,
+  not their own key; the key spreads them only over the connections the proxy
+  opens. Clients that reach Sōzu on their own connections are keyed as
+  configured.
+- **A header or cookie key is chosen by the client.** It spreads clients over
+  backends; it does not stop a client from picking its backend by picking its
+  value, exactly as a sticky-session cookie does not.
+
+**Check before upgrading to a release carrying [#524](https://github.com/sozu-proxy/sozu/issues/524).**
+An HTTP, HTTPS or TCP cluster already configured with `HRW` or `MAGLEV` ran
+round-robin before it — the policy received no key — and now pins each client by
+its source IP. Review such clusters whose clients reach Sōzu from few addresses:
+behind a NAT, or behind an L4 load balancer that does not send the PROXY
+protocol, all clients share one or a few source IPs and so land on one or a few
+backends. Switch those clusters to another policy, enable the PROXY protocol on
+the balancer and the listener, or key them with `affinity_header` /
+`affinity_cookie`.
+
+#### Shuffle sharding
+
+Shuffle sharding isolates clients from one another: each client is served by a
+small **shard** of the cluster's backends instead of all of them, so a client
+that overloads or poisons its backends takes down only the clients whose shard
+lies entirely inside its own. Colm MacCárthaigh's
+[*Workload isolation using shuffle sharding*](https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/)
+(Amazon Builders' Library, 2019) is the reference: with `N` backends in shards
+of `k` there are `C(N, k)` distinct shards against `N / k` plain partitions —
+eight backends in shards of two give `C(8, 2) = 28` shards instead of 4
+partitions, so any two clients share their whole shard with probability 1/28
+instead of 1/4. The gain grows quickly with `N` and is negligible on small
+clusters, which is why sharding applies only from `shard_min_backends`.
+
+Sōzu takes a client's shard as the top `k` of the
+[rendezvous (HRW) ranking](https://doi.org/10.1109/90.663936) (David Thaler and
+Chinya Ravishankar, *Using name-based mappings to increase hit rates*, IEEE/ACM
+Transactions on Networking, 1998) of its client key — the same key and the same
+weighted score `HRW` uses, see "Client affinity" — over the cluster's
+**configured** primary addresses, healthy or not. Several ids at one address
+count as one address (see "One address is one share" above): it is ranked
+once, and a shard that holds it holds every primary id there, so a sibling
+can serve when the address's representative is down. That makes a shard:
+
+- **the same on every worker and across restarts**, since the key and the
+  ranking are pure functions of the client and the backend addresses. On HTTP,
+  HTTPS and TCP the key hash is Sōzu's own seeded FNV and does not change
+  between builds; on UDP the affinity key (the source IP, or source IP and port
+  per `affinity_key`) is hashed with the standard library's
+  `DefaultHasher`, whose algorithm Rust does not promise to keep across
+  toolchain versions, so a UDP client's shard may move after an upgrade built
+  with another Rust version;
+- **stable**: removing a backend outside a client's shard does not change the
+  shard, and adding one can displace only its lowest-ranked member, so a
+  change of `N` moves clients only at the tail of their ranking;
+- **exhaustible**: a member that goes down does not pull another backend into
+  the shard. Isolation that silently widened under failure would not isolate.
+
+The ranking reads `weight` exactly as `HRW` does, whatever the cluster's policy:
+a heavier backend ranks higher for more keys and so appears in more shards. Its
+share of shards is not proportional to its weight once `k > 1`, though: the
+weight raises its chance of ranking in a client's top `k`, a chance that
+saturates as it approaches every shard.
+
+| key | default | description |
+|---|---|---|
+| `shard_percent` | unset (off) | Share of the primary backends in a shard, `1..=100`: `k = max(2, ceil(shard_percent × N / 100))`, capped at `N`, where `N` counts distinct primary addresses. The floor of 2 keeps a retry possible inside the shard. |
+| `shard_min_backends` | `8` | Shard only while the cluster has at least this many primary backends (distinct addresses); below it the cluster selects over all of them, exactly as without sharding. At least 2. |
+| `shard_mode` | `"FALLBACK"` | When no backend of a client's shard can take a connection: `"FALLBACK"` selects over the rest of the cluster (backup tier and fail-open included) and counts `backend.shard.spillover`; `"STRICT"` selects nothing — HTTP answers 503, TCP closes the connection — and counts `backend.shard.exhausted`. |
+
+`shard_min_backends` and `shard_mode` are refused without `shard_percent`, and
+all three are hot-updatable (`AddCluster`), from the next selection. From the
+CLI: `sozu cluster add … --shard-percent 25 [--shard-min-backends 8]
+[--shard-strict]`.
+
+```toml
+[clusters.tenants]
+protocol = "http"
+load_balancing = "LEAST_LOADED"   # picks inside the shard
+shard_percent = 25                # k = 2 on 8 backends, 3 on 12, 5 on 20
+# shard_min_backends = 8
+# shard_mode = "STRICT"
+# affinity_header = "X-Tenant"    # shard tenants rather than source IPs
+```
+
+How it composes with the rest of selection:
+
+- **The cluster's policy picks inside the shard.** Sharding narrows the
+  candidates; `load_balancing` then chooses among them as usual —
+  `LEAST_LOADED` or `POWER_OF_TWO` balance a client over its shard, `HRW` pins
+  it to its shard's top member with the rest of the shard as failover. A
+  sharded cluster derives a client key under every policy, not only `HRW` and
+  `MAGLEV`.
+- **Retries stay in the shard.** A failed connection puts the backend in its
+  back-off window, and the next attempt selects again inside the same shard.
+  Each request has `max_connection_attempts` connection attempts (5 by
+  default, see "Backend connection failover"): with a shard of `k` members
+  where `k` is below that budget, a request whose `k` shard members all refuse
+  spills over (`FALLBACK`) or is answered 503 (`STRICT`) on attempt `k + 1`;
+  with a shard at least as large as the budget, that request exhausts its
+  attempts inside the shard and is answered 503, and the next request, finding
+  the members in back-off, spills over or is refused at once.
+- **A sticky session wins.** On a frontend with `sticky_session`, a cookie
+  naming a live backend is honoured even outside the client's shard; a client
+  without a usable cookie selects inside its shard.
+- **Connection reuse wins.** As for the client key, a request that reuses a
+  backend connection its session already holds follows that connection.
+- **Backups are outside every shard.** The shard is drawn from the primary
+  backends. `FALLBACK` reaches the backup tier only after spilling over.
+  `STRICT` never uses a backup, and backups do not take part in its decision:
+  when no member of the shard can take a connection, `STRICT` refuses if any
+  other **primary** backend could, and otherwise — every primary backend
+  failing its health checks, the fail-open regime of the primary tier — fails
+  open inside the shard, picking a member that is administratively up and out
+  of its back-off window, whether or not a backup is healthy.
+- **No key, no shard.** A request with no source address (and no configured
+  header or cookie) selects over the whole cluster.
+- **Every datapath.** Sharding lives in the cluster's backend list, so a UDP
+  cluster that sets it shards its flows by their affinity key too (the source
+  IP, or source IP and port per `affinity_key`).
+
+**Before enabling it.** Sharding is off unless `shard_percent` is set, so
+upgrading changes nothing by itself. Before setting it:
+
+- **Upgrade the main process and every worker first.** An older worker ignores
+  `Cluster` fields 20–22 (`shard_percent`, `shard_min_backends`, `shard_mode`)
+  and serves the cluster unsharded, so a partially upgraded fleet shards only
+  on its upgraded workers.
+- **Retire older `sozu` CLIs.** An older CLI that patches a cluster by reading
+  it back and re-sending it — `sozu cluster h2 enable|disable`, a
+  `QueryClusterById` → `AddCluster` read-modify-write — does not know the new
+  fields, drops them from the `AddCluster` it sends, and so silently turns
+  sharding off.
+- **Check the client key.** The shard follows it: behind a NAT, or an L4 load
+  balancer that does not send the PROXY protocol, every client shares one
+  source IP and so one shard — every request of the cluster then lands on `k`
+  backends. Enable the PROXY protocol, or key on a header or cookie, before
+  sharding such a cluster.
+
+**The "load reads" column is not the per-request cost of the policy.** Every
+selection, under every policy, first builds the candidate set: Sōzu walks the
+cluster's backend list and records each healthy backend's position in a reused
+buffer (`BackendList::next_available_backend_with_key`, `lib/src/backends.rs`)
+without allocating, before the policy runs. All six policies are thus `O(n)` per
+request, and none of them removes that walk. What `POWER_OF_TWO` removes is
+the load reads layered on top of it — two instead of `n`. That saving is
+largest with `load_metric = "connection_time"`, where every load read decays
+and re-stamps a backend's peak-EWMA average; with `connections` or `requests`
+a load read is a field read and the saving is small.
+
+So do not switch a cluster to `POWER_OF_TWO` expecting a latency win from a
+shorter scan: there is no shorter scan. Choose between the two load-aware
+policies on balance instead. `LEAST_LOADED` gives the best balance a single
+worker can compute. `POWER_OF_TWO` gives up a little of it — the
+power-of-two-choices result is a maximum load of `O(log log n)` against
+`O(log n)` for `RANDOM` — in exchange for never computing a global minimum,
+which is what stops several independently seeded workers from all sending
+their next request to the same "least loaded" backend.
+
+`LEAST_LOADED` and `POWER_OF_TWO` both read the load through `load_metric`
+(see below); the other four ignore it.
+
+#### HTTP/2 backend connections (h2c)
+
+By default, Sōzu speaks HTTP/1.1 to backend servers. You can enable cleartext
+HTTP/2 (h2c) for backend connections on a per-cluster basis using the `http2`
+option:
+
+```toml
+[clusters.MyH2Cluster]
+protocol = "http"
+http2 = true
+
+frontends = [
+  { address = "0.0.0.0:8443", hostname = "app.example.com", certificate = "cert.pem", key = "key.pem", certificate_chain = "chain.pem" }
+]
+backends = [
+  { address = "127.0.0.1:8080" }
+]
+```
+
+When `http2 = true`, Sōzu opens cleartext HTTP/2 connections to the backend
+servers. This is useful when your backends natively support HTTP/2 (e.g., gRPC
+servers).
+
+> **Important:** `http2` is a **backend-capability hint** — it tells Sōzu
+> whether the backend speaks H2, nothing more. It does **not** gate H2
+> acceptance at the frontend. Frontend H2 is negotiated entirely via TLS ALPN
+> (the `alpn_protocols` listener option) and is independent of per-cluster
+> configuration. A cluster with `http2 = false` (or omitted) can still receive
+> H2 requests from clients; Sōzu will translate them to H1 before forwarding to
+> the backend. See `FileClusterConfig::http2` (`command/src/config.rs`) for
+> the field definition.
+
+You can also toggle HTTP/2 at runtime on an existing cluster via the CLI:
+
+```bash
+sozu cluster h2 enable --id MyH2Cluster
+sozu cluster h2 disable --id MyH2Cluster
+```
+
+The frontend and backend protocols are independent. All four combinations work:
+
+| Client → Sōzu | Sōzu → Backend | Configuration                                  |
+| ------------- | -------------- | ---------------------------------------------- |
+| HTTP/1.1      | HTTP/1.1       | Default (no `http2` flag)                      |
+| HTTP/2        | HTTP/1.1       | Client negotiates H2 via ALPN, default backend |
+| HTTP/1.1      | HTTP/2         | `http2 = true` on cluster                      |
+| HTTP/2        | HTTP/2         | Client negotiates H2 via ALPN + `http2 = true` |
+
+> **Note:** The `http2` option controls the backend protocol only. The frontend
+> protocol is determined by TLS ALPN negotiation between the client and Sōzu.
+
+#### UDP clusters
+
+A cluster fronting a UDP listener selects its load-balancing algorithm with the
+shared cluster-level `load_balancing` key, and carries its datagram-specific
+knobs (flow affinity, teardown counters, PROXY-protocol, health checks) under an
+optional `[clusters.<id>.udp]` block.
+
+Two source-hash algorithms are added for flow-affine UDP selection (both are
+also valid for HTTP, HTTPS and TCP clusters, see "Client affinity"):
+
+| `load_balancing` | Affinity | Notes                                                                                                                                  |
+| ---------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `ROUND_ROBIN`    | none     | Rotate through backends, each in proportion to `weight`. The existing default; no source affinity.                                     |
+| `HRW`            | yes      | Highest-Random-Weight / rendezvous hashing — the recommended UDP default. `O(N)` per selection, no precomputed table, so no rebuild stall on hot-reconfig and provably-minimal flow remapping when backends change. |
+| `MAGLEV`         | yes      | Maglev consistent hashing — `O(1)` per-packet table lookup, near-perfect balance, for large backend sets / high pps. The lookup table is rebuilt in the control-plane reconcile step on a backend-set change (not per-packet) and remaps ~2× more keys than HRW on churn. |
+
+> **Note:** the `load_balancing` enum is parsed in `SCREAMING_SNAKE_CASE`
+> (`"ROUND_ROBIN"`, `"HRW"`, `"MAGLEV"`, …) — the same casing as every other
+> proto-backed enum in this file (e.g. `tls_versions`).
+
+The `[clusters.<id>.udp]` block:
+
+| Key                             | Default      | Description                                                                                                                                   |
+| ------------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `affinity_key`                  | `SOURCE_IP`  | Backend affinity key for hash LBs. `SOURCE_IP` pins every port from one client to one backend; `SOURCE_IP_PORT` keys on the full source 2-tuple. It only selects the backend: a flow is always one client source IP and port, with its own upstream socket, and replies return to that source. |
+| `responses`                     | `0`          | Expected replies per flow. A DNS flow sets `responses = 1` so the flow closes immediately after its single reply; `0` = unlimited (syslog-style fire-and-forget). |
+| `requests`                      | `0`          | Maximum client datagrams per flow before teardown. `0` = unlimited.                                                                           |
+| `send_proxy_protocol`           | `false`      | Prepend a PROXY protocol **v2** header (carrying the real client `SocketAddr`) to the backend. By default it is sent on the **first** datagram of the flow only. Backend PPv2-over-UDP parse support is not guaranteed by the spec — verify per backend. |
+| `proxy_protocol_every_datagram` | `false`      | When `true`, prepend the PPv2 header to **every** datagram instead of the first only. Useful when a flow may be re-created after idle eviction and the backend needs the client context on each datagram. |
+
+Per-source flow limits (opt-in): each client source IP and port is its own
+flow, with its own upstream socket and `max_flows` slot. A cluster's own
+`max_connections_per_ip` and `max_connections_per_subnet` (with the global
+`subnet_ipv4_prefix` / `subnet_ipv6_prefix`) cap the concurrent flows one
+source address, or one source subnet, holds on the cluster. The global
+`max_connections_per_ip` / `max_connections_per_subnet` defaults do **not**
+apply to UDP: a cluster without its own value has no per-source limit. A datagram that would open a flow over either limit is dropped
+(`udp.flows.shed`, `udp.flows.shed.source_limit`); datagrams of existing
+flows are not affected, and a closed flow frees its slot. The source is the
+datagram's source address. The counters are kept per UDP listener and are
+separate from the TCP/HTTP connection counters.
+
+```toml
+[clusters.dns]
+max_connections_per_ip = 64       # concurrent flows per source address
+```
+
+The `[clusters.<id>.udp.health]` sub-block configures active backend health
+checks, bound to the endpoint:
+
+| Key                      | Default     | Description                                                                                                               |
+| ------------------------ | ----------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `mode`                   | `TCP_PROBE` | `HEALTH_OFF` disables health checking; `TCP_PROBE` opens a non-blocking TCP connection to a companion port (the industry-standard liveness hint — a hint, not proof of UDP reachability); `UDP_PROBE` sends an application datagram and expects any reply. Defaults to `TCP_PROBE` when a `[…udp.health]` block is present. |
+| `tcp_port`               | data port   | Companion TCP probe port. Unset = the backend's data port.                                                                |
+| `rise`                   | `2`         | Consecutive successes before a backend is marked up (hysteresis).                                                         |
+| `fall`                   | `3`         | Consecutive failures before a backend is marked down (hysteresis). A flapping probe never re-hashes live flows; flows on a now-unhealthy backend stay pinned via the flow table until idle-timeout. |
+| `fail_open`              | `true`      | When **all** backends read unhealthy, still run the normal LB over the full configured backend set (ignoring health) rather than black-holing traffic. |
+| `udp_probe_payload`      | —           | Literal payload sent for a `UDP_PROBE` (e.g. a DNS query).                                                                |
+| `probe_interval_seconds` | `5`         | Delay between probes, in seconds.                                                                                         |
+| `probe_timeout_seconds`  | `2`         | Per-probe response timeout, in seconds.                                                                                   |
+
+Each probe result applies to the backend it was launched for, identified by
+its backend id and address, never to another backend at the same address. A
+probe still in flight when its backend is removed is discarded on completion,
+even if a backend with the same id and address was added in the meantime: the
+re-added backend starts with a fresh health state.
+
+A complete DNS cluster, with HRW affinity, single-reply flows, PROXY v2 to the
+backend, and a TCP-probe health check:
+
+```toml
+[[listeners]]
+protocol = "udp"
+address  = "0.0.0.0:53"
+
+[clusters.dns]
+protocol       = "tcp"            # cluster transport family; UDP knobs live under [clusters.dns.udp]
+load_balancing = "HRW"            # ROUND_ROBIN | HRW (source-hash, recommended for UDP) | MAGLEV
+frontends = [
+  { address = "0.0.0.0:53" }
+]
+backends = [
+  { address = "10.0.0.10:53" },
+  { address = "10.0.0.11:53" }
+]
+
+[clusters.dns.udp]
+affinity_key        = "SOURCE_IP" # SOURCE_IP | SOURCE_IP_PORT
+responses           = 1           # DNS = one reply per query; closes the flow when reached
+requests            = 0           # 0 = unlimited client datagrams per flow
+send_proxy_protocol = true        # PROXY v2 to the backend, first datagram only
+
+[clusters.dns.udp.health]
+mode      = "TCP_PROBE"           # HEALTH_OFF | TCP_PROBE | UDP_PROBE
+tcp_port  = 53                    # companion probe port; default = the data port
+rise      = 2
+fall      = 3
+fail_open = true                  # all-unhealthy ⇒ LB over the full configured set
+```
+
+#### Buffer size for HTTP/2
+
+HTTP/2 uses a default maximum frame size of 16384 bytes (16 KiB) per RFC 9113
+§6.5.2. Sōzu needs at least 9 additional bytes for the frame header (§4.1). Set
+`buffer_size` in the global section to at least **16393**:
+
+```toml
+buffer_size = 16393
+```
+
+This is also the default — no action is needed unless an operator explicitly
+lowers `buffer_size`. **As of
+[PR #1209](https://github.com/sozu-proxy/sozu/pull/1209) Sōzu rejects start-up
+if `buffer_size < 16393` and any HTTPS listener advertises `h2` in its ALPN
+list**, with a `BufferSizeTooSmallForH2` error pointing at the conflicting
+listeners. The previous behaviour (silently accept the typo, then deadlock H2
+mux on full-size frames) is gone.
+
+To run with a smaller buffer, remove `h2` from the listeners' `alpn_protocols`:
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+alpn_protocols = ["http/1.1"]   # h2 removed; buffer_size < 16393 is now valid
+```
+
+#### H2 flood detection thresholds
+
+Sozu includes built-in flood detection for HTTP/2 connections. When a client
+sends an excessive number of certain frame types within a rolling window, Sozu
+terminates the connection with a `GOAWAY(ENHANCE_YOUR_CALM)` frame. This
+protects against several known HTTP/2 denial-of-service vectors.
+
+Seven thresholds are configurable per-listener: the six per-window counters
+below, half-decayed once per `FLOOD_WINDOW_DURATION` (1 second), plus
+`h2_max_continuation_frames`, which counts per header block and is reset when
+the block completes. When omitted, compile-time defaults are used (see also
+[RST_STREAM lifetime caps](#h2-rst_stream-lifetime-caps) for connection-lifetime
+counters).
+
+Every one of them must be `>= 1`. A `0` does not disable the check — flood
+detection compares `count > threshold`, so it makes the first event that
+counter sees a violation, and the connection is torn down with
+`GOAWAY(ENHANCE_YOUR_CALM)` as soon as one client sends the frame that counter
+counts. (`h2_max_header_list_size` and `h2_max_header_fields`, in the
+[listener field table](#http-and-https-listeners), are worse still: they are
+also the HPACK decode budget, so `0` refuses *every* request with
+`ENHANCE_YOUR_CALM` — per stream for a header block that fits one HEADERS
+frame, and as a connection `GOAWAY` for one that spans CONTINUATION frames.)
+
+A `0` is refused when the configuration is loaded, refused by `sozu ctl` on a
+listener update, and refused on a raw `AddHttpListener` / `AddHttpsListener`
+sent straight to the command socket, so the value is never silently rewritten.
+Replaying a state file saved before those checks existed is the one exception:
+the listener is kept and its threshold clamped to the floor, because dropping
+it would unbind it and take its frontends offline. `sozu` logs that at `warn!`
+with the key to fix, and counts `config.load_h2_knob_clamped`.
+
+The seven thresholds:
+
+| Parameter                                 | Default | Protects against                                                                                                                                                                                                                             | CVE            |
+| ----------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| `h2_max_rst_stream_per_window`            | 2000    | RST_STREAM storm: client resets streams in a tight loop. A browser tab closing cancels up to `h2_max_concurrent_streams` streams at once; the Rapid Reset signature itself (resets before the response) is capped by `h2_max_rst_stream_abusive_lifetime` | CVE-2023-44487 |
+| `h2_max_ping_per_window`                  | 2000    | Ping flood: client sends PING frames faster than the server can respond                                                                                                                                                                      | CVE-2019-9512  |
+| `h2_max_settings_per_window`              | 1000    | Settings flood: client sends SETTINGS frames requiring ACKs, exhausting server resources                                                                                                                                                     | CVE-2019-9515  |
+| `h2_max_empty_data_per_window`            | 2000    | Empty DATA flood: client sends zero-length DATA frames to consume processing time                                                                                                                                                            | CVE-2019-9518  |
+| `h2_max_window_update_stream0_per_window` | 2000    | Connection-level (stream 0) WINDOW_UPDATE flood: client sends a torrent of non-zero stream-0 WINDOW_UPDATE frames to burn server CPU parsing each one (zero-increment frames short-circuit into `GOAWAY(PROTOCOL_ERROR)` per RFC 9113 §6.9). Only **unsolicited** updates count: each DATA frame Sōzu sends entitles the peer to two stream-0 WINDOW_UPDATEs that are not counted, so a client returning credit as it downloads — one update per DATA frame, per half window, … — never reaches it. |                |
+| `h2_max_continuation_frames`              | 20      | CONTINUATION flood: client sends many small CONTINUATION frames to exhaust header memory                                                                                                                                                     | CVE-2024-27316 |
+| `h2_max_glitch_count`                     | 2000    | Cumulative protocol violations: minor protocol errors (see [below](#tuning-h2_max_glitch_count-in-production)) before disconnection                                                                                                          |                |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+# H2 flood detection thresholds (optional, defaults shown)
+h2_max_rst_stream_per_window = 2000   # RST_STREAM storm (CVE-2023-44487)
+h2_max_ping_per_window = 2000         # Ping flood (CVE-2019-9512)
+h2_max_settings_per_window = 1000     # Settings flood (CVE-2019-9515)
+h2_max_empty_data_per_window = 2000   # Empty DATA flood (CVE-2019-9518)
+h2_max_window_update_stream0_per_window = 2000  # Unsolicited connection-level WINDOW_UPDATE flood (stream 0)
+h2_max_continuation_frames = 20       # CONTINUATION flood (CVE-2024-27316) — a memory bound
+h2_max_glitch_count = 2000            # Cumulative protocol violations
+```
+
+The rate defaults are deliberately generous: they stop floods, which run at
+thousands of frames per second, without tripping on ordinary browsers,
+large downloads or a Sōzu in front of another Sōzu. `h2_max_continuation_frames`,
+`h2_max_header_list_size`, `h2_max_header_fields` and `h2_max_header_table_size`
+bound memory rather than a rate, and keep their tighter defaults.
+
+> **Note:** When any threshold is exceeded, the connection is terminated with a
+> `GOAWAY` frame using the `ENHANCE_YOUR_CALM` error code (HTTP/2 error code
+> 0xb). The event is logged at `warn` level with the specific flood type that
+> triggered disconnection.
+
+##### Tuning `h2_max_glitch_count` in production
+
+`h2_max_glitch_count` is a catch-all counter for _low-severity_ protocol drift
+that no other flood counter covers. It is incremented on stream-close races
+(`RST_STREAM` / `WINDOW_UPDATE` / `DATA` on a closed stream, one per frame —
+a cancelled upload with a full 64 KiB stream window in flight is about four of them),
+`WINDOW_UPDATE` with zero increment on a closed stream, unknown SETTINGS
+identifiers, every stream Sōzu refuses once the client has acknowledged its
+SETTINGS (over its concurrency limit, including the lower limit back-pressure
+sets, while the connection drains, or under flood pressure — buffer-pool
+refusals excepted), every
+reset the client provokes (see `h2_max_rst_stream_emitted_lifetime`), and each
+received `GOAWAY` (a graceful close sends at most two, RFC 9113 §6.8). The
+counter uses a 1-second sliding window with
+_half-decay_ (it halves at each window roll rather than resetting), so a
+threshold of `N` tolerates a one-shot burst of `N` glitches or a sustained rate
+of roughly `N/2` glitches per second.
+
+The default of `2000` absorbs the races of busy browser, mobile and gRPC
+traffic; nghttp2 budgets the same class at a burst of 10 000 and 330 per
+second. If `h2.flood.violation.glitch_window` fires on traffic you know is
+benign, raise the threshold per-listener:
+
+| Traffic profile                   | Suggested `h2_max_glitch_count` |
+| --------------------------------- | ------------------------------- |
+| Default / mixed public traffic    | 2000                            |
+| gRPC / mobile / high cancellation | 4000                            |
+| Load-test absorption only         | 10000                           |
+
+Before raising blindly, drop the relevant module to `debug` level and check
+which branch dominates — a single misbehaving backend or client emitting
+`WINDOW_UPDATE` on closed streams can be fixed upstream instead of hiding behind
+a larger budget. Never set the threshold to `u32::MAX`; the catch-all is the
+last line of defence against peers that stay just under every specific per-frame
+cap.
+
+#### H2 connection tuning
+
+Additional H2 parameters control connection-level behavior. All are optional
+per-listener with safe compile-time defaults:
+
+| Parameter                               | Default                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h2_initial_connection_window`          | 16777216 (16 MiB)       | Connection-level receive window size in bytes (RFC 9113 §6.9.2). Clamped to [65535, 2^31-1]. **Advertised to the peer, not enforced**: it sizes the one-shot `WINDOW_UPDATE(0, …)` grant and the grant-back cadence (one stream-0 `WINDOW_UPDATE` per half window received; a small window makes that hundreds per second at LAN speed, which peers' flood detection may refuse), and raising it raises no bound on inbound DATA. User-space memory is bounded by the buffer pool instead, which refuses one stream with `RST_STREAM(REFUSED_STREAM)` rather than failing the connection. The kernel is not: when Sōzu stops reading a connection, the peer may still send up to min(this window, `h2_max_concurrent_streams` × 65535) octets, about 6.25 MiB at the default 100 streams, which wait in that socket's receive buffer (Sōzu sets no `SO_RCVBUF`; autotuning caps it at `net.ipv4.tcp_rmem[2]`). See `doc/h2_mux_internals.md`, "The advertised connection-level receive window is not enforced" (sozu-proxy/sozu#1488).                  |
+| `h2_max_concurrent_streams`             | 100                     | Maximum concurrent H2 streams the proxy accepts (`SETTINGS_MAX_CONCURRENT_STREAMS`). Minimum: 1.                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `h2_stream_shrink_ratio`                | 2                       | Shrink threshold ratio for recycled stream slots. The internal stream Vec is shrunk when `total_slots > active_streams * ratio`. Minimum: 2.                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `h2_max_header_list_size`               | 65536                   | Maximum accumulated HPACK-decoded header list size per request (`SETTINGS_MAX_HEADER_LIST_SIZE`, RFC 9113 §6.5.2). Accounted as name + value + 32 octets per field, per §6.5.2; the per-field overhead also bounds the field count.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `h2_stream_idle_timeout_seconds`        | `max(30, back_timeout)` | Per-stream idle timeout in seconds. An open H2 stream that receives no meaningful application data (non-empty DATA or HEADERS) for this duration is cancelled (`RST_STREAM` / `CANCEL`) to defend against slow-multiplex Slowloris. When unset the listener inherits `back_timeout` (floored at 30 s) so streams are not cancelled before the backend socket budget elapses; set explicitly to cap the per-stream deadline below `back_timeout` when under a slow-multiplex attack. Active uploads that trickle DATA frames reset the timer on each frame. The same deadline also governs a second, independent guard: a stream whose buffered response cannot drain because the peer keeps its receive window exhausted (HTTP/2 window-stall / `WINDOW_UPDATE`-drip) is reaped too. That flow-control-stall guard is NOT refreshed by inbound activity, so neither an inbound DATA drip nor a `WINDOW_UPDATE(+1)` drip can keep a window-stalled stream alive: the deadline clears only on a genuinely open send window or once cumulative outbound progress reaches one max DATA frame (16 KiB), so a trickle below that floor ages out and is reaped, while legitimate slow-but-steady transfers (sustaining more than ~0.5 KiB/s at the 30 s default) are unaffected. The guard is bidirectional — it also reaps a stalled request **upload** to a slow H2 backend (returning the client a 502), so raise this timeout if you proxy large uploads to slow H2 backends. A continuously window-blocked peer sustaining less than ~0.5 KiB/s for a full timeout is the one disclosed residual (raise the timeout to tolerate it). |
+| `h2_max_header_table_size`              | 65536                   | Maximum HPACK dynamic table size (`SETTINGS_HEADER_TABLE_SIZE`) accepted from the peer. Caps the peer-advertised value to prevent unbounded HPACK encoder memory growth.                                                                                                                                                                                                                                                                                                                                                                                   |
+| `h2_max_header_fields`                  | 128                     | Maximum number of materialized header fields, enforced per HEADERS block and (independently) per trailers block — HPACK fields plus expanded cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK indexed-reference "header bomb", where 1-byte indexed references amplify into per-entry bookkeeping; cookie crumbs are counted individually (cf. Apache CVE-2026-49975). The same value bounds the trailer section of an HTTP/1.1 chunked request, where one field more is answered 400 (#1701). Minimum: 1. |
+| `h2_graceful_shutdown_deadline_seconds` | 5                       | Maximum wall-clock seconds to wait for in-flight H2 streams after `GOAWAY(NO_ERROR)` has been sent during soft-stop. This includes a request whose header block is still arriving when the soft-stop lands. Once the deadline elapses the connection is forcibly closed, after a final `GOAWAY(NO_ERROR)` whose `last_stream_id` excludes a stream whose header block never completed. It also bounds the HTTP/2 sessions drained by `sozu cluster close-sessions`. Set to `0` to disable the forced close entirely — shutdown (or that drain) then waits for every stream to drain naturally (use with caution: a long-running request can delay the whole soft-stop indefinitely).                                                                                                                                                                         |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+# H2 connection tuning (optional, defaults shown)
+h2_initial_connection_window = 16777216           # 16 MiB, min 65535, max 2147483647
+h2_max_concurrent_streams = 100                   # min 1
+h2_stream_shrink_ratio = 2                        # min 2
+h2_max_header_list_size = 65536                   # HPACK decoded header budget
+h2_stream_idle_timeout_seconds = 30               # per-stream idle timeout (default: max(30, back_timeout))
+h2_max_header_table_size = 65536                  # HPACK dynamic table size cap
+h2_max_header_fields = 128                         # max header fields/request (incl. cookie crumbs)
+h2_graceful_shutdown_deadline_seconds = 5         # soft-stop forced-close deadline (0 = wait forever)
+```
+
+#### H2 RST_STREAM lifetime caps
+
+In addition to the per-window `h2_max_rst_stream_per_window` threshold, three
+connection-lifetime counters limit the RST_STREAM frames associated with a
+single connection — two on the **received** side (Rapid Reset, CVE-2023-44487)
+and one on the **emitted** side (MadeYouReset, CVE-2025-8671). Together they
+catch patient-attacker patterns that stay just below the per-window threshold.
+
+Each configured value is a **floor**, not a fixed ceiling: a cap trips only once
+its count exceeds the floor and the ratio below is crossed. The ratio is taken
+over the **backend-routed** streams of the connection: those a backend
+answered, those Sōzu answered 502, 503 or 504 after selecting a backend that
+then refused the connection, failed or timed out, and those it answered 503
+because every backend of the cluster was failing its health check or backing
+off after connection failures. A stream answered before any backend was
+selected for another reason does not count, whatever its status: no route,
+redirect, 401, 421, 429, a refusal, a 503 for a cluster with no backend, or a
+session or buffer limit hit before selection. The two pre-response caps share
+one count — resets the client sent before a response plus resets it provoked —
+and trip once more than half of the backend-routed streams were reset before
+their response. A connection whose client cancels a minority of its requests
+therefore never accumulates toward a cap, however long it lives, while a client
+that resets (or makes Sōzu reset) every stream it opens trips just past the
+floor. This is the shape of Envoy's premature-reset guard, which closes a
+connection once at least half of its streams, and at least 250 of them, were
+reset before a response; Sōzu's floors are higher.
+
+`h2_max_rst_stream_lifetime` leaves pre-response resets to the caps above: past
+its floor, it trips once the resets received after a response started or on a
+stream already closed outnumber the streams a backend answered. A stream reset
+after its response started counts as answered before the check, so a client
+that cancels its streams after their responses never trips it.
+
+| Parameter                            | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h2_max_rst_stream_lifetime`         | 200000  | Floor of the cap on RST_STREAM frames **received** on this connection; trips once the resets received after a response started or on an already-closed stream also outnumber the streams a backend answered. |
+| `h2_max_rst_stream_abusive_lifetime` | 1000    | Floor of the cap on "abusive" **received** RST_STREAM frames — resets the client sends on a frontend connection before the response starts, the Rapid Reset signature (CVE-2023-44487); trips once these resets plus the resets the client provoked are more than half of the backend-routed streams. Resets a backend sends on a backend connection never count as abusive: Sōzu opened those streams. |
+| `h2_max_rst_stream_emitted_lifetime` | 10000   | Floor of the cap on RST_STREAM frames **emitted by the server** that the peer provoked (CVE-2025-8671 "MadeYouReset"): Content-Length mismatch, header parse error, oversized header block, PRIORITY self-dependency, zero-increment or overflowing `WINDOW_UPDATE` on an open stream. Trips once these resets plus the pre-response resets the client sent are more than half of the backend-routed streams. Each one also counts as a glitch. Resets Sōzu decides on its own are **not** counted: the idle-stream reaper's `CANCEL`, `REFUSED_STREAM` from its concurrency limit, back-pressure, buffer pool or `h2_stream_refusal_percent`, `STREAM_CLOSED` for DATA on a closed stream, and the error a failing backend response produces. `NoError` resets are not counted either. Crossing the cap emits `GOAWAY(EnhanceYourCalm)`. |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+h2_max_rst_stream_lifetime = 200000
+h2_max_rst_stream_abusive_lifetime = 1000
+h2_max_rst_stream_emitted_lifetime = 10000
+```
+
+#### Refusing new streams before the pre-response cap
+
+The pre-response cap (`h2_max_rst_stream_abusive_lifetime`) ends the connection
+with `GOAWAY(ENHANCE_YOUR_CALM)`, and every stream in flight on it with the
+connection. Before that, Sōzu refuses new streams on the connection: each new
+stream gets `RST_STREAM(REFUSED_STREAM)` and the streams already open keep being
+served. A refused stream did no work, so the client may retry it (RFC 9113
+§8.7). The refusal holds while all three hold:
+
+- the client's pre-response resets are past `h2_stream_refusal_percent` of the
+  cap's floor;
+- they already outnumber the backend-routed streams — the cap's own ratio, so a
+  client that would never trip the cap is never refused;
+- the client reset a stream before its response within the last second. The
+  pre-response count never decays, so a client that stops cancelling is served
+  again one second after its last pre-response reset.
+
+The cap and the other flood limits are unchanged. Like a refusal at
+`SETTINGS_MAX_CONCURRENT_STREAMS` or during a graceful shutdown, each refusal
+counts one glitch toward `h2_max_glitch_count` once the client acknowledged
+Sōzu's SETTINGS: that budget is what ends the connection of a client that keeps
+opening streams it is refused. A refusal is not counted as a provoked reset
+and does not trigger the `SETTINGS_MAX_CONCURRENT_STREAMS` back-pressure.
+
+A client that resets a stream Sōzu refused does not honour the refusal: that
+reset counts as a pre-response reset, since the stream never had a response,
+and Sōzu stops refusing streams on that connection, which then meets the cap
+exactly as it would without the soft state. The refused stream is no longer
+tracked, so its reset also counts one glitch, like any RST_STREAM on a closed
+stream. Only the latest run of refused streams is remembered — the streams
+refused since the last one Sōzu accepted; a reset of a stream refused before
+that counts as a reset after a response, as without the soft state. A client
+that does honour refusals can still meet this once: if it cancels a stream at
+the moment Sōzu refuses it, its RST_STREAM crosses the `REFUSED_STREAM` and
+counts as a reset of a refused stream, and the refusals end for the rest of that
+connection, which then behaves as it would without the soft state.
+
+Frames a client sent on a refused stream before it read that stream's
+`REFUSED_STREAM` — DATA, request trailers — are ignored, as on any stream Sōzu
+reset (RFC 9113 §5.1): the refused stream costs the client that stream only,
+and the connection and its other streams carry on. This holds for every
+refusal, not only this soft state: over `SETTINGS_MAX_CONCURRENT_STREAMS`,
+during a graceful shutdown, whose drain still ends with `NO_ERROR`, and on
+buffer-pool exhaustion. Sōzu remembers refused ids in the same bounded list as
+the streams it reset (the last 256), and holds them to the same allowance: two
+header blocks per stream and DATA within the stream's initial window, still
+credited to the connection window. Each frame beyond that counts one glitch
+(`h2_max_glitch_count`). The flood-pressure, graceful-shutdown and
+`SETTINGS_MAX_CONCURRENT_STREAMS` refusals themselves count one glitch each once
+the client acknowledged Sōzu's SETTINGS (a client that never acknowledges them
+is disconnected after 5 s); a buffer-pool refusal counts none
+([#1815](https://github.com/sozu-proxy/sozu/issues/1815)).
+
+HEADERS on a client stream id that was never opened opens no stream. An id
+above the last stream Sōzu accepted and at or below the highest id the client
+used, skipped by the client (or refused longer ago than the list of reset
+streams remembers), ends the connection with `GOAWAY(PROTOCOL_ERROR)` (RFC 9113
+§5.1.1). Such an id below the last accepted stream takes the closed-stream path
+and ends it with `GOAWAY(STREAM_CLOSED)`, as before.
+
+Clients that retry fast meet the refusals too. A gRPC client whose calls hit
+their deadlines cancels each one before its response — a pre-response reset —
+and a client that retries a refused stream at once opens it again within the
+second, so during such a storm its retries are refused, each costing a glitch,
+until it stops cancelling for a second or its retries exhaust the glitch
+budget and the connection ends with `GOAWAY(ENHANCE_YOUR_CALM)`. The per-window RST_STREAM rate
+(`h2_max_rst_stream_per_window`) has no soft threshold: it counts every reset,
+answered streams included, and with its half-decay a client at half the rate
+never reaches the limit, so refusing there would refuse clients the limit never
+cuts off. PING, SETTINGS, empty DATA, CONTINUATION and stream-0
+`WINDOW_UPDATE` floods open no stream and have no soft threshold either. Each
+refusal is counted in `h2.flood.stream_refused`.
+
+| Parameter                   | Default | Description                                                                                                                                              |
+| --------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h2_stream_refusal_percent` | 50      | Share, in percent, of the `h2_max_rst_stream_abusive_lifetime` floor at which new streams are refused. `0` disables the refusal; `100` or more never refuses before the cap itself trips. |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+h2_stream_refusal_percent = 50
+```
+
+#### Security and protocol settings
+
+| Parameter            | Default | Description                                                                                                                                                                                                            |
+| -------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `strict_sni_binding` | true    | Every HTTP request must have its `:authority` / `Host` covered by a SAN dNSName entry of the certificate served on this TLS session, with RFC 6125 §6.4.3 wildcard handling (CWE-346 / CWE-444). Per RFC 6125 §6.4.4, when the SAN dNSName list is present the Common Name is ignored; CN is only consulted as a fallback identity when the cert omits the SAN extension. Applies to HTTPS listeners only; plaintext listeners never have an SNI to compare against. Default-cert handshakes (rustls fell back to the bundled cert because no SAN matched the SNI) fall back to the legacy SNI exact-match check — pre-fix posture. Misses are answered with 421 Misdirected Request (RFC 9110 §15.5.20). This matches Firefox / Chrome HTTP/2 connection-coalescing semantics (RFC 7540 §9.1.1 / RFC 9113 §9.1.1) — browsers reuse one H2 connection for any origin covered by the served cert. |
+| `disable_http11`     | false   | Only accept HTTP/2 connections; clients that do not negotiate `h2` via TLS ALPN (including those that omit ALPN entirely) are dropped at handshake instead of silently downgrading to HTTP/1.1.                        |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+strict_sni_binding = true   # require :authority covered by served cert SANs (RFC 6125 wildcards, default)
+disable_http11 = false      # allow HTTP/1.1 fallback (default)
+sozu_id_header = "Sozu-Id"  # rename the per-request correlation header (default "Sozu-Id")
+```
+
+The `sozu_id_header` knob renames the correlation header Sozu injects on every
+request AND response. Each request gets a unique ULID whose value is written to
+both sides — operators can grep the same identifier across client logs, proxy
+access logs, and backend logs. "Each request" includes every request of an
+HTTP/1.1 keep-alive connection and every stream of an HTTP/2 connection: two
+requests never share an id, even on one connection. Default is `Sozu-Id`; a common rebrand is
+`X-Request-Trace` or `X-Edge-Id`. The value must be a valid HTTP header name
+(token chars per RFC 9110 §5.1). Applies to both HTTP and HTTPS listeners.
+
+#### `X-Real-IP` injection and anti-spoof elision
+
+Two listener-scoped flags control how Sōzu handles the `X-Real-IP` header. They
+default off (current behaviour: client-supplied value passes through, no proxy
+injection) and are independently combinable:
+
+| Parameter         | Default | Description                                                                                                                                                                                                                   |
+| ----------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `elide_x_real_ip` | false   | Strip any client-supplied `X-Real-IP` header from forwarded requests before they reach the backend. Anti-spoofing — without this, a client can claim any value and downstream apps that key on `X-Real-IP` trust it verbatim. |
+| `send_x_real_ip`  | false   | Append a proxy-generated `X-Real-IP` header carrying `session_address.ip()` — the connection peer IP after PROXY-v2 unwrap, i.e. the original client IP.                                                                      |
+
+The four valid combinations cover the typical use cases:
+
+| `elide_x_real_ip` | `send_x_real_ip` | Behaviour                                                                                                                                                                                                                                                             |
+| ----------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false`           | `false`          | Default. Client header passes through, no proxy injection.                                                                                                                                                                                                            |
+| `false`           | `true`           | Send-only. Both client and proxy headers reach the backend. **Operator caveat:** backends that read the _first_ `X-Real-IP` header (rather than the last) trust the client value over the proxy value. Use `elide_x_real_ip = true` alongside for full anti-spoofing. |
+| `true`            | `false`          | Anti-spoof only. Client header stripped, no proxy injection.                                                                                                                                                                                                          |
+| `true`            | `true`           | Anti-spoof + send. Client header stripped, proxy header carries the connection peer IP.                                                                                                                                                                               |
+
+The injected value is the IP of the connection peer **after** PROXY-v2 unwrap.
+When the listener has `expect_proxy = true` and the upstream sends a PROXY-v2
+frame, `session_address` is rewritten to the original client IP before this
+header is generated, so the carried address is the real client even with one (or
+more) PROXY-v2 hops in front of Sōzu. A frame carrying the `LOCAL` command
+(ver/cmd `0x20`) is the exception: it describes a connection the upstream proxy
+originated itself, its address block is discarded per the HAProxy PROXY protocol
+specification §2.2, and no address pair survives for the session to adopt. An
+HTTP or HTTPS listener does **not** fall back to the connection peer: the
+expect upgrade needs both endpoints (`HttpSession::upgrade_expect` in
+`lib/src/http.rs`, `HttpsSession::upgrade_expect` in `lib/src/https.rs`), gets
+neither, and the session is closed (`HttpSession::upgrade`,
+`lib/src/http.rs`). No `X-Real-IP` is injected because no request is ever read.
+Only raw TCP listeners fall back to `peer_addr`, and they inject no HTTP
+header. HAProxy pairs `LOCAL` with `AF_UNSPEC`, which already closed such a
+session, so the only behaviour that changes is a forged `LOCAL` carrying a
+populated address block: it used to be injected verbatim as `X-Real-IP`, and now
+closes the session.
+
+Both flags apply uniformly to HTTP/1 and HTTP/2 because the elision and
+injection live on the shared `HttpContext::on_request_headers` callback. That
+callback only sees the header block, so both frontends also drop client
+attribution from a request's trailer section, unconditionally and whatever these
+flags say (RFC 9110 §6.5.1): `X-Real-IP`, `X-Forwarded-For`, `Forwarded`,
+`X-Request-Id`, `X-Forwarded-Proto`, `X-Forwarded-Port` and `X-Forwarded-Host`,
+the single list `TRAILER_SPOOF_VECTOR_HEADERS`
+(`lib/src/protocol/kawa_h1/editor.rs`). H2 trailer HEADERS frames are filtered by
+`pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) and H1 chunked trailer
+sections by `HttpContext::filter_request_trailers` (`editor.rs`), so a client
+cannot spoof its address as a trailer to bypass the anti-spoof (#1689).
+
+Both frontends also elide every field RFC 9110 §6.5.1 keeps out of a trailer
+section because its evaluation is needed before the content: framing
+(`Content-Length`, `Transfer-Encoding`), routing (`Host`), request modifiers
+(`Cache-Control`, `Expect`, `Max-Forwards`, `Pragma`, `Range`, `TE`, and the
+`If-*` conditionals), authentication (`Authorization`, `Proxy-Authorization`,
+`Cookie`), content processing (`Content-Encoding`, `Content-Type`,
+`Content-Range`, `Trailer`) and the connection-specific `Connection`,
+`Keep-Alive`, `Proxy-Connection` and `Upgrade` (RFC 9110 §7.6.1), the list
+`TRAILER_FORBIDDEN_FIELDS` (`lib/src/protocol/kawa_h1/editor.rs`). RFC 7230
+§4.1.2 has a recipient ignore such a field "since processing them as if they
+were present in the header section might bypass external security filters",
+and RFC 9112 §7.1.2 lets it discard any trailer field, so the request is still
+forwarded without them rather than refused (#1701 for H1). An H2 trailer block
+is filtered against the same list by `pkawa::handle_trailer`
+(`lib/src/protocol/mux/pkawa.rs`) before a backend is chosen, so the set of
+trailer fields left for an H1 or an H2 backend is the same (#1714); this says
+nothing about how each backend protocol frames them. The connection-specific names of
+the list never reach that filter on H2, because RFC 9113 §8.2.2 makes a field
+block carrying them malformed and the stream is reset. An H1 trailer section is
+also bounded by the listener's `h2_max_header_fields`, the bound the H2 frontend
+applies to a trailer block: one field more, elided fields included, answers the
+request 400, or cuts the response when the backend already started it. The
+advisory `Trailer` request header is forwarded as sent, since RFC 9110 §6.6.2
+makes it a hint the sender need not follow through. Every other trailer field,
+such as `grpc-status`, is forwarded.
+
+Both knobs are runtime-patchable via `UpdateHttpListenerConfig` /
+`UpdateHttpsListenerConfig`. Patches apply immediately to all H1 sessions and to
+**new** H2 connections; **already-open H2 connections continue using the values
+captured at their handshake** (same connection-scoped-capture semantic as
+`strict_sni_binding`). Long-lived H2 connections (CDN-style, mobile keep-alive)
+therefore observe a delayed flag flip — this is the established mux precedent,
+not a new defect.
+
+The main process records both patched values in its `ConfigState`
+(`ConfigState::update_http_listener` / `ConfigState::update_https_listener`,
+`command/src/state.rs`), so `sozu listener list`, `SaveState` and the state
+replayed to a new worker on upgrade or restart carry the hot value rather than
+the one the listener was created with.
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+elide_x_real_ip = true   # strip client-supplied X-Real-IP before forwarding
+send_x_real_ip  = true   # inject a proxy-generated X-Real-IP carrying the peer IP
+```
+
+#### Forwarding headers: `X-Forwarded-*` and RFC 7239 `Forwarded`
+
+The listener-scoped `forwarded_headers` key chooses which forwarding header
+family Sōzu adds to every request it forwards. It applies to HTTP and HTTPS
+listeners alike, and to HTTP/1 and HTTP/2 frontends alike, since both go through
+`HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`).
+
+| Value         | Sōzu adds                                                                                                     | A client-supplied header                                                                                                                               |
+| ------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `both`        | Default, the historical behaviour: `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` and `Forwarded` | `X-Forwarded-For` and `Forwarded` chains are extended with this hop; an existing `X-Forwarded-Proto` / `X-Forwarded-Port` is kept as sent              |
+| `x_forwarded` | `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port`                                                    | Same as `both` for the `X-Forwarded-*` family; `Forwarded` passes through untouched                                                                    |
+| `rfc7239`     | `Forwarded` only (`proto=…;for="…";by=…`, RFC 7239 §4–§6)                                                     | `Forwarded` is extended with this hop (RFC 7239 §4); `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` and `X-Forwarded-Host` are **removed** |
+| `none`        | nothing                                                                                                       | Every forwarding header passes through untouched                                                                                                       |
+
+`rfc7239` removes the four `X-Forwarded-*` headers Sōzu itself manages rather
+than passing them through or converting them. RFC 7239 §8.1 states that a
+forwarding header "cannot be relied upon to be correct, as it may be modified
+[…] by every node on the way to the server, including the client". In this mode
+Sōzu no longer appends its hop to `X-Forwarded-For`, so a client value passed
+through would reach the backend with nothing Sōzu wrote after it, which is weaker
+than `both`. Converting it into `Forwarded` elements, which RFC 7239 §7.4
+encourages only "if it can be done in a sensible way", is not attempted either.
+§7.4 warns that the order of pre-existing mixed headers cannot be known, and the
+converted elements would be exactly as untrusted. RFC 7239 §4 allows a proxy to
+remove forwarding fields, so the backend is left with one family whose last
+element is Sōzu's. Other `X-Forwarded-*` names (for example
+`X-Forwarded-Prefix`) are not forwarding attestations Sōzu manages and pass
+through in every mode. A trailer cannot smuggle a forwarding header past the
+mode: `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) for an H2
+trailer block, and `HttpContext::filter_request_trailers`
+(`lib/src/protocol/kawa_h1/editor.rs`) for an H1 chunked trailer section, drop
+`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` and
+`X-Forwarded-Host` from trailers in every mode.
+
+In the two modes that extend a client `Forwarded` chain, `both` and `rfc7239`,
+a client `Forwarded` line that is not a well-formed RFC 7239 §4 list is
+removed instead of extended. An unclosed quoted-string such as
+`Forwarded: for="6.6.6.6` would otherwise swallow the element Sōzu appends
+(`for="6.6.6.6, proto=http;for=…`), so a backend would read neither. Sōzu's
+element then goes to an earlier well-formed `Forwarded` line, or into a
+`Forwarded` header of its own, and is always parseable and last. A well-formed
+chain is extended exactly as before. `x_forwarded` and `none` do not touch
+`Forwarded`, so there a malformed line passes through as sent. Each removed
+line increments the proxy counter `http.forwarded_malformed_elided` once, so a
+non-conforming upstream proxy whose chain is being dropped — for example one
+that writes an unquoted port (`for=1.2.3.4:80`) or an unquoted IPv6 address
+(`for=2001:db8::1`) — shows up on the dashboard, not only in a `debug` log.
+
+A listener whose `forwarded_headers` wire value names no mode is refused when
+it is added or updated, by the main process and by the worker alike.
+
+A frontend `rewrite_host` sends the pre-rewrite authority as
+`X-Forwarded-Host` in `both` and `x_forwarded`, replacing a client one. In
+`rfc7239` and `none` no `X-Forwarded-Host` is injected and the original
+authority is not conveyed; under `none` a client `X-Forwarded-Host` passes
+through as sent. Sōzu's `Forwarded` element carries `proto`, `for` and `by` in
+every mode that emits it, never `host`.
+
+> **Trust caveat.** With `none`, and with `x_forwarded` for `Forwarded`,
+> Sōzu passes client-supplied forwarding headers through without adding its
+> own hop, so the backend cannot tell a value the client forged from one an
+> upstream proxy wrote. Use those modes only when every client reaches Sōzu
+> through a trusted proxy that sets the headers itself, or when the backend
+> ignores them.
+
+`forwarded_headers` is independent of `elide_x_real_ip` and `send_x_real_ip`:
+`X-Real-IP` belongs to neither family, and `send_x_real_ip = true` still injects
+it under `none`. The access log's `xff_chain` records a client `X-Forwarded-For`
+in every mode, including when `rfc7239` removes it from the forwarded request.
+The `http.trusting.x_proto` and `http.trusting.x_port` counters (and their
+`.diff` variants) count only in `both` and `x_forwarded`, the modes in which a
+client `X-Forwarded-Proto` / `X-Forwarded-Port` is kept in place of Sōzu's own.
+
+The key is runtime-patchable with `UpdateHttpListenerConfig` /
+`UpdateHttpsListenerConfig` (`sozu listener {http,https} update
+--forwarded-headers <mode>`) and takes effect at the same boundary as
+`send_x_real_ip`: the next HTTP/2 stream, and the next HTTP/1.1 connection
+(`doc/configure_admin_ops.md`, "When a patch takes effect on traffic already in
+flight").
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+forwarded_headers = "rfc7239"   # both (default) | x_forwarded | rfc7239 | none
+```
+
+#### TLS handshake log severity cheat-sheet
+
+Sōzu tiers the log severity of every rustls handshake error by root cause so
+scanner noise does not crowd out real configuration errors (commit `156cc217`).
+Operators monitoring logs should expect the following classification:
+
+| Error variant                                                                                                                              | Level   | Typical cause                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------------------------------------------ | ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `NoApplicationProtocol`, `NoKxGroupsInCommon`, `NoCipherSuitesInCommon`, `NoCertificatesPresented`                                         | `warn`  | Remote scanner / ssllabs probe with restricted cipher or ALPN set. **Benign** — no action required unless the client is legitimate.      |
+| `InappropriateMessage`, `InappropriateHandshakeMessage`, `InvalidMessage`, `PeerMisbehaved`, `PeerIncompatible`, `PeerSentOversizedRecord` | `warn`  | Peer protocol violation — typically a broken or outdated TLS client, occasionally a port-scan. Review if persistent from a known client. |
+| `InvalidCertificate`, `DecryptError`                                                                                                       | `warn`  | Client certificate rejected (e.g. expired, unknown CA) or bad shared key material. Relevant only when mTLS is configured.                |
+| `AlertReceived(_)`                                                                                                                         | `debug` | Client sent a TLS alert (e.g. `user_canceled`, `close_notify_required`) — conversation-level noise.                                      |
+| Everything else (server-side faults, unexpected internal errors)                                                                           | `error` | Real bug or misconfiguration on the proxy. **Actionable** — triage immediately.                                                          |
+
+In particular, the recurring
+`Could not look up a certificate for server name "<name>"` line (issue #774) is
+emitted at `warn` when the `rustls::server::ClientHello` SNI does not match any
+configured frontend — the usual culprit is a generic scanner (Shodan, ssllabs,
+Censys) probing `default.example` or an IP-only hello. No action required unless
+the name matches a frontend you expect to serve.
+
+## Frontend matching: pairing, precedence, and patterns
+
+This section covers operator-facing rules that surfaced as
+[#1220](https://github.com/sozu-proxy/sozu/issues/1220),
+[#1221](https://github.com/sozu-proxy/sozu/issues/1221), and
+[#1222](https://github.com/sozu-proxy/sozu/issues/1222).
+
+### HTTPS listener pairing — frontends and cluster protocol
+
+A `protocol = "https"` listener terminates TLS at the listener boundary. After
+termination, the request is plaintext HTTP/1.1 or HTTP/2 (the listener decides
+via ALPN), and the routed cluster sees it as `protocol = "http"`. Frontends
+bound to an HTTPS listener address therefore declare `protocol = "http"` on the
+cluster — there is no separate `protocol = "https"` cluster mode.
+
+Working configuration (one HTTP listener, one HTTPS listener, both routing to
+the same backend pool):
+
+```toml
+[[listeners]]
+protocol = "http"
+address = "[::]:80"
+
+[[listeners]]
+protocol = "https"
+address = "[::]:443"
+# Certificates are loaded via the runtime API or [listeners.https.certificates]
+# (see "Listeners" §Certificates and TLS).
+
+[clusters.example]
+protocol = "http"  # plaintext after TLS termination at the listener
+frontends = [
+  { address = "[::]:80",  hostname = "subdomain.domain.tld" },
+  { address = "[::]:443", hostname = "subdomain.domain.tld" },
+]
+backends = [
+  { address = "[::1]:8080" },
+]
+```
+
+Sōzu refuses to start when an HTTPS listener has no matching frontend — no
+graceful fallback. The listener-end-to-end design is intentional: TLS settings
+(cipher list, ALPN, SNI binding, X-Real-IP elision) live on the listener;
+per-cluster TLS-to-backend remains a separate v2.1.0 feature
+([#1218](https://github.com/sozu-proxy/sozu/issues/1218)).
+
+### Path matching precedence within a frontend
+
+Path filtering in Sōzu is **frontend-level**, not backend-level. Backends inside
+a cluster cannot be restricted to a path; if you need different backend pools
+for `/` and `/some-path` on the same hostname, declare two clusters that share
+the hostname and differ on the frontend `path` rule. For example, sending
+`example.com` to one backend pool and `example.com/instance` to another:
+
+```toml
+[clusters.example-main]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:443", hostname = "example.com" },
+]
+backends = [
+  { address = "127.0.0.1:8001" },
+  { address = "127.0.0.1:8002" },
+]
+
+[clusters.example-instance]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:443", hostname = "example.com", path = "/instance" },
+]
+backends = [
+  { address = "127.0.0.1:8011" },
+  { address = "127.0.0.1:8012" },
+]
+```
+
+A request to `https://example.com/instance/foo` matches the longer prefix
+`/instance` and lands on `example-instance`; everything else falls back to the
+empty-prefix frontend on `example-main`. Per-frontend `certificate` / `key` /
+`certificate_chain` fields are omitted here for brevity but are valid on each
+frontend entry.
+
+When multiple frontends share the same `(address, hostname)` tuple and differ
+only on `path` / `path_type`, the lookup resolves them in one pass over the
+rules in declaration order. Exactly one thing ends that pass early, and whether
+a rule does so depends on its `method` as much as its `path_type`:
+
+1. An `EQUALS` or `REGEX` rule that **also carries a `method` matching the
+   request** answers immediately. It beats any `PREFIX`, however long, and any
+   rule declared without a `method`, in either declaration order. This is the
+   only short-circuit in the scan. Between two such rules the **first declared**
+   answers: neither exact-match nor pattern outranks the other, and longer
+   literal substrings within a regex are not weighted.
+2. Everything else is accumulated rather than returned, and a later match
+   replaces an earlier one. Among `PREFIX` rules that resolves to longest-wins;
+   for `EQUALS` and `REGEX` rules declared **without** a `method` it resolves to
+   last-declared-wins — the opposite of the case above.
+
+A `path_type = "REGEX"` pattern is **anchored at both ends**. The configured
+value is wrapped as `\A(?:…)\z` when the frontend is registered, so it must
+match the **whole** request path: the pattern `bc` does **not** match `/abcd`,
+and `/ab` does not match `/abcd` either. That is the same both-ends anchoring
+regex *hostname* segments have carried since v2.0.0 — see "Regex hostname
+segments" below, which also carries the alternation rule that follows. Every
+branch of an alternation is anchored, not just the first and last: `/a|/b`
+matches `/a` and `/b` and neither `/axx` nor `/xx/b`.
+
+**This is a behaviour change, and it narrows existing rules** (sozu#1350). Up to
+and including 2.2.1 the value was compiled verbatim and matched with `is_match`,
+which is a substring search, so every `REGEX` path rule also matched in the
+middle of a path. If you were relying on that, make the wildcards explicit —
+and put them on the side the pattern is **open** on:
+
+| the rule you have       | used to match     | after anchoring         | write instead                       |
+|-------------------------|-------------------|-------------------------|-------------------------------------|
+| `bc` (substring)        | `/abcd`           | only the path `bc`      | `.*bc.*`                            |
+| `/api` (prefix-shaped)  | `/api/v1`         | only `/api`             | `/api.*`, or `path_type = "PREFIX"` |
+| `\.js$` (suffix-shaped) | `/static/app.js`  | nothing a client sends  | `.*\.js$`                           |
+
+**The third row is the one that breaks silently, and a trailing `.*` does not
+fix it.** Extension routing — `\.js$`, `\.(js|css)$`, a trailing `/v1$` — is
+open at the *start*, so it needs a **leading** `.*`. Measured on this release:
+`\.js$` no longer matches `/static/app.js`, `\.(js|css)$` no longer matches
+`/a/b/style.css`, and `/v1$` no longer matches `/api/v1`. The remediation from
+the other two rows makes it no better — `\.js.*` still does not match
+`/static/app.js`, and `/v1.*` still does not match `/api/v1` — while
+`.*\.js$`, `.*\.(js|css)$` and `.*/v1$` all match again.
+
+An end-anchored pattern with nothing before it can now only match a path that
+*is* its own suffix. For `\.js$` that is the literal path `.js`, which no
+origin-form request-target ever is, since those begin with `/`: the rule stops
+matching anything a client can send. `/v1$` is less dramatic and no less
+broken — it still matches `/v1`, and no longer matches `/api/v1`.
+
+An empty `REGEX` value used as a catch-all matched every path and now matches
+only the empty path.
+
+The narrowing applies to **deny rules**, and that is where it bites hardest. A
+frontend with no `cluster_id`, and one carrying `redirect = "unauthorized"`,
+both answer 401 for the paths their rule matches, through the very same
+`path`/`path_type` matching. A loosely written `REGEX` deny that used to cover a
+whole family of paths now covers exactly one: a `REGEX` deny of `/admin` still
+denies `/admin`, but no longer denies `/admin/secret` or `/administrator` —
+those requests fall through to whatever else matches, which may be a frontend
+that serves them. **Audit every deny-shaped `REGEX` frontend before upgrading**
+and widen the ones meant as a subtree (`/admin.*`).
+
+Anchors written by hand keep working and are never stripped: in the `regex`
+crate's default mode `^` and `$` are exactly `\A` and `\z`, so an already
+anchored `^/abc$` is unchanged by the wrapping. A **half**-written one gains the
+anchor it was missing, and that cuts both ways. `^/abc` gains the end and stops
+matching `/abcd` — a narrowing. `\.js$` gains the **start** and stops matching
+every path that merely ends in `.js`; measured, `/static/app.js` no longer
+matches. That second direction is the destructive one, and it is the suffix row
+of the table above.
+
+A pattern that does not compile is still rejected at frontend registration, and
+anchoring never turns an invalid pattern into a valid one: the configured value
+is compiled on its own first, precisely so that the wrapper's own parentheses
+cannot balance an unbalanced pattern. The reverse is possible, though rare — a
+pattern that compiles bare can be **rejected** once wrapped, because the
+appended `)\z` has to survive whatever the pattern left open. Two measured
+cases: `(?x)/api/v1 # v1 only` compiles bare and fails wrapped with
+`error: unclosed group`, the appended `)` having landed inside the `#` comment
+that `(?x)` mode enables; and a 249-deep nested group compiles bare and fails
+wrapped with `error: exceed the maximum number of nested parentheses/brackets
+(250)`. Both surface like any other bad pattern — `RouterError::InvalidPathRule`
+at frontend registration, refused by the main process before any worker sees it,
+so the outcome is a loudly rejected frontend and never a silently mis-routing
+one.
+
+Throughout this section, **request path** means the request-target as it arrives
+on the wire, *including any query string*: a `GET /abc?x=1` is matched against
+`/abc?x=1`, not `/abc`. That bites `EQUALS` first — a `path_type = "EQUALS"`
+rule for `/abc` does **not** match a request carrying a query string — and now
+it bites `REGEX` the same way, because the pattern is anchored: a `REGEX` of
+`/abc` does not match `GET /abc?x=1` either. Append `.*` when the rule has to
+survive a query string — on the side the pattern is open on, per the table
+above. After a `$` it does nothing: measured, `^/abc$.*` does not match
+`/abc?x=1`. A suffix rule that must tolerate a query string has to spell it
+out, `.*\.js([?].*)?`, which matches `/static/app.js` and `/static/app.js?v=2`
+and not `/static/app.json`. That last point is not new — `\.js$` did not match
+`/static/app.js?v=2` before this release either. It also changes which rule
+wins in the whole-path case below.
+
+`method` is optional on a frontend, so tier 2 is the default shape unless you
+set one; declaration order is load-bearing in more cases than it looks. See
+"When declaration order decides" below.
+
+Operators wanting to route `/.well-known/acme-challenge` separately from `/` on
+the same hostname should declare:
+
+```toml
+[[clusters.acme-helper.frontends]]
+address = "[::]:80"
+hostname = "mail.example.tld"
+path = "/.well-known/acme-challenge"
+path_type = "PREFIX"
+
+[[clusters.mail-server.frontends]]
+address = "[::]:80"
+hostname = "mail.example.tld"
+path = "/"
+path_type = "PREFIX"
+```
+
+Both PREFIX rules match a request, but the longer prefix
+(`/.well-known/acme-challenge`) wins per the longest-match rule above — and note
+*why* that example is safe to declare in any order: it is built from `PREFIX`
+rules only. That is a property of `PREFIX`, not a general guarantee.
+
+### When declaration order decides
+
+Everything below describes the ordinary hostname-routed frontends this document
+covers — those matched through the routing trie, which is the default. The two
+other rule positions sit outside it entirely: a `Pre` frontend is consulted
+*before* the trie and answers first whatever the rules here say, and a `Post`
+frontend is consulted *after* it, answering only requests the trie matched
+nothing for. How rules are ordered inside those two lists is covered in
+"Rule order within `PRE` and `POST`" below.
+
+The `path` rules of one hostname are not resolved by trie structure. They are a
+flat list held at the trie leaf, in the order they were added, and scanned once.
+Whether a rule **ends** that scan decides everything, and that depends on its
+`method`, which has three cases and not two: it may match the request, be
+absent, or be set to something the request does not match. The third case
+removes the rule from the contest altogether, whatever its `path_type`. Note
+that matching is case-**sensitive**, for every method and not just the unknown
+ones. RFC 9110 §9.1 makes the method token case-sensitive and the backend
+receives the bytes the client sent, so Sōzu compares them verbatim: `method =
+"patch"` does not match a `PATCH` request, and `method = "get"` no longer
+matches a `GET` one — each lands silently in that third case. Write every
+method in the exact case the client sends. So:
+
+- **`EQUALS` / `REGEX` carrying a `method` that matches the request** — ends the
+  scan on the spot, so the **first declared wins**. Nothing compares two
+  patterns for specificity and `EQUALS` holds no priority over `REGEX`. The same
+  early exit is why such a rule beats a `PREFIX` of any length, and any
+  method-less rule, declared before or after it.
+- **`EQUALS` / `REGEX` declared without a `method`** — does **not** end the
+  scan. The match is only recorded, and a later match overwrites it, so here the
+  **last declared wins** — the reverse of the case above. A `PREFIX` declared
+  afterwards overwrites it too, but only if its prefix covers the **whole**
+  request path — query string included, per the definition above. A shorter
+  prefix leaves it standing, and so does the *same* prefix once the request
+  carries a query string: `/abc` covers all of `GET /abc`, but not of
+  `GET /abc?x=1`, so adding `?x=1` to the request can flip the winner back to
+  the regex with no configuration change at all. **Since path regexes are
+  anchored, that flip now needs the regex to span the query string too** — it
+  is a property of the regex, not of the query string. Measured with both rules
+  declared method-less: with the regex `/a.*`, `GET /abc` goes to the prefix and
+  `GET /abc?x=1` flips to the regex, as it always did. With the regex `/abc`,
+  which after anchoring does not match `/abc?x=1` at all, **both** requests go
+  to the prefix — the prefix still matches as a prefix, it has merely lost its
+  rival, so adding `?x=1` changes nothing. The regex does not simply lose here,
+  it stops being a candidate: declared alone, `/abc` answers `GET /abc` and
+  leaves `GET /abc?x=1` unrouted.
+- **`PREFIX`** — among the rules whose `method` matches the request, the
+  **longest match wins**, whatever the declaration order. The qualifier is
+  load-bearing: a rule whose `method` is set but does **not** match the request
+  is skipped entirely, so a longer prefix can lose to a shorter one. `/a` for
+  `GET` declared alongside `/ab` for `POST` sends `GET /abc` to `/a` — the
+  longer rule never competes. (Two `PREFIX` rules tie on length only by carrying
+  the same prefix string and differing on `method`. If both methods match the
+  request the tie goes to the **last** declared; if one of them does not match
+  it is skipped, so `/ab` for `GET` then `/ab` for `POST` sends `GET /abc` to
+  the **first**.)
+- **regex hostname segments** — one level up in the routing trie. Two
+  overlapping segments are settled by declaration order, so the **first
+  declared wins** — but only among the segments that actually serve the
+  request: a segment whose rules all reject this path or method hands the
+  request to the next candidate instead of ending the lookup (see "Hostname
+  precedence" below).
+
+The method dependence is easiest to see side by side. On `www.example.com`, for
+`GET /abc`, with a regex `/a.*` and the whole-path prefix `/abc`:
+
+| the two rules carry | declared first | wins     |
+|---------------------|----------------|----------|
+| `method = "GET"`    | regex          | regex    |
+| `method = "GET"`    | prefix         | regex    |
+| no `method`         | regex          | **prefix** |
+| no `method`         | prefix         | regex    |
+
+So a method-less `REGEX` or `EQUALS` does **not** reliably outrank a `PREFIX`:
+it loses to one declared after it that covers the whole path. Since `method` is
+optional on a frontend, that is the default shape unless you set one.
+
+The table's third row is the fragile one. It holds for `GET /abc` and inverts
+for `GET /abc?x=1`, where the prefix no longer spans the request path and the
+regex wins instead — the table's `/a.*` spans the query string, which is what
+lets it win; a regex that does not is the case covered in the bullet above.
+Read "whole path" as "the entire request-target the client sent", not as the
+path you wrote in the configuration file.
+
+Keep overlapping `REGEX`/`EQUALS` path rules either mutually exclusive or
+deliberately ordered. "Most specific first" is the right instinct only for rules
+that carry a matching `method`; without one, a later rule wins, so the order to
+write is most specific *last*. Only `PREFIX`-against-`PREFIX` sorts itself out.
+
+None of that carries over to hostnames, which have a precedence order of their
+own — see the next section.
+
+### Hostname precedence
+
+Hostnames are resolved **most specific first**, whatever order the frontends
+were declared in:
+
+1. the **exact** name (`test4.example.com`),
+2. a **regex segment** that matches it (`/test[0-9]/.example.com`), the first
+   declared among those that overlap,
+3. the **`*` wildcard** (`*.example.com`), which stands for exactly one
+   leftmost label.
+
+That order is a search, not a filter. A candidate whose path and method rules
+serve nothing for this request hands it to the next candidate, so splitting one
+host's paths across an exact frontend and a regex family routes every path:
+`test4.example.com/only-for-test4` reaches the exact frontend, and
+`test4.example.com/anything-else` reaches the regex family that also claims the
+host. The same fall-through applies between two overlapping regex segments, so
+a first-declared segment carrying only `method = "POST"` no longer 404s a `GET`
+that a later segment would serve.
+
+Declaration order therefore changes nothing outside step 2, and reordering two
+overlapping regex segments is the only reordering that changes an answer.
+Keeping hostname patterns mutually exclusive is still the clearest
+configuration, but overlap is now resolved by a stated rule rather than by the
+shape of the trie. (Before the fix, an exact name added *after* a regex segment
+that matched it attached its rule to that segment instead of getting its own
+node, and the whole regex family served it — sozu#1351.)
+
+### Catch-all hostname
+
+A frontend can answer every request that no other frontend claimed, whatever
+its `Host:` — an IP literal such as `127.0.0.1` or `10.0.0.7`, a single-label
+name such as `localhost`, or any fully qualified name. Declare `hostname = "*"`
+with `position = "POST"`:
+
+```toml
+[clusters.fallback]
+protocol = "http"
+frontends = [
+  # every request the other frontends did not match
+  { address = "0.0.0.0:8080", hostname = "*", position = "POST" },
+]
+backends = [
+  { address = "127.0.0.1:1026" }
+]
+```
+
+`position` chooses where the rule is evaluated. `TREE`, the default, places the
+frontend in the routing trie with every other hostname. `PRE` rules are tried
+one by one before the trie, and `POST` rules are tried one by one after it, so a
+`POST` rule only answers requests that no `PRE` rule and no trie frontend
+matched. The value is an enum spelled in upper case: `"PRE"`, `"POST"` or
+`"TREE"`. Any other spelling, `"Post"` included, fails the configuration load
+with ``unknown variant `Post`, expected one of `PRE`, `POST`, `TREE` ``.
+
+A bare `*` means something different in each place. On `PRE` or `POST` it is the
+catch-all: it matches every host. On the trie it is the single-label wildcard of
+"Hostname precedence" above, so a `TREE` frontend on `*` answers `localhost`
+but neither `127.0.0.1` nor `www.example.com`. Declare the catch-all on `POST`
+rather than `PRE`, which would answer every request before the trie is
+consulted. `a_bare_star_hostname_is_a_catch_all_on_post_and_one_label_on_the_trie`
+and `a_catch_all_post_frontend_loads_from_toml_and_rejects_a_mixed_case_position`
+pin this behaviour.
+
+The `sozu frontend http add` and `sozu frontend https add` commands always
+create a `TREE` rule and take no position argument, so a catch-all frontend can
+only be declared in the configuration file.
+
+### Rule order within `PRE` and `POST`
+
+The three positions are consulted in a fixed order: every `PRE` rule, then the
+routing trie, then every `POST` rule. Inside the trie, precedence comes from
+hostname specificity and the path rules described above, not from the order of
+the frontends. `PRE` and `POST` are different: each is a plain list, scanned
+from the start, and the **first** rule whose hostname, path and method all match
+answers the request (`Router::lookup`). A worker appends each new rule to the
+end of its list and ignores a second rule on the same hostname, path and method
+(`Router::add_pre_rule`, `Router::add_post_rule`).
+
+What decides a list's order is when each rule reached the worker, and that is
+not always the order of the configuration file:
+
+- **A reload does not re-apply existing frontends.** `sozu reload` re-sends
+  every frontend of the file, and the main process refuses each one whose
+  address, hostname, path and method it already holds, with `Skipping a config
+  entry the state refused` at `warn`. The key includes neither `position` nor
+  `cluster_id`, so reordering frontends in the file, or changing only the
+  position or cluster of an existing one, changes nothing on a reload. A
+  frontend deleted from the file is not removed either.
+- **A new worker gets the rules sorted by key.** A worker that starts, restarts
+  or is upgraded receives the saved state, which lists frontends sorted by
+  address, hostname, path and method (`ConfigState::generate_requests`), not in
+  the order they were added. Removing a frontend and adding it again moves it to
+  the end of its list on the running workers only, and the next worker starts
+  from the sorted order.
+
+Keep overlapping `PRE` rules, and overlapping `POST` rules, mutually exclusive
+rather than relying on their order.
+
+### Hostname case
+
+A `hostname` is matched **case-insensitively**, per RFC 9110 §4.2.3. The route
+table stores every configured hostname ASCII-lowercased, and the incoming
+`Host:` header / HTTP/2 `:authority` is normalised the same way before the
+lookup, so all of these reach the same frontend:
+
+```
+hostname = "case.example.com"
+
+Host: case.example.com        -> routed
+Host: CASE.EXAMPLE.COM        -> routed
+Host: CaSe.ExAmPlE.cOm        -> routed
+Host: CASE.EXAMPLE.COM:80     -> routed (the port is stripped first)
+Host: other.example.com       -> 404, as before
+```
+
+Writing the frontend itself in uppercase changes nothing — `hostname =
+"CASE.EXAMPLE.COM"` is stored as `case.example.com` and answers the same four
+requests. There is no configuration that makes hostname matching
+case-*sensitive*.
+
+Normalisation happens to the key *before* the precedence search above runs, so
+the two compose in one direction only: case never decides which candidate wins.
+`CASE.EXAMPLE.COM` picks the same exact / regex-segment / wildcard tier that
+`case.example.com` picks, and reordering frontends still changes nothing
+outside overlapping regex segments.
+
+Consequences worth knowing:
+
+- **A regex hostname segment is matched against the normalised host.** An
+  uppercase literal inside one — `/API[0-9]/.example.com` — therefore matches
+  `api7.example.com` as well as `API7.example.com`. Do not use a character
+  class to distinguish case in a hostname segment; it cannot work, and a
+  `Tree`-position frontend has always had its whole pattern lowercased at
+  insert time anyway.
+- **`$HOST[n]` captures carry the normalised host**, so a `rewrite_host`
+  template emits lowercase regardless of what the client typed.
+- **The value the client sent is not lost.** The normalisation happens inside
+  the route lookup and nowhere else: the parsed authority every other consumer
+  reads — the access log, the `X-Forwarded-Host` header a `rewrite_host`
+  frontend injects, the redirect `Location:` — is untouched. The observable
+  case is the builtin 404 answer, whose `route` field echoes the client's
+  spelling (`GET OTHER.EXAMPLE.COM/`, not the lowercased key), because that is
+  the diagnostic you need when a route misses.
+- **A trailing dot is not yet handled.** `Host: case.example.com.` is the legal
+  absolute form of the same name (RFC 1034 §3.1), but it does **not** reach a
+  frontend declared as `case.example.com` — the trailing dot survives
+  normalisation and the trie sees an extra empty label. The TLS side already
+  strips one trailing dot (`lib/src/https.rs`'s post-handshake SNI and
+  `lib/src/protocol/tcp_preread/mod.rs`'s `normalize_sni`); HTTP routing does
+  not. Declare the absolute form as a second frontend if you need it.
+
+Certificate names follow the same rule on the TLS side: the worker
+ASCII-lowercases every SAN / `names` entry before it enters the SNI lookup
+table, because rustls hands the resolver an SNI it has already lowercased. A
+certificate carrying `MiXeD.Example.COM` therefore serves `mixed.example.com`
+instead of silently falling through to the default certificate.
+
+**A certificate name may not carry a regex segment.** Frontend hostnames get
+the slash-delimited grammar described in the next section; certificate names do
+not. `sozu certificate add` refuses any `names` entry containing `/` — the
+worker answers `could not add certificate: the SNI route table cannot host a
+certificate name` and loads nothing — because the SNI lookup table is the same
+trie as the router's, and a name such as
+`/te.*/.example.com` would otherwise compile to a regex segment and bind one
+certificate to every host the pattern happens to cover (`test.example.com` and
+`tenant.example.com` alike). `/` cannot occur in a DNS name, so no legitimate
+SAN is refused; a wildcard SAN such as `*.example.com` is not a regex segment
+and still loads and still serves its subtree. This is the rule TCP SNI routes
+have always had.
+
+The refusal is per certificate, not per name: one bad entry rejects the whole
+`AddCertificate` or `ReplaceCertificate`, before any main-process state or
+worker resolver is mutated, so a partially-loaded certificate is not a state
+the command can reach. When the `names` override is left empty the validator
+derives the names from the certificate's own SAN / CN, so the refusal can also
+fire on a certificate carrying no dNSName SAN and a Common Name that contains a
+slash — reissue it with a proper dNSName SAN, or state the intended hostnames
+explicitly in `names`.
+
+### Regex hostname segments
+
+A `hostname` may carry a regex in any one of its dot-separated segments by
+wrapping that segment in slashes. The pattern is wrapped as `\A(?:...)\z` at
+insert time (see the 2.0.0 upgrade note), so it matches that whole segment and
+nothing else:
+
+```toml
+[[clusters.regional.frontends]]
+address  = "0.0.0.0:443"
+hostname = "/test[0-9]/.example.com"      # test4.example.com, not testAB
+
+[[clusters.regional-foo.frontends]]
+address  = "0.0.0.0:443"
+hostname = "foo./test[0-9]/.example.com"  # foo.test4.example.com
+```
+
+The two frontends above share one regex segment, and the order in which they
+are declared or added does not matter: either may be declared first, and both
+resolve.
+
+Two regex segments that **overlap** are decided by declaration order, under the
+same first-declared-wins rule as `REGEX` path rules above: a node holds its
+regex segments in an ordered list, a lookup takes the first that matches *and
+serves the request*, and a new segment is appended. With both of these
+declared, `test4.example.com` routes to whichever came first:
+
+```toml
+[[clusters.numbered.frontends]]
+address  = "0.0.0.0:443"
+hostname = "/test[0-9]/.example.com"
+
+[[clusters.any-suffixed.frontends]]
+address  = "0.0.0.0:443"
+hostname = "/[a-z]+[0-9]/.example.com"   # also matches `test4`
+```
+
+Declaring `numbered` first sends `test4.example.com` to `numbered`; declaring
+`any-suffixed` first sends it to `any-suffixed`. If `numbered` carries no rule
+for the request's path or method, `any-suffixed` answers it even when
+`numbered` was declared first.
+
+Before the fix shipped in the current release, declaring the deeper
+`foo./test[0-9]/.example.com` first made the leftmost
+`/test[0-9]/.example.com` un-addable for as long as the worker lived:
+`sozu frontend http add` reported success and `sozu query frontends` listed it,
+but the routing trie never served it, so requests for `test4.example.com`
+missed the route.
+
+**The next worker restart makes such a route live, and no operator action is
+needed to get there.** The main process validates a frontend against a *fresh,
+empty* router probe, which by construction cannot see an ordering conflict, and
+then commits it to its `ConfigState` before fanning it out to the workers. In a
+release build the worker reported success, so the safety net that reverts an add
+no worker acknowledged never fired — it only triggers when *no* worker answers
+`Ok`. The frontend is therefore recorded in the main process's authoritative
+state, which is exactly why `sozu query frontends` lists it, and that state is
+what is replayed into every worker at launch.
+
+That replay walks the frontends in map-key order, and the key begins with the
+address and hostname — so `/test[0-9]/.example.com` is replayed **before**
+`foo./test[0-9]/.example.com`, which is the insertion order that always worked.
+That is why the divergence never survives a restart: it lasts exactly as long as
+the worker that took the adds in the unlucky order. A `sozu worker upgrade`, a
+`sozu upgrade`, an automatic respawn after a worker death, or a full restart all
+heal it, on the fixed build and on an older one alike. Upgrading is simply one
+way to restart, not the thing that activates the route. Re-adding the frontend
+is **not** required, and doing nothing does **not** leave it dormant.
+
+(A debug build behaved differently and loudly: the worker panicked on the add
+instead of reporting success, so nothing was recorded and there is nothing to
+inherit.)
+
+To find the shape before that restart: an HTTP/HTTPS frontend whose hostname
+carries a regex segment, that `sozu query frontends` lists, and that is not
+actually serving traffic. Each one will start routing at the next restart, so
+remove the ones you do not want live — that is the only way to keep them off.
+**Confirm each candidate before deleting it.** That predicate cannot tell a
+route dormant because of this bug from one that is simply idle, and the fact
+that separates them — that a deeper sibling sharing the regex segment was added
+to that worker first — is not recoverable from `sozu query frontends`. A quiet
+but healthy route looks identical.
+
+Every branch of an alternation inside a segment is anchored, not just the first
+and the last. `/a|b|c/.example.com` matches `a.example.com`, `b.example.com` and
+`c.example.com`, and none of `axx.example.com`, `xxc.example.com` or
+`zzbzz.example.com`.
+
+**This narrows existing rules, and up to and including 2.2.1 it did not hold**
+(sozu#1356). The segment was wrapped without a group, and `|` binds looser than
+concatenation, so `\Aa|b\z` parsed as `(\Aa)|(b\z)`: the first branch kept
+only its opening anchor, the last only its closing one, and a middle branch kept
+neither, matching as a bare substring anywhere in the label. A frontend written
+`/api|admin/.example.com` also served `apifoo.example.com` and
+`xadmin.example.com`, neither of which the operator declared. If you were
+relying on that, write the wildcards out: `/api.*|.*admin/`.
+
+**A `.*` inside a segment does not stop at the label boundary, and where it
+stops depends on the rule position.** A trie-routed frontend — the default —
+matches each segment against one label, so `/api.*|.*admin/.example.com` there
+matches `apifoo.example.com` and neither `api.foo.example.com` nor
+`zz.admin.example.com`. A `Pre` or `Post` frontend is matched by a single
+whole-host pattern instead, in which `.` matches the separator like any other
+character, so the same rule also takes `api.foo.example.com` and
+`zz.admin.example.com` — subdomains the operator did not write. This is not new
+and is not introduced by the anchoring, but the remediation above is what walks
+you into it: on `Pre`/`Post`, spell the boundary out with `[^.]*` rather than
+`.*`.
+
+**A `*` label in a hostname that also carries a regex segment is a wildcard on
+the trie and a literal on `Pre`/`Post`**, and that divergence is a behaviour
+change on the `Pre`/`Post` side. Same configured hostname
+`*./x/.example.com`:
+
+| rule position | `zz.x.example.com` | `*.x.example.com` |
+|---------------|--------------------|-------------------|
+| trie (default) | routes             | routes            |
+| `Pre` / `Post` | does **not** route | routes            |
+
+A trie-routed frontend splits the hostname into labels and a `*` label is the
+ordinary single-label wildcard documented above, so it matches one label and not
+two — `a.b.x.example.com` misses on both positions. A `Pre`/`Post` frontend is
+matched by one whole-host pattern, and there the `*` is now escaped and matches
+the literal character `*`. Up to and including 2.2.1 it was neither: it was a
+regex quantifier over whatever preceded it, and since what preceded it was the
+opening `\A` anchor, `*./x/.example.com` compiled to a pattern that was not
+anchored at its start at all and took **any** host ending in `.x.example.com` at
+any depth, `evil.attacker.x.example.com` included. If you want a wildcard on a
+`Pre`/`Post` rule, write it as a regex segment — `/[^.]*/./x/.example.com` — or
+declare the frontend on the trie, where `*` means what the wildcard section says
+it means.
+
+The group is **non-capturing**, so it changes no `$HOST[n]` index: in
+`/cdn([0-9]+)/.example.com`, `$HOST[1]` is still the operator's own group
+(`42` for `cdn42.example.com`), and `$HOST[0]` is still the whole hostname.
+
+**Case inside a regex segment is preserved, and the segment is matched
+case-insensitively.** Only the literal labels of a hostname are IDN-normalised;
+the source between the slashes is stored byte for byte. So
+`/API[0-9]/.example.com` still routes `api7.example.com` (a host is
+case-insensitive, RFC 9110 §4.2.3, and the lookup key is lowercased), while
+`\D`, `\W` and `\S` keep meaning what the regex grammar says they mean —
+case-insensitivity does not reach a character-class escape. This is how `Pre`
+and `Post` rules have always treated a hostname regex; the trie now agrees.
+
+**Up to and including 2.2.1 it did not, and this changes existing rules**
+(sozu#1377). A trie-routed hostname — the default position — went through IDN
+normalisation *whole*, regex source included, and that ASCII-lowercases:
+`/\D+/.example.com` was stored as `/\d+/.example.com` and
+`/[^\D]/.example.com` as `/[^\d]/.example.com`. Lowercasing an uppercase escape
+**inverts the character class it names** — `\D` is "not a digit", `\d` is "a
+digit" — so the installed rule matched the exact **complement** of what was
+written. It was invisible from configuration: the frontend loads, `sozu query
+frontends` echoes the original spelling, and only the traffic disagrees. A
+frontend written `/\D+/.example.com` served `777.example.com` and not
+`abc.example.com`; after this change it serves `abc.example.com` and not
+`777.example.com`. `\W`/`\w` and `\S`/`\s` inverted the same way.
+
+Audit trie-routed hostnames carrying `\D`, `\W`, `\S` or `\B` before upgrading.
+A rule whose behaviour was tuned against the folded form — `/\D+/` chosen
+because it was observed to match digits — must be respelled with the lowercase
+escape it actually meant. A segment with no uppercase escape is unaffected, and
+an uppercase **literal** such as `/API[0-9]/` keeps matching exactly the hosts
+it matched before. `Pre` and `Post` frontends never carried the defect.
+
+A segment regex must occupy a complete segment. `abc/[0-9]+/.example.com` is
+rejected, because the regex does not start at a `.` boundary, as is a hostname
+with an empty label such as `.example.com` or `./test[0-9]/.example.com`. A
+segment that is not a valid regex **on its own** is rejected too, even when the
+wrapping would balance it: `/a)(b/.example.com` is refused rather than compiled
+into `\A(?:a)(b)\.example\.com\z`, which would match `ab.example.com` — a host
+the operator never wrote. A rejected frontend is reported as an error and leaves
+the route table unchanged.
+
+Captured segments are addressable from `rewrite_host` / `rewrite_path` as
+`$HOST[n]` — see the redirect and rewrite section below.
+
+### Header predicates — routing on request headers
+
+A frontend can require request headers, on top of its hostname, path and
+method ([#1253](https://github.com/sozu-proxy/sozu/issues/1253)). Each entry of
+`header_predicates` names one header and how to test it; the frontend matches
+only when **every** predicate holds. A frontend without `header_predicates`
+behaves exactly as before.
+
+| `match`   | `value`  | holds when the request's header…                                   |
+|-----------|----------|--------------------------------------------------------------------|
+| `exact`   | required | equals `value`, byte for byte (case-sensitive)                     |
+| `regex`   | required | matches `value`, anchored at both ends like a `REGEX` path         |
+| `present` | refused  | is carried, whatever its value (the empty one included)            |
+
+The canonical use is a canary by header: the same hostname and path served by
+two clusters, the canary reached only by requests that ask for it.
+
+```toml
+[clusters.api-stable]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:80", hostname = "api.example.com" },
+]
+backends = [ { address = "127.0.0.1:8001" } ]
+
+[clusters.api-canary]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:80", hostname = "api.example.com", header_predicates = [
+    { name = "X-Canary", match = "exact", value = "always" },
+  ] },
+]
+backends = [ { address = "127.0.0.1:8101" } ]
+```
+
+`curl -H 'X-Canary: always' http://api.example.com/` reaches `api-canary`;
+every other request, `X-Canary: never` included, reaches `api-stable`. The same
+pair from the command line:
+
+```bash
+sozu frontend http add --address 0.0.0.0:80 --hostname api.example.com id api-stable
+sozu frontend http add --address 0.0.0.0:80 --hostname api.example.com \
+  --match-header exact=X-Canary=always id api-canary
+```
+
+`--match-header` takes `<match>=<name>[=<value>]` and repeats, one flag per
+predicate: `--match-header regex=X-Region=eu-.* --match-header present=X-Beta`.
+
+The rules:
+
+- **Names** compare case-insensitively (RFC 9110 §5.1) and must be an RFC 9110
+  token. `Host` and `Cookie` are refused: H1 folds `Host` into the request
+  authority and H2 sends `:authority`, and both parsers move cookies into a
+  jar, so neither is a header Sōzu could test — route on the hostname instead.
+- **Only the first occurrence** of a header is tested, raw as the client sent
+  it. A value is not split on commas.
+- **A `regex` value is anchored at both ends**: `eu-.*` matches `eu-west` and
+  not `us-eu-west`. It follows the same grammar as a `REGEX` path, so a value
+  that does not compile, or only compiles once wrapped, is refused when the
+  frontend is added.
+- **Precedence.** For one hostname, a frontend whose predicates all hold
+  outranks every frontend without predicates, whatever their paths and
+  declaration order; among frontends of one kind the path and method
+  precedence above applies unchanged. A frontend whose predicates do not all
+  hold is skipped, like one whose method does not match, so a hostname whose
+  only frontends are unsatisfied predicated ones hands the request to the next
+  hostname candidate (a wildcard, for instance). `PRE` and `POST` lists apply
+  the same rule: the first satisfied predicated rule in declaration order, else
+  the first rule without predicates (`Router::lookup_with_headers`).
+- **Identity.** Predicates are part of a frontend's identity, next to address,
+  hostname, path and method: a canary and its base coexist, and removing a
+  frontend — `sozu frontend http remove … --match-header …` — must name the
+  same predicates. Order and header-name case do not matter, and a predicate
+  repeated verbatim counts once. Removing one leaves the other.
+- **HTTP and HTTPS only.** `header_predicates` is valid on `http` and `https`
+  frontends. A `tcp` cluster frontend that sets it is refused at configuration
+  load, never silently discarded.
+- **Mixed versions.** A frontend with predicates is sent to the workers as
+  `AddHttpFrontendWithHeaderPredicates` / `AddHttpsFrontendWithHeaderPredicates`
+  (and removed with the matching `Remove…` verbs), not as the historical
+  `AddHttpFrontend` & co. A worker that predates header routing would skip the
+  unknown predicate field and install the route without its guard, sending
+  every request for the host to the canary cluster; it cannot decode the new
+  verbs, so it fails the request instead, and is counted as failed once
+  `worker_timeout` expires. Frontends without predicates keep the historical
+  verbs and work across versions as before.
+- **Visibility.** The predicate values appear in clear in the saved state and
+  in the main process's state key, exactly as hostnames and paths already do;
+  `Debug` logs carry only their count and lengths. The human-readable frontend
+  and cluster listing tables show only the number of predicates, not their
+  values. Do not put a secret in an `exact` value.
+
+### Regex limitations — no look-around
+
+Sōzu uses the standard Rust [`regex`](https://docs.rs/regex/) crate which does
+not support look-around (negative or positive lookahead / lookbehind). Patterns
+like `^(?!\/\.well-known\/acme-challenge)` will not compile or will be rejected
+at frontend registration.
+
+If you need "match all paths except X", decompose into two PREFIX rules per the
+example above and rely on the longest-prefix rule, or declare an explicit list
+of EQUALS rules.
+
+The [`fancy-regex`](https://docs.rs/fancy-regex/) crate supports look-around but
+is not currently a Sōzu dependency.
+[#1222](https://github.com/sozu-proxy/sozu/issues/1222) tracks the discussion if
+look-around becomes a real operator constraint.
+
+### `send_proxy` and `expect_proxy` apply to TCP only
+
+The PROXY-protocol forwarding/expecting flags `send_proxy = true` and
+`expect_proxy = true` on a backend or frontend are valid **only** for clusters
+with `protocol = "tcp"`. HTTP/HTTPS clusters use the forwarding HTTP headers
+(`X-Forwarded-For`, `X-Real-IP` and RFC 7239 `Forwarded`, chosen per listener by
+`forwarded_headers`) instead.
+
+Setting `send_proxy = true` on an HTTP/HTTPS cluster is silently ignored at
+runtime. This contradicts a literal reading of
+[#1221](https://github.com/sozu-proxy/sozu/issues/1221); the documentation
+tracks reality but operators upgrading from older configs should remove the
+no-op flag from HTTP cluster definitions.
+
+See [#PROXY Protocol](#proxy-protocol) below for the supported TCP-mode shape.
+
+## Custom HTTP answer templates
+
+Sōzu lets operators replace any default error response with a templated body.
+Templates are specified as a `[listeners.<id>.answers]` map at listener scope —
+the **global default** that fires whenever no cluster-level override matches —
+or as a `[clusters.<id>.answers]` map at cluster scope, which overrides the
+matching listener entry on requests routed through that cluster. Both layers
+accept the same key/value shape: the key is the HTTP status code (e.g. `"503"`);
+the value is **either** an inline literal body (the default — the value is taken
+verbatim) **or** `file://<path>` to load the body off disk. The inline form is
+convenient for short canned responses, secrets-free containers where mounting a
+template directory is awkward, and test rigs that want to avoid disk
+dependencies.
+
+```toml
+# listener-level: global default for every status not overridden by a cluster.
+[listeners.https.answers]
+"401" = "file:///etc/sozu/templates/401.http"        # load from disk
+"404" = "file:///etc/sozu/templates/404.http"
+"503" = """HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbusy"""  # inline literal (no prefix)
+
+# cluster-level: overrides the listener default for THIS cluster only.
+[clusters.MyCluster.answers]
+"503" = "file:///etc/sozu/templates/MyCluster.503.http"
+```
+
+Each template is a complete HTTP response (status line + headers + body) with
+optional placeholders. Sōzu substitutes the placeholders at render time:
+
+| Placeholder                                                                                             | Scope         | Meaning                                             |
+| ------------------------------------------------------------------------------------------------------- | ------------- | --------------------------------------------------- |
+| `%REQUEST_ID`                                                                                           | header & body | Per-request ULID (matches `Sozu-Id`)                |
+| `%CLUSTER_ID`                                                                                           | header & body | Cluster the request was routed to (or empty)        |
+| `%BACKEND_ID`                                                                                           | header & body | Backend the request was forwarded to (or empty)     |
+| `%ROUTE`                                                                                                | header & body | Request method + authority + path                   |
+| `%REDIRECT_LOCATION`                                                                                    | header & body | Resolved `Location` URL (301 only)                  |
+| `%WWW_AUTHENTICATE`                                                                                     | header only   | Realm string for 401 (header is elided when empty)  |
+| `%MESSAGE`, `%PHASE`, `%SUCCESSFULLY_PARSED`, `%PARTIALLY_PARSED`, `%INVALID`, `%CAPACITY`, `%DURATION` | varies        | Diagnostic detail for parse / size / timeout errors |
+
+When the template carries a `Content-Length: <N>` header, the engine recomputes
+the value from the actual rendered body size after `%`-substitutions — so a
+literal value that drifted from the body length cannot land on the wire (RFC
+9110 §8.6 / RFC 7230 §3.3.2 anti- smuggling). Templates that omit
+`Content-Length` keep the byte-for-byte shape they were written with; nothing is
+synthesised. Operators who want a Content-Length include one; those who rely on
+`Connection: close` for body framing get a clean header-only response.
+
+When a template carries `Connection: close`, the response will close an
+HTTP/1.1 frontend connection after delivery; a custom template without that
+header keeps frontend keep-alive on. On an HTTP/2 frontend the header is
+stripped (RFC 9113 §8.2.2) and the answer ends only its own stream; the
+connection and its other streams continue. The value is read as a comma-separated list of
+case-insensitive options, on every `Connection` line of the template, so
+`Connection: keep-alive, close` and `Connection: close, x-custom` close too,
+while `Connection: closed` does not. The HAProxy parallel is `errorfile NNN /path`.
+
+The legacy `answer_NNN = "/path"` per-status fields under `[listeners.<name>]`
+continue to work — they are merged into the new map at load time so existing
+state files round-trip cleanly. New configs should prefer the
+`[listeners.<name>.answers]` shape.
+
+## Frontend redirect, URL rewrite, and custom headers
+
+Each frontend can carry a routing decision richer than "forward to a cluster".
+Three top-level knobs drive different policies:
+
+```toml
+[[clusters.MyCluster.frontends]]
+address  = "0.0.0.0:80"
+hostname = "old.example.com"
+# Force a permanent 301 to the canonical name on a different port.
+redirect        = "permanent"      # forward (default) | permanent | found | permanent_redirect | unauthorized | silent_close
+redirect_scheme = "use-https"      # use-same (default) | use-http | use-https
+rewrite_host    = "new.example.com"
+rewrite_port    = 8443             # paired with `cluster.https_redirect_port`
+```
+
+`redirect = "permanent"` returns a 301 with a resolved `Location` URL built from
+`redirect_scheme`, the (optionally rewritten) host, the cluster's
+`https_redirect_port` (or the rewritten `rewrite_port`), and the original
+request path. `redirect = "found"` and `redirect = "permanent_redirect"` share
+the same `Location`-resolution machinery and emit 302 (RFC 9110 §15.4.3) or 308
+(RFC 9110 §15.4.9) respectively. The semantic distinction matters to clients:
+301 and 302 permit user agents to rewrite POST → GET on follow, whereas 308 (and
+the IETF-modern 307) MUST preserve the request method. Pick `permanent_redirect`
+(308) when you want a stable cacheable redirect that keeps method semantics —
+e.g. an API endpoint relocation. Pick `found` (302) for short-lived forwards
+(login flows, A/B-testing gates). `redirect = "unauthorized"` returns 401
+unconditionally — useful for blanket deny-by-default frontends that still want
+to surface a login prompt with the cluster's `www_authenticate` realm.
+
+`redirect = "silent_close"` refuses the request without sending any response,
+the equivalent of nginx's `return 444`: on an HTTP/1.x frontend Sōzu closes the
+connection without writing a byte, and on an HTTP/2 frontend it resets only that
+stream with `RST_STREAM(CANCEL)`, so the connection's other streams carry on. The
+backend is never contacted, with or without a `cluster_id`, and the policy wins
+over every other redirect, rewrite or authentication setting of the frontend. The
+access log records the request with status `444` and message `silent_close`, not
+as an error (`http.errors` is not incremented); the status counts in
+`http.status.4xx`. Use it for traffic that should get no answer at all, such as
+scanners hitting a blocked path. The CLI spelling is
+`sozu frontend http add ... --redirect silent_close`.
+
+`rewrite_host` and `rewrite_path` accept a small template grammar: `$HOST[n]`
+references the n-th host capture (0 is the full hostname; 1+ are regex /
+wildcard subgroups), and `$PATH[n]` references the n-th path capture.
+Host captures are numbered left to right in the hostname, whatever the rule's
+`position`, and the groups of one regex label keep their order: in
+`/a([0-9]+)/./([a-z])([0-9])/.example.com`, `a1.x9.example.com` gives
+`$HOST[1] = 1`, `$HOST[2] = x` and `$HOST[3] = 9`. Up to and including 2.2.1 a
+`Tree` rule (the default) numbered its labels from the rightmost one instead
+(`x`, `9`, `1` above); the changelog carries the migration (sozu#1595). When the
+host is rewritten, Sōzu injects the original host into `X-Forwarded-Host` so
+backends can reconstruct the request URL.
+
+Custom headers attach to the same frontend:
+
+```toml
+[[clusters.MyCluster.frontends.headers]]
+position = "request"               # request | response | both
+key      = "X-Forwarded-Proto"
+value    = "https"
+
+[[clusters.MyCluster.frontends.headers]]
+position = "response"
+key      = "X-Cache-Backend"
+value    = ""                      # empty value DELETES the header by name
+                                   # (HAProxy `del-header` parity)
+```
+
+HAProxy parallels: `http-request redirect` (permanent / scheme), `set-uri` and
+`set-path` (rewrite), `http-request set-header` and `http-request del-header`
+(custom headers).
+
+### HSTS for the HTTPS counterpart of an automatic redirect
+
+When an HTTP listener carries a `redirect_scheme = "use-https"` frontend
+that pushes traffic to an HTTPS counterpart, HSTS belongs on the **HTTPS**
+side, **never** on the redirect itself. RFC 6797 §7.2 forbids
+`Strict-Transport-Security` on plaintext-HTTP responses; conformant browsers
+ignore the header on plain-HTTP and Sōzu refuses the configuration at
+load time on HTTP listeners.
+
+The recommended pattern is two paired frontends with HSTS attached to
+the HTTPS one:
+
+```toml
+# Plain-HTTP frontend that pushes everything to HTTPS via 301.
+[[clusters.api.frontends]]
+address         = "0.0.0.0:80"
+hostname        = "api.example.com"
+redirect        = "permanent"     # 301 (or "permanent_redirect" for 308)
+redirect_scheme = "use-https"
+# NO [hsts] block here — Sōzu would reject it (RFC §7.2).
+
+# HTTPS counterpart that serves traffic and pins HSTS.
+[[clusters.api.frontends]]
+address  = "0.0.0.0:443"
+hostname = "api.example.com"
+
+[clusters.api.frontends.hsts]
+enabled            = true
+max_age            = 31536000     # 1 year — preload list minimum
+include_subdomains = true
+preload            = false        # opt-in only
+```
+
+For convenience, declare HSTS once at the listener default and let every
+HTTPS frontend inherit:
+
+```toml
+[[listeners]]
+protocol = "https"
+address  = "0.0.0.0:443"
+
+[hsts]
+enabled            = true
+max_age            = 31536000
+include_subdomains = true
+```
+
+Per-frontend `hsts.enabled = false` suppresses the inherited default for
+a single frontend that cannot commit to HSTS yet.
+
+The header is emitted on every successful HTTPS response, including
+proxy-generated 3xx redirects (e.g. `redirect_scheme = "use-https"` from
+an HTTPS frontend, or a `redirect = "permanent"` shape served on the
+HTTPS side), 401 auth-deny, and 502 / 503 / 504 default answers — RFC
+6797 §8.1 requires HSTS on every response code from the host.
+
+## HTTP Basic authentication on a frontend
+
+Operators can require a valid `Authorization: Basic` header on a frontend and
+validate it against a list of pre-hashed credentials on the cluster. The mux
+iterates the entire authorized list in constant time (via
+`subtle::ConstantTimeEq`), so neither the matching index nor a successful lookup
+leak through the time spent validating.
+
+```toml
+[clusters.MyCluster]
+# Realm rendered into `WWW-Authenticate: Basic realm="…"` on a 401.
+www_authenticate = 'Basic realm="MyCluster"'
+# Each entry is `username:hex(sha256(password))`. The runtime hashes
+# ONLY the password — the username appears verbatim before the colon
+# and is NOT part of the hashed input. Generate the hash for password
+# `secret` with:
+#   printf 'secret' | sha256sum | awk '{print $1}'
+# `printf` (not `echo`) omits the trailing newline so the digest matches
+# the bytes carried in `Authorization: Basic <base64>`.
+authorized_hashes = [
+    "admin:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
+]
+
+[[clusters.MyCluster.frontends]]
+address       = "0.0.0.0:80"
+hostname      = "secured.example.com"
+required_auth = true               # gate this frontend on basic-auth
+```
+
+Failure modes:
+
+- Missing `Authorization: Basic` header → 401 with the cluster's realm
+- Malformed credential (bad base64, missing `:`) → 401
+- Wrong username or password → 401
+- Empty `authorized_hashes` while the frontend has `required_auth = true` → 401
+  (closed-by-default policy)
+
+The `WWW-Authenticate` header is rendered through the answer template's
+`%WWW_AUTHENTICATE` placeholder; when no realm is configured the entire header
+line is elided from the 401 response. HAProxy parallel:
+`http-request auth realm Foo unless { http_auth(...) }`.
+
+### Tuning the credential decode cap
+
+A hostile peer can send arbitrarily long `Authorization: Basic <token>` values.
+Sōzu base64-decodes the token in a transient allocation; an unbounded decode per
+failed-auth attempt is a memory pressure vector. The worker caps the decoded
+length to **4096 bytes by default** — well above the realistic
+`username:password` shape (typical credentials are <100 bytes). Operators
+running hardened tenants can lower this in the main TOML config:
+
+```toml
+# in the top-level config (alongside `buffer_size`, `max_connections`, etc.)
+basic_auth_max_credential_bytes = 256
+```
+
+The override is committed once on each worker at boot and applies to every
+cluster. Setting `0` is a no-op (the built-in default stays in force) so an
+explicit zero in a config file does not accidentally disable the cap.
+
+The config validator emits a `warn!` line at boot when the configured cap is
+**>= `buffer_size / 3`**: at that point a single failed-auth attempt can pin
+~33% of the per-frontend buffer's worth of bytes, which combined with in-flight
+request/response framing pushes the buffer toward back-pressure under load. The
+warning is informational only — operators with a deliberate trade-off can keep
+the value, but the surprise stays visible in the boot log.
+
+## Runtime patch — `sozu listener update`
+
+`sozu listener {http,https,tcp} update` patches a live listener **in place**
+without cycling the listening socket. Only the fields you pass are written; all
+others are preserved exactly as they are. Existing sessions continue with their
+configuration snapshot; only new sessions, connections, or TLS handshakes —
+depending on the field — pick up the new values. Use `sozu listener list` to
+inspect current values before patching.
+
+A patch is **all-or-nothing**. When any field is refused — an invalid
+`sozu_id_header`, an unknown `forwarded_headers` mode or ALPN value, a flood
+knob below its floor, an answer template that does not parse, an `hsts` block
+without `enabled` — the whole patch is refused and none of its fields is
+applied, neither in the main process (what `sozu listener list` and `SaveState`
+report) nor on the workers. The main process and the workers run the same
+checks, so a patch the workers would refuse is refused by the main process
+before it reaches them. One refusal stays worker-only: a worker that fails to
+rebuild its TLS context for a new `alpn_protocols` list keeps its listener
+unchanged, but the main process has already recorded the patch.
+
+> **Bind-only fields are not patchable.** The address, TLS crypto parameters,
+> and the `active` flag can only be changed by removing and re-adding the
+> listener:
+>
+> ```bash
+> sozu listener https remove -a 0.0.0.0:8443
+> sozu listener https add --address 0.0.0.0:8443 [...]
+> ```
+>
+> Bind-only fields: `address`, `tls_versions`, `cipher_list`, `cipher_suites`,
+> `signature_algorithms`, `groups_list`, `certificate`, `certificate_chain`,
+> `key`, `send_tls13_tickets`, `active`.
+
+### Updatable fields
+
+Fields are grouped by the earliest point at which a patched value takes effect
+for connections already in progress. All fields apply to new sessions
+immediately after the patch is acknowledged.
+
+#### HTTP and HTTPS listeners
+
+| Field                                     | Type            | Mutability class     | Default                 | Notes                                                                                                                                                        |
+| ----------------------------------------- | --------------- | -------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `public_address`                          | `SocketAddr`    | session-at-accept    | —                       | Source address reported to backends / logs                                                                                                                   |
+| `expect_proxy`                            | `bool`          | session-at-accept    | `false`                 | Enable PROXY protocol v2 on new sessions                                                                                                                     |
+| `sticky_name`                             | `string`        | session-at-accept    | `"SOZUBALANCEID"`       | Sticky-session cookie name                                                                                                                                   |
+| `front_timeout`                           | `u32` (seconds) | session-at-accept    | `60`                    | Max idle time on the client socket                                                                                                                           |
+| `back_timeout`                            | `u32` (seconds) | session-at-accept    | `30`                    | Max idle time on the backend socket                                                                                                                          |
+| `connect_timeout`                         | `u32` (seconds) | session-at-accept    | `3`                     | Max time to establish a backend connection                                                                                                                   |
+| `request_timeout`                         | `u32` (seconds) | session-at-accept    | `10`                    | Max time to send a complete request; also bounds the lingering close of an H1 connection answered before its request was received whole (RFC 9112 §9.6), and of an H2 connection after its final GOAWAY(NO_ERROR); one whose final GOAWAY carries an error code lingers at most 1 s and 256 KiB, never longer than this |
+| `http_answers`                            | file paths      | session-at-accept    | built-in defaults       | Listener-default HTTP error bodies (301/401/404/408/413/421/502/503/504/507). Per-cluster `answer_503` overrides are preserved.                              |
+| `sozu_id_header`                          | `string`        | session-at-accept    | `"Sozu-Id"`             | Correlation header name (RFC 9110 §5.1 token; reject empty or containing CR/LF/colon/space)                                                                  |
+| `forwarded_headers`                       | enum            | session-at-accept    | `both`                  | `both` \| `x_forwarded` \| `rfc7239` \| `none` — forwarding header family added to requests (see "Forwarding headers")                                       |
+| `h2_max_rst_stream_per_window`            | `u32` (≥ 1)     | per-connection setup | `2000`                  | RST_STREAM flood cap — CVE-2023-44487, CVE-2019-9514                                                                                                         |
+| `h2_max_ping_per_window`                  | `u32` (≥ 1)     | per-connection setup | `2000`                  | PING flood cap — CVE-2019-9512                                                                                                                               |
+| `h2_max_settings_per_window`              | `u32` (≥ 1)     | per-connection setup | `1000`                  | SETTINGS flood cap — CVE-2019-9515                                                                                                                           |
+| `h2_max_empty_data_per_window`            | `u32` (≥ 1)     | per-connection setup | `2000`                  | Empty DATA flood cap — CVE-2019-9518                                                                                                                         |
+| `h2_max_continuation_frames`              | `u32` (≥ 1)     | per-connection setup | `20`                    | CONTINUATION flood cap — CVE-2024-27316                                                                                                                      |
+| `h2_max_glitch_count`                     | `u32` (≥ 1)     | per-connection setup | `2000`                  | Cumulative protocol-anomaly budget                                                                                                                           |
+| `h2_max_window_update_stream0_per_window` | `u32` (≥ 1)     | per-connection setup | `2000`                  | Unsolicited stream-0 WINDOW_UPDATE flood cap (two per DATA frame sent are not counted)                                                                       |
+| `h2_max_rst_stream_lifetime`              | `u64` (≥ 1)     | per-connection setup | `200000`                | Floor of the received RST_STREAM cap (also needs the resets after a response or on a closed stream to exceed the streams a backend answered) — CVE-2023-44487           |
+| `h2_max_rst_stream_abusive_lifetime`      | `u64` (≥ 1)     | per-connection setup | `1000`                  | Floor of the pre-response RST_STREAM cap (also needs the pre-response resets, received plus provoked, to exceed the streams a backend answered) — Rapid Reset signature |
+| `h2_max_rst_stream_emitted_lifetime`      | `u64` (≥ 1)     | per-connection setup | `10000`                 | Floor of the peer-provoked server-emitted RST_STREAM cap (also needs the pre-response resets, received plus provoked, to exceed the streams a backend answered) — CVE-2025-8671 |
+| `h2_stream_refusal_percent`               | `u32`           | per-connection setup | `50`                    | Share of the pre-response RST_STREAM cap's floor at which new streams get `REFUSED_STREAM`. `0` disables; `100` or more never refuses. |
+| `h2_initial_connection_window`            | `u32`           | per-connection setup | `16777216`              | Connection receive window advertised to the peer (bytes, RFC 9113 §6.9.2); not enforced on inbound DATA                                                      |
+| `h2_max_concurrent_streams`               | `u32` (≥ 1)     | per-connection setup | `100`                   | `SETTINGS_MAX_CONCURRENT_STREAMS`                                                                                                                            |
+| `h2_stream_shrink_ratio`                  | `u32` (≥ 2)     | per-connection setup | `2`                     | Stream-slot Vec shrink threshold                                                                                                                             |
+| `h2_max_header_list_size`                 | `u32` (≥ 1)     | per-connection setup | `65536`                 | HPACK decoded header budget (`SETTINGS_MAX_HEADER_LIST_SIZE`). `0` refuses every request.                                                                    |
+| `h2_max_header_table_size`                | `u32` (≥ 1)     | per-connection setup | `65536`                 | HPACK dynamic table size cap (`SETTINGS_HEADER_TABLE_SIZE`)                                                                                                  |
+| `h2_max_header_fields`                    | `u32` (≥ 1)     | per-connection setup | `128`                   | Materialized header fields per HEADERS/trailers block, cookie crumbs included (RFC 9113 §8.2.3); also the H1 chunked request trailer bound. `0` refuses every request. |
+| `h2_stream_idle_timeout_seconds`          | `u32`           | per-connection setup | `max(30, back_timeout)` | Per-stream idle timeout (slow-multiplex Slowloris defence). When unset, inherits `back_timeout` floored at 30 s; set explicitly to cap below `back_timeout`. |
+| `h2_graceful_shutdown_deadline_seconds`   | `u32`           | per-connection setup | `5`                     | Forced-close deadline after `GOAWAY(NO_ERROR)` on soft-stop. `0` = wait forever.                                                                             |
+
+#### HTTPS-only fields
+
+| Field                | Type       | Mutability class | Default             | Notes                                                                                                                                     |
+| -------------------- | ---------- | ---------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `alpn_protocols`     | `string[]` | per-handshake    | `["h2","http/1.1"]` | Rebuilds the rustls `ServerConfig`. In-flight handshakes finish on the old config. Pass `--reset-alpn` on the CLI to restore the default. |
+| `strict_sni_binding` | `bool`     | per-handshake    | `true`              | Require `:authority`/`Host` covered by served cert SAN dNSName (RFC 6125 §6.4.3/6.4.4, CWE-346/CWE-444). Default-cert handshakes fall back to legacy SNI exact-match. Miss → 421 (RFC 9110 §15.5.20). |
+| `disable_http11`     | `bool`     | per-handshake    | `false`             | Drop clients that do not negotiate `h2` via ALPN                                                                                          |
+
+The mTLS keys (`client_auth`, `client_ca_certificates`, `client_ca_crls`) change only together, through `client_auth_policy`. That field replaces the mode, the CAs and the CRLs in full, and is sent by `sozu reload` or by a client. The main process validates the new policy before it commits it. The patch travels on `UpdateHttpsListenerWithClientAuth`, which a worker that predates mutual TLS fails. A replacement can lower the policy, down to `none`, and it applies to new handshakes only. See [Refreshing CRLs and CAs](#refreshing-crls-and-cas).
+
+#### TCP listeners
+
+| Field             | Type            | Mutability class  | Default | Notes |
+| ----------------- | --------------- | ----------------- | ------- | ----- |
+| `public_address`  | `SocketAddr`    | session-at-accept | —       |       |
+| `expect_proxy`    | `bool`          | session-at-accept | `false` |       |
+| `front_timeout`   | `u32` (seconds) | session-at-accept | `60`    |       |
+| `back_timeout`    | `u32` (seconds) | session-at-accept | `30`    |       |
+| `connect_timeout` | `u32` (seconds) | session-at-accept | `3`     |       |
+
+#### UDP listeners
+
+Patched values apply to **new** flows; flows already in progress keep their
+captured value. `address` and `active` are bind-only — change them with
+`RemoveListener` + add.
+
+| Field                  | Type            | Mutability class | Default | Notes                                                                 |
+| ---------------------- | --------------- | ---------------- | ------- | --------------------------------------------------------------------- |
+| `public_address`       | `SocketAddr`    | flow-at-admit    | —       | Source address reported to backends / logs                            |
+| `front_timeout`        | `u32` (seconds) | flow-at-admit    | `30`    | Client flow idle timeout                                              |
+| `back_timeout`         | `u32` (seconds) | flow-at-admit    | `30`    | Upstream flow idle timeout                                            |
+| `max_rx_datagram_size` | `u32` (bytes)   | flow-at-admit    | `1500`  | Clamped to the effective `buffer_size`                                |
+| `max_flows`            | `u32`           | flow-at-admit    | `0`     | `0` = auto (~70% of soft RLIMIT_NOFILE)                               |
+
+### Examples
+
+#### Tighten H2 flood thresholds under attack (CVE-2023-44487)
+
+```bash
+# Inspect current values first
+sozu listener list
+
+# Tighten the Rapid Reset budget on the HTTPS listener
+sozu listener https update -a 0.0.0.0:8443 \
+    --h2-max-rst-stream-per-window 500 \
+    --h2-max-rst-stream-abusive-lifetime 250
+
+# Confirm the new values are live
+sozu listener list
+```
+
+Existing H2 connections continue with their original thresholds. New connections
+opened after the patch acknowledge see the tighter limits.
+
+#### Toggle `disable_http11` to enforce H2-only mode
+
+```bash
+# Require all clients to negotiate h2 via TLS ALPN
+sozu listener https update -a 0.0.0.0:8443 --disable-http11
+
+# Revert — allow HTTP/1.1 fallback again
+sozu listener https update -a 0.0.0.0:8443 --enable-http11
+```
+
+The existing HTTP/1.1 sessions in progress are not disrupted; only new TLS
+handshakes that omit `h2` from their ALPN offer are refused after the patch.
+
+#### Rebrand the correlation header
+
+```bash
+# Rename "Sozu-Id" to "X-Edge-Id" organisation-wide
+sozu listener http  update -a 0.0.0.0:80   --sozu-id-header "X-Edge-Id"
+sozu listener https update -a 0.0.0.0:8443 --sozu-id-header "X-Edge-Id"
+```
+
+The new header name takes effect for sessions accepted after the patch.
+Previously accepted sessions continue to inject the old `Sozu-Id` header until
+they close.
+
+### Observability
+
+Two worker metrics track update outcomes:
+
+| Metric                   | Description                                                 |
+| ------------------------ | ----------------------------------------------------------- |
+| `listener.updated`       | Incremented each time a worker successfully applies a patch |
+| `listener.update_failed` | Incremented when the worker-side apply returns an error     |
+
+The control-plane command server also emits a `LISTENER_UPDATED` event on the
+`SubscribeEvents` bus (carrying the listener address and type) and writes a
+structured audit log line at `info!` level in the MUX `Session(...)` layout. See
+[`observability.md`](observability.md#control-plane-audit-trail) for the full
+format.
+
+The same bus carries `EventKind::ClusterRecovered` (proto tag 29) on the
+`AllDown → Available` transition for any cluster that previously emitted
+`EventKind::NoAvailableBackends`. Subscribers that already track the all-down
+event get the recovery side for free without polling
+`cluster.available_backends`.
+
+#### Access-log `message` field on timeout
+
+When a session terminates on a timeout, Sōzu populates the access-log `message`
+field with a stable, structured token so dashboards and log-pipeline rules can
+attribute the outcome without inspecting the HTTP status. The vocabulary is
+closed (operator-visible API once shipped):
+
+| Token                            | Trigger                                                                                                                                                                                                                                                                                                                                       | Status seen by client                      |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `client_timeout`                 | Frontend timer fired while waiting for the request to arrive (`StreamState::Idle` in the mux path, which serves both H1 and H2)                                                                                                                                                                                                   | `408 Request Timeout`                      |
+| `client_timeout_during_response` | Frontend timer fired while the request was linked to a backend that had not yet answered, including during connection failover before any backend accepted — ambiguous case where timeout responsibility should already have switched. Mapped to gateway-timeout for client clarity | `504 Gateway Timeout`                      |
+| `backend_timeout`                | Backend timer fired on an established backend connection before any response byte arrived — backend stuck pre-headers (a connection still being established fails over to another backend instead, see `max_connection_attempts`). The invariant-break arm (an idle stream on the backend side) collapses into the same token because the operator-visible cause is identical; the internal `error!` log keeps the diagnostic signal for sozu maintainers | `504 Gateway Timeout`                      |
+| `backend_response_timeout`       | Backend timer fired while the response body was streaming — partial response in flight. Mux replies with `RST_STREAM` (`H2Error::InternalError`); H1 forcibly closes the session because no default-answer can replace an in-flight response body                                                                                             | `RST_STREAM` (mux) / connection close (H1) |
+
+Non-timeout default-answer paths (e.g. 503 from `Router::route_from_request`,
+401 from auth, 301 from redirects) leave the field as `None` and the access log
+emits `message: None` exactly as before. One non-timeout outcome carries its own token: a request
+refused by a `redirect = "silent_close"` frontend is logged with message
+`silent_close` and status `444`, a status that never reaches the wire (the
+client gets a closed connection or an `RST_STREAM(CANCEL)`). Sessions that complete normally are
+also unaffected.
+
+#### Backend health checks
+
+You can optionally configure active health checks for backends: an HTTP
+probe (the default) or a TCP connect probe. See
+[health_checks.md](./health_checks.md) for full details. Upgrade the main
+process and every worker, and use the new `sozu` CLI, before setting
+`mode = "TCP"` or `accepted_statuses`: an older Sōzu ignores both and probes
+`GET <uri>` accepting only 2xx. The same holds for `port`: an older Sōzu
+ignores it and probes the backend's data port.
+
+```toml
+[clusters.NameOfYourCluster.health_check]
+mode = "HTTP"             # or "TCP": healthy iff the TCP connection is established
+uri = "/health"           # HTTP mode only (default: "/")
+interval = 10
+timeout = 5
+healthy_threshold = 3
+unhealthy_threshold = 3
+expected_status = 0       # 0 = any 2xx; exclusive with accepted_statuses
+# accepted_statuses = ["200-399", "404"]  # codes, ranges, "2xx" classes or "any"
+# port = 9090             # probe this port on the backend's IP (default: the data port);
+#                         # refused when a backend of the cluster has a `unix_path`
+
+# HTTP mode: custom request headers, sent in this order. The configuration holds
+# a reference to the value, never the value: parsing it does not open
+# `value_file`. Use an absolute path.
+# [[clusters.NameOfYourCluster.health_check.headers]]
+# name = "Authorization"
+# value_file = "/run/secrets/sozu-probe-authorization"
+```
+
+##### Custom request headers
+
+`[[clusters.<id>.health_check.headers]]` is a repeatable table with exactly two
+keys, both strings: `name`, the header name, and `value_file`, the path of the
+file holding its value. There is no inline `value` key, and an unknown key is
+refused. The headers are sent in declaration order; the rules are:
+
+- at most 32 headers; names are RFC 9110 tokens, unique when compared
+  case-insensitively; names starting with `:` and `Host`, `Connection`,
+  `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `Content-Length`, `TE`,
+  `Trailer`, `Upgrade` and `Expect` are reserved and refused;
+- `HTTP` mode only: the headers of a `TCP` health check are refused;
+- two distinct size limits: the headers (name + value + 4 bytes each) sum to at
+  most 8192 bytes, and the HTTP/2 header block of the h2c probe (pseudo-headers,
+  URI and headers) fits in 16384 bytes;
+- the file is read as is, except for one final `LF` and the `CR` right before
+  it; no other whitespace is trimmed, and a value that begins or ends with a
+  space or a tab, or holds a control byte, is refused.
+
+Only the ordered `name` and `value_file` reference lives in the configuration,
+kept as written, never a literal value: parsing the configuration validates the
+names and opens no `value_file`, so use absolute paths. The hardened main
+process may read a configured `value_file` into protected memory before it forks
+or launches the workers; the typed capability query that precedes any file or
+standard-input read is a guarantee of the `sozu` CLI, not of this startup path. The fingerprint and the epoch below are produced by the main process, so
+a configuration file never carries them, and the saved state never carries a
+`value_file` path. A value is never carried by `SetHealthCheck`: it travels in a
+protected request, for example
+`sozu cluster health-check set --header-file NAME=PATH`, which first checks that
+the main process and every worker support it. See
+[health_checks.md § Custom request headers](./health_checks.md#custom-request-headers)
+for the file and standard-input forms, the capability check, cold restarts and
+upgrades.
+
+What the state and the queries carry for a header is its name and its
+fingerprint, in sending order:
+
+```json
+{ "name": "Authorization", "fingerprint": "sozu-hc-hmac-sha256:v1:<epoch>:<tag>" }
+```
+
+`<epoch>` is 32 lowercase hexadecimal digits naming the key of the main process
+that made the fingerprint; `<tag>` is the full HMAC-SHA256, 64 lowercase
+hexadecimal digits, of the header name and value. The key is generated by each
+cold start and is never written anywhere, so an authoritative saved state
+restored by a new process holds fingerprints of a foreign epoch: that health
+check sends no probe, and counts `health_check.missing_secret`, until the values
+are provided again with a complete ordered match. A saved state is authoritative
+at startup, on reload and for `LoadState`, `RemoveCluster` included: for a
+cluster it adds, removes or rewrites, a foreign or stale epoch cannot activate a
+value by carrying the same cluster name, and the same-name `value_file` entry of
+the configuration cannot resurrect a removed health check. Re-injecting the
+exact ordered headers with `--header-file` is how the values come back; the saved
+state never contains them. A value never appears in the
+saved state, in a query response, in a log line or in `Debug` output.
+
+## Metrics
+
+Sōzu reports its own state to another network component through a `UDP` socket.
+The main process and the workers are responsible to send their states. We
+implement the [statsd](https://github.com/b/statsd_spec) protocol to send
+statistics. Any service that understands the `statsd` protocol can then gather
+metrics from Sōzu.
+
+### Architecture
+
+Metrics are collected via thread-local storage macros (`count!`, `gauge!`,
+`gauge_add!`, `time!`, `incr!`, `decr!`) and dispatched to two drains:
+
+- **Local drain**: Accumulates metrics in-memory with HDR histograms for latency
+  percentiles. Queried via the CLI (`sozu metrics get`).
+- **Network drain**: Sends metrics over UDP using the statsd protocol. Supports
+  both plain dotted format and InfluxDB-style tagged format.
+
+Metric types:
+
+| Type    | Macro                      | StatsD suffix | Description                                                                                                                                         |
+| ------- | -------------------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Counter | `count!`, `incr!`, `decr!` | `\|c`         | Monotonically increasing. Network drain: zeroed after each successful UDP send (per-interval delta). Local drain: cumulative since worker start.    |
+| Gauge   | `gauge!`, `gauge_add!`     | `\|g`         | Snapshot value (absolute or delta). Last-value-wins; never automatically reset.                                                                     |
+| Time    | `time!`                    | `\|ms`        | Latency in milliseconds. Local drain stores an HDR histogram (`Histogram<u64>`, sigfig=3); samples accumulate since worker start.                   |
+
+Metrics have three scopes:
+
+- **Proxy-level**: Global to the worker (no cluster or backend context)
+- **Cluster-level**: Tagged with a `cluster_id`
+- **Backend-level**: Tagged with both `cluster_id` and `backend_id`
+
+### Configure metrics
+
+In your `config.toml`, you can define the address and port of your external
+service by adding:
+
+```toml
+[metrics]
+address = "127.0.0.1:8125"
+# use InfluxDB's statsd protocol flavor to add tags
+# tagged_metrics = false
+# metrics key prefix
+# prefix = "sozu"
+# cardinality knob — defaults to "cluster" (preserves historical behaviour)
+# detail = "cluster"
+```
+
+Metrics are sent at most once per second per key (if updated). Cluster/backend
+metrics that have not been updated for 10 minutes are automatically dropped from
+the network drain.
+
+#### Metrics scopes (local CLI vs network drain)
+
+- The **network drain** (StatsD UDP) sends per-second deltas; counters are
+  zeroed after each successful send. On `RemoveCluster` / `RemoveBackend`,
+  the drain immediately drops the cluster's `cluster_metrics`,
+  `backend_metrics`, and queued `MetricLine` entries — any unsent statsd
+  interval for the cluster is discarded (no final flush). Without an
+  explicit `RemoveCluster`, the existing 10-minute idle GC still applies.
+- The **local drain** (queryable via `sozu metrics`) is **cumulative since
+  worker start** for both `proxy_metrics` and per-cluster /
+  per-backend `cluster_metrics`. There is no implicit hourly reset.
+  Operators reset it explicitly with `sozu metrics clear`, which wipes
+  everything (counts, gauges, histograms, proxy-wide and per-cluster, AND
+  the master-process `main_metrics` aggregator).
+- Per-cluster local-drain entries are dropped on `RemoveCluster` /
+  `RemoveBackend` so the keyspace is bounded by the live configuration. A
+  backend row is keyed by backend id alone, so `RemoveBackend` drops it only
+  once no backend of that id remains in the cluster at any address.
+- A remove then add of the same cluster id creates a new internal metrics
+  incarnation. In-flight HTTP, WebSocket and TCP sessions retain the
+  incarnation they were routed to, so their late cluster/backend emissions
+  cannot update the replacement's rows even when backend id and address are
+  reused. At `cluster` and `backend` detail, the incarnation check rejects
+  those old labelled events. At `process` and today's `frontend` detail, they
+  still contribute to the intentional worker aggregate after label removal,
+  so a late decrement balances its earlier increment. Metrics emitted
+  directly without cluster labels remain independent. A live `AddCluster`
+  update, disabling and re-enabling collection, and `sozu metrics clear`
+  preserve the current incarnation.
+- Implication for dashboards: counters in `sozu metrics` output are
+  monotonic. Charts must compute `rate()` / `irate()` rather than treat
+  successive snapshots as windowed counts. Histograms accumulate every
+  sample since worker start, so percentiles in the CLI snapshot are
+  lifetime values, not windowed.
+
+#### Cardinality knob (`metrics.detail`)
+
+Mirrors HAProxy's `extra-counters` opt-in: operators choose the lowest level
+that satisfies their dashboards so the StatsD keyspace stays bounded. The level
+filters the `(cluster_id, backend_id)` labels at emission time — both the local
+CLI drain and the network drain see the same filtered labels, so dashboards stay
+consistent.
+
+Each level is a SUPERSET of the previous one:
+
+| Level      | Behaviour                                                                                                                                                                                                                          | Use when                                                                                                   |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `process`  | Both `cluster_id` and `backend_id` are dropped — proxy-only counters.                                                                                                                                                              | The smallest possible keyspace; dashboards aggregate everything at the worker level.                       |
+| `frontend` | Same as `process` today. Reserved for the per-listener (frontend) counters that are tracked as a follow-up — operators can opt in already, the value is just stored on `ServerMetricsConfig.detail` and applied on every emission. | Forward-compatible config that picks up per-listener counters when they ship without a config-file change. |
+| `cluster`  | Keeps `cluster_id`, drops `backend_id`. **Default** — preserves the historical pre-knob behaviour.                                                                                                                                 | The current shape of every existing dashboard.                                                             |
+| `backend`  | Keeps both labels. Highest cardinality.                                                                                                                                                                                            | Per-backend SLOs / hotspot debugging when the cluster has few backends.                                    |
+
+Memory note for `Time` histograms: per-bucket counters are `Histogram<u64>`
+(widened from `Histogram<u32>` to avoid saturation at sustained
+high-RPS — `u32` saturates a single popular bucket in ≈72 minutes at
+1 M samples/s in a 64-bit count). Memory footprint per Time histogram is
+bounded by `hdrhistogram`'s sigfig=3 shape, roughly 16–32 KB per
+histogram, doubled vs. the prior `u32` shape. With `cluster`-level
+cardinality this multiplies by the number of live clusters × Time-key
+distinct names; with `backend`-level, also by per-cluster backend count.
+Plan capacity accordingly.
+
+Filtering happens centrally in `Aggregator::receive_metric`
+(`lib/src/metrics/mod.rs`) via the pure helper `filter_labels_for_detail`,
+unit-tested exhaustively across all four levels. Workers receive the level over
+the SCM socket as a proto enum (`MetricDetail`); old binaries on either side
+fall back to `cluster` so a mixed-version rollout keeps emitting the historical
+metric shape.
+
+The effective level is applied independently to each emission. A static
+configuration change or runtime lease transition does not migrate or clear
+metrics already stored under the previous label shape. Long-lived gauge
+increments and decrements that straddle such a transition can therefore land
+in different shapes by inspection of that emission-time policy; no separate
+transition defect is asserted here. Cluster-incarnation filtering uses the
+effective level at the time of the emission and does not add migration.
+
+#### Runtime cardinality lease
+
+Operators can elevate a worker's effective `metric_detail` for the lifetime of
+an interactive session without rewriting `config.toml`. `sozu top` uses this
+mechanism to enable `backend` detail while the TUI is attached, and reverts it
+on exit. Other tooling (per-host scraper agents, ad-hoc debugging) can use the
+same surface.
+
+The lease is keyed by an operator-supplied `client_id` and stored on each
+worker. The effective level is `max(configured, max(active leases))`, so a
+lease never *lowers* the configured detail; it only elevates. A client MAY
+renew its own lease at a lower level than its previous request — that is the
+client voluntarily giving back cardinality it no longer needs, and the
+effective level recomputes downward in response, same as any other apply;
+it still never drops below the configured floor. When the last lease expires
+(TTL pop) or is explicitly cleared, the effective level falls back to the
+configured value.
+
+The proto verb that exposes this surface is `SetMetricDetail` (request tag
+`55`); the response shape is `MetricDetailStatus` carrying the master's
+`(configured, effective, previous_effective)` triple plus a per-worker
+`WorkerMetricDetailStatus` map. Every apply, clear, and TTL expiry emits an
+audit-log event of kind `MetricDetailChanged` (`EventKind::METRIC_DETAIL_CHANGED`,
+tag `30`) on the text and JSON sinks, with `lease_id=` and
+`metric_detail_reason=` as dedicated columns so operator-supplied strings
+cannot smuggle a forged adjacent column.
+
+Server-side caps and defaults (all defined in `lib/src/metrics/mod.rs`):
+
+| Knob                          | Default | Cap      | Notes                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ttl_seconds`                 | `60`    | `300`    | Lease lifetime. The TUI renews every `ttl/2` seconds; on TUI crash the lease self-expires within `ttl` plus the worker's 5 s janitor cadence and its 1 s poll timeout, with no further command. The master rejects out-of-range TTLs before fan-out so a buggy or malicious request cannot N×amplify worker-side rejections.                                                                            |
+| `LEASE_TABLE_CAP`             | —       | `64`     | Maximum number of simultaneous leases per worker. Renewals of existing entries always succeed; only new inserts are subject to this cap. Mitigates the CWE-770 vector where a misbehaving client rolls `client_id` faster than expiry.                                                                                              |
+| `LEASE_CLIENT_ID_MAX_BYTES`   | —       | `64`     | Maximum `client_id` length. Operator tooling should pick a stable identifier (the TUI uses `top:<pid>:<8-hex>`); arbitrary user input must be capped at this length before submission.                                                                                                                                              |
+
+Trust model: the lease records the connecting peer's PID and master session
+ULID (from `SO_PEERCRED` on Linux). Subsequent `clear` requests are
+authorised against the apply-time binding — a different operator on the same
+host cannot clear another operator's lease even if they guess the
+`client_id`. Pre-binding callers and platforms without `SO_PEERCRED` degrade
+to "binding unknown" → accept any clear. Clients NEVER set the peer fields
+themselves; the master populates them from the `ClientSession` before
+fan-out.
+
+Reversibility: leases self-expire, so a crashed dashboard does not leave a
+worker permanently emitting at elevated cardinality. The audit-log trail
+records every transition; SOC tooling can reconstruct the cardinality
+posture of every worker at any point in time without polling.
+
+Renewals are not state transitions — `SetMetricDetail` is deliberately
+*not* in the systemd `RELOADING=1` / `READY=1` bracket set, so a long-lived
+TUI session does not flap the unit state. The audit-log event remains the
+authoritative trail for cardinality changes.
+
+#### StatsD wire format
+
+**Untagged** (default, `tagged_metrics = false`):
+
+```
+sozu.WRK-00.http.requests:1|c
+sozu.WRK-00.cluster.my-cluster.http.errors:0|c
+sozu.WRK-00.cluster.my-cluster.backend.backend-1.backend_response_time:125|ms
+```
+
+**Tagged** (InfluxDB format, `tagged_metrics = true`):
+
+```
+sozu.http.requests,origin=WRK-00,version=1.1.0:1|c
+sozu.cluster.http.errors,origin=WRK-00,version=1.1.0,cluster_id=my-cluster:0|c
+sozu.backend.backend_response_time,origin=WRK-00,version=1.1.0,cluster_id=my-cluster,backend_id=backend-1:125|ms
+```
+
+### Available metrics
+
+Sōzu emits the following metrics via statsd. All metrics are emitted by both
+HTTP/1.1 and HTTP/2 code paths unless noted otherwise. The prefix (default
+`sozu`) is omitted from metric names below.
+
+#### Infrastructure
+
+| Metric                                | Type    | Scope            | Description                                                                                                                                                                                                                                                              |
+| ------------------------------------- | ------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `panic`                               | counter | proxy            | Worker thread panicked (logged before crash)                                                                                                                                                                                                                             |
+| `configuration.clusters`              | gauge   | proxy            | Number of configured clusters                                                                                                                                                                                                                                            |
+| `configuration.backends`              | gauge   | proxy            | Number of configured backend servers                                                                                                                                                                                                                                     |
+| `configuration.frontends`             | gauge   | proxy            | Number of configured frontends                                                                                                                                                                                                                                           |
+| `client.connections`                  | gauge   | proxy            | Active frontend connections                                                                                                                                                                                                                                              |
+| `client.connections_max`              | gauge   | proxy            | Configured `max_connections`. Renamed from `client.max_connections`                                                                                                                                                                                                      |
+| `client.connections_percent`          | gauge   | proxy            | Percentage of `max_connections` in use. Renamed from `client.connections_percentage`                                                                                                                                                                                     |
+| `connections.rejected_per_cluster_ip` | counter | cluster, backend | HTTP/HTTPS request answered with 429 because the per-(cluster, source-IP or subnet) connection limit was reached; a TCP session that limit closes is not counted. Labels carry `cluster_id` and `backend_id` (always empty: rejected before backend selection).          |
+| `slab.entries`                        | gauge   | proxy            | Session slab allocator slots used                                                                                                                                                                                                                                        |
+| `slab.capacity`                       | gauge   | proxy            | Configured slab capacity (`10 + slab_entries_per_connection * max_connections`)                                                                                                                                                                                          |
+| `slab.usage_percent`                  | gauge   | proxy            | `slab.entries * 100 / slab.capacity`. Pure slab-utilisation gauge                                                                                                                                                                                                        |
+| `slab.accept_threshold_percent`       | gauge   | proxy            | `slab.entries * 100 / (10 + 2 * max_connections)`. Charts proximity to the `at_capacity()` accept gate, which can flip true while `slab.usage_percent` still shows headroom (configured slab is larger when `slab_entries_per_connection > 2`)                           |
+| `process.uptime_seconds`              | gauge   | proxy            | Seconds since the worker started. Captured once in `Server::new`; never reset on hot upgrade (the new worker starts its own counter)                                                                                                                                     |
+| `server.live`                         | gauge   | proxy            | `1` while the worker accepts traffic, `0` once a graceful shutdown is requested. Mirrors Envoy `server.live` semantics — L4 health checks (HAProxy / cloud LBs) can poll this gauge to drain a worker before the OS-level termination signal lands                       |
+| `buffer.in_use`                       | gauge   | proxy            | Buffers currently checked out of the buffer pool. Renamed from `buffer.number`                                                                                                                                                                                           |
+| `buffer.capacity`                     | gauge   | proxy            | Configured buffer pool capacity                                                                                                                                                                                                                                          |
+| `buffer.usage_percent`                | gauge   | proxy            | `buffer.in_use * 100 / buffer.capacity`                                                                                                                                                                                                                                  |
+| `zombies`                             | counter | proxy            | Zombie sessions detected and removed                                                                                                                                                                                                                                     |
+
+#### Accept queue
+
+| Metric                                                | Type    | Scope | Description                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------------------------------------------------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `accept_queue.connections`                            | gauge   | proxy | Sockets waiting in the accept queue                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `accept_queue.backpressure`                           | gauge   | proxy | `1` when max connections reached, `0` when accepting again                                                                                                                                                                                                                                                                                                                                                                                       |
+| `accept_queue.wait_time`                              | time    | proxy | How long a socket waited in the accept queue (ms)                                                                                                                                                                                                                                                                                                                                                                                                |
+| `accept_queue.timeout`                                | counter | proxy | Sockets that timed out in the accept queue and were closed                                                                                                                                                                                                                                                                                                                                                                                       |
+| `accept_queue.saturated_seconds`                      | counter | proxy | Incremented at 1 Hz while `SessionManager::can_accept` is `false`. Distinguishes "queue spent N seconds at max" from "queue briefly hit max" — the binary `accept_queue.backpressure` gauge collapses that duration                                                                                                                                                                                                                              |
+| `listener.accepted.total`                             | counter | proxy | Sockets accepted by the worker, all listeners combined                                                                                                                                                                                                                                                                                                                                                                                           |
+| `listener.accepted.tcp`                               | counter | proxy | Sockets accepted on TCP listeners                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `listener.accepted.http`                              | counter | proxy | Sockets accepted on HTTP listeners                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `listener.accepted.https`                             | counter | proxy | Sockets accepted on HTTPS listeners                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `listener.connection_capped`                          | counter | proxy | Accepted sockets dropped unserved by `create_sessions` because `SessionManager::check_limits` returned `false` (max connections reached or slab at capacity), once per dropped socket; with `evict_on_queue_full`, a socket served after eviction made room is not counted                                                                                                                                                                       |
+| `client.connect.per_source.bucket_000` … `bucket_255` | counter | proxy | Per-accept counter bucketed by masked source subnet. Source IPs are masked to /24 (IPv4) or /48 (IPv6) and hashed (`DefaultHasher`) into 256 fixed buckets. The bucket noise is intentional: `incr!` requires `&'static str` keys, and a per-IP counter would be unbounded under SYN flood (OWASP A05, NIST SP 800-92). Operators wanting per-IP attribution should pair these counters with structured access logs or a downstream rate-limiter |
+| `sessions.evicted`                                    | counter | proxy | Sessions force-closed by `evict_on_queue_full` to make room for new accepts. Counts the number of evictions DECIDED in a cap event (one per call to `evict_least_active_sessions`); the helper may skip already-closed tokens, so a small drift versus the slab-removal count is possible. Only emitted when `evict_on_queue_full = true`                                                                                                        |
+
+The accept-loop telemetry above does **not** label by listener address. `incr!`
+requires `&'static str` keys, and listener addresses can be added or removed at
+runtime via the control plane — labelling by address would either require
+runtime `Box::leak` of unbounded strings or a fixed bucket cap. We chose the
+per-protocol breakdown (3 keys + aggregate) instead. Operators needing
+per-listener-address attribution should run distinct workers per listener or
+correlate via access logs.
+
+#### Cluster availability
+
+Per-cluster signals that pair the existing `EventKind::NoAvailableBackends` with
+`EventKind::ClusterRecovered`. Latched on `BackendList` so the log + counter +
+event fire exactly once per `Available` ↔ `AllDown` transition, not once per
+request. Empty clusters (`total == 0`) emit the gauges but never log a
+transition — avoids spam during cluster bootstrap when backends are still being
+registered.
+
+| Metric                          | Type    | Scope   | Description                                                                                                                                                                                                                                                                                   |
+| ------------------------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cluster.available_backends`    | gauge   | cluster | Backends currently passing the availability predicate (`status == Normal && health.is_healthy() && !retry_policy.is_down()`). Updated on every routing decision and every health-check tick                                                                                                   |
+| `cluster.total_backends`        | gauge   | cluster | Backends configured for the cluster, regardless of state. Pairs with `cluster.available_backends` so dashboards can compute health ratios per cluster                                                                                                                                         |
+| `cluster.no_available_backends` | counter | cluster | Incremented exactly once per `Available → AllDown` transition. Pairs with the existing `EventKind::NoAvailableBackends` event and the `error!` log line `cluster X: all N backends are down`                                                                                                  |
+| `cluster.available_recovered`   | counter | cluster | Incremented exactly once per `AllDown → Available` transition. Pairs with `EventKind::ClusterRecovered` (proto tag 29) and the `info!` log line `cluster X: backends recovered (i/N available)`                                                                                               |
+| `backend.available`             | gauge   | backend | `1` when the backend passes `is_available()` (health + retry policy + status), `0` after a transition to unavailable. Emitted at the up/down transition sites in `health_check.rs`, `mux`, and `tcp` — not per-request, so the cardinality cost is bounded by transition frequency |
+
+The `health_check.healthy_backends` gauge is now labelled with `cluster_id`;
+prior emissions overwrote each other across clusters because the unlabelled key
+collapsed every cluster's value into a single bucket.
+
+##### Works without an active health check
+
+The tracker is driven by **both** the data-plane connect path and the active
+health-check tick. Clusters that have **not** configured a
+`[clusters.<id>.health_check]` block still see the full `cluster.*` and
+`backend.available` surface — transitions are detected through the per-backend
+retry policy as TCP connect attempts succeed or fail.
+
+- Every TCP connect failure on the data path (`lib/src/tcp.rs`,
+  `lib/src/protocol/mux/mod.rs`) calls `Backend::retry_policy.fail()`, arming an
+  exponential-backoff window. After `max_tries` consecutive failures (default
+  `6`) the policy reports `is_down() == true`. When every backend in the cluster
+  reaches that state, the next routing call observes
+  `available == 0 && total > 0`, flips the cell to `AllDown`, and emits the
+  `error!` log line + `cluster.no_available_backends` counter +
+  `EventKind::NoAvailableBackends` event.
+- Every successful TCP connect calls `Backend::retry_policy.succeed()`, which
+  clears `is_down()` immediately. The success arm of the routing call then
+  re-evaluates and flips the cell back to `Available`, emitting the `info!` log
+  line + `cluster.available_recovered` counter + `EventKind::ClusterRecovered`
+  event.
+
+Backends in the brief `WAIT` window (post-fail, pre-budget-exhaustion) are
+intentionally counted as `available` because the predicate is
+`!retry_policy.is_down()`, not `Backend::can_open()`. This avoids flapping
+`AllDown ↔ Available` when every backend happens to be in a 1-second backoff at
+the same instant. The `WAIT` state is transient by design; the cluster is still
+healthy from the operator's perspective, just briefly throttled. Only budget
+exhaustion (`current_tries >= max_tries`) drives the cell to `AllDown`.
+
+Configuring an active health check on top of the data-plane signal adds a second
+observation cadence — useful when a cluster is idle (no requests, so no passive
+observations) but you still want timely up/down detection — but is not required
+for the per-cluster availability surface to function.
+
+#### Event loop
+
+| Metric            | Type | Scope | Description                              |
+| ----------------- | ---- | ----- | ---------------------------------------- |
+| `epoll_time`      | time | proxy | Time spent in `epoll_wait`/`kqueue` (ms) |
+| `event_loop_time` | time | proxy | Total event loop iteration time (ms)     |
+
+#### Protocol state
+
+These gauges track how many sessions are in each protocol phase. A session
+transitions through phases (e.g., Expect → TLS Handshake → HTTPS → WSS).
+
+| Metric                      | Type  | Scope | Description                                           |
+| --------------------------- | ----- | ----- | ----------------------------------------------------- |
+| `protocol.proxy.expect`     | gauge | proxy | Sessions expecting a PROXY protocol header            |
+| `protocol.proxy.send`       | gauge | proxy | Sessions sending a PROXY protocol header to a backend |
+| `protocol.proxy.relay`      | gauge | proxy | Sessions relaying a PROXY protocol header             |
+| `protocol.tls.handshake`    | gauge | proxy | Sessions in TLS handshake (HTTPS only)                |
+| `protocol.http`             | gauge | proxy | Active HTTP sessions                                  |
+| `protocol.https`            | gauge | proxy | Active HTTPS sessions                                 |
+| `protocol.tcp`              | gauge | proxy | Active TCP proxy sessions                             |
+| `protocol.ws`               | gauge | proxy | Active WebSocket sessions (over HTTP)                 |
+| `protocol.wss`              | gauge | proxy | Active WebSocket sessions (over HTTPS)                |
+| `websocket.active_requests` | gauge | proxy | Active WebSocket requests (HTTP + HTTPS)              |
+
+#### Request lifecycle
+
+| Metric                 | Type    | Scope                   | Description                                                                                                                                                                                                                    |
+| ---------------------- | ------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `http.requests`        | counter | proxy, cluster, backend | Total HTTP requests received (incremented when headers are fully parsed)                                                                                                                                                       |
+| `http.active_requests` | gauge   | proxy                   | Currently in-flight requests                                                                                                                                                                                                   |
+| `http.e2e.http11`      | counter | proxy                   | Completed HTTP/1.1 request/response cycles                                                                                                                                                                                     |
+| `http.e2e.h2`          | counter | proxy                   | Completed HTTP/2 request/response cycles                                                                                                                                                                                       |
+| `http.errors`          | counter | proxy, cluster, backend | General HTTP processing errors. Labels are filtered centrally per `metrics.detail`: `process` / `frontend` collapse to a proxy-wide counter, `cluster` (default) attributes per cluster, `backend` keeps the per-backend split |
+| `tcp.requests`         | counter | proxy                   | TCP proxy connection requests                                                                                                                                                                                                  |
+
+#### Byte counters
+
+| Metric           | Type    | Scope                   | Description                          |
+| ---------------- | ------- | ----------------------- | ------------------------------------ |
+| `bytes_in`       | counter | proxy, cluster, backend | Bytes received from frontend clients |
+| `bytes_out`      | counter | proxy, cluster, backend | Bytes sent to frontend clients       |
+| `back_bytes_in`  | counter | proxy                   | Bytes received from backend servers  |
+| `back_bytes_out` | counter | proxy                   | Bytes sent to backend servers        |
+
+#### Timing / latency
+
+These are recorded as HDR histograms locally (queryable as percentiles: p50,
+p90, p99, p99.9, p99.99, p99.999, p100) and sent as `|ms` values over StatsD.
+
+| Metric                    | Type | Scope            | Description                                                    |
+| ------------------------- | ---- | ---------------- | -------------------------------------------------------------- |
+| `request_time`            | time | proxy, cluster   | Total request time: first byte received to last byte sent (ms) |
+| `service_time`            | time | proxy, cluster   | Internal processing time excluding backend I/O (ms)            |
+| `backend_response_time`   | time | cluster, backend | Time from backend connection to last response byte (ms)        |
+| `backend_connection_time` | time | cluster, backend | TCP connection establishment time to backend (ms)              |
+| `backend_header_time`     | time | cluster, backend | Time from backend connection to response headers parsed (ms)   |
+| `frontend_matching_time`  | time | cluster          | Cluster/frontend route matching time (ms)                      |
+| `regex_matching_time`     | time | proxy            | Regex evaluation time for path-based routing (ms)              |
+
+#### Response status classes
+
+Incremented per backend response (scope: cluster + backend for `1xx`–`5xx`).
+Buckets are emitted for every response with a status; per-code counters below
+are emitted in addition to the bucket for the eighteen short-listed codes Sōzu
+either generates as a default answer or that operators routinely chart. Status
+codes outside that list contribute only to their bucket so the metric keyspace
+stays bounded.
+
+| Metric                                                            | Type    | Scope            | Description                                                        |
+| ----------------------------------------------------------------- | ------- | ---------------- | ------------------------------------------------------------------ |
+| `http.status.1xx`                                                 | counter | cluster, backend | 1xx informational responses                                        |
+| `http.status.2xx`                                                 | counter | cluster, backend | 2xx success responses                                              |
+| `http.status.3xx`                                                 | counter | cluster, backend | 3xx redirection responses                                          |
+| `http.status.4xx`                                                 | counter | cluster, backend | 4xx client error responses                                         |
+| `http.status.5xx`                                                 | counter | cluster, backend | 5xx server error responses                                         |
+| `http.status.other`                                               | counter | proxy            | Non-standard status codes                                          |
+| `http.status.none`                                                | counter | proxy            | Responses without a status code                                    |
+| `http.status.200` / `201` / `204`                                 | counter | cluster, backend | Common 2xx success codes (in addition to `http.status.2xx`)        |
+| `http.status.301` / `302` / `304`                                 | counter | cluster, backend | Common 3xx redirect/cache codes (in addition to `http.status.3xx`) |
+| `http.status.400` / `401` / `403` / `404` / `408` / `413` / `429` | counter | cluster, backend | Common 4xx client-error codes (in addition to `http.status.4xx`)   |
+| `http.status.500` / `502` / `503` / `504` / `507`                 | counter | cluster, backend | Common 5xx server-error codes (in addition to `http.status.5xx`)   |
+
+#### Default answer / error responses
+
+Incremented when Sōzu generates a default error response instead of proxying:
+
+| Metric                                 | Type    | Scope | Description                                                                                                              |
+| -------------------------------------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------ |
+| `http.301.redirection`                 | counter | proxy | 301 Moved Permanently (HTTP→HTTPS redirect, `RedirectPolicy::Permanent`)                                                 |
+| `http.302.redirection`                 | counter | proxy | 302 Found (`RedirectPolicy::Found` — UA may rewrite POST → GET)                                                          |
+| `http.308.redirection`                 | counter | proxy | 308 Permanent Redirect (`RedirectPolicy::PermanentRedirect` — method MUST be preserved)                                  |
+| `http.redirect_template.compile_error` | counter | proxy | Operator-supplied per-frontend `redirect_template` failed to compile at request time; the listener default fired instead |
+| `http.400.errors`                      | counter | proxy | 400 Bad Request (cannot parse hostname)                                                                                  |
+| `http.401.errors`                      | counter | proxy | 401 Unauthorized                                                                                                         |
+| `http.404.errors`                      | counter | proxy | 404 Not Found (no matching cluster)                                                                                      |
+| `http.408.errors`                      | counter | proxy | 408 Request Timeout                                                                                                      |
+| `http.413.errors`                      | counter | proxy | 413 Payload Too Large                                                                                                    |
+| `http.502.errors`                      | counter | proxy | 502 Bad Gateway                                                                                                          |
+| `http.503.errors`                      | counter | proxy | 503 Service Unavailable (no backend available, or `max_connection_attempts` spent on failed connections)                 |
+| `http.504.errors`                      | counter | proxy | 504 Gateway Timeout                                                                                                      |
+| `http.507.errors`                      | counter | proxy | 507 Insufficient Storage (buffer full)                                                                                   |
+| `http.other.errors`                    | counter | proxy | Non-standard error response code (mux path only)                                                                         |
+
+#### Parse errors
+
+| Metric                                      | Type    | Scope | Description                                                                                                                                                                                     |
+| -------------------------------------------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `http.frontend_parse_errors`                 | counter | proxy | Frontend request parsing failures (malformed HTTP/1.1 or HPACK decode errors in HTTP/2)                                                                                                        |
+| `http.frontend.transfer_encoding_smuggling`  | counter | proxy | H1 request rejected (400) for ambiguous `Transfer-Encoding` framing: more than one non-elided `Transfer-Encoding` header, or one whose final coding is not `chunked` (e.g. `chunked, gzip`), or one present without kawa adopting chunked framing (RFC 9110 §7.6 / RFC 9112 §6.1; #726). Whitespace around a coding is not ambiguity — kawa >= 0.7.1 excludes it from the field value (RFC 9112 §5), so `chunked\t` frames as chunked and is forwarded canonically rather than counted here |
+| `http.frontend.content_length_invalid`      | counter | proxy | H1 request rejected (400) by Sōzu's own check because its forwarded `Content-Length` value is not `1*DIGIT` — e.g. `+5`, which kawa 0.7.1 framed as 5 and forwarded verbatim (RFC 9110 §8.6 / RFC 9112 §6.3; #1652). Since kawa 0.7.2 the parser refuses such a value first, so the request is still answered 400 but this counter stays at zero unless kawa regresses (defense in depth). A leading-zero value such as `005` is `1*DIGIT` and is not counted. Also counted in `http.frontend_parse_errors` |
+| `http.backend_parse_errors`                  | counter | proxy | Backend response parsing failures                                                                                                                                                              |
+| `http.trailer.field_limit_exceeded`       | counter | proxy | H1 chunked requests refused because their trailer section carried more fields than the listener's `h2_max_header_fields`, elided fields included (#1701). One increment per request; the request is answered 400, or its response cut if the backend already started it |
+| `http.trailer.forbidden_field_elided`     | counter | proxy | Trailer fields elided from an H1 chunked request because RFC 9110 §6.5.1 keeps their name out of trailers: framing, routing, request modifiers, authentication, content processing or connection-specific fields, the list `TRAILER_FORBIDDEN_FIELDS` (#1701). One increment per field; the request is still forwarded. The H2 frontend counts the same drop in `h2.trailer.forbidden_field_elided` |
+| `http.trailer.spoof_vector_elided`          | counter | proxy | Trailer fields elided from an H1 chunked request because their name is a forwarding header a trailer must not carry — `X-Real-IP`, `X-Forwarded-For`, `Forwarded`, `X-Request-Id`, `X-Forwarded-Proto`, `X-Forwarded-Port` or `X-Forwarded-Host`, in any case (RFC 9110 §6.5.1; #1689). One increment per field; the request is still forwarded. The H2 frontend counts the same drop in `h2.trailer.spoof_vector_elided` |
+| `http.backend.content_length_invalid`       | counter | proxy | H1 backend response discarded and answered 502 by Sōzu's own check because its `Content-Length` value is not `1*DIGIT` (RFC 9112 §6.3; #1652). Since kawa 0.7.2 the parser refuses such a response first — still 502 — so this counter stays at zero unless kawa regresses (defense in depth). Also counted in `http.backend_parse_errors` |
+
+#### Backend health
+
+| Metric                              | Type    | Scope            | Description                                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------- | ------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend.connections`               | gauge   | proxy            | Active backend connections                                                                                                                                                                                                                                                                                                             |
+| `connections_per_backend`           | gauge   | cluster, backend | Per-backend connection count                                                                                                                                                                                                                                                                                                           |
+| `backend.up`                        | counter | proxy            | Backend marked as healthy (after successful connection)                                                                                                                                                                                                                                                                                |
+| `backend.down`                      | counter | proxy            | Backend marked as unhealthy (retry policy triggered)                                                                                                                                                                                                                                                                                   |
+| `backend.connections.error`         | counter | proxy            | Backend connections that failed to establish: refused, timed out on `connect_timeout`, or reporting a socket error once dialled. Each one feeds the backend's retry policy. See "Backend connection failover".                                                                                                                         |
+| `backend.connect.retries_exhausted` | counter | cluster, backend | Per-request backend connection attempt budget (`max_connection_attempts`, 5 by default, overridable per cluster) was exhausted. Emitted once per event at the TCP, HTTP/1, and HTTP/2-mux gates. Alert on this counter's rate instead of grepping `WARN` / `ERROR` logs — the underlying log line is `warn!` since the condition is peer-driven backpressure, not a Sōzu invariant break. |
+| `backend.shard.spillover`           | counter | cluster          | Shuffle sharding `FALLBACK`: a selection found no backend of the client's shard able to take a connection and chose one outside the shard (a fail-open pick that lands back inside the shard is not counted). See "Shuffle sharding". |
+| `backend.shard.exhausted`           | counter | cluster          | Shuffle sharding `STRICT`: a selection found no backend of the client's shard able to take a connection and chose none (HTTP 503, TCP close, UDP flow not admitted). See "Shuffle sharding". |
+| `backend.retry.stale_upstream`      | counter | cluster, backend | A request written onto a POOLED H1 keep-alive backend connection that then closed without answering was re-issued on a fresh backend instead of being answered `502 Bad Gateway`. Labelled with the **stale** backend — the one that did not answer. One client request can increment this more than once. See "Stale-upstream retry" below, which covers how to read a rate that tracks the request rate. |
+| `backend.retry.captures_armed`      | gauge   | proxy            | Request captures currently armed for a stale-upstream replay, summed over every live stream of this worker. Ceiling 512. To read the capture heap the bound is `2 * gauge * buffer_size`, not `gauge * buffer_size` — the write path grows a capture with `Vec::reserve`, so a multi-write capture can allocate twice what it carries. See "Capture budget" below. |
+| `backend.retry.captures_declined`   | counter | proxy            | An idempotent request written onto a pooled keep-alive upstream was not captured because 512 captures were already armed on this worker. Nothing was refused: the request proceeds un-replayable, and answers normally unless its upstream turns out to be stale. An **upper bound on lost retries, not a count of them** — most declined requests never needed the capture. Compare against `backend.retry.stale_upstream` before reading anything into its rate. Non-idempotent requests are never captured, so they never appear here. Only moves while `backend.retry.captures_armed` sits at the ceiling. |
+
+#### Stale-upstream retry
+
+An H1 keep-alive backend connection sitting in the pool can be closed by its
+peer at any time, and Sōzu may not have processed that event when the next
+request is routed. The request is then written onto a dead socket, the read
+returns EOF, and there is no response to forward.
+
+Sōzu re-issues that request on a fresh backend chosen by the load balancer
+instead of answering `502 Bad Gateway`. The retry is allowed only while **no
+response byte has been received** — nothing was observed by the client, so
+re-issuing is unobservable — and only when all of the following hold:
+
+- the connection came out of the keep-alive pool, not a fresh dial. Sōzu
+  cannot tell *why* the upstream went away — a stale pool socket, a backend
+  that half-closed after processing the request, and one that crashed
+  mid-request all arrive as the same EOF — so this is a policy that narrows
+  the retry to the case where an unobserved idle close is plausible, not a
+  diagnosis. A fresh dial has not been idle, so it is never re-issued;
+- the method is idempotent (RFC 9110 §9.2.2): `GET`, `HEAD`, `PUT`, `DELETE`,
+  `OPTIONS`, `TRACE`. `POST`, `CONNECT` and any method Sōzu does not
+  recognise — including `PATCH` — are never re-issued. Those six spellings
+  are matched **case-sensitively**, exactly as the routing `method` rule above
+  is: a client sending `get` carries a method Sōzu does not recognise, so it
+  is not replayable. That is deliberate — the origin receives the `get` bytes
+  and is free to treat them as an extension method with side effects of its
+  own, so re-issuing them would not be the no-op RFC 9110 §9.2.2 promises;
+- the serialized request fits in one front buffer. The bound the code applies
+  is the front kawa's `storage.capacity()` (`ConnectionH1::writable`,
+  `lib/src/protocol/mux/h1.rs`), not the configured `buffer_size` itself: a
+  checked-out buffer holds *at least* `buffer_size` (default 16393 bytes), and
+  the pool rounds the per-entry extra up to `align_of::<Entry>`, so that
+  default yields 16400 bytes of usable capacity (`lib/src/pool.rs`). A request
+  larger than that is not re-issued.
+
+The re-issued request is byte-identical to the first attempt, `Sozu-Id`
+included, so one client request still produces one access-log line. Retries
+consume the same per-request budget as connection attempts
+(`max_connection_attempts`, 5 by default); exhausting it answers `503` and increments
+`backend.connect.retries_exhausted`. That budget is the only bound: a re-issued
+request that again lands on a pooled connection may be re-issued again, so
+`backend.retry.stale_upstream` can increment more than once for one client
+request, and the counter is not the number of replays that reached a backend.
+It is incremented in `ConnectionH1::end_stream` / `ConnectionH2::end_stream`
+*before* the stream is pushed back onto `pending_links`, so `Router::plan_connect`
+has not yet had the chance to refuse it. With a budget of `n` attempts that is
+at most `n` increments for one client request, of which at most `n - 1`
+replays are actually written to a backend: the last increment is immediately
+followed by the exhausted-budget `503`.
+
+**Reading the counter.** It says "an upstream went away before answering", not
+"the pool held a closed socket". If its rate tracks the request rate, check the
+backends' own error rate and restart/OOM history first. Backends dying
+mid-request land on this counter too, and for them raising the keep-alive idle
+timeout changes nothing. If the backends are healthy, their keep-alive idle
+timeout is shorter than Sōzu's and should be raised — the retry is correct, but
+it is costing a dial per request.
+
+This is deliberately narrower than nginx's default `proxy_next_upstream error
+timeout`, which also re-issues an idempotent request that failed on a freshly
+dialled upstream, and narrower than HAProxy's opt-in `retry-on
+empty-response`. There is no configuration knob: the conditions above are not
+tunable, and neither is the capture budget below.
+
+#### Capture budget
+
+Capturing a request costs memory that no `max_buffers` accounting sees. The
+captures are plain allocations on the global allocator, deliberately NOT taken
+from the buffer pool: pooling them would turn "we decline to retry, and the
+client gets the `502` it would have got anyway" into "we refuse new sessions
+with `503` and park frontends", under exactly the memory pressure the bound
+exists to manage.
+
+**What bounds it without a ceiling.** A capture can exist only on a live
+request stream, and `Stream::new` takes exactly two `BufferSource::checkout` calls, each served by the worker's `Pool`, so
+no more than `max_buffers / 2` captures can be armed at once. The capture heap
+is therefore `(max_buffers / 2) * buffer_size` — about **8.2 MB carried** at
+the defaults (`max_buffers` 1000, `buffer_size` 16393), and up to twice that
+allocated for the `Vec` reason set out below. The obvious
+`max_connections * buffer_size` estimate gives ~160 MB and is wrong by a factor
+of 20: `max_buffers` does not permit 10000 concurrent requests. Reaching 160 MB
+needs `max_buffers` raised to about 20000. That relationship is also stated on
+the `max_buffers` row of the configuration table above, because it is where an
+operator sizing that value will be looking.
+
+**The ceiling.** `MAX_ARMED_REPLAY_CAPTURES` (`lib/src/protocol/mux/stream.rs`)
+caps the captures one worker holds armed at once at **512**. It is a constant,
+not a configuration key: the value it wants is "high enough not to bite at the
+stock defaults", the ceiling is a memory-safety bound rather than a tuning
+knob, and `backend.retry.captures_declined` is the operational signal for the
+case where it does bite. Sōzu states this class of bound as a constant
+elsewhere too — `MIN_PENDING_RST_STREAMS`.
+
+512 is chosen against the arithmetic above. The defaults can produce at most
+500 concurrent captures, which fits under it, so a stock deployment replays
+exactly what it replayed before the ceiling existed. What the ceiling removes
+is the growth: the capture heap stops tracking `max_buffers` and becomes a
+constant, where before it grew linearly with it.
+
+**The size of that constant.** 512 captures carry at most `512 * 16400` ≈
+**8.4 MB** at the defaults, and may have **allocated up to twice that, ≈16.8
+MB**. Size RSS against the larger figure. The factor of two is real and is
+part of the bound: `ConnectionH1::writable` grows a capture with
+`Vec::reserve`, which allocates `max(2 * old_capacity, required)`, while the
+guard beside it bounds the capture's *length* — not its capacity — by
+`storage.capacity()`. Measured on this tree at the defaults, a single
+16393-byte write gives `len 16393 / capacity 16393`, while writes of
+`[8192, 8192, 9]` give `len 16393 / capacity 32768`. A request written in one
+pass, the common case, costs the smaller figure.
+
+**The budget counts captures, not bytes**, and that is still a memory bound
+rather than a proxy for one, because each capture is independently bounded: a
+write that would carry one past its front kawa's `storage.capacity()` drops it
+whole (`ConnectionH1::writable`), the HAProxy rule stated above. The `Vec`
+slack loosens the constant by a factor of two; it does not make it depend on
+`max_buffers` again, which is the property the ceiling exists to deliver.
+
+**Only idempotent requests are captured.** A capture for a non-idempotent
+request could never be spent — the method veto above would refuse the replay —
+so `Stream::arm_upstream_replay` does not take one, and does not spend a
+budget slot on it. Without that, a POST-heavy pooled workload would fill the
+budget with charges no replay could ever use: at 80% POST only about one slot
+in five would be spendable, and `backend.retry.captures_armed` sitting at 512
+would tell an operator nothing about why.
+
+**Past the ceiling nothing is refused.** `Stream::arm_upstream_replay` installs
+no buffer, `backend.retry.captures_declined` is incremented, and the request
+proceeds un-replayable; if its upstream then turns out to be stale it answers
+the same `502 Bad Gateway` it answered before the retry existed. No session is
+refused, no frontend parks, and no request fails *because of* the ceiling.
+
+**Reading `backend.retry.captures_declined`.** It is an *upper bound* on lost
+retries, not a count of them. It counts requests left un-replayable; the great
+majority of those get a normal answer from an upstream that was never stale and
+would never have used the capture. Only the fraction that then hits the
+stale-pool race becomes a `502` the ceiling turned into a lost retry. Compare
+its rate against `backend.retry.stale_upstream`, which is how often that race
+actually fires on this worker, before reading anything into it.
+
+The budget is per worker. A Sōzu worker is a single event-loop thread with its
+own buffer pool, which is the same scope `max_buffers` has, so an `N`-worker
+deployment's capture heap is at most `N * 2 * 512 * buffer_size` exactly as its
+pool footprint is `N * max_buffers * buffer_size`.
+
+#### Backend pool
+
+H2 mux reuses backend connections via
+`Router::backends: BackendConnections`
+(`lib/src/protocol/mux/router.rs`). There is no separate pool abstraction: the
+map is the pool. It keeps the lowest-token connection inline and the others in
+a `BTreeMap<Token, Connection>`, so the one backend connection a session
+usually holds costs no heap allocation (a `BTreeMap` leaf would have been
+~18.8 KiB, 11 slots of a ~1.7 KiB `Connection`; sozu-proxy/sozu#1610). Reuse picks an existing non-draining H2 multiplex slot (below
+`SETTINGS_MAX_CONCURRENT_STREAMS`) or an H1 keep-alive socket; misses dial a
+fresh backend socket.
+
+The map is ordered rather than hashed so that reuse is reproducible. Three of
+`Router::plan_connect`'s decisions read the scan order directly: the H2 least-loaded
+arm compares stream counts with a strict `<` (first-at-minimum wins), the
+connecting-backend fallback assigns last-wins, and the H1 keep-alive arm
+assigns and breaks. While the map was a `HashMap` its per-process `RandomState`
+seed therefore decided **which backend served a request** whenever two
+candidates tied — sozu-proxy/sozu#1338's widest order leak, and the only one
+that reaches a different machine rather than reordering bytes on one
+connection. The total order on `Token` resolves those three to the lowest,
+highest and lowest token respectively. This pins the choice; it does not
+rebalance anything, and `LEAST_LOADED` and the other `load_balancing`
+algorithms above are untouched — they choose which backend server to DIAL,
+while this chooses among sockets this session already holds.
+
+| Metric                        | Type    | Scope | Description                                                                                                                                                                                                                                                                                                                       |
+| ----------------------------- | ------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backend.pool.hit`            | counter | proxy | Request attached to an existing backend connection (H2 multiplex slot or H1 keep-alive).                                                                                                                                                                                                                                          |
+| `backend.pool.miss`           | counter | proxy | No reusable connection found; a fresh dial starts. Incremented before `backend_from_request`, so failed selections still count. Dial may still fail — in that case `backend.pool.size` is not bumped.                                                                                                                             |
+| `backend.pool.size`           | gauge   | proxy | Live mux router entries. `+1` at `router.rs::connect` new-dial commit; `-1` at `connection.rs::pre_close_client_bookkeeping` and `mod.rs::close_backend`. Mirrors the `backend.connections` site set in mux exactly, so gauge symmetry follows from `backend.connections` correctness. Non-mux H1/TCP paths are NOT counted here. |
+| `backend.flow_control.paused` | counter | proxy | Direction-scoped counterpart of `h2.flow_control_stall`: emitted only when the converter stalls while writing toward an upstream backend (`Position::Client`) because the backend's HTTP/2 receive window is empty.                                                                                                               |
+
+Intentionally **not** emitted in this slice (no corresponding lifecycle exists):
+
+- `backend.pool.idle_closed` — mux has no connection-level idle eviction. The H2
+  `stream_idle_timeout` cancels individual streams (slow-multiplex guard), not
+  pool entries.
+- `backend.pool.overflow` — `Router::backends` is unbounded. The only
+  new-connection refusal is HTTP/2 buffer-pool exhaustion (`MaxBuffers`),
+  unrelated to pool sizing.
+- `backend.flow_control.resumed` — the converter has no "resumed" boundary; the
+  next writable cycle just succeeds when the backend ACKs window updates.
+  Plumbing an explicit marker through the write pass's flush was deferred.
+
+#### Backend metrics (per cluster/backend)
+
+These metrics are recorded with `cluster_id` and `backend_id` labels via the
+`record_backend_metrics!` macro at the end of each request:
+
+| Metric                    | Type    | Scope            | Description                                 |
+| ------------------------- | ------- | ---------------- | ------------------------------------------- |
+| `requests`                | counter | cluster, backend | Requests handled by this backend            |
+| `bytes_in`                | counter | cluster, backend | Bytes received from this backend            |
+| `bytes_out`               | counter | cluster, backend | Bytes sent to this backend                  |
+| `backend_response_time`   | time    | cluster, backend | Response time for this backend (ms)         |
+| `backend_connection_time` | time    | cluster, backend | Connection setup time for this backend (ms) |
+| `backend_header_time`     | time    | cluster, backend | Response-header time for this backend (ms)  |
+
+`backend_header_time` is the third of the three upstream timings nginx exposes
+(`$upstream_connect_time`, `$upstream_header_time`, `$upstream_response_time`),
+and it is emitted only where a response has headers to time — the HTTP/1.x and
+HTTP/2 paths. A raw-TCP cluster has none, so the key is **absent** for it
+rather than present as a zero. It is anchored on the FINAL response: after a
+1xx informational response the back buffer is cleared and the timing is retaken
+on the response that follows, which is the same response `backend_response_time`
+ends on. `backend_header_time <= backend_response_time` therefore holds for
+every request that reports both.
+
+#### ALPN negotiation
+
+| Metric                                | Type    | Scope | Description                                                                                                                                                                                                              |
+| ------------------------------------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `http.alpn.h2`                        | counter | proxy | TLS connections where client negotiated HTTP/2 via ALPN                                                                                                                                                                  |
+| `http.alpn.http11`                    | counter | proxy | TLS connections where client negotiated HTTP/1.1 via ALPN (or no ALPN)                                                                                                                                                   |
+| `https.alpn.rejected.http11_disabled` | counter | proxy | TLS connection refused on an H2-only listener because the peer offered `http/1.1` or no ALPN value                                                                                                                       |
+| `https.alpn.rejected.unsupported`     | counter | proxy | TLS connection refused because the peer negotiated an ALPN protocol Sōzu does not recognise (anything other than `h2`, `http/1.1`, or absent ALPN). Add to the same SOC bucket as `https.alpn.rejected.http11_disabled`. |
+
+#### TLS version and cipher suite
+
+Incremented once per TLS connection after the handshake completes.
+
+| Metric                      | Type    | Scope | Description                                    |
+| --------------------------- | ------- | ----- | ---------------------------------------------- |
+| `tls.version.SSLv2`         | counter | proxy | Connections using SSLv2                        |
+| `tls.version.SSLv3`         | counter | proxy | Connections using SSLv3                        |
+| `tls.version.TLSv1_0`       | counter | proxy | Connections using TLS 1.0                      |
+| `tls.version.TLSv1_1`       | counter | proxy | Connections using TLS 1.1                      |
+| `tls.version.TLSv1_2`       | counter | proxy | Connections using TLS 1.2                      |
+| `tls.version.TLSv1_3`       | counter | proxy | Connections using TLS 1.3                      |
+| `tls.version.DTLSv1_0`      | counter | proxy | Connections using DTLS 1.0                     |
+| `tls.version.DTLSv1_2`      | counter | proxy | Connections using DTLS 1.2                     |
+| `tls.version.DTLSv1_3`      | counter | proxy | Connections using DTLS 1.3                     |
+| `tls.version.Unknown`       | counter | proxy | Unrecognized TLS version                       |
+| `tls.version.unimplemented` | counter | proxy | TLS version not yet handled in code            |
+| `tls.default_cert_used`     | counter | proxy | Fallback to default certificate (no SNI match) |
+
+Negotiated cipher suite (rustls):
+
+| Metric                                                     | Type    | Scope |
+| ---------------------------------------------------------- | ------- | ----- |
+| `tls.cipher.TLS13_AES_128_GCM_SHA256`                      | counter | proxy |
+| `tls.cipher.TLS13_AES_256_GCM_SHA384`                      | counter | proxy |
+| `tls.cipher.TLS13_CHACHA20_POLY1305_SHA256`                | counter | proxy |
+| `tls.cipher.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`       | counter | proxy |
+| `tls.cipher.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`       | counter | proxy |
+| `tls.cipher.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` | counter | proxy |
+| `tls.cipher.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`         | counter | proxy |
+| `tls.cipher.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`         | counter | proxy |
+| `tls.cipher.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256`   | counter | proxy |
+| `tls.cipher.Unsupported`                                   | counter | proxy |
+
+#### TLS handshake telemetry
+
+Emitted by the rustls handshake driver at `lib/src/protocol/rustls.rs`. Failure
+counters sit next to the tiered log emission in `log_handshake_error` so every
+`warn!`/`error!`/`debug!` about a broken handshake also bumps the matching
+counter. The histogram is recorded at the moment the handshake transitions out
+of `is_handshaking()` (both through the `readable` and `writable` exit paths).
+
+| Metric                                                 | Type    | Scope | Description                                                                                                                                                                                                                   |
+| ------------------------------------------------------ | ------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tls.handshake.failed.alert_received`                  | counter | proxy | Remote peer sent a fatal TLS alert (`RustlsError::AlertReceived`). Typical causes: cert-pinning client, stale CA bundle, scanner. Logged at `debug!`.                                                                         |
+| `tls.handshake.failed.peer_incompatible`               | counter | proxy | Peer advertised a version/feature mix we cannot negotiate (`PeerIncompatible`). Logged at `warn!`.                                                                                                                            |
+| `tls.handshake.failed.peer_misbehaved`                 | counter | proxy | Peer deviated from the TLS state machine (`PeerMisbehaved`). Logged at `warn!`.                                                                                                                                               |
+| `tls.handshake.failed.invalid_message`                 | counter | proxy | Wire-level record parse failure (`InvalidMessage`). Logged at `warn!`.                                                                                                                                                        |
+| `tls.handshake.failed.inappropriate_message`           | counter | proxy | Peer sent a record type that was valid on the wire but not allowed in the current phase (`InappropriateMessage`). Logged at `warn!`.                                                                                          |
+| `tls.handshake.failed.inappropriate_handshake_message` | counter | proxy | Peer sent a handshake sub-type the state machine did not expect (`InappropriateHandshakeMessage`). Logged at `warn!`.                                                                                                         |
+| `tls.handshake.failed.oversized_record`                | counter | proxy | Peer sent a record larger than the RFC 8446 §5.1 cap (`PeerSentOversizedRecord`). Logged at `warn!`.                                                                                                                          |
+| `tls.handshake.failed.no_alpn`                         | counter | proxy | ALPN negotiation failed (`NoApplicationProtocol`) — e.g. peer offered only protocols the listener does not serve. Logged at `warn!`.                                                                                          |
+| `tls.handshake.failed.invalid_certificate`             | counter | proxy | Peer-supplied certificate failed verification (`InvalidCertificate`). Logged at `warn!`. Only relevant when mTLS is enabled.                                                                                                  |
+| `tls.handshake.failed.decrypt_error`                   | counter | proxy | Record failed to decrypt (`DecryptError`) — almost always an attack or a broken middlebox. Logged at `warn!`.                                                                                                                 |
+| `tls.handshake.failed.no_certificates_present`         | counter | proxy | mTLS: peer sent an empty Certificate message (`NoCertificatesPresented`). Logged at `warn!`.                                                                                                                                  |
+| `tls.handshake.failed.other`                           | counter | proxy | Catch-all for local/config/provider failures (`General`, `Other`, `EncryptError`, `FailedToGetRandomBytes`, CRL errors, future rustls variants). Logged at `error!` — these indicate a server-side problem, not a bad client. |
+| `tls.handshake_ms`                                     | time    | proxy | Wall-clock duration in milliseconds from the first TLS byte observed on the socket to the handshake leaving `is_handshaking()`. Histogram — not a counter — so alert rules should use quantiles.                              |
+
+#### TLS certificate expiration
+
+| Metric                            | Type  | Scope | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| --------------------------------- | ----- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tls.cert.min_expires_at_seconds` | gauge | proxy | Unix-seconds timestamp of the soonest-expiring certificate currently loaded in the `CertificateResolver`. Recomputed after a successful certificate-set or effective-material mutation at `lib/src/tls.rs`; a strict duplicate add, missing removal or identical replace retry leaves the gauge untouched. Aggregate only — per-SNI granularity is intentionally omitted because statsd has no label support and the resolver can hold tens of thousands of names; operators query per-cert detail through the command API. Already-expired certificates clamp to `0`, which dashboards should interpret as the "rotate now" alert condition. |
+
+#### HTTP/2 specific
+
+| Metric                                 | Type  | Scope | Description                                                                                                                                                                                                                                                                                                   |
+| -------------------------------------- | ----- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h2.connection.active_streams`         | gauge | proxy | **Aggregate** count of open HTTP/2 streams across every live H2 connection on the worker. Emitted as a signed lifecycle delta that `ConnectionH2::gauge_connection_state` returns and the H2 shell records; the per-connection contribution is subtracted on connection drop, so the value sums correctly under multi-connection load. |
+| `h2.connection.window_bytes`           | gauge | proxy | **Aggregate** sum of available connection-level flow-control window bytes across every live H2 connection. Negative per-connection windows clamp to 0 — the aggregate measures available capacity, not deficit. Lifecycle-delta semantics as above.                                                           |
+| `h2.connection.pending_window_updates` | gauge | proxy | **Aggregate** number of queued (un-flushed) per-stream WINDOW_UPDATE entries across every live H2 connection. Lifecycle-delta semantics as above.                                                                                                                                                             |
+
+> **Migration note (renamed metrics).** The three keys above replace the earlier
+> `h2.connection_window`, `h2.active_streams`, and `h2.pending_window_updates`
+> gauges. The old keys had **per-connection snapshot** semantics implemented via
+> absolute `gauge!`: under concurrent load every H2 connection clobbered the
+> previous one's value, so the dashboard saw the last writer rather than the
+> aggregate. The new keys emit lifecycle deltas via `gauge_add!`, so the value
+> is the **sum across all live H2 connections** on the worker. Update dashboards
+> and alerts accordingly — the new values typically rise into the hundreds or
+> thousands under load instead of cycling 0…N.
+
+| `h2.flow_control_stall` | counter | proxy | Converter stalled due to flow
+control | | `h2.streams.reaped.idle_timeout` | counter | proxy | Streams reaped by the per-stream bidirectional-idle guard (slow-multiplex Slowloris) | | `h2.streams.reaped.window_stall` | counter | proxy | Streams reaped by the outbound flow-control-stall guard (a buffered response or backend upload the peer will not drain — the HTTP/2 window-stall / `WINDOW_UPDATE`-drip vector) | | `h2.streams.reaped.stall_budget` | counter | proxy | Subset of `window_stall`: reaps where the stream dribbled progress below the 16 KiB cumulative-stall floor (the `WINDOW_UPDATE`-drip the budget closes) | | `h2.close_with_active_streams` | counter | proxy | H2 connections
+closed while streams were still active | | `h2.window_update_dropped` | counter
+| proxy | WINDOW_UPDATE frame dropped because the per-connection pending-update
+queue was already at capacity | | `h2.rst_stream_dropped` | counter | proxy |
+Proxy-emitted RST_STREAM never queued because `pending_rst_streams` was already
+at its bound — `MIN_PENDING_RST_STREAMS` (4000), or four per advertised
+`h2_max_concurrent_streams` when that is larger — within one pass. A non-zero
+value means the pending queue overflowed, so the connection is either on its way to
+`GOAWAY(ENHANCE_YOUR_CALM)` — the escalation only fires while the connection is
+not yet in `GoAway`/`Error` — or already past it and about to be
+force-disconnected. In the first case no dropped frame would have been
+serialised anyway; in the second the peer already holds a GOAWAY, so the
+dropped resets do not change what it can still believe about a stream
+| | `h2.headers_no_stream.error` | counter | proxy
+| HEADERS frame received with no matching stream (protocol error) | |
+`h2.frames.tx.headers` | counter | proxy | HEADERS frames emitted by the H2
+block converter (one per response, plus the first frame of any header block
+split into HEADERS+CONTINUATION when the encoded headers exceed the negotiated
+`max_frame_size`) | | `h2.frames.tx.continuation` | counter | proxy |
+CONTINUATION frames emitted by the converter when a single response's encoded
+headers cross `max_frame_size` (default 16 KB). Stays at zero for typical
+responses | | `h2.frames.tx.data` | counter | proxy | DATA frames emitted by the
+converter — both the normal data path and the empty `END_STREAM`-only marker
+emitted when the response has zero bytes after headers |
+
+#### TLS / SNI binding
+
+| Metric                        | Type    | Scope | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----------------------------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `http.sni_authority_mismatch` | counter | proxy | Request rejected because its `:authority` (HTTP/2) or `Host` header (HTTP/1.1) was not covered by any SAN dNSName of the certificate served on this TLS session (RFC 6125 §6.4.4, with RFC 6125 §6.4.3 wildcard handling). Default-cert handshakes fall back to legacy SNI exact-match. Defence against cross-tenant frontend confusion (CWE-346). Increment site: `lib/src/protocol/mux/router.rs`. The historical `sni_*` prefix is preserved so existing operator dashboards keep working. |
+| `h2.coalescing.accepted`      | counter | proxy | HTTP/2 stream accepted via RFC 7540 §9.1.1 / RFC 9113 §9.1.1 connection coalescing — `:authority` differed from the TLS SNI negotiated at handshake but matched a SAN dNSName of the served certificate (with RFC 6125 §6.4.3 wildcards). ALPN-gated to `h2` so HTTP/1.1 cross-`Host` keep-alive does not double-count. Multi-tenant observability for Firefox / Chrome coalescing on shared wildcard certs. Increment site: `lib/src/protocol/mux/router.rs`.                                |
+
+#### HTTP/2 frame counters
+
+Per-frame-type counters split by direction. Receive side counts every H2 frame
+the parser hands to `handle_frame` — single chokepoint, so adding a new H2 frame
+type fails the build inside the metric helper. Send side covers the control
+frames Sozu emits; HEADERS and DATA tx flow through the H2 block converter and
+are not yet broken out per type (tracked as follow-up — pair with
+`back_bytes_out` for the byte view today).
+
+| Metric                       | Type    | Scope | Description                                                                                                                                                                                                    |
+| ---------------------------- | ------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h2.frames.rx.data`          | counter | proxy | DATA frames received                                                                                                                                                                                           |
+| `h2.frames.rx.headers`       | counter | proxy | HEADERS frames received                                                                                                                                                                                        |
+| `h2.frames.rx.push_promise`  | counter | proxy | PUSH_PROMISE frames received (always rejected; see `h2.goaway.sent.protocol_error`)                                                                                                                            |
+| `h2.frames.rx.priority`      | counter | proxy | RFC 7540 PRIORITY frames received                                                                                                                                                                              |
+| `h2.frames.rx.rst_stream`    | counter | proxy | RST_STREAM frames received (paired with `h2.rst_stream.received.<code>` for per-error breakdown)                                                                                                               |
+| `h2.frames.rx.settings`      | counter | proxy | SETTINGS frames received (both peer-settings and ACKs)                                                                                                                                                         |
+| `h2.frames.rx.ping`          | counter | proxy | PING frames received (both probes and ACKs)                                                                                                                                                                    |
+| `h2.frames.rx.goaway`        | counter | proxy | GOAWAY frames received (paired with `h2.goaway.received.<code>`)                                                                                                                                               |
+| `h2.frames.rx.window_update` | counter | proxy | WINDOW_UPDATE frames received                                                                                                                                                                                  |
+| `h2.frames.rx.continuation`  | counter | proxy | Reachable only via the defensive fallback path (RFC 9113 §6.10 standalone CONTINUATION) — the inline header parser absorbs CONTINUATION during HEADERS decoding, so under normal conditions this stays at zero |
+| `h2.frames.rx.unknown`       | counter | proxy | Unknown frame type ignored per RFC 9113 §5.5. A non-zero rate is the early-warning signal for a peer trying H2 extensions                                                                                      |
+| `h2.frames.tx.settings`      | counter | proxy | SETTINGS frames emitted (initial + later updates)                                                                                                                                                              |
+| `h2.frames.tx.window_update` | counter | proxy | WINDOW_UPDATE frames emitted (per-frame in the queued-update flush loop)                                                                                                                                       |
+| `h2.frames.tx.rst_stream`    | counter | proxy | RST_STREAM frames emitted (across both the queued flush loop and the end-stream cancel path)                                                                                                                   |
+| `h2.frames.tx.goaway`        | counter | proxy | GOAWAY frames emitted (one per phase of `graceful_goaway`, plus error-path `goaway`)                                                                                                                           |
+| `h2.frames.tx.ping_ack`      | counter | proxy | PING ACK frames emitted in response to peer probes                                                                                                                                                             |
+
+#### HTTP/2 edge-triggered wake-up instrumentation
+
+LIFECYCLE `§9` invariant 15 compliance counters. Each firing records a site
+where sozu paired `Ready::WRITABLE` with `signal_pending_write` so the
+edge-triggered epoll scheduler re-runs `writable()` on the next tick — required
+whenever bytes land in sozu-owned buffers (the kernel never signals WRITABLE for
+buffers it does not own). Useful as a regression baseline: the first two
+correlate with 504/500/400 rate and RFC 9218 PRIORITY_UPDATE rate respectively,
+the last two correlate with backend-H2 traffic volume. A 10× spike on any
+counter without a matching spike on the upstream driver is the early warning for
+a hot loop regression.
+
+| Metric                                                   | Type    | Scope | Description                                                                                                                                                                                                                                                                                                                  |
+| -------------------------------------------------------- | ------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h2.signal.writable.rearmed.default_answer`              | counter | proxy | Fired in `mux/answers.rs::set_default_answer` (504 backend timeout, 500/400 parse errors). Rate should track the default-answer render rate closely.                                                                                                                                                                         |
+| `h2.signal.writable.rearmed.forcefully_terminate_answer` | counter | proxy | Fired in `mux/answers.rs::forcefully_terminate_answer` when the proxy injects a default answer mid-response (e.g. backend disconnects after partial body). Companion to `default_answer`; the forcefully-terminate path is exercised on backend hard-failure and proxy-initiated stream resets.                              |
+| `h2.signal.writable.rearmed.priority_update`             | counter | proxy | Fired in `mux/h2.rs::handle_priority_update_frame` whenever a PRIORITY_UPDATE mutates `Prioriser` state. Pairs with `h2.frames.rx.priority_update`. Low-to-zero on Firefox-only fleets (Firefox does not emit 0x10).                                                                                                         |
+| `h2.signal.writable.rearmed.peer_data`                   | counter | proxy | Fired in `mux/h2.rs::handle_data_frame` when an H2 DATA frame wakes the linked peer. Non-zero only on clusters that use H2 to the origin.                                                                                                                                                                                    |
+| `h2.signal.writable.rearmed.peer_headers`                | counter | proxy | Fired in `mux/h2.rs::handle_headers_frame` when an H2 HEADERS frame wakes the linked peer. Non-zero only on clusters that use H2 to the origin.                                                                                                                                                                              |
+| `h2.signal.writable.rearmed.control_queue`               | counter | proxy | Fired in `mux/h2.rs::flush_pending_control_frames` when a queued WINDOW_UPDATE or RST_STREAM forces an extra writable pass. Pairs with `h2.frames.tx.window_update` / `h2.frames.tx.rst_stream`. Persistent non-zero rate without matching tx growth points to a control-frame queue that fills faster than it drains.       |
+| `h2.streams.ready_incremental.by_urgency`                | gauge   | proxy | Sum across live connections of each connection's last post-scheduling-pass count of ready incremental streams, itself summed over that connection's urgency buckets (RFC 9218 §4). Emitted as a signed lifecycle delta with `impl Drop for H2Shell` teardown, so a connection's contribution leaves the aggregate when it closes. Debug hint for scheduler fairness — a consistently non-zero value under load means the round-robin is active.  |
+| `h2.trailers_dropped_content_length`                     | counter | proxy | Fired in `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) when an H2 trailer block of a message framed by `Content-Length` (`BodySize::Length`) is about to be written to an H1 peer, a backend or a client: HTTP/1.1 carries trailers only with chunked coding (RFC 9112 §7.1), so the block is dropped (RFC 9110 §6.5.1) and nothing follows the body. An H2 peer receives these trailers. A `content-length` trailer field is still elided and counted in `h2.trailer.forbidden_field_elided`. Omit `Content-Length` to have trailers forwarded to an H1 peer. |
+| `h2.trailers_dropped_no_body`                            | counter | proxy | Fired in `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) when an H2 trailer block of a response to HEAD, a 204 or a 304 is about to be written to an H1 client: such a response ends with its header section on HTTP/1.1 (RFC 9112 §6.3), so the block and the last chunk are dropped (RFC 9110 §6.5.1) and, for a stream ended by that trailer HEADERS frame, nothing follows the head. A `Content-Length`-framed block is counted in `h2.trailers_dropped_content_length` instead. |
+| `h2.bodiless_response_data_reset`                        | counter | proxy | Fired in `ConnectionH2::handle_data_frame` (`lib/src/protocol/mux/h2.rs`) when an H2 backend sends DATA carrying a payload on a 204 or a 304 response, which cannot carry content (RFC 9110 §15.3.5, §15.4.5; RFC 9113 §8.1.1): the backend stream is reset with PROTOCOL_ERROR and the payload never reaches the client. The payload of a response to HEAD is discarded without a reset and not counted. |
+| `h2.trailer.forbidden_field_elided`                      | counter | proxy | Request trailer fields elided by `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) because their name is one of `TRAILER_FORBIDDEN_FIELDS`, the list the H1 frontend counts in `http.trailer.forbidden_field_elided` (RFC 9110 §6.5.1; #1714). One increment per field; the request is still forwarded. The connection-specific names of that list are refused earlier as a malformed field block (RFC 9113 §8.2.2) and are not counted here, except `te: trailers`: RFC 9113 §8.2.2 allows that value, so it passes that check and is then elided and counted here like any other forbidden name |
+| `h1.backend_eof_before_message_complete`                 | counter | proxy | Fired in `ConnectionH1::terminate_close_delimited` (`lib/src/protocol/mux/h1.rs`) when a `Connection: close` H1 backend closes the socket before the response body is fully delivered (a chunked body without its terminating zero chunk, or a `Content-Length` body short of its length), and in the close-delimited arm of `ConnectionH2::end_stream` (`lib/src/protocol/mux/h2.rs`) when such a backend goes away without that EOF being read (socket error, backend timeout). Only a body with neither framing ends cleanly at the close. The H2 frontend surfaces it as `RST_STREAM(InternalError)`; the H1 frontend closes the client connection without completing the response. Non-zero rate maps to backend application crashes or restarts mid-response. |
+
+#### HTTP/2 GOAWAY and RST_STREAM by error code
+
+Counters split by direction (sent vs received) and RFC 9113 §7 error code. Every
+variant in the H2Error enum gets its own counter so SOC dashboards can
+distinguish a sustained `protocol_error` (parser issue / fuzzer) from
+`enhance_your_calm` (flood-detector trip) from `no_error` (graceful drain).
+Codes the wire delivers but RFC 9113 does not define are bucketed under
+`unknown_error` to keep cardinality bounded.
+
+| Metric pattern                              | Type    | Scope | Description                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------- | ------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h2.goaway.sent.<code>`                     | counter | proxy | GOAWAY emitted by Sozu. `<code>` ∈ `no_error`, `protocol_error`, `internal_error`, `flow_control_error`, `settings_timeout`, `stream_closed`, `frame_size_error`, `refused_stream`, `cancel`, `compression_error`, `connect_error`, `enhance_your_calm`, `inadequate_security`, `http_1_1_required`. The graceful drain (`graceful_goaway`) emits two `no_error` increments per connection — one per phase. |
+| `h2.goaway.received.<code>`                 | counter | proxy | GOAWAY received from peer. Same code suffixes as sent, plus `unknown_error` for codes outside RFC 9113 §7. Useful on backend H2 connections to detect upstreams under pressure (`enhance_your_calm`) or with bugs (`internal_error`).                                                                                                                                                                       |
+| `h2.rst_stream.sent.<code>`                 | counter | proxy | RST_STREAM emitted by Sozu. Same code suffixes. The `no_error` and `cancel` increments are graceful (stream recycle, propagated client cancel); the rest are server-side defences against attacker-crafted frames.                                                                                                                                                                                          |
+| `h2.rst_stream.received.<code>`             | counter | proxy | RST_STREAM received from peer. Same code suffixes plus `unknown_error`.                                                                                                                                                                                                                                                                                                                                     |
+| `h2.rst_stream.received.pre_response_start` | counter | proxy | Subset of `h2.rst_stream.received.*` where the RST arrived before the backend started answering. The canonical Rapid Reset signature (CVE-2023-44487). Emitted alongside the per-code counter, not instead of, so a Rapid Reset attack surfaces both as a `cancel` rate spike and as the pre-response signal.                                                                                               |
+
+#### HTTP/2 header validation (HPACK rejections)
+
+Counters emitted whenever the HPACK decoder in the H2→H1 converter rejects a
+header. `h2.headers.rejected.total` is bumped on every reject; a per-reason
+counter is bumped alongside so `total == sum(per_reason)`. Rejection is silent
+on the wire (the mux either RSTs the stream or treats the request as malformed)
+— this counter family is the only externally visible signal for
+request-smuggling probes, HPACK fuzzing, and H2-specific protocol abuse.
+
+| Metric                                           | Type    | Scope | Description                                                                                      |
+| ------------------------------------------------ | ------- | ----- | ------------------------------------------------------------------------------------------------ |
+| `h2.headers.rejected.total`                      | counter | proxy | Aggregate count of all HPACK rejections                                                          |
+| `h2.headers.rejected.invalid_name_byte`          | counter | proxy | Header name with uppercase / CTL / separator / space byte (CWE-93)                               |
+| `h2.headers.rejected.connection_specific_header` | counter | proxy | `connection`, `proxy-connection`, `transfer-encoding`, `upgrade`, `keep-alive` (RFC 9113 §8.2.2) |
+| `h2.headers.rejected.te_not_trailers`            | counter | proxy | `te` with value other than `trailers` (RFC 9113 §8.2.2)                                          |
+| `h2.headers.rejected.crlf_in_value`              | counter | proxy | CR or LF in a header value — request-smuggling vector (CWE-444)                                  |
+| `h2.headers.rejected.nul_in_value`               | counter | proxy | NUL byte in a header value                                                                       |
+| `h2.headers.rejected.oversized_pseudo_value`     | counter | proxy | Pseudo-header value exceeded storage cap                                                         |
+| `h2.headers.rejected.cl_te_conflict`             | counter | proxy | Content-Length declared alongside a Transfer-Encoding — classic smuggling vector                 |
+| `h2.headers.rejected.duplicate_cl`               | counter | proxy | Multiple disagreeing Content-Length values (RFC 9110 §8.6)                                       |
+| `h2.headers.rejected.duplicate_pseudo`           | counter | proxy | Same pseudo-header appeared twice                                                                |
+| `h2.headers.rejected.pseudo_after_regular`       | counter | proxy | Pseudo-header appeared after a regular header (RFC 9113 §8.3)                                    |
+| `h2.headers.rejected.unknown_pseudo`             | counter | proxy | Unknown `:` -prefixed pseudo-header                                                              |
+| `h2.headers.rejected.empty_pseudo`               | counter | proxy | Pseudo-header value was empty (RFC 9113 §8.3.1)                                                  |
+| `h2.headers.rejected.invalid_method`             | counter | proxy | `:method` value was not a valid RFC 9110 §9 token                                                |
+| `h2.headers.rejected.invalid_scheme`             | counter | proxy | `:scheme` was not `http` or `https`                                                              |
+| `h2.headers.rejected.invalid_path`               | counter | proxy | `:path` contained a `#` fragment (not allowed on the wire)                                       |
+| `h2.headers.rejected.invalid_status`             | counter | proxy | Response `:status` was not three ASCII digits                                                    |
+| `h2.headers.rejected.header_list_size`           | counter | proxy | HEADERS/trailer block exceeded `SETTINGS_MAX_HEADER_LIST_SIZE` (name + value + 32 octets/field, RFC 9113 §6.5.2) — the indexed-reference "header bomb" byte budget. Block-level reject (`ENHANCE_YOUR_CALM`) |
+| `h2.headers.rejected.header_fields`              | counter | proxy | HEADERS/trailer block exceeded `h2_max_header_fields` materialized fields (cookie crumbs counted individually, RFC 9113 §8.2.3). Block-level reject (`ENHANCE_YOUR_CALM`) |
+
+#### Request-ID propagation
+
+Sōzu preserves or generates an `x-request-id` header on every H1 request and
+every H2 stream (both paths share the same H1 editor callback via `pkawa.rs`).
+A client-supplied `x-request-id` takes priority and is forwarded verbatim;
+otherwise Sōzu generates one from the request ULID, the value it also writes
+in `Sozu-Id` and `%REQUEST_ID`. That ULID is fresh for every request, including
+each request of an HTTP/1.1 keep-alive connection. The value also lands on the
+access log's `x_request_id` field — same value Sōzu forwarded to the backend,
+end to end.
+
+| Metric                         | Type    | Scope | Description                                                                                               |
+| ------------------------------ | ------- | ----- | --------------------------------------------------------------------------------------------------------- |
+| `http.x_request_id.propagated` | counter | proxy | Request already carried an `x-request-id` header; Sōzu preserved it verbatim                              |
+| `http.x_request_id.generated`  | counter | proxy | Request had no `x-request-id`; Sōzu generated one from the request ULID and injected it before forwarding |
+
+The `x_request_id` access-log field (wire tag `ProtobufAccessLog.x_request_id`
+#24) carries whichever value was sent to the backend.
+
+#### TLS handshake metadata on access logs
+
+Five additional access-log fields surface the negotiated TLS metadata and the
+upstream-attested forwarded chain. They are wire-compatible appends to
+`ProtobufAccessLog` (tags 25–29) and are populated end-to-end on H1 and H2 mux
+paths, plus the WSS post-upgrade pipe. Pure plaintext paths (HTTP, WS, TCP) emit
+`None` for all five.
+
+| Field         | Wire tag                            | Source                                                                  | Notes                                                                                                                                                                                                                               |
+| ------------- | ----------------------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tls_version` | `ProtobufAccessLog.tls_version` #25 | `rustls_version_label(handshake.session.protocol_version())`            | Short form (e.g. `TLSv1.3`). Captured once at handshake completion in `lib/src/https.rs::upgrade_handshake`. `None` when rustls reports an unknown variant.                                                                         |
+| `tls_cipher`  | `ProtobufAccessLog.tls_cipher` #26  | `rustls_ciphersuite_label(handshake.session.negotiated_cipher_suite())` | Short form (e.g. `TLS_AES_128_GCM_SHA256`). `None` when rustls reports an unsupported cipher.                                                                                                                                       |
+| `tls_sni`     | `ProtobufAccessLog.tls_sni` #27     | `handshake.session.server_name()`                                       | Pre-lowercased, no port. Same value the routing layer uses to enforce the SNI ↔ `:authority` binding. `None` when the client omitted SNI.                                                                                           |
+| `tls_alpn`    | `ProtobufAccessLog.tls_alpn` #28    | ALPN negotiation in `upgrade_handshake`                                 | `h2`, `http/1.1`, or `None` when no ALPN was negotiated.                                                                                                                                                                            |
+| `xff_chain`   | `ProtobufAccessLog.xff_chain` #29   | Verbatim `X-Forwarded-For` header value                                 | Snapshotted in `editor.rs::on_request_headers` _before_ Sōzu appends its own peer hop, so the log records the upstream-attested chain (e.g. `203.0.113.5, 198.51.100.10`). `None` when the request has no `X-Forwarded-For` header. |
+
+TLS fields are connection-scoped: they are stamped once on the mux `Context` at
+handshake time and propagated to every per-stream `HttpContext` via
+`Context::create_stream`, so an H2 connection multiplexing N streams pays the
+cost once. The labels are `&'static str` borrows into rustls's static label
+tables — no per-request allocation.
+
+#### Round-trip-time fields on access logs
+
+`client_rtt` and `server_rtt` carry the kernel-measured TCP round-trip time on
+each side of the proxy. Source: `getsockopt(TCP_INFO)` (Linux `SOL_TCP`, BSD
+`IPPROTO_TCP`, Darwin `IPPROTO_TCP` opt `0x106`) wrapped in
+`lib/src/socket.rs::stats::socket_rtt`. Unit on the wire: microseconds
+(`uint64`); on Darwin the kernel reports `tcpi_srtt` in milliseconds and the
+helper multiplies by 1000 before exposing the same `Duration`.
+
+| Access-log field | Wire tag                                               | Populated on                                                                             |
+| ---------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `client_rtt`     | `ProtobufAccessLog.client_rtt` #9 (`optional uint64`)  | every protocol path: H1 and H2 (`mux`), Pipe (TCP/WS), TCP frontend                      |
+| `server_rtt`     | `ProtobufAccessLog.server_rtt` #10 (`optional uint64`) | every protocol path that has a backend socket; `None` for the TCP frontend (no upstream) |
+
+`None` on AF_UNIX or any FSM state where `TCP_INFO` is not usable
+(pre-handshake, dead socket). Real implementations exist for Linux, FreeBSD,
+NetBSD, OpenBSD, DragonFly, macOS and iOS; non-Unix stub builds short-circuit
+to `None`.
+
+##### When each cell is measured
+
+**On HTTP/1.x and HTTP/2, each cell is sampled once per connection, at the
+first access log of that connection, and reused for every later request of the
+same connection.** `client_rtt` is the frontend connection's SRTT when its first
+request was logged; `server_rtt` is the backend connection's SRTT when the
+first response that went through it was logged — a backend connection taken
+back out of the keep-alive pool keeps the value it was first sampled at. A
+keep-alive connection carrying twenty requests therefore costs one
+`getsockopt(TCP_INFO)` per side, not twenty, and a connection that logs nothing
+costs none.
+
+The sample is not taken at `accept` or `connect`, although Linux already has a
+handshake RTT on an accepted socket (27–34 µs on loopback straight out of
+`accept`): the first access log costs nothing on a connection that never logs,
+and a backend dial is still in flight when its non-blocking `connect(2)`
+returns.
+
+Consequences for anyone trending the field:
+
+- **`client_rtt` and `server_rtt` mean "the SRTT at the first request of the
+  connection", not "the SRTT when this request finished".** Every access line
+  of one connection carries the same value in each cell, so repeated values are
+  expected and are not a stuck measurement. The kernel's SRTT keeps moving over
+  the life of a connection; the log does not follow it. A percentile computed
+  over access logs is weighted by requests per connection.
+- **The two cells of one line come from two different instants**, each the
+  first access log of its own connection. Do not subtract one from the other
+  and read the difference as a network asymmetry.
+- **Pipe (TCP and WebSocket) and the TCP frontend** log once per session, at
+  its end, and read both cells then: one sample per connection there too.
+
+`Mux::close`, which logs the streams still in flight when a session is torn
+down, asks for the connection's sample if it finds such a stream — a read only
+when the connection had logged nothing before — and not at all otherwise.
+
+The history: issue #1339 (question 11) made the HTTP/2 frontend value one per
+readiness sweep, issue #1590 made that sample lazy (it had been taken at the
+top of every sweep, 7.85 `getsockopt(TCP_INFO)` per H2 request), and the
+per-connection sample removed the last per-request reads (about 2 per H1
+keep-alive request). See `doc/h2_mux_internals.md` for the measurements.
+
+#### HTTP/2 flood mitigations
+
+Incremented once per connection at the moment the H2 flood detector trips its
+threshold and the proxy escalates to `GOAWAY(ENHANCE_YOUR_CALM)`. Every CVE
+mitigation in the H2 family (Rapid Reset, MadeYouReset, the CONTINUATION / PING
+/ SETTINGS / empty-DATA flood family, oversized header lists, and the generic
+`glitch` budget) routes through `ConnectionH2::handle_flood_violation`, which
+emits both the contextual log line and the per-kind counter below.
+
+| Metric                                                | Type    | Scope | Description                                                                                                                                                          |
+| ----------------------------------------------------- | ------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h2.flood.violation.rst_stream_window`                | counter | proxy | Per-window RST_STREAM rate ceiling exceeded. Generic stream-cancel storm signal — usually a misbehaving client, sometimes Rapid Reset.                               |
+| `h2.flood.violation.rst_stream_lifetime`              | counter | proxy | Lifetime received-RST cap exceeded: past the `h2_max_rst_stream_lifetime` floor, the resets received after a response started or on a closed stream outnumber the streams a backend answered (CVE-2023-44487). Pre-response resets are left to the next row. |
+| `h2.flood.violation.rst_stream_pre_response_lifetime` | counter | proxy | Pre-response RST cap exceeded: past the `h2_max_rst_stream_abusive_lifetime` floor, more than half of the backend-routed streams were reset before their response. The canonical Rapid Reset signature (CVE-2023-44487). |
+| `h2.flood.violation.rst_stream_emitted_lifetime`      | counter | proxy | Peer-provoked server-emitted RST cap exceeded: past the `h2_max_rst_stream_emitted_lifetime` floor, with the same more-than-half pre-response ratio. MadeYouReset mitigation (CVE-2025-8671) — peer kept feeding the server crafted frames that forced it to reset streams. |
+| `h2.flood.violation.ping_window`                      | counter | proxy | Per-window PING flood (CVE-2019-9512).                                                                                                                               |
+| `h2.flood.violation.ping_lifetime`                    | counter | proxy | Lifetime PING ceiling (200 000, not configurable) exceeded — catches sustained low-rate PING abuse that stays under the windowed cap.                                |
+| `h2.flood.violation.settings_window`                  | counter | proxy | Per-window SETTINGS flood (CVE-2019-9515).                                                                                                                           |
+| `h2.flood.violation.settings_lifetime`                | counter | proxy | Lifetime SETTINGS ceiling (200 000, not configurable) exceeded.                                                                                                      |
+| `h2.flood.violation.empty_data_window`                | counter | proxy | Per-window flood of empty DATA frames (CVE-2019-9518).                                                                                                               |
+| `h2.flood.violation.window_update_stream0_window`     | counter | proxy | Per-window flood of unsolicited connection-level (stream 0) `WINDOW_UPDATE` frames past `h2_max_window_update_stream0_per_window`; the two each DATA frame the proxy sends entitles the peer to are not counted. |
+| `h2.flood.violation.continuation_per_block`           | counter | proxy | Single header block split across more CONTINUATION frames than the configured cap (CVE-2024-27316).                                                                  |
+| `h2.flood.violation.header_size_per_block`            | counter | proxy | Single header block accumulated more bytes than the configured cap (CVE-2024-27316 sibling — header overflow).                                                       |
+| `h2.flood.violation.glitch_window`                    | counter | proxy | Generic anomaly budget exceeded (unknown SETTINGS, WINDOW_UPDATE on closed stream, other low-severity protocol drift).                                               |
+
+`h2.flood.stream_refused` (counter, proxy) is incremented once per new stream
+refused with `RST_STREAM(REFUSED_STREAM)` because its connection is past
+`h2_stream_refusal_percent` of the pre-response cap's floor. The connection
+stays open; a rising rate is the early warning before
+`h2.flood.violation.rst_stream_pre_response_lifetime`.
+
+#### Protocol upgrade failures
+
+Incremented when a session fails to transition between protocol phases:
+
+| Metric                           | Type    | Scope | Description                                                |
+| -------------------------------- | ------- | ----- | ---------------------------------------------------------- |
+| `http.upgrade.expect.failed`     | counter | proxy | HTTP: PROXY protocol expect → mux transition failed        |
+| `http.upgrade.mux.failed`        | counter | proxy | HTTP: mux protocol upgrade failed                          |
+| `http.upgrade.ws.failed`         | counter | proxy | HTTP: WebSocket upgrade failed                             |
+| `https.upgrade.expect.failed`    | counter | proxy | HTTPS: PROXY protocol expect → handshake transition failed |
+| `https.upgrade.handshake.failed` | counter | proxy | HTTPS: TLS handshake → mux transition failed               |
+| `https.upgrade.mux.failed`       | counter | proxy | HTTPS: mux protocol upgrade failed                         |
+| `https.upgrade.wss.failed`       | counter | proxy | HTTPS: WebSocket over TLS upgrade failed                   |
+| `tcp.upgrade.pipe.failed`        | counter | proxy | TCP: pipe protocol upgrade failed                          |
+| `tcp.upgrade.send.failed`        | counter | proxy | TCP: PROXY protocol send transition failed                 |
+| `tcp.upgrade.relay.failed`       | counter | proxy | TCP: PROXY protocol relay transition failed                |
+| `tcp.upgrade.expect.failed`      | counter | proxy | TCP: PROXY protocol expect transition failed               |
+| `tcp.upgrade.sni_preread.failed` | counter | proxy | TCP: SNI-preread → pipe / PROXY-protocol-send transition failed (see below) |
+
+#### TCP SNI preread (passthrough routing)
+
+Emitted by the SNI+ALPN preread routing feature
+([#1279](https://github.com/sozu-proxy/sozu/issues/1279)) on a TCP listener
+with at least one `hostname`-scoped frontend. `tcp.sni_preread.active` is a
+gauge and is guaranteed not to underflow: it is incremented exactly once per
+session entering the preread state and decremented exactly once on whichever
+of its three mutually-exclusive exits fires (reject / upgrade-to-backend /
+teardown). A bare TCP health check (connect then close, zero bytes sent) is
+**not** counted in any `rejected.*` reason — see the reject-policy note in
+[Options specific to TCP listeners](#options-specific-to-tcp-listeners).
+
+| Metric                                          | Type    | Scope | Description                                                                            |
+| ------------------------------------------------ | ------- | ----- | --------------------------------------------------------------------------------------- |
+| `tcp.sni_preread.routed`                          | counter | proxy | A cluster was chosen from the ClientHello's SNI (+ optional ALPN)                       |
+| `tcp.sni_preread.active`                          | gauge   | proxy | Sessions currently prereading. Never underflows                                        |
+| `tcp.sni_preread.duration`                        | time    | proxy | Wall-clock time spent prereading, recorded on every exit (including the defensive upgrade-time early-return paths, which record it immediately rather than waiting on the `active` decrement, since the latter may only land later, in `close()`) |
+| `tcp.sni_preread.rejected.not_tls`                | counter | proxy | First TLS record's `ContentType` wasn't `handshake`                                    |
+| `tcp.sni_preread.rejected.malformed_record`       | counter | proxy | Bad TLS record framing (declared length lies, or a non-handshake record interrupts an in-progress hello) |
+| `tcp.sni_preread.rejected.malformed_handshake`    | counter | proxy | Not a ClientHello, or a length-prefixed field inside it lies about the bytes available |
+| `tcp.sni_preread.rejected.fragmented`              | counter | proxy | The preread deadline (`sni_preread_timeout`) fired before a terminal verdict            |
+| `tcp.sni_preread.rejected.too_large`               | counter | proxy | The ClientHello failed to complete within `sni_preread_max_bytes` (the preread never reads past the cap; a hello that completes within it routes even when coalesced bytes follow) |
+| `tcp.sni_preread.rejected.no_sni`                  | counter | proxy | The `server_name` extension was absent, empty, or its `host_name` entry missing         |
+| `tcp.sni_preread.rejected.ech_outer_absent`        | counter | proxy | Encrypted Client Hello (`0xfe0d`) was present with no usable outer SNI — distinct from `no_sni` |
+| `tcp.sni_preread.rejected.sni_unmatched`           | counter | proxy | The normalized SNI matched no configured `hostname` on this listener                    |
+| `tcp.sni_preread.rejected.alpn_unmatched`          | counter | proxy | The SNI matched a route but no entry's `alpn` accepted the client's offer (and no catch-all was present) |
+| `tcp.sni_preread.rejected.proxy_header_invalid`    | counter | proxy | The inbound PROXY-v2 header (on an `expect_proxy` listener) failed to parse            |
+| `tcp.sni_preread.rejected.front_closed`            | counter | proxy | The frontend closed before a decision was reached (bytes were seen; a bare zero-byte health check is silent, not counted here) |
+
+See `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full state lifecycle,
+the four `proxy_protocol` handoff paths out of preread, and the reasoning
+behind each reject reason.
+
+> **`tcp.infinite_loop.error` on an SNI-routed listener.** Before
+> [#1373](https://github.com/sozu-proxy/sozu/issues/1373), a session whose
+> client coalesced its ClientHello with the first payload bytes — a TLS client
+> writing a large request in one go — kept the frontend selected as readable
+> while its backend was still connecting, even though a routed preread
+> deliberately reads nothing more. The event loop re-entered that dispatch
+> until the 10 000-iteration safety breaker tripped: the worker logged
+> `Handling session went through 10000 iterations, there's a probable infinite
+> loop bug`, incremented `tcp.infinite_loop.error`, and closed a healthy
+> connection that had delivered none of the client's bytes. The symptom is a
+> `tcp.infinite_loop.error` rising in step with `tcp.sni_preread.routed` while
+> `tcp.read.error` and `tcp.write.error` stay flat. Nothing to configure: the fix is in the datapath,
+> and the wider the gap between a fast client and a slow backend connect, the
+> more often the old behaviour fired.
+
+#### Socket and I/O errors
+
+| Metric                             | Type    | Scope | Description                                                                             |
+| ---------------------------------- | ------- | ----- | --------------------------------------------------------------------------------------- |
+| `socket.write.infinite_loop.error` | counter | proxy | TCP socket write loop safety breaker triggered                                          |
+| `tcp.read.error`                   | counter | proxy | TCP socket read error                                                                   |
+| `tcp.read.reset`                   | counter | proxy | Peer reset seen by a plain TCP read or splice from the socket                           |
+| `tcp.write.error`                  | counter | proxy | TCP socket write error, a peer reset met by a `send` included                           |
+| `tcp.write.reset`                  | counter | proxy | Peer reset seen by a plain TCP write or splice to the socket                            |
+| `tcp.infinite_loop.error`          | counter | proxy | TCP session event loop safety breaker triggered                                         |
+| `rustls.read.error`                | counter | proxy | TLS read error                                                                          |
+| `rustls.read.reset`                | counter | proxy | Peer reset seen by a TLS frontend read, during the handshake or after it                |
+| `rustls.write.error`               | counter | proxy | TLS write error, a peer reset included                                                  |
+| `rustls.write.reset`               | counter | proxy | Peer reset seen by a TLS frontend write, during the handshake or after it               |
+| `rustls.read.infinite_loop.error`  | counter | proxy | TLS read loop safety breaker triggered                                                  |
+| `rustls.write.infinite_loop.error` | counter | proxy | TLS write loop safety breaker triggered                                                 |
+
+A peer reset is a client or backend that aborts its connection with a TCP RST
+instead of closing it cleanly: `ECONNRESET` (or `ECONNABORTED`) from the
+`recv`, `send` or `splice` that meets it. It is not necessarily an error, so
+the four `*.reset` counters report it on its own; the session still closes
+exactly as before. The kernel reports the reset to one syscall only, so each
+reset is counted once, on the read or the write side, whichever met it first.
+A reset that reaches Sōzu only as a hang-up event, on a session that then
+closes without reading or writing, is not counted: learning that it was a
+reset would take an extra `getsockopt(SO_ERROR)` per closing session.
+
+#### UDP
+
+Emitted by `protocol = "udp"` listeners. `udp.active_flows` is a gauge and is
+guaranteed not to underflow on close / timeout / shed / error paths.
+
+| Metric                   | Type    | Scope            | Description                                                                                                                          |
+| ------------------------ | ------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `udp.datagrams.in`       | counter | cluster, backend | Client datagrams received                                                                                                           |
+| `udp.datagrams.out`      | counter | cluster, backend | Datagrams forwarded (to backend) and returned (to client)                                                                          |
+| `udp.bytes.in`           | counter | cluster, backend | Bytes received from clients                                                                                                         |
+| `udp.bytes.out`          | counter | cluster, backend | Bytes sent (to backend and back to client)                                                                                         |
+| `udp.active_flows`       | gauge   | proxy            | Currently tracked flows (one connected upstream socket each). Never underflows                                                     |
+| `udp.flows.created`      | counter | cluster, backend | Flows admitted and tracked                                                                                                          |
+| `udp.flows.evicted`      | counter | cluster, backend | Flows torn down (idle timeout / `responses` reached / `requests` reached / drain / listener removal or soft-stop / an admitted flow whose upstream connect failed or found no backend) |
+| `udp.flows.shed`         | counter | proxy            | New flows dropped at the `max_flows` cap, at a per-source flow limit, or on `EMFILE`/`ENFILE` (existing flows protected)           |
+| `udp.flows.shed.source_limit` | counter | proxy       | New flows dropped at the cluster's `max_connections_per_ip` / `max_connections_per_subnet` flow limit (also counted in `udp.flows.shed`) |
+| `udp.datagrams.dropped`  | counter | proxy            | Datagrams dropped, by reason: `invalid` / `truncated` / `no-backend` / `shed` / `wq-full` (write-queue full) / `unknown-flow` / `send-error` |
+| `udp.backend.health`     | gauge   | cluster, backend | `1` when the backend passes its UDP health check, `0` when down                                                                    |
+| `udp.flow.duration`      | time    | cluster, backend | Flow lifetime, from admission to teardown                                                                                          |
+
+#### Other
+
+| Metric                         | Type    | Scope            | Description                                                  |
+| ------------------------------ | ------- | ---------------- | ------------------------------------------------------------ |
+| `http.infinite_loop.error`     | counter | proxy            | HTTP event loop safety breaker triggered                     |
+| `http.failed_backend_matching` | counter | proxy            | Frontend matched but no backend could be selected            |
+| `http.early_response_close`    | counter | proxy            | Client closed before response was fully sent                 |
+| `http.close.request_incomplete` | counter | proxy          | H1 client connection closed because the response completed before the request was received whole (the rest of the body is never read as a request; it is drained and dropped for up to `request_timeout` and 4 MiB before the close) |
+| `http.forwarded_malformed_elided` | counter | proxy          | Client `Forwarded` line removed as not RFC 7239 §4, once per line (`both` and `rfc7239` only) |
+| `http.trusting.x_proto`        | counter | proxy            | Request had an existing `X-Forwarded-Proto` header (trusted) |
+| `http.trusting.x_proto.diff`   | counter | proxy            | Trusted `X-Forwarded-Proto` differed from actual protocol    |
+| `http.trusting.x_port`         | counter | proxy            | Request had an existing `X-Forwarded-Port` header (trusted)  |
+| `http.trusting.x_port.diff`    | counter | proxy            | Trusted `X-Forwarded-Port` differed from actual port         |
+| `pipe.errors`                  | counter | proxy            | Pipe/WebSocket protocol errors                               |
+| `proxy_protocol.errors`        | counter | proxy            | PROXY protocol v2 parsing and framing errors                 |
+| `unsent-access-logs`           | counter | proxy            | Access log entries that could not be sent                    |
+| `access_logs.count`            | counter | cluster, backend | Access log entries emitted per cluster/backend               |
+
+### Example of external services
+
+- [statsd](https://github.com/etsy/statsd)
+- [grad](https://github.com/geal/grad)
+
+## OpenTelemetry (traceparent passthrough)
+
+The `opentelemetry` compile-time feature flag enables **W3C Trace Context
+passthrough**: Sōzu parses, generates, and forwards `traceparent` headers across
+the proxy hop, and records the trace identifiers in its access logs. The feature
+name is historic — the implementation is intentionally a propagator only. There
+is no OpenTelemetry SDK dependency, no span lifecycle, and no OTLP exporter. See
+"Out of scope" below.
+
+### Enabling
+
+Build Sōzu with the `opentelemetry` feature:
+
+```bash
+cargo build --release --features opentelemetry
+```
+
+Or in `Cargo.toml`:
+
+```toml
+[dependencies]
+sozu-lib = { path = "lib", features = ["opentelemetry"] }
+```
+
+### How it works
+
+When the `opentelemetry` feature is enabled, Sōzu acts as a **trace context
+propagator** for both HTTP/1.1 and HTTP/2 frontends. The kawa H1 editor
+(`lib/src/protocol/kawa_h1/editor.rs`) runs on every request, including those
+decoded from HPACK on the H2 mux path (`lib/src/protocol/mux/pkawa.rs` calls
+back into the same editor). On the wire the H2 backend leg re-encodes the
+rewritten `traceparent` via `H2BlockConverter`.
+
+1. **Incoming request with `traceparent` header**: Sōzu parses the W3C
+   traceparent (format: `00-<trace_id>-<parent_id>-<flags>`), preserves the
+   trace ID, generates a new span ID for the Sōzu hop, and rewrites the header
+   before forwarding to the backend.
+
+2. **Incoming request without `traceparent` header**: Sōzu generates a new
+   random trace ID and span ID, and injects a `traceparent` header into the
+   request before forwarding.
+
+3. **`tracestate` header**: Preserved if a valid `traceparent` is present.
+   Elided if no `traceparent` accompanies it (per W3C spec).
+
+4. **Access logs**: The trace context (trace ID, span ID, parent span ID) is
+   included in access log entries and in the protobuf `AccessLog` message,
+   enabling correlation between Sōzu access logs and distributed traces in your
+   observability platform.
+
+### Access log fields
+
+When OpenTelemetry is enabled, access logs include:
+
+| Field            | Format                   | Description                                            |
+| ---------------- | ------------------------ | ------------------------------------------------------ |
+| `trace_id`       | 32 hex characters        | W3C trace ID (propagated or generated)                 |
+| `span_id`        | 16 hex characters        | Sōzu-generated span ID for this hop                    |
+| `parent_span_id` | 16 hex characters or `-` | Parent span ID from incoming `traceparent`, if present |
+
+### Out of scope
+
+The `opentelemetry` feature is intentionally narrow. It does NOT:
+
+- Pull `opentelemetry`, `opentelemetry-sdk`, `opentelemetry-otlp`, or
+  `tracing-opentelemetry` as dependencies. The feature gate (`lib/Cargo.toml`)
+  wires no extra crates.
+- Emit spans. There is no `Span::start`/`Span::end`, no in-process exporter, no
+  OTLP/gRPC client. Use your access log pipeline to feed Jaeger, Tempo,
+  Honeycomb, or Datadog with the per-request trace identifiers.
+- Honour the sampled-flag bit of incoming `traceparent`. Today the rewritten
+  header is always emitted with `-01` (sampled). Downstream backends that
+  respect the sampled flag will see every request as sampled.
+- Provide runtime configuration. The feature is selected at compile time only.
+
+A real span model and an OTLP exporter are tracked separately and would land as
+their own feature flag rather than expanding the scope of `opentelemetry`.
+
+## PROXY Protocol
+
+When a network stream goes through a proxy, the backend server will only see the
+IP address and port used by the proxy as client address. The real source IP
+address and port will only be seen by the proxy. Since this information is
+useful for logging, security, etc, the
+[PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
+was developed to transmit it to backend servers. With this protocol, after
+connecting to the backend server, the proxy will first send a small header
+indicating the client IP address and port, and the proxy's receiving IP address
+and port, and will then send the stream from the client.
+
+Sōzu support the _version 2_ of the `PROXY protocol` in three configurations:
+
+- "send" protocol: Sōzu, in TCP proxy mode, will send the header to the backend
+  server
+- "expect" protocol: Sōzu receives the header from a proxy, interprets it for
+  its own logging and metrics, and uses it in HTTP forwarding headers
+- "relay" protocol: Sōzu, in TCP proxy mode, can receive the header, and
+  transmit it to a backend server
+
+More information here:
+[proxy-protocol spec](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
+
+### Configuring Sōzu to _expect_ a PROXY Protocol header
+
+Configures the client-facing connection to receive a PROXY protocol header
+before any byte sent by the client is read from the socket.
+
+```txt
+                           send PROXY                    expect PROXY
+                           protocol header               protocol header
+    +--------+
+    | client |             +---------+                   +------------+      +-----------+
+    |        |             | proxy   |                   | Sozu       |      | upstream  |
+    +--------+  ---------> | server  |  ---------------> |            |------| server    |
+   /        /              |         |                   |            |      |           |
+  /________/               +---------+                   +------------+      +-----------+
+```
+
+It is supported by HTTP, HTTPS and TCP proxies.
+
+_Configuration:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:80"
+expect_proxy = true
+```
+
+### Configuring Sōzu to _send_ a PROXY Protocol header to an upstream backend
+
+Send a PROXY protocol header over any connection established to the backends
+declared in the cluster.
+
+```txt
+                           send PROXY
+    +--------+             protocol header
+    | client |             +---------+                +-----------------+
+    |        |             | Sozu    |                | proxy/upstream  |
+    +--------+  ---------> |         |  ------------> | server          |
+   /        /              |         |                |                 |
+  /________/               +---------+                +-----------------+
+```
+
+_Configuration:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:81"
+
+[clusters]
+[clusters.NameOfYourTcpCluster]
+send_proxy = true
+frontends = [
+  { address = "0.0.0.0:81" }
+]
+```
+
+NOTE: Only for TCP clusters (HTTP and HTTPS proxies will use the forwarding
+headers).
+
+### Configuring Sōzu to _relay_ a PROXY Protocol header to an upstream
+
+Sōzu will receive a PROXY protocol header from the client connection, check its
+validity and then forward it to an upstream backend. This allows for chains of
+reverse-proxies without losing the client connection information.
+
+```txt
+                           send PROXY                       expect PROXY               send PROXY
+                           protocol header                  protocol header            protocol header
+    +--------+
+    | client |             +---------+                      +------------+             +-------------------+
+    |        |             | proxy   |                      | Sozu       |             | proxy/upstream    |
+    +--------+  +--------> | server  |  +-----------------> |            | +---------> | server            |
+   /        /              |         |                      |            |             |                   |
+  /________/               +---------+                      +------------+             +-------------------+
+```
+
+_Configuration:_
+
+This only concerns TCP clusters (HTTP and HTTPS proxies can work directly in
+expect mode, and will use the forwarding headers).
+
+```toml
+[[listeners]]
+address = "0.0.0.0:80"
+expect_proxy = true
+
+[clusters]
+
+[clusters.NameOfYourCluster]
+send_proxy = true
+frontends = [
+  { address = "0.0.0.0:80" }
+]
+```

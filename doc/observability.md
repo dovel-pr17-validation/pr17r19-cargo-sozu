@@ -1,0 +1,931 @@
+# Observability — architecture & extension points
+
+This document explains **how** Sōzu emits metrics, logs, audit events, and trace
+context, where the seams are, and what conventions to follow when adding new
+instrumentation. For the **inventory** of currently emitted metrics and access-
+log fields, see [`configure.md`](configure.md). For the H2 mux internals see
+[`h2_mux_internals.md`](h2_mux_internals.md).
+
+## Topology
+
+Each Sōzu worker is a **single-threaded mio event loop** with three concurrent
+observability surfaces:
+
+```
+                            ┌──────────────────────────────┐
+                            │       worker process          │
+                            │                                │
+   accept loop ──┐          │   ┌─ thread-local METRICS ─┐  │       ┌─ statsd UDP ─┐
+   TLS handshake │          │   │                         │──┼──────▶│ network drain│
+   H2 mux        │── incr! ─┼─▶ │   Aggregator            │  │       └──────────────┘
+   H1 editor     │  count!  │   │  (counters, gauges,     │  │
+   backend pool  │  gauge!  │   │   HDR-time histograms)  │──┼──┐
+   socket I/O    │  gauge_  │   │                         │  │  │  ┌─ sozu CLI ─┐
+   …             │  add!    │   └─────────────────────────┘  │  └─▶│ local drain│
+                 │  time!   │                                 │     └────────────┘
+                            │
+                            │   log_context!  ─────────────► main log stream
+                            │   (structured prefix)            (info/warn/error)
+                            │
+                            │   log_access!   ─────────────► access log stream
+                            │   (RequestRecord)               (ASCII or protobuf)
+                            │
+                            │   SubscribeEvents bus ───────► control-plane events
+                            │   (EventKind)                    (incl. audit log line — MUX-style, at info level)
+                            └──────────────────────────────┘
+```
+
+Three properties shape every extension:
+
+1. **Single-threaded per worker** — no `Arc<Mutex>` inside the loop. `METRICS`
+   is `thread_local!` (`lib/src/metrics/mod.rs`).
+2. **Edge-triggered epoll via mio** — anything queued from the read path must
+   `signal_pending_write` on the readiness tracker: under edge-triggered epoll
+   the WRITABLE event bit must be live for `filter_interest` to return
+   non-zero, so a queued write that never signalled is invisible to the event
+   loop and is never flushed. This affects metric flush timing only when the
+   metrics socket itself stalls — usually transparent to instrumentation
+   authors.
+3. **`&'static str` keys everywhere** — counters and gauges accept only
+   `&'static str` keys (the type signature of `count_add` / `set_gauge`).
+   Per-error / per-kind breakdowns must materialise the keys at compile time.
+
+## Metric primitives
+
+| Macro | Signature | When to use | Example |
+|---|---|---|---|
+| `incr!(key)` / `incr!(key, cluster_id, backend_id)` | `&'static str` | Increment by 1. The 3-arg form labels by cluster+backend. | `incr!("h2.frames.rx.data");` |
+| `count!(key, value)` | `&'static str, i64` | Increment by N (e.g. byte counts). | `count!("bytes_in", n as i64);` |
+| `decr!(key)` | `&'static str` | Decrement by 1. Pair with a prior `incr!`. | `decr!("http.active_requests");` |
+| `gauge!(key, value)` | `&'static str, usize` | **Absolute snapshot.** ⚠️ Last-writer-wins across emit sites — only safe for proxy-level state with a single emitter (e.g. `client.connections`). | `gauge!("client.connections_max", n);` |
+| `gauge_add!(key, delta)` / `gauge_add!(key, delta, cluster, backend)` | `&'static str, i64` | **Lifecycle delta.** Aggregates correctly across emit sites. Pair every `+1` with a `-1` on every close path. | `gauge_add!("backend.pool.size", 1);` |
+| `time!(key, ms)` / `time!(key, cluster_id, ms)` | `&'static str, usize` | Latency in ms. Stored as HDR histogram in the local drain. | `time!("backend_response_time", cluster, ms);` |
+
+### Gauge correctness
+
+The most common metric bug is a `gauge!()` emitted from a per-connection /
+per-stream context: the value the dashboard sees is "whatever the last
+emitter wrote", not aggregate state. **Default to `gauge_add!()` for any
+metric that is incremented from more than one emit site.** The H2 connection
+gauges (`h2.connection.{active_streams,window_bytes,pending_window_updates}`)
+were converted to `gauge_add!` lifecycle deltas plus `impl Drop` symmetric
+teardown after this exact bug went unnoticed for a while.
+`h2.streams.ready_incremental.by_urgency` was added later in the old style and
+repeated it verbatim — a per-connection `gauge!` on a global key — and now
+rides the same delta funnel as a fourth component of that snapshot. The
+structural guard against the next one is `lib/tests/metric_names.rs`: every
+metric key in `lib/src` must be a `metrics::names` constant, so a new key is
+visible in one file instead of being spelled out at its single emit site. Read
+that test's header before relying on it — it scans `sozu-lib`'s own `src` and
+nothing else, so `bin/` and `command/` are ungated (`config.load_skipped_invalid`
+in `bin/src/command/requests.rs` is still a literal), and a key assembled by
+`concat!` inside a helper macro is invisible to it by construction. It closes
+the shape that has actually bitten us, not every shape.
+
+### Gauge underflow
+
+Past production incidents (`ff401b54`, `aadb3fa4`) came from a `gauge_add!(-1)`
+reaching the metric unpaired. `ff401b54` had both shapes in one commit: a `-1`
+for streams that never ran the `+1` (idle timeouts, TLS failures, malformed
+requests), and a `-1` that ran twice on the same stream (100-Continue, and an
+H2 reset followed by close). `aadb3fa4` was the doubled `-1` alone, let through
+by an early return. Both
+`MetricValue::update` and `AggregatedMetric::update` saturate the value to
+0 and emit a single `error!` log line on underflow, in both debug and
+release builds; neither panics. The metric is still wrong on the next
+snapshot, but the process keeps running and the log line names the
+offending key. Two patterns prevent this class of bug:
+
+1. **Co-locate increments and decrements with the state being tracked.** If
+   the gauge measures "active backend connections", emit the `+1` at the same
+   site that creates the backend connection and the `-1` at the same site
+   that closes it.
+2. **Move teardown into `impl Drop`** when the close paths are scattered
+   across the codebase (graceful shutdown, force-disconnect, panic-unwind).
+   `impl Drop for H2Shell` is the canonical example: it subtracts whatever
+   positive contribution the connection ever made, regardless of which close
+   path runs. It sits on the shell rather than on `ConnectionH2` because the
+   core returns its metrics as `MetricEvent`s instead of writing `METRICS`
+   itself; the shell owns the core, so the RAII guarantee is unchanged.
+
+### Cardinality budgets
+
+StatsD (UDP) is forgiving but Prometheus / influxdb is not. Two rules:
+
+1. **Static keys only.** A key is `&'static str` — synthesised at compile
+   time via `concat!`, a literal, or `LazyLock`-leaked at startup. Per-IP
+   labels MUST hash into a bounded bucket table (see
+   `lib/src/server.rs::PER_SOURCE_BUCKETS` for the canonical 256-bucket
+   pattern with `LazyLock` static-string array).
+2. **Opt-in granularity.** `MetricDetail` (proto) /
+   `MetricDetailLevel` (config) lets operators choose
+   `process | frontend | cluster | backend`. Mirrors HAProxy's
+   `extra-counters` opt-in. New label dimensions should respect this knob;
+   the wiring layer is a follow-up MR.
+
+### Local drain reset cadence
+
+The local drain (`LocalDrain` in `lib/src/metrics/local_drain.rs`) keeps two
+maps: `proxy_metrics` (proxy-wide) and `cluster_metrics` (per-cluster +
+per-backend). **Both are cumulative since worker start.** There is no
+automatic timer that resets them — the wall-clock `if now.minute() == 0
+&& now.second() == 0` block that used to clear `cluster_metrics` every UTC
+hour was removed because it produced apparent spikes / drops to zero in
+operator dashboards, and because gauges had to be preserved across the
+clear anyway (long-lived H2 sessions could close after the clear and
+underflow the gauge counter). Operators who want to reset issue
+`sozu metrics clear` (proto: `MetricsConfiguration::Clear`), which wipes
+both maps in one shot AND wipes the master process's own `main_metrics`.
+Per-cluster entries are also dropped on `RemoveCluster` /
+`RemoveBackend` IPC so retired clusters do not leak metric keys; on the
+StatsD `network_drain` the same two events drop the cluster's
+`cluster_metrics`, `backend_metrics`, and queued `MetricLine`s, so the
+wire side goes silent immediately (any unsent statsd interval for the
+cluster is discarded — bounded by the one-second network-drain cadence
+hard-coded in `NetworkDrain::send_metrics`).
+
+`RemoveCluster` also arms a per-drain tombstone (`removed_clusters:
+HashSet<String>`) so subsequent emissions for the removed cluster are
+dropped on the floor rather than resurrecting the row via
+`entry().or_default()`. This matters in production: the per-proxy
+`remove_cluster` paths in `lib/src/http.rs` / `https.rs` / `tcp.rs`
+drop cluster config, and `Server::notify_proxys` drops the cluster's
+frontends and backends, but none of them closes in-flight sessions, so long-lived
+H2 / WebSocket / TCP sessions continue emitting access-log /
+response-time / gauge metrics for the removed cluster. Without the
+tombstone those emissions would keep growing the cluster row until the
+last session closed; with it, the wire and the local drain stay quiet.
+The tombstone is cleared when the replacement lifetime starts: on
+`AddCluster`, or on the first legal route after removal when frontends and
+backends recreate the id without an `AddCluster`. `sozu metrics clear` also
+clears it as part of the operator-initiated full reset.
+
+The tombstone alone cannot distinguish that replacement from the removed
+cluster. Each effective cluster lifetime therefore has an opaque metrics
+incarnation. HTTP streams capture it when their request is routed, TCP
+sessions when their static or SNI route resolves, and backend connections
+retain it until close. At `cluster` or `backend` detail, the aggregator rejects
+a labelled emission whose captured incarnation is no longer current before
+either drain sees it. A late close from the old cluster therefore cannot
+decrement the replacement's identically labelled `connections_per_backend`
+gauge, even when the backend id and address are unchanged.
+
+At `process` and today's `frontend` detail, removing those labels deliberately
+forms a worker-wide aggregate. A stale-incarnation event remains part of that
+aggregate: while detail remains at that level, an old connection's late
+decrement balances the increment it contributed before removal. Metrics
+emitted directly without cluster labels,
+including `backend.connections`, also continue to record the physical close;
+they are a separate emission from the label-stripped aggregate.
+
+The effective detail is evaluated independently for every emission. Changing
+it, including when a runtime lease starts or expires, does not migrate or
+clear values already stored under the previous label shape. By inspection of
+that emission-time policy, a gauge whose increment and decrement straddle the
+transition can be split between shapes; this change does not add a migration
+layer or claim a separately reproduced defect there. The
+cluster-incarnation gate follows the effective detail at the time of the late
+emission.
+
+The first legal route to an id allocates an incarnation even when no
+`AddCluster` has arrived; frontends and backends are allowed to reference that
+implicit cluster. A later `AddCluster` without an intervening removal keeps the
+same identity, so a labelled gauge opened by the implicit route can still be
+closed. `RemoveCluster` is the lifetime boundary: it drops the active identity,
+and the next route or add allocates a different one. A route-created
+replacement also re-arms both drains, so its metrics are visible without an
+`AddCluster`; emissions carrying the removed identity remain fenced.
+Disabling and re-enabling cluster metric collection, changing
+`metrics.detail`, and `sozu metrics clear` do not alter active identities. This
+keeps old emissions obsolete across collection controls even though a clear
+resets drain storage and tombstones.
+
+`RemoveCluster` ends an identity only while the main process's configuration
+state declares the id. The main process refuses a `RemoveCluster` for an id its
+configuration state does not currently declare, whether it was never added or
+was already removed (`ConfigState::remove_cluster` returns `NotFound`), so the
+request never reaches a worker. An implicit identity, allocated by a route to a
+never-added id or by the first route that recreates a removed one, therefore
+lasts until the worker exits; a second `RemoveCluster` for the id is refused
+too. Removing the id's last frontend or backend does not end it, exactly as it
+does not end a declared cluster's identity: frontends and backends re-added
+later belong to the same lifetime and contribute to the same rows. The identity
+map holds at most one entry per distinct id referenced during the worker's
+life. To end such a lifetime explicitly, in both cases, send `AddCluster` and
+then `RemoveCluster` for the id; the removal also removes any frontend or
+backend still naming it. `sozu metrics clear` empties the id's rows but keeps
+its identity.
+
+The public `SessionMetrics` shape and
+`SessionMetrics::register_end_of_session(&LogContext)` API retain their
+current-configuration semantics for embedders. Sōzu's delayed HTTP, WebSocket,
+and TCP owners use a separate internal registration path with the capture made
+by their request, session, pipe, or backend handle. That closed capture state
+distinguishes an active identity from a missing capture and terminal 64-bit
+identity exhaustion. At `cluster` and `backend` detail only an active captured
+identity equal to the current one reaches the drains; missing and exhausted
+captures fail closed. At `process` and today's `frontend` detail the labels are
+removed, so every capture state still contributes to the worker aggregate and
+a late decrement can balance its earlier increment.
+
+Every request ends with a burst of emissions into the local drain
+(`SessionMetrics` end-of-session registration: two cluster-labelled times and,
+under `metrics.detail = "backend"`, up to seven backend-labelled metrics —
+the connection and header times are absent when not measured), so its
+lookup path is held to **zero heap allocation in steady state**. Each level is
+a `BTreeMap` keyed by an owned `String` — `cluster_metrics` by cluster id, each
+cluster's `backends` by backend id, each `MetricsMap` by metric name — and
+each is searched with `get_mut(&str)` through `Borrow<str>`; the owned key is
+built only on the insert branch, a key's first sighting. `BTreeMap::entry`
+must not be reached on the hit path, because it takes an owned key and would
+allocate a copy on every emission. `steady_state_emission_does_not_allocate`
+holds the contract, and `lib/benches/local_drain.rs` measures the path per
+request for 1 to 10000 backends in one cluster. Because `backends` is a map, a
+metrics query lists a cluster's backends sorted by backend id.
+
+Backend rows are keyed by backend id alone, while a cluster may hold one id at
+several addresses: `RemoveBackend` drops the id's row only once no backend of
+that id remains in the cluster, so removing one address keeps the counters the
+others still feed. Unlike `RemoveCluster`, it arms no tombstone: a session still open on the removed backend re-creates the row
+when it ends, and nothing removes it again until the next `RemoveBackend` for
+that id, `RemoveCluster`, or `sozu metrics clear`.
+
+Implication for dashboards: counters in `sozu metrics` output are
+monotonic; charts should compute `rate()` / `irate()` rather than
+treating successive snapshots as windowed counts. Histograms accumulate
+every sample since worker start, so `Percentiles.p_99` is the lifetime
+p99, not a windowed one. Per-bucket counters are `u64` so saturation is
+not a concern under realistic uptime / RPS combinations.
+
+Operator clear caveat: issuing `sozu metrics clear` during live traffic
+resets in-flight gauge accuracy. Sessions that opened before the clear
+and decrement gauges on close (e.g. `connections_per_backend`) land on
+the saturating-to-zero path and emit one `error!` log line per
+occurrence, naming the offending key. This is intentional; the gauge
+recovers as new sessions arrive. Operators who want to reset counts but
+keep live gauges intact should not use `sozu metrics clear` — wait for
+the cumulative counters to roll over in their dashboard math instead.
+
+### A removed client `Forwarded` line
+
+`http.forwarded_malformed_elided` is a proxy-scoped counter with no label. It
+is incremented once for each client `Forwarded` line that
+`HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`)
+removes because its value is not a well-formed RFC 7239 §4 list, which happens
+only in the `both` and `rfc7239` `forwarded_headers` modes. The request is
+still forwarded, with Sōzu's own element on an earlier well-formed line or on a
+line of its own, so the counter is not an error rate: a steady non-zero value
+names an upstream proxy whose chain the backend no longer receives. The
+matching `debug!` line carries the request context for a single occurrence.
+The increment sits on the removal branch alone, so a well-formed line pays
+nothing for it. See `forwarded_headers` in [`configure.md`](configure.md).
+
+## Log primitives
+
+Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
+`log_context_lite!` macros — defined per file:
+
+| Prefix | File | Carries |
+|---|---|---|
+| `MUX` | `protocol/mux/mod.rs` | session ULID, peer/local, frontend, backend list. `peer` is a snapshot (see below), not a live lookup |
+| `MUX-H2` | `protocol/mux/h2.rs` | …plus position, state, total RST counts, draining. `peer` is a snapshot (see below), not a live lookup |
+| `MUX-H1` | `protocol/mux/h1.rs` | …plus stream id, parked, close_notify. `peer` is a snapshot (see below), not a live lookup |
+| `MUX-ROUTER` | `protocol/mux/router.rs` | renders `[session req cluster backend]` via `HttpContext::log_context()` |
+| `MUX-CONN` / `MUX-CONV` / `MUX-PARSER` / `MUX-PKAWA` / `MUX-STREAM` | corresponding files | module-level only (no per-session context) |
+| `RUSTLS` | `protocol/rustls.rs` | SNI/ALPN byte lengths, version, source, frontend |
+| `PIPE` | `protocol/pipe.rs` | addresses, frontend/backend status & readiness |
+| `TCP` | `tcp.rs` | frontend, backend, peer (cached on `SessionTcpStream`) |
+| `SOCKET` | `socket.rs` | session, peer, local, RTT, state. `peer` is a snapshot (see below), not a live lookup |
+
+**Conventions:**
+
+- Use the macro defined in the file. Do not call `log::info!`/`log::error!`
+  directly from protocol code — the prefix tag is load-bearing for
+  log-search.
+- The `peer` slot of a `MUX-H1` or `MUX-H2` line is a snapshot, not a live
+  `getpeername(2)`. It is captured once when the connection is constructed
+  (`ConnectionH1::peer_address` and `ConnectionH2::peer_address`), reading the
+  snapshot the socket handler itself took when it was built
+  (`SocketHandler::peer_addr`, `lib/src/socket.rs`). The two agree for every
+  production handler, which is why rendering the line costs no socket access
+  at all. Three consequences an operator should expect.
+  First, it stays populated after the peer resets — `getpeername(2)`
+  answers `ENOTCONN` there, so a live lookup renders `peer=None` on exactly
+  the error lines being read during an incident. Do not match `peer=None`
+  on a `MUX`, `MUX-H1` or `MUX-H2` line to detect a reset. Second, on a
+  PROXY-protocol frontend it is the source the PROXY header advertised, so it
+  names the client and agrees with the `HTTP`/`HTTPS` line for the same
+  request id rather than naming the load balancer. (A `MUX-H2` frontend line
+  only ever exists on a TLS frontend: `Connection::new_h2_server` is called
+  once, from the ALPN branch of `https.rs`, and h2c is unimplemented on the
+  cleartext listener. A `MUX-H1` frontend line exists on both listeners.)
+  Third — and with no `MUX-H2` counterpart, because only `ConnectionH1` is
+  built by both `Connection::new_h1_server` and `Connection::new_h1_client` —
+  a backend `MUX-H1` line names the cluster-configured backend address. The
+  dial path caches it for exactly this reason: a nonblocking `connect()` still
+  in flight makes `getpeername(2)` refuse, so the live lookup rendered
+  `peer=None` for the whole window in which an ECONNREFUSED line is emitted.
+  `MUX` (`protocol/mux/mod.rs`) renders the same snapshot, through
+  `Connection::peer_address` (`protocol/mux/connection.rs`), which forwards to
+  whichever of `ConnectionH1::peer_address` / `ConnectionH2::peer_address` the
+  session holds. Before that accessor existed it reached the raw stream through
+  `Connection::socket()`, whose `&mio::net::TcpStream` resolves `peer_addr` to
+  mio's *inherent* method, so the slot was a live `getpeername(2)` and one
+  session ULID rendered two different peers depending on which envelope the
+  line came from. Pinned by
+  `protocol::mux::tests::log_context_renders_the_snapshotted_peer_not_a_live_lookup`
+  and
+  `protocol::mux::tests::log_context_lite_renders_the_snapshotted_peer_not_a_live_lookup`
+  (`lib/src/protocol/mux/mod.rs`).
+- The `peer` slot of a `SOCKET` line is the same snapshot, through the
+  same accessor, for every handler. Both of the layer's two renderers now
+  read `configured_peer` first and fall back to `getpeername(2)` only
+  when there is none: `log_socket_module_prefix` (`lib/src/socket.rs`), which
+  every plaintext frontend and every backend socket reaches through
+  `SessionTcpStream`, always did; `log_socket_context!` (`lib/src/socket.rs`),
+  whose only caller is `impl SocketHandler for FrontRustls` and therefore
+  every TLS frontend, now does too. So the two consequences described
+  above for `MUX-H2` hold for `SOCKET` as well, and on a PROXY-protocol
+  TLS frontend the `SOCKET` and `MUX-H2` lines of one connection name the
+  same host. They did not before: `SOCKET` named the load balancer while
+  `MUX-H2` named the client, which was an artefact of `FrontRustls`
+  having carried no cached address rather than a deliberate split between
+  layers.
+  Measured on a PROXY-v2 TLS frontend whose advertised client and whose
+  TCP source genuinely differ, by
+  `e2e::tests::socket_log_context_tests::test_tls_socket_log_peer_is_the_advertised_client`:
+  before, the one captured `SOCKET` line named the TCP source and none
+  named the advertised client; after, the reverse. That test also asserts
+  the line was written while the connection was still
+  `state=Some("ESTABLISHED")` — this half of the defect is not the
+  `ENOTCONN` one, and a healthy live lookup was simply naming a different
+  host.
+  The other half, the slot surviving a live lookup that FAILS, is pinned
+  by `socket::tests::log_socket_context_renders_the_cached_peer_when_the_live_lookup_fails`,
+  which stages the failure with a never-connected socket: only that
+  refuses `getpeername(2)` deterministically, whereas a socket waiting on
+  an RST is a race. So what is measured is the rendering once the socket
+  refuses, not a reset end to end — and deliberately so, because the
+  reset-related error kinds are exactly the arms of
+  `FrontRustls::socket_read`/`socket_write` that emit no log line at all.
+  `socket::tests::log_socket_context_renders_the_cached_peer_not_a_live_lookup`
+  pins the succeeding half at the macro directly.
+  Only `peer` changed. `local` is still `getsockname(2)`, and `rtt`,
+  `state` and `protocol` are untouched.
+- Tier severity by intent: `debug!`/`trace!` for expected idle closes,
+  timeouts, noisy state. `warn!`/`error!` for real protocol errors or
+  invariant breaks.
+- When an `HttpContext` is in scope, prefer `$http_ctx.log_context()`
+  (`HttpContext::log_context`, `lib/src/protocol/kawa_h1/editor.rs`) over
+  hand-rolling a `LogContext { ... }` struct literal — the helper is the
+  canonical formatter.
+
+### Sensitive-value logging boundary
+
+`Debug` is a production logging projection in Sōzu, not a lossless inspection
+format. Generic log sites format command requests, worker responses, retained
+tasks and state, router/listener errors, and TLS runtime objects with `{:?}`.
+Every type reachable from those paths must therefore produce bounded metadata
+when its fields can contain operator- or customer-controlled material.
+
+The protected material includes certificate and private-key contents, chains,
+certificate names and fingerprints, certificate-query domains and results,
+cluster identifiers, HTTP routing hosts/paths/methods/tags, redirect and
+rewrite values, TCP SNI and ALPN values, custom-answer keys and bodies, and
+header names and values. Their log projections may retain only operationally
+useful metadata such as socket addresses, enum variants, booleans, presence
+flags, collection counts, and aggregate byte lengths. Certificate and key
+slots render as `[redacted]` in addition to their lengths.
+
+The canonical `[session request cluster backend]` prefix is the explicit
+correlation envelope and is not a generic object dump: its cluster/backend
+slots remain lossless so operators can join lines for one request. The same
+identifiers must still be bounded when they appear inside `Debug` output,
+retained task/state dumps, error text, or ad-hoc message fields. This exception
+is limited to the named correlation slots; it does not permit raw authority,
+path, method, SNI, ALPN, certificate SAN, or request payload fields in the
+verbose `Session(...)` body.
+
+Apply the boundary at every layer that can reach a log sink:
+
+- Generated protobuf types that carry sensitive fields are listed in
+  `command/build.rs` via `prost_build::Config::skip_debug`; their bounded
+  implementations live in `command/src/proto/mod.rs`. The top-level
+  `Request` and its `RequestType` enum render only the exhaustive request kind,
+  so string-valued verbs remain bounded both directly and inside
+  `WorkerRequest`.
+- Configuration, response, retained-state, gatherer, router, listener, and TLS
+  wrappers must summarize their own collections and string-keyed maps rather
+  than relying on an enclosing type to hide them. `TaskContainer` renders only
+  the concrete task kind and timeout presence; it never delegates to a retained
+  `GatheringTask`'s `Debug` implementation.
+- Direct `debug!`, `info!`, `warn!`, `error!`, and failure-message projections
+  must interpolate the same counts, kinds, addresses, and byte lengths. A safe
+  `Debug` implementation does not protect a log statement that formats a raw
+  field directly. TLS preread/handshake and mux routing logs therefore render
+  cluster/authority/SNI/ALPN/SAN counts, match kinds, and aggregate byte lengths
+  rather than individual values.
+- Error and poisoned-lock paths follow the same rule; exceptional control flow
+  is not permission to disclose the rejected value or the retained object.
+
+This is deliberately a logging-only boundary. Protobuf wire encoding,
+Serde/JSON output, retained-state keys, certificate-query response payloads,
+and the raw fields stored in `StateError`, `RouterError`, and
+`RetrieveClusterError::SniAuthorityMismatch` remain unchanged. These error
+types bound only `Display`/`Debug`; callers matching their public variants
+still receive the complete identifiers, frontend keys, rejection reasons,
+hosts, paths, methods, SNI values, and authorities.
+`RequestHttpFrontend::Display`, which is used as an operational/state key, also
+remains lossless. Callers that are explicitly authorized to retrieve these
+values continue to receive them; generic diagnostics do not.
+
+Regression tests use a distinct long sentinel for every protected field and
+assert all three parts of the contract: the sentinel is absent, the expected
+count/length metadata is present, and output stays within a fixed size bound.
+Coverage must include the leaf `Debug` implementation, generic/nested command
+wrappers, retained state or tasks, direct log statements, and runtime TLS and
+error paths as applicable.
+
+### Per-flood-detector helper macro pattern
+
+When a violation funnel (`H2FloodViolation`, `RustlsError`, `H2Error`) needs a
+`&'static str` metric key per variant, define a `concat!`-based macro:
+
+```rust
+macro_rules! h2_error_metric_key {
+    ($prefix:literal, $error:expr) => {
+        match $error {
+            H2Error::NoError => concat!($prefix, ".no_error"),
+            H2Error::ProtocolError => concat!($prefix, ".protocol_error"),
+            // …14 arms, exhaustive — adding a new H2Error variant fails the build here
+        }
+    };
+}
+```
+
+Then wrap with one helper per direction:
+
+```rust
+fn metric_for_goaway_sent(error: H2Error) -> &'static str {
+    h2_error_metric_key!("h2.goaway.sent", error)
+}
+```
+
+This keeps the breakdown in lock-step with the underlying enum (the build
+breaks on a new variant) while preserving `&'static str` semantics.
+
+## Access logs
+
+Schema lives in `command/src/logging/access_logs.rs::RequestRecord` with the
+protobuf wire shape in `command/src/command.proto::ProtobufAccessLog`. Adding
+a field requires:
+
+1. Field on `RequestRecord<'a>` (Rust struct, `lib/src/protocol/...` populates).
+2. Field on `ProtobufAccessLog` (proto, append a new optional tag — never
+   reuse or reorder existing tags).
+3. Populate at every emit site:
+   - H1 and H2 mux: `lib/src/protocol/mux/stream.rs::generate_access_log`
+   - TCP: `lib/src/tcp.rs::log_request`
+   - WS / WSS post-upgrade pipe: `lib/src/protocol/pipe.rs::log_request`
+4. Update `RequestRecord::duplicate()` in `access_logs.rs` so the protobuf
+   path serialises the new field.
+5. Document the field in [`configure.md`](configure.md) §OpenTelemetry / §TLS
+   handshake metadata.
+
+The TLS metadata fields (`tls_version`, `tls_cipher`, `tls_sni`, `tls_alpn`)
+are sourced from the rustls handshake context in `lib/src/https.rs` and
+plumbed via `mux::Context` into `HttpContext`. The pipe path picks them up
+via `Pipe::set_tls_metadata` called from `https.rs::upgrade_mux`.
+
+### The cost of one access-log line
+
+An ASCII access-log line costs **no heap allocation in steady state**, on
+every target. Every `RequestRecord` field is a borrow, `file://` and `stdout`
+format straight into their own line buffer, and the socket targets format into
+the one `LoggerBuffer` the logger reuses for every record. What is left to keep
+free is the rendering of the fields themselves, and each one that used to
+build a `String` now writes into the formatter
+(`command/src/logging/display.rs`):
+
+| Field | Rendered by | Replaced |
+|---|---|---|
+| client and backend socket addresses | `LogAddress` | `AsString::as_string_or`, two allocations per address |
+| session and request ULIDs of the `[…]` context | `write_ulid`, a Crockford encoder on a 26-byte stack array | `rusty_ulid`'s `Display`, which is `f.write_str(&self.to_string())` |
+| user agent | `EscapedUserAgent`, which writes the spans between the replaced bytes | three chained `str::replace`, one `String` each |
+| HTTP status, colored or not | `write_status` | a `String` built by `display_status` |
+
+The output is unchanged byte for byte. The user agent still rewrites only a
+space to `_`, `[` to `{` and `]` to `}`; control bytes, quotes, other
+whitespace and non-ASCII pass through as before. Because `LogContext` renders
+through the same encoder, every main-log line that carries a
+`[session req cluster backend]` context saves its ULID allocations too.
+
+Two tests in `command/tests/access_log_allocations.rs` hold the contract under
+a counting global allocator: `a_file_access_log_line_does_not_allocate` and
+`a_udp_access_log_line_does_not_allocate` emit a record that exercises every
+field above and require 64 lines after warm-up to allocate nothing. The two
+targets are the two rendering paths, the `MultiLineWriter` and the reused
+buffer. Before this change each line allocated 10 times. On a release worker
+serving 20 sequential HTTP/1.1 requests to a `file://` target, the worker's
+`malloc` plus `realloc` count fell from 83.8 to 73.7 per request, and the
+backtraces of the remaining allocations no longer name the logging module.
+
+A new rendered field must follow the same rule: pass a value whose `Display`
+writes into the formatter, never `to_string()`, `format!` or
+`AsString::as_string_or` in the argument list of `InnerLogger::log_access`.
+The protobuf format (`access_logs_format = "protobuf"`) is a separate path,
+`RequestRecord::into_binary_access_log`, and these tests do not measure it.
+Each protobuf record is framed by `encode_protobuf_access_log`
+(`command/src/logging/logs.rs`): the prost length delimiter, the record, then
+two zero bytes. A `tcp://` target receives the frame through
+`write_stream_record`, which uses `write_all`: a stream may accept only a
+prefix, and a discarded count would truncate the record and shift every record
+after it ([#1830](https://github.com/sozu-proxy/sozu/issues/1830),
+`short_writes_keep_consecutive_protobuf_records_framed`).
+
+### Where a frontend's `--tags` come from
+
+On HTTP and HTTPS listeners the access-log `tags` field is resolved **through
+the router**, not by a hostname lookup. `Router::add_http_front_with_hsts_origin`
+(`lib/src/router/mod.rs`) treats a frontend's `tags` as a policy field, so a
+tagged frontend is stored as `Route::Frontend(Rc<Frontend>)` carrying
+`Rc<CachedTags>`; `Router::lookup` returns them on `RouteResult.tags`;
+`Router::route_from_request` (`lib/src/protocol/mux/router.rs`) stashes them on
+`HttpContext.tags` before any of its early returns, so a redirect, a 401 and a
+backend-connect failure log them too; and
+`Stream::generate_access_log` (`lib/src/protocol/mux/stream.rs`) reads them from
+there.
+
+This is what makes a frontend whose hostname is not an exact literal log its
+tags at all. The matched frontend rule is the only correct owner: the operator
+configures tags per rule (`*.example.com`, `/foo.*/.example.com`, a `Pre`/`Post`
+string) while a request only ever carries a concrete authority, so no string key
+can be spelled the same on both sides.
+
+Two paths still use the older `ListenerHandler::get_tags` key lookup against the
+listener's `BTreeMap<String, CachedTags>`:
+
+- a request that **never reached routing** (malformed request, unknown host, TLS
+  SNI / `:authority` mismatch) falls back to an exact-authority lookup — there is
+  no matched frontend to ask, and an exact-literal frontend still answers;
+- the **WS / WSS post-upgrade pipe** (`lib/src/protocol/pipe.rs::log_request`)
+  looks up `Pipe::set_tags_key`, which only the TCP SNI-preread path sets. On an
+  HTTP/HTTPS listener it falls back to the listener address, which is never a
+  hostname key, so a WebSocket access-log line carries no frontend tags on any
+  frontend shape. Tracked separately from the routed-request resolution.
+
+The TCP proxy resolves its own tags with a structured key built by the same
+function on both sides (`sni_tags_key` in `lib/src/tcp.rs`); UDP keys by the
+frontend address on both sides. Neither has the L7 spelling asymmetry.
+
+### The request line of a rejected HTTP/1.1 request
+
+An HTTP/1.1 request answered `400` because its parse was rejected — kawa
+refused a header or the framing, or Sōzu's own CL.TE guard in
+`HttpContext::on_request_headers` refused it — still logs the parts of its
+request line that were parsed. The line format is unchanged; the method, path
+and authority columns stop reading `-` where the request supplied them:
+
+| Rejected request | Logged `authority method path` |
+|---|---|
+| `GET /diag?x=1 HTTP/1.1`, then an invalid header | `- GET /diag?x=1` |
+| `GET http://example.com:8080/abs HTTP/1.1`, then an invalid header | `example.com:8080 GET /abs` |
+| CL.TE rejection of `POST /upload` with `Host: example.com` | `example.com POST /upload` |
+| an invalid request line | `- - -` |
+
+The authority of an origin-form request is **not** taken from a `Host` header
+when a header was refused: whether the `Host` line was reached before the bad
+one is the client's choice, and it was never validated. Only an authority the
+request line itself carries (absolute-form, `CONNECT`) is logged. A CL.TE
+rejection logs the authority kawa resolved, since every header parsed.
+
+The line is emitted by `Stream::generate_access_log`
+(`lib/src/protocol/mux/stream.rs`) once the `400` is written, with message
+`H1::Complete` at `INFO` level: a parse rejection increments
+`http.frontend_parse_errors`, not `http.errors`. The request line is borrowed
+from the front buffer (`rejected_request_line` in the same file), so this adds
+no allocation to the access-log path. HTTP/2 has its own subsection below.
+
+### The request line of a rejected HTTP/2 request
+
+An HTTP/2 request whose field block is refused — a missing, repeated or empty
+pseudo-header, a connection-specific or uppercase field, a `host` field that
+disagrees with `:authority` — is reset with `RST_STREAM(PROTOCOL_ERROR)`. Its
+access-log line keeps the pseudo-headers decoded before the refusal:
+
+| Refused request | Logged `authority method path` |
+|---|---|
+| a `connection:` or an uppercase field after the four pseudo-headers | `example.com GET /diag` |
+| `:path` missing or empty | `example.com GET -` |
+| a second `:method` | `example.com GET /diag` (the first value) |
+| a second `:authority`, or a `host` field that disagrees with it | `- GET /diag` |
+| a control byte in `:path` | `example.com GET -` |
+
+The decode stops at the first refused field, so a pseudo-header sent after it
+is never stored and is logged `-`. `:authority` is logged only when it was
+validated: refused, repeated, or disputed by a `host` field, it is `-`, and a
+`host` field is never logged in its place, for the reason the HTTP/1.1 path
+never reads `Host`. No value can carry a control byte into the line, although
+the formatter escapes nothing: a pseudo value holding one (and a `:method` that
+is not a token) is refused before it is stored, so it is logged `-`.
+
+The values are the pseudo-header slices already written into the stream's
+front buffer, borrowed, so this adds no allocation either:
+`record_rejected_request` (`lib/src/protocol/mux/pkawa.rs`) keeps them as a
+`Version::V20` request line and marks the front in error, and
+`rejected_request_line` reads them back.
+
+The line is still emitted when the session closes, with message
+`session close` at `ERROR` level, not when the stream is reset:
+`ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs`) only logs a stream
+that reached routing, and a refused one never did. Its timings therefore run to
+the end of the connection. A refusal that closes the whole connection with
+`GOAWAY` (an HPACK decoding error) logs no line at all.
+
+### When the RTT cells are sampled
+
+`client_rtt` and `server_rtt` are the kernel's smoothed round-trip time of the
+frontend and backend socket, read with `getsockopt(TCP_INFO)`. They feed the
+access log and nothing else: no metric, histogram or load-balancing cost reads
+`TCP_INFO` (`PeakEWMA` is fed from the connect time, `lib/src/backends.rs`), so
+no periodic sampling cadence exists and none is needed. Each connection is read
+once, at its first access log, and the value is reused for every later line of
+that connection:
+
+- **H1 and H2**: `client_rtt` is the frontend connection's sample, taken at the
+  first request it logs; `server_rtt` is the backend connection's sample, taken
+  at the first response logged through it, and kept across keep-alive pool
+  reuse. Every line of one connection carries the same value in each cell. A
+  connection that logs nothing reads nothing.
+- **Pipe (WebSocket) and TCP**: one access log per session, at its end, which
+  reads both sides once.
+- **`Mux::close`** asks for the frontend's sample only if it finds a stream that
+  still owes its access log.
+
+Before issue #1590 the H2 frontend was sampled at the top of every pass whether
+or not the pass logged, and `Mux::close` sampled unconditionally: 7.85
+`TCP_INFO` reads per H2 request and 2.80 per H1 request, against at most the
+two each log line prints; after it, 1.85 for both (release build, 20 requests,
+the counts in `doc/h2_mux_internals.md`). The per-connection sample then took a
+keep-alive connection from two reads per request to two per connection. The
+operator-facing contract is in [`configure.md`](configure.md) §"When each cell
+is measured".
+
+## Tracing — current state
+
+**This is W3C `traceparent` passthrough only.** No span lifecycle, no OTLP
+exporter, no SDK dependency. Behind the `opentelemetry` compile-time
+feature flag:
+
+- `traceparent` is parsed in `lib/src/protocol/kawa_h1/editor.rs::on_request_headers`
+  (the same callback runs on H1 and on H2 frames decoded via `pkawa.rs`).
+- A new span ID is generated per Sōzu hop; the value is rewritten on the
+  outgoing request and stored on `HttpContext.otel`.
+- Access logs surface `trace_id`, `span_id`, `parent_span_id`.
+- Access logs include `start_time` (proto field 30, `Uint128`, nanoseconds
+  since epoch) — a wall-clock timestamp captured at the start of the request
+  via `SessionMetrics::mark_request_start()`. Consumers reconstructing OTel
+  spans should prefer this field over `time - request_time`, which mixes
+  `CLOCK_REALTIME` and `CLOCK_MONOTONIC` and produces unreliable start
+  timestamps on short-lived requests.
+
+To go further (real spans, OTLP exporter, B3/Datadog propagation), see the
+"Out of scope" section in [`configure.md`](configure.md). It would land
+behind a new feature flag rather than expanding the scope of `opentelemetry`.
+
+## Control-plane audit trail
+
+Every privileged mutation on the unix command socket (`AddCluster`,
+`RemoveCertificate`, `ActivateListener`, …) goes through three observability
+surfaces:
+
+1. An `Event` of the matching `EventKind` is published on the
+   `SubscribeEvents` bus. The 14 mutation variants are enumerated in
+   `command/src/command.proto::EventKind`.
+2. An `incr!("config.<verb>")` counter is bumped (e.g.
+   `config.cluster_added`).
+3. A structured audit log line is emitted at `info!` level in the MUX-family
+   layout (keyword `Command(...)` rather than `Session(...)`, which names a
+   data-plane session). Every free-form field (`target`, `actor_comm`,
+   `actor_user`, `socket`, `reason`) is sanitized at render time — control
+   chars (`\x00..=\x1f`, `\x7f`) are replaced with `?` so attacker-influenced
+   input cannot forge additional audit lines via embedded `\t` / `\n` /
+   ANSI escapes. Rendered form (ANSI colours off):
+
+   ```
+   [01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Command(verb=cluster_added, actor_uid=1000, actor_gid=1000, actor_pid=12345, actor_user=florentin, actor_comm=sozu, client_id=42, socket=/run/sozu/sozu.sock, target=cluster:my_app, result=ok, sozu_version=1.1.1)
+   ```
+
+   ### Field reference
+
+   **Mandatory fields** (always present):
+
+   - `verb` — stable static identifier for the audited operation (e.g.
+     `cluster_added`, `state_loaded`, `listener_updated`). One `config.<verb>`
+     statsd counter per verb.
+   - `actor_uid` / `actor_gid` / `actor_pid` — peer credentials from
+     `SO_PEERCRED` on the unix command socket. `unknown` on read failure
+     / non-Linux builds.
+   - `actor_user` — resolved POSIX account name (`getpwuid_r(uid)` at
+     accept time). `unknown` when NSS has no match for the UID.
+   - `actor_comm` — `/proc/<pid>/comm` at accept time (up to 15 chars), lets
+     SOC distinguish the `sozu` binary running with the `command` sub-command
+     from ad-hoc shells that share a UID.
+   - `client_id` — per-accept monotonic counter. Distinct from the
+     `session_ulid` bracket slot, which survives as a grep-correlation key
+     across every verb a single sozu CLI invocation emits.
+   - `socket` — path of the command socket the client connected through.
+     Lets multi-instance sozu deployments that share a SIEM sink pick
+     which instance emitted each line.
+   - `target` — free-form verb-specific descriptor (e.g.
+     `cluster:my-cluster`, `file:/var/lib/sozu/state.bin`, `stop:hard`,
+     `listener:http:127.0.0.1:8080`). For `UpdateHttp/Https/TcpListener`,
+     each patched field is rendered as `field=old→new`. For
+     `ReplaceCertificate`, both old and new cert fingerprints are included
+     (`certificate:<addr>:old=<fp>:new=<fp>`). Sanitized.
+   - `result` — `ok` or `err`.
+   - `sozu_version` — `CARGO_PKG_VERSION` at build time. Forensic pin for
+     mixed-fleet audit streams.
+
+   **Optional fields** (appear when relevant):
+
+   - `error_code` — structured failure bucket: `dispatch_error`,
+     `worker_failure`, `worker_timeout`, `peer_cred_unavailable`,
+     `invalid_input`, `io_error`, `other`. Present when `result=err`.
+   - `reason` — truncated human-readable failure detail (max 256 chars,
+     sanitized). Pairs with `error_code`.
+   - `elapsed_ms` — wall-clock time between request acceptance and audit
+     emission. Set on completion-time lines.
+   - `fanout` — worker fan-out outcome: `ok`, `partial`, `timeout`, or
+     `local_only`. Set on completion-time lines for verbs that scatter to
+     workers.
+   - `workers` — `<ok>/<err>/<expected>` per-worker counts. Pairs with
+     `fanout`.
+   - `request_sha256` — truncated (64-bit, 16 hex chars) SHA-256 of the
+     proto `Request` wire-encoding. Set for verbs that flow through
+     `worker_request`. Useful for dedupe / replay detection.
+
+   ### Dedicated sink: `audit_logs_target`
+
+   Operators can route audit lines to a dedicated file (distinct from
+   `log_target`) via the `audit_logs_target` config option. Set to a plain
+   filesystem path (e.g. `/var/log/sozu/audit.log`) to have every audit line
+   also appended there. The file opens `O_APPEND | O_CREAT` with mode
+   `0o640` (owner read+write, group read), so granting an `audit` group
+   tail-only access is one filesystem ACL away. ANSI escape sequences are
+   stripped before writing to the dedicated sink so the file stays
+   SIEM-parseable even when `log_colored = true`. Write failures log a
+   warning but never block the mutation. `None` (default) keeps audit
+   lines routed only through `log_target`.
+
+   ### JSON sink: `audit_logs_json_target`
+
+   For SIEM pipelines that prefer not to parse the human-readable line,
+   `audit_logs_json_target` writes a structured JSON object per line to a
+   dedicated file. Same `O_APPEND | O_CREAT | 0o640` semantics. Schema is
+   stable; every key is always present, missing values are JSON `null`:
+
+   ```json
+   {
+     "ts": "2026-04-23T13:14:15.123456Z",
+     "boot_generation": 0,
+     "session_ulid": "01HXS4GZ9EYP3F2R7K8M6B4N2C",
+     "request_ulid": "01HXS4H5K2QR9C7PVWXY8T6ZNA",
+     "actor": {
+       "uid": 1000, "gid": 1000, "pid": 12345,
+       "user": "florentin", "comm": "sozu", "role": "user"
+     },
+     "client_id": 42,
+     "connect_ts": "2026-04-23T13:14:14.500000Z",
+     "socket": "/run/sozu/sozu.sock",
+     "verb": "cluster_added",
+     "target": "cluster:my_app",
+     "result": "ok",
+     "cluster_id": "my_app",
+     "backend_id": null,
+     "sozu_version": "1.1.1",
+     "build_git_sha": "9a1b2c3d4e5f",
+     "extras": {
+       "elapsed_ms": 17,
+       "fanout": {"status": "ok", "workers_ok": 2, "workers_err": 0, "workers_expected": 2},
+       "request_sha256": "0123456789abcdef"
+     }
+   }
+   ```
+
+   Both sinks are independent — set both for an operator-friendly tail
+   stream + a machine-parseable archive.
+
+   ### Retention policy
+
+   PCI-DSS 10.7 requires audit trails to be **retained ≥ 1 year**, with
+   the most recent **3 months immediately available** for analysis. ISO
+   27001 A.8.15 recommends similar but defers to organisational policy.
+
+   `audit_logs_target` and `audit_logs_json_target` are append-only files
+   under your operator's logrotate / archival pipeline — the recommended
+   shape on Clever Cloud Linux deployments is:
+
+   - `/etc/logrotate.d/sozu` rotates `/var/log/sozu/audit*.{log,jsonl}`
+     **daily**, compresses with `xz` after 1 day, archives off-host
+     after 90 days.
+   - Off-host archive bucket retains for **400 days** to clear the
+     PCI-DSS 1-year window with cushion.
+   - Restrict on-host read access via `setfacl -m g:audit:r-x
+     /var/log/sozu/`; only the `audit` group should be able to tail the
+     live file.
+   - The `Server.boot_generation` field stamped on every line lets log
+     analysers stitch sessions across hot-upgrade re-execs without
+     trusting PIDs.
+
+   Sōzu does **not** rotate or compress audit files itself — that is
+   delegated to the OS-level rotator. Operators who want native rotation
+   should use `logrotate` with the `copytruncate` directive (since sōzu
+   keeps the file handle open) or send `SIGHUP` after rename to trigger
+   a re-open (not yet implemented — TODO).
+
+   ### Two lines per worker-fanning verb
+
+   Verbs that fan out to every worker (AddCluster, RemoveHttpFrontend,
+   UpdateHttpsListener, AddCertificate, …) emit **two** audit lines:
+
+   - **Attempt-time**: `result=ok` means "accepted by the main process
+     state". Fires immediately after `state.dispatch` succeeds. No fanout /
+     elapsed_ms.
+   - **Completion-time**: emitted when every worker has responded (or the
+     scatter deadline fires). Carries `fanout=ok|partial|timeout`,
+     `workers=<ok>/<err>/<expected>`, `elapsed_ms`, and — on `result=err`
+     — `error_code` + `reason`.
+
+   Operators correlate the two via the shared `[session_ulid request_ulid …]`
+   bracket.
+
+   ### Local-only verbs
+
+   Verbs that don't fan out — `SoftStop`/`HardStop` request,
+   `LoggingLevelChanged`, `UpgradeMain` / `UpgradeWorker` init,
+   `SubscribeEvents`, `SaveState`, and `LoadState` completion — emit a
+   single audit line carrying `result` and (when applicable)
+   `error_code` + `reason`. `LoadState` and `SaveState` embed
+   `ok:<n> errors:<n>` counts in `target=file:<path>`; `LoadState` adds
+   `reverted:<n>`, the number of replayed entries no worker acknowledged
+   that were rolled back out of the main-process state (sozu#1313), and
+   carries `error_code=worker_timeout` when the replay hit its bounded
+   deadline, `worker_failure` when workers rejected entries.
+
+   Bracket slots follow the `[session_ulid request_ulid cluster_id|- backend_id|-]`
+   convention shared with `MUX` / `MUX-ROUTER` / `RUSTLS` / `PIPE` / `TCP` lines.
+
+The `actor_uid` is captured at unix-socket accept time via `SO_PEERCRED`
+(`bin/src/command/server.rs`, stored on `ClientSession.actor_uid`). Failed
+syscalls or non-Linux builds collapse to `actor_uid=unknown` rather than
+panicking. This satisfies PCI-DSS 10.2 / ISO 27001 A.8.15 / SOC 2 audit-trail
+requirements without an external audit shim.
+
+To add a new audited verb:
+
+1. Add the `EventKind` variant to the proto (preserve existing tags).
+2. Update `Display for Event` in `command/src/proto/display.rs`.
+3. In the `bin/src/command/requests.rs` handler:
+   - Push the `Event` to the bus (find an existing `EventKind::CLUSTER_ADDED`
+     emit site to copy from).
+   - Emit `incr!("config.<verb>")`.
+   - Emit the audit line via the `audit_log_context!` macro in
+     `bin/src/command/requests.rs` — it renders the verb into the MUX
+     `Session(verb=..., actor_uid=..., client_id=..., target=..., result=...)`
+     block automatically.
+
+## Extension checklist
+
+Before merging an instrumentation change:
+
+- [ ] Metric keys are `&'static str` (compile-time literal or `LazyLock`-leaked).
+- [ ] Per-direction / per-error / per-frame breakdowns use a `concat!`-based
+  helper macro so the build breaks on a new enum variant.
+- [ ] Cardinality is bounded — either no labels, or labels from a fixed-size
+  table, or hashed into a bucket of known size.
+- [ ] Gauges that are emitted from more than one site use `gauge_add!`
+  (lifecycle delta) and pair every `+N` with a `-N` on the close path.
+  Consider `impl Drop` for symmetric teardown.
+- [ ] New protocol modules define their own `log_context!` /
+  `log_module_context!` with a unique prefix tag.
+- [ ] Types and direct log sites reachable from sensitive command, state,
+  routing, or TLS data expose only bounded counts/lengths/kinds/addresses, with
+  sentinel-absence and fixed-output-bound regression tests.
+- [ ] New access-log fields land on `RequestRecord`, `ProtobufAccessLog`
+  (new tag), all four emit sites, and `RequestRecord::duplicate()`.
+- [ ] [`configure.md`](configure.md) is updated in the same changeset.
+- [ ] Privileged control-plane verbs land an `EventKind` + `config.<verb>`
+  counter + audit log line (MUX `Session(...)` layout, `info!` level,
+  routed via the `audit_log_context!` macro).
+
+## See also
+
+- [`configure.md`](configure.md) — full inventory of currently emitted
+  metrics, access-log fields, OpenTelemetry passthrough config.
+- [`h2_mux_internals.md`](h2_mux_internals.md) — H2 mux state machine and
+  flood-detector design.
+- [`lib/src/protocol/mux/LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md)
+  — stream/slot lifecycle with `file.rs:LINE` citations.
+- [`CLAUDE.md`](../CLAUDE.md) — agent conventions including log macro
+  discipline, metric macros list, and security-sensitive areas.

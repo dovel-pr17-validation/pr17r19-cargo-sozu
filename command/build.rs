@@ -1,0 +1,159 @@
+pub fn main() {
+    prost_build::Config::new()
+        .btree_map(["."])
+        .type_attribute(".", "#[derive(::serde::Serialize, ::serde::Deserialize)]")
+        .message_attribute(".", "#[derive(Ord, PartialOrd)]")
+        .message_attribute("Request", "#[derive(Eq)]")
+        .message_attribute("RequestHttpFrontend", "#[derive(Hash, Eq)]")
+        .message_attribute("RequestTcpFrontend", "#[derive(Hash, Eq)]")
+        .message_attribute("RequestUdpFrontend", "#[derive(Hash, Eq)]")
+        .message_attribute("CertificatesByAddress", "#[derive(Hash, Eq)]")
+        .message_attribute("ResponseContent", "#[derive(Hash, Eq)]")
+        .message_attribute("WorkerInfos", "#[derive(Hash, Eq)]")
+        .message_attribute("AggregatedMetrics", "#[derive(Hash, Eq)]")
+        .message_attribute("WorkerResponses", "#[derive(Hash, Eq)]")
+        .message_attribute("ListedFrontends", "#[derive(Hash, Eq)]")
+        .message_attribute("ClusterInformation", "#[derive(Hash, Eq)]")
+        .message_attribute("ClusterInformations", "#[derive(Hash, Eq)]")
+        .message_attribute("ClusterHashes", "#[derive(Hash, Eq)]")
+        .message_attribute("ListenersList", "#[derive(Hash, Eq)]")
+        .message_attribute("WorkerMetrics", "#[derive(Hash, Eq)]")
+        .message_attribute("ListOfCertificatesByAddress", "#[derive(Hash, Eq)]")
+        .message_attribute("CertificatesWithFingerprints", "#[derive(Hash, Eq)]")
+        .message_attribute("RequestCounts", "#[derive(Hash, Eq)]")
+        .message_attribute("HealthChecksList", "#[derive(Hash, Eq)]")
+        .message_attribute("FilteredMetrics", "#[derive(Hash, Eq)]")
+        .message_attribute("ClusterMetrics", "#[derive(Hash, Eq)]")
+        .message_attribute("BackendMetrics", "#[derive(Hash, Eq)]")
+        .message_attribute("FilteredHistogram", "#[derive(Hash, Eq)]")
+        .message_attribute("WorkerRequest", "#[derive(Hash, Eq)]")
+        .message_attribute("WorkerResponse", "#[derive(Hash, Eq)]")
+        .message_attribute("Request", "#[derive(Hash)]")
+        .message_attribute("Response", "#[derive(Hash, Eq)]")
+        .message_attribute("InitialState", "#[derive(Hash, Eq)]")
+        .message_attribute("ProtobufAccessLog", "#[derive(Hash, Eq)]")
+        // The messages below carry at least one `map<string, string>` field
+        // (`tags`, `answers`) or a nested `Header` value. prost stops
+        // auto-deriving `Hash`/`Eq` once a map appears, and downstream code
+        // (state-diff hashing, IPC framing, request fan-out) needs both
+        // traits, so re-attach them explicitly here.
+        .message_attribute("Cluster", "#[derive(Hash, Eq)]")
+        .message_attribute("HttpListenerConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("HttpsListenerConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("UpdateHttpListenerConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("UpdateHttpsListenerConfig", "#[derive(Hash, Eq)]")
+        // Re-attach Hash/Eq for the `sozu top` runtime cardinality lease
+        // status message: it carries `map<string, WorkerMetricDetailStatus>`,
+        // which strips prost's auto-derive. Without this the
+        // `Request.request_type` and `ResponseContent.content_type` oneofs
+        // can't derive their own Hash/Eq either.
+        .message_attribute("MetricDetailStatus", "#[derive(Hash, Eq)]")
+        // `HealthCheckConfig.accepted_statuses` is a repeated message field,
+        // which also strips the auto-derive from the config and from the
+        // `SetHealthCheck` request that carries it.
+        .message_attribute("HealthCheckConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("SetHealthCheck", "#[derive(Hash, Eq)]")
+        .message_attribute("SetProtectedHealthCheck", "#[derive(Hash, Eq)]")
+        .message_attribute("ProtectedHealthCheckOrder", "#[derive(Hash, Eq)]")
+        // JSON state-file forward compat: `SaveState`/`LoadState` files are
+        // JSON-encoded `WorkerRequest` records. Without `#[serde(default)]`,
+        // serde rejects records that don't carry every `Vec`/`map` field — so
+        // a payload written by an older `sozu-command-lib` (e.g. 1.1.1) fails
+        // to deserialize once a new `repeated`/`map` field lands on a message
+        // that older clients still emit. The annotations below mirror the
+        // protobuf wire-format default (empty repeated, empty map) for the
+        // post-1.1.1 additions on every state-file-emittable message.
+        // Required scalars stay strict on purpose: `add_cluster` keys the
+        // cluster map by `cluster_id` without a non-empty check, so a
+        // struct-level blanket would silently insert a bogus `""`-keyed
+        // entry. Whenever a new `repeated`/`map` field is added to a message
+        // that appears in `ConfigState::generate_requests` (or in any
+        // `RequestType` an external client builds and feeds through
+        // `LoadState`), append the matching `field_attribute` line here.
+        // Regression guard: `command/tests/state_compat_v1_1_1.rs`.
+        .field_attribute("Cluster.answers", "#[serde(default)]")
+        .field_attribute("Cluster.authorized_hashes", "#[serde(default)]")
+        .field_attribute("RequestHttpFrontend.headers", "#[serde(default)]")
+        .field_attribute("RequestHttpFrontend.header_predicates", "#[serde(default)]")
+        .field_attribute("HttpListenerConfig.answers", "#[serde(default)]")
+        .field_attribute("HttpsListenerConfig.alpn_protocols", "#[serde(default)]")
+        .field_attribute("HttpsListenerConfig.answers", "#[serde(default)]")
+        .field_attribute("TcpListenerConfig.answers", "#[serde(default)]")
+        .field_attribute("RequestUdpFrontend.tags", "#[serde(default)]")
+        .field_attribute("RequestTcpFrontend.alpn", "#[serde(default)]")
+        .field_attribute("HealthCheckConfig.accepted_statuses", "#[serde(default)]")
+        .field_attribute("HealthCheckConfig.headers", "#[serde(default)]")
+        // The ingress carrier holds a secret, and prost's generated decode
+        // replaces a populated `bytes` field with `clear`, `reserve`, `put`: a
+        // reallocation frees the old buffer before any `Drop` can wipe it.
+        // `crate::secret::HealthCheckHeaderValue` is hand-written with a
+        // `Message` impl that wipes first; it is the same wire message (same
+        // tags, same types) and is re-exported at the generated path. Its
+        // serde, `Debug` and derives live there, not in generated attributes.
+        .extern_path(
+            ".command.HealthCheckHeaderValue",
+            "crate::secret::HealthCheckHeaderValue",
+        )
+        // `mode` is a required scalar added after the state format shipped:
+        // a record written before it carries no `mode`, which must load as
+        // `HTTP` (0), the only probe those records could describe.
+        .field_attribute("HealthCheckConfig.mode", "#[serde(default)]")
+        .field_attribute(
+            "HttpsListenerConfig.client_ca_certificates",
+            "#[serde(default)]",
+        )
+        .field_attribute("HttpsListenerConfig.client_ca_crls", "#[serde(default)]")
+        .field_attribute(
+            "ClientAuthPolicy.client_ca_certificates",
+            "#[serde(default)]",
+        )
+        .field_attribute("ClientAuthPolicy.client_ca_crls", "#[serde(default)]")
+        .skip_debug([
+            "CertificateAndKey",
+            "CertificateSummary",
+            "CertificatesByAddress",
+            "CertificatesWithFingerprints",
+            "Cluster",
+            "Header",
+            "HeaderPredicate",
+            "HealthCheckHeader",
+            "RequestHttpFrontend",
+            "HttpListenerConfig",
+            "HttpsListenerConfig",
+            "ListOfCertificatesByAddress",
+            "QueryCertificatesFilters",
+            "RemoveCertificate",
+            "ReplaceCertificate",
+            "Request",
+            "RequestTcpFrontend",
+            "ResponseContent",
+            "UpdateHttpListenerConfig",
+            "UpdateHttpsListenerConfig",
+            "ClientAuthPolicy",
+            "WorkerRequest",
+            "WorkerResponse",
+            "WorkerResponses",
+        ])
+        .enum_attribute(".", "#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]")
+        .enum_attribute(
+            "ResponseContent.content_type",
+            "#[derive(Hash, Eq, Ord, PartialOrd)]",
+        )
+        .enum_attribute(
+            "FilteredMetrics.inner",
+            "#[derive(Hash, Eq, Ord, PartialOrd)]",
+        )
+        .enum_attribute("IpAddress.inner", "#[derive(Ord, PartialOrd)]")
+        .enum_attribute("ProtobufEndpoint.inner", "#[derive(Ord, PartialOrd)]")
+        .enum_attribute(
+            "Request.request_type",
+            "#[allow(clippy::large_enum_variant)]",
+        )
+        .enum_attribute(
+            "Request.request_type",
+            "#[derive(Hash, Eq, Ord, PartialOrd)]",
+        )
+        .format(true)
+        .compile_protos(&["command.proto"], &["src"])
+        .expect("Could not compile protobuf types in command.proto");
+}

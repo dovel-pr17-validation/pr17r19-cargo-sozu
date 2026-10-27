@@ -1,0 +1,46 @@
+[package]
+name = "sozu-fuzz"
+version = "2.3.3"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "^0.4.13"
+sozu-lib = { path = "../lib", default-features = false, features = ["crypto-ring"] }
+sozu-command-lib = { path = "../command" }
+
+# Prevent this from joining the workspace
+[workspace]
+
+[[bin]]
+name = "fuzz_frame_parser"
+path = "fuzz_targets/fuzz_frame_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_hpack_decoder"
+path = "fuzz_targets/fuzz_hpack_decoder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_hpack_roundtrip"
+path = "fuzz_targets/fuzz_hpack_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_udp_flow"
+path = "fuzz_targets/fuzz_udp_flow.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tcp_clienthello"
+path = "fuzz_targets/fuzz_tcp_clienthello.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_command_channel"
+path = "fuzz_targets/fuzz_command_channel.rs"
+doc = false

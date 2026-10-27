@@ -1,0 +1,4912 @@
+//! End-to-end correctness tests for fixes identified during Codex review:
+//!
+//! * [`test_h2_end_stream_nonzero_content_length_rejected`]: RFC 9113 §8.1.1 —
+//!   HEADERS with END_STREAM + non-zero Content-Length yields RST_STREAM(PROTOCOL_ERROR).
+//! * [`test_h2_end_stream_zero_content_length_accepted`]: Content-Length: 0 with
+//!   END_STREAM is valid and must be accepted.
+//! * [`test_h2_session_teardown_clean_with_active_backends`]: Multiple in-flight
+//!   streams on multiple backends — abrupt client disconnect produces clean
+//!   shutdown (no panic, no hang) and the worker can soft-stop.
+//! * [`test_h2_idle_stream_timeout_frees_slot`]: A stream held idle past the
+//!   per-stream deadline gets RST_STREAM(CANCEL) and frees its
+//!   MAX_CONCURRENT_STREAMS slot, allowing a new stream to open.
+//! * [`test_h2_active_upload_survives_idle_timeout`]: A POST stream that
+//!   trickles non-empty DATA frames past the idle timeout is NOT cancelled —
+//!   each DATA frame resets the per-stream idle timer.
+//! * [`test_h2_idle_stream_no_data_cancelled`]: A POST stream that sends no
+//!   DATA (only connection-level PINGs) is RST_STREAM(CANCEL)'d after the idle
+//!   timeout, proving the Slowloris guard remains effective.
+//! * [`test_h2_stranded_expect_write_survives_cancellation`]: When a stream is
+//!   cancelled by the per-stream idle timer while the write path is parked on
+//!   that stream's [`expect_write`], opening a new stream recycles the slot and
+//!   may shrink the context streams Vec — the stranded [`expect_write`] must
+//!   not panic on the next `writable()` call — the OOB regression in
+//!   `ConnectionH2::write_streams` (`lib/src/protocol/mux/h2.rs`).
+//! * [`test_h2_stranded_expect_write_peer_rst_survives_cancellation`][] — same
+//!   invariant as above but triggered via **peer-initiated RST_STREAM**; the
+//!   `handle_rst_stream_frame` eviction path must also invalidate any cached
+//!   `expect_write`/`expect_read` referencing the evicted gid.
+
+use std::{
+    io::{Read, Write},
+    net::{Shutdown, SocketAddr},
+    thread,
+    time::{Duration, Instant},
+};
+
+use sozu_command_lib::{
+    config::ListenerBuilder,
+    proto::command::{
+        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, RequestHttpFrontend,
+        SocketAddress, request::RequestType,
+    },
+};
+
+use crate::{
+    mock::{
+        aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend,
+        raw_h2_stall_backend::RawH2StallBackend, sync_backend::Backend as SyncBackend,
+    },
+    sozu::worker::Worker,
+    tests::{State, h2_utils::*, provide_port, repeat_until_error_or, tests::create_local_address},
+};
+
+// ============================================================================
+// Test 1: END_STREAM with non-zero Content-Length → RST_STREAM(PROTOCOL_ERROR)
+// ============================================================================
+
+/// RFC 9113 §8.1.1: A HEADERS frame with END_STREAM set means no DATA frames
+/// follow, so the payload length is 0. If Content-Length declares a non-zero
+/// value, this is a stream error (PROTOCOL_ERROR).
+fn try_h2_end_stream_nonzero_content_length() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-COR-CL-ENDSTREAM", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Build HEADERS with :method GET, :path /, :scheme https, :authority localhost,
+    // content-length: 42, and END_STREAM + END_HEADERS flags.
+    let mut header_block = vec![
+        0x82, // :method GET (indexed)
+        0x84, // :path / (indexed)
+        0x87, // :scheme https (indexed)
+        0x41, 0x09, // :authority, value length 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    // Add content-length: 42 (literal without indexing, new name)
+    header_block.push(0x00);
+    header_block.push(0x0E); // name length 14
+    header_block.extend_from_slice(b"content-length");
+    header_block.push(0x02); // value length 2
+    header_block.extend_from_slice(b"42");
+
+    // END_STREAM + END_HEADERS
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 500, 3, 500);
+    log_frames("END_STREAM + CL:42", &frames);
+
+    // Stream-scope violation (RFC 9113 §8.1.2.6): END_STREAM with non-zero
+    // Content-Length must emit RST_STREAM(PROTOCOL_ERROR) or GOAWAY(PROTOCOL_ERROR)
+    // after the eager-RST fix. Silent close is no longer accepted.
+    let rst_streams = extract_rst_streams(&frames);
+    let has_protocol_error_rst = rst_streams
+        .iter()
+        .any(|(sid, ec)| *sid == 1 && *ec == H2_ERROR_PROTOCOL_ERROR);
+    let has_protocol_error_goaway = contains_goaway_with_error(&frames, H2_ERROR_PROTOCOL_ERROR);
+    let rejected = has_protocol_error_rst || has_protocol_error_goaway;
+
+    println!("END_STREAM + CL:42 - rejected with PROTOCOL_ERROR: {rejected}");
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && rejected {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_end_stream_nonzero_content_length_rejected() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 correctness: END_STREAM + non-zero Content-Length \u{2192} RST_STREAM(PROTOCOL_ERROR)",
+            try_h2_end_stream_nonzero_content_length
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 2: END_STREAM with Content-Length: 0 must be accepted
+// ============================================================================
+
+/// Counterpart to test 1: Content-Length: 0 with END_STREAM is perfectly valid —
+/// the payload length is 0 and the declared length matches. Sozu must accept it
+/// and forward to the backend.
+fn try_h2_end_stream_zero_content_length() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-COR-CL0-OK", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let mut header_block = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    // content-length: 0
+    header_block.push(0x00);
+    header_block.push(0x0E);
+    header_block.extend_from_slice(b"content-length");
+    header_block.push(0x01); // value length 1
+    header_block.push(b'0');
+
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 500, 5, 500);
+    log_frames("END_STREAM + CL:0", &frames);
+
+    // Should NOT get RST_STREAM(PROTOCOL_ERROR) — expect a valid response HEADERS
+    let has_response = frames
+        .iter()
+        .any(|(ft, _, sid, _)| *ft == H2_FRAME_HEADERS && *sid == 1);
+    let has_protocol_error = frames.iter().any(|(ft, _, sid, payload)| {
+        *ft == H2_FRAME_RST_STREAM
+            && *sid == 1
+            && payload.len() >= 4
+            && u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                == H2_ERROR_PROTOCOL_ERROR
+    });
+
+    println!(
+        "END_STREAM + CL:0 - got response: {has_response}, protocol_error: {has_protocol_error}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && has_response && !has_protocol_error {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_end_stream_zero_content_length_accepted() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 correctness: END_STREAM + Content-Length: 0 accepted normally",
+            try_h2_end_stream_zero_content_length
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 3: Abrupt client disconnect with active backend streams
+// ============================================================================
+
+/// When a client abruptly disconnects (TCP RST) while multiple streams are
+/// in-flight across multiple backends, the session teardown must:
+/// - not panic or hang
+/// - properly clean up backend active_requests counters
+/// - allow the worker to soft-stop cleanly
+///
+/// This exercises the fix for backend_streams.clear() ordering in mod.rs close().
+fn try_h2_session_teardown_with_active_backends() -> State {
+    let (mut worker, backends, front_port) = setup_h2_test("H2-COR-TEARDOWN", 2);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Open 3 concurrent streams (all without END_STREAM to keep them in-flight)
+    for stream_id in (1..=5).step_by(2) {
+        let mut header_block = vec![
+            0x83, // :method POST
+            0x84, // :path /
+            0x87, // :scheme https
+            0x41, 0x09, // :authority localhost
+            b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+        ];
+        // content-length: 100 (claim a body that we will never send)
+        header_block.push(0x00);
+        header_block.push(0x0E);
+        header_block.extend_from_slice(b"content-length");
+        header_block.push(0x03); // value length 3
+        header_block.extend_from_slice(b"100");
+
+        let headers = H2Frame::headers(stream_id, header_block, true, false);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    // Wait for sozu to start connecting to backends
+    thread::sleep(Duration::from_millis(500));
+
+    // Abrupt disconnect — drop the TLS stream and immediately close TCP
+    let tcp = tls.get_ref();
+    let _ = tcp.shutdown(Shutdown::Both);
+    drop(tls);
+
+    // Wait a beat for sozu to process the disconnect
+    thread::sleep(Duration::from_millis(500));
+
+    // Verify worker is still alive and can serve new connections
+    let still_alive = verify_sozu_alive(front_port);
+    println!("After abrupt disconnect - sozu alive: {still_alive}");
+
+    // Clean soft-stop (this tests that no counters are stuck preventing shutdown)
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    for mut backend in backends {
+        backend.stop_and_get_aggregator();
+    }
+
+    if still_alive && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_session_teardown_clean_with_active_backends() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: abrupt client disconnect with active backends \u{2014} clean teardown",
+            try_h2_session_teardown_with_active_backends
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 4: Idle stream timeout frees MAX_CONCURRENT_STREAMS slot
+// ============================================================================
+
+/// With h2_stream_idle_timeout_seconds=2, open a stream without sending
+/// END_STREAM, wait for the timeout to fire, then verify that:
+/// (a) the timed-out stream receives RST_STREAM(CANCEL)
+/// (b) a new stream can be opened (slot was freed)
+fn try_h2_idle_stream_timeout_frees_slot() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-IDLE-RECYCLE", config, listeners, state);
+
+    // Use a very short stream idle timeout (2 seconds)
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("pong0".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Open stream 1 as POST without END_STREAM (to keep it idle)
+    let header_block = vec![
+        0x83, // :method POST
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Wait for the idle timeout to fire (2s + margin)
+    thread::sleep(Duration::from_secs(4));
+
+    // Send a PING to tickle the readable path (which runs cancel_timed_out_streams)
+    let ping = H2Frame::ping([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    let _ = tls.write_all(&ping.encode());
+    let _ = tls.flush();
+    thread::sleep(Duration::from_millis(500));
+
+    // Read any pending frames — should contain RST_STREAM(CANCEL) for stream 1
+    let data = read_all_available(&mut tls, Duration::from_millis(1000));
+    let mut all_frames = parse_h2_frames(&data);
+    log_frames("Idle timeout", &all_frames);
+
+    // Now open a new stream — should succeed because the slot was freed
+    let header_block_new = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers_new = H2Frame::headers(3, header_block_new, true, true);
+    let write_ok = tls.write_all(&headers_new.encode()).is_ok() && tls.flush().is_ok();
+    println!("New stream 3 write: {write_ok}");
+
+    let frames_new = collect_response_frames(&mut tls, 500, 5, 500);
+    log_frames("New stream after timeout", &frames_new);
+    // Merge all frames for checking
+    all_frames.extend(frames_new.iter().cloned());
+
+    let cancel_code: u32 = 0x8; // CANCEL
+    let rst_cancel = extract_rst_streams(&all_frames)
+        .iter()
+        .any(|(sid, ec)| *sid == 1 && *ec == cancel_code);
+    println!("Stream 1 got RST_STREAM(CANCEL): {rst_cancel}");
+
+    // Expect a response on stream 3 (HEADERS frame)
+    let got_response = all_frames
+        .iter()
+        .any(|(ft, _, sid, _)| *ft == H2_FRAME_HEADERS && *sid == 3);
+    println!("New stream 3 got response: {got_response}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+    if infra_ok && rst_cancel && got_response {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_idle_stream_timeout_frees_slot() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: idle stream timeout frees MAX_CONCURRENT_STREAMS slot",
+            try_h2_idle_stream_timeout_frees_slot
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Window-stalled response stream is reaped by the flow-control-stall guard
+// ============================================================================
+
+/// With `h2_stream_idle_timeout_seconds = 2` and the client advertising
+/// `SETTINGS_INITIAL_WINDOW_SIZE = 0`, a GET gets its response HEADERS (not
+/// flow-controlled) but the response DATA cannot egress and sits buffered in
+/// sozu's kawa with the send window exhausted. The dedicated flow-control-stall
+/// deadline must arm and RST_STREAM(CANCEL) the stream after the timeout,
+/// freeing its MAX_CONCURRENT_STREAMS slot. (End-to-end coverage that the write
+/// loop *arms* `stream_fc_stalled_since`; the reaper union itself is unit-tested
+/// in `collect_timed_out_streams`.)
+fn try_h2_window_stall_response_reaped() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-WINDOW-STALL", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("window-stall-body".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // Zero stream window: HEADERS flow, response DATA stays window-blocked.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let header_block = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Poll past the 2s deadline, sending a PING each iteration to drive the
+    // readable path (which runs `cancel_timed_out_streams`) — a passive read
+    // never fires the read-path reaper, so the PING is REQUIRED. Polled deadline
+    // instead of a fixed `thread::sleep`, per the "prefer explicit deadlines over
+    // sleep" rule (matches the sibling window-stall tests).
+    let mut rst_cancel = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        let ping = H2Frame::ping([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        let _ = tls.write_all(&ping.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(500));
+        let data = read_all_available(&mut tls, Duration::from_millis(200));
+        let all_frames = parse_h2_frames(&data);
+        if !all_frames.is_empty() {
+            log_frames("Window-stall reaped", &all_frames);
+        }
+        if extract_rst_streams(&all_frames)
+            .iter()
+            .any(|(sid, ec)| *sid == 1 && *ec == 0x8 /* CANCEL */)
+        {
+            rst_cancel = true;
+            break;
+        }
+    }
+    println!("Window-stall stream 1 RST_STREAM(CANCEL): {rst_cancel}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+    if infra_ok && rst_cancel {
+        State::Success
+    } else {
+        println!("Window-stall reaped - FAIL: rst_cancel={rst_cancel} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_stall_response_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: window-stalled response stream reaped (flow-control-stall guard)",
+            try_h2_window_stall_response_reaped
+        ),
+        State::Success
+    );
+}
+
+/// The distinguishing case for the flow-control-stall guard: a peer that
+/// keeps the bidirectional-liveness timer warm with an inbound 1-byte DATA drip
+/// while its response stays window-blocked. The idle guard cannot fire (each
+/// non-empty inbound DATA refreshes `stream_last_activity_at`), so ONLY the
+/// dedicated flow-control-stall deadline can produce the RST_STREAM(CANCEL).
+/// This is the test that fails if the write-loop arming of `stream_fc_stalled_since`
+/// is removed (the GET case above is reaped by the idle guard regardless).
+fn try_h2_window_stall_inbound_drip_reaped() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-WINDOW-STALL-DRIP", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("window-stall-body".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    // POST WITHOUT END_STREAM: the request body stays open so we can drip
+    // inbound DATA. The backend (one read + immediate response) buffers the
+    // response, which is window-blocked at the client's zero window.
+    let header_block = vec![
+        0x83, // :method POST
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Drip a 1-byte non-empty DATA frame every 700ms (< the 2s deadline). Each
+    // refreshes the idle timer (content_len > 0) but makes ZERO outbound
+    // progress, so only the flow-control-stall deadline can reap the stream.
+    let mut rst_cancel = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < deadline {
+        let data = H2Frame::new(H2_FRAME_DATA, 0 /* no END_STREAM */, 1, vec![0x41]);
+        let _ = tls.write_all(&data.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(700));
+        let bytes = read_all_available(&mut tls, Duration::from_millis(200));
+        let frames = parse_h2_frames(&bytes);
+        if !frames.is_empty() {
+            log_frames("Window-stall inbound-drip", &frames);
+        }
+        if extract_rst_streams(&frames)
+            .iter()
+            .any(|(sid, ec)| *sid == 1 && *ec == 0x8)
+        {
+            rst_cancel = true;
+            break;
+        }
+    }
+    println!("Window-stall (inbound drip) stream 1 RST_STREAM(CANCEL): {rst_cancel}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+    if infra_ok && rst_cancel {
+        State::Success
+    } else {
+        println!("Window-stall inbound-drip - FAIL: rst_cancel={rst_cancel} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_stall_inbound_drip_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: window-stalled stream reaped despite inbound DATA drip (flow-control-stall guard)",
+            try_h2_window_stall_inbound_drip_reaped
+        ),
+        State::Success
+    );
+}
+
+/// M2 cumulative-stall budget: a `WINDOW_UPDATE(+1)` drip lets sozu drain ~1
+/// byte of the window-blocked response per grant (`consumed > 0`), which under
+/// the old clear-on-any-progress reset the deadline forever. The budget
+/// accumulates these toward a 16 KiB floor the drip never reaches, so the
+/// deadline still ages out and the stream is reaped. This is the test that fails
+/// if the cumulative-stall budget regresses to clear-on-`consumed>0`.
+fn try_h2_window_stall_wu_drip_reaped() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-WINDOW-STALL-WU-DRIP", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("window-stall-body".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // Zero stream window: response HEADERS flow, response DATA stays blocked.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let header_block = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Drip a +1 stream-window grant every 700ms (< the 2s deadline). Each lets
+    // sozu drain ~1 byte (`consumed > 0`) but never enough to reach the 16 KiB
+    // cumulative floor, so the budget keeps aging the deadline -> reaped.
+    let mut rst_cancel = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < deadline {
+        let wu = H2Frame::window_update(1, 1);
+        let _ = tls.write_all(&wu.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(700));
+        let bytes = read_all_available(&mut tls, Duration::from_millis(200));
+        let frames = parse_h2_frames(&bytes);
+        if !frames.is_empty() {
+            log_frames("Window-stall WU-drip", &frames);
+        }
+        if extract_rst_streams(&frames)
+            .iter()
+            .any(|(sid, ec)| *sid == 1 && *ec == 0x8)
+        {
+            rst_cancel = true;
+            break;
+        }
+    }
+    println!("Window-stall (WU drip) stream 1 RST_STREAM(CANCEL): {rst_cancel}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+    if infra_ok && rst_cancel {
+        State::Success
+    } else {
+        println!("Window-stall WU-drip - FAIL: rst_cancel={rst_cancel} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_stall_wu_drip_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: window-stalled stream reaped despite WINDOW_UPDATE(+1) drip (cumulative-stall budget)",
+            try_h2_window_stall_wu_drip_reaped
+        ),
+        State::Success
+    );
+}
+
+// NOTE (M2 false-reject guard): the budget's false-reject-avoidance — a stream
+// making >= FC_STALL_CLEAR_FLOOR cumulative progress per idle period clears its
+// deadline and is NOT reaped — is proven DETERMINISTICALLY by the unit tests
+// `test_fc_stall_budget_floor_clears` and `test_fc_stall_budget_wu_drip_ages_until_floor`
+// (lib/src/protocol/mux/h2.rs). A pure-e2e version is intentionally omitted: at
+// the integration level the PER-STREAM IDLE guard (`stream_last_activity_at`,
+// refreshed only on outbound bytes) reaps any stream whose outbound flow pauses
+// for the idle timeout — so a window-stalled stream that drains in bursts (the
+// only way to hold it "blocked but progressing" from a test client) gets
+// idle-reaped on the gaps regardless of the budget, making an e2e false-reject
+// assertion race the idle guard rather than test the budget. The deterministic
+// unit test is the stronger, non-flaky guarantee.
+
+/// Fully-silent window-stall: peer sends one zero-window GET then NO further
+/// frames. The connection-timeout path must run the reaper AND flush the queued
+/// `RST_STREAM(CANCEL)` (M3: via `has_pending_control_write`, since
+/// `has_pending_write` ignores `pending_rst_streams`). We assert the actual
+/// RST(CANCEL) reaches the wire — not merely EOF — so this fails if the
+/// silent-peer flush regresses (slot would still be freed, but the peer would
+/// only ever see EOF).
+fn try_h2_window_stall_silent_reaped() -> State {
+    use std::io::Read as _;
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-WINDOW-STALL-SILENT", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+    // Frontend timer is armed with `request_timeout` in
+    // `HttpsSession::new` (`lib/src/https.rs`).
+    listener_config.request_timeout = 3;
+    listener_config.front_timeout = 3;
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("window-stall-body".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let header_block = vec![
+        0x82, 0x84, 0x87, 0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let mut rst_cancel = false;
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 16384];
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        match tls.read(&mut buf) {
+            // EOF: the connection closed. If we have NOT seen the RST(CANCEL) by
+            // now, the silent-peer flush (M3) regressed — the peer only saw EOF.
+            Ok(0) => break,
+            Ok(n) => {
+                acc.extend_from_slice(&buf[..n]);
+                let frames = parse_h2_frames(&acc);
+                if !frames.is_empty() {
+                    log_frames("Window-stall silent", &frames);
+                }
+                if extract_rst_streams(&frames)
+                    .iter()
+                    .any(|(sid, ec)| *sid == 1 && *ec == 0x8)
+                {
+                    rst_cancel = true;
+                    break;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    println!("Window-stall (silent) RST_STREAM(CANCEL) flushed: {rst_cancel}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+    if infra_ok && rst_cancel {
+        State::Success
+    } else {
+        println!("Window-stall silent - FAIL: rst_cancel={rst_cancel} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_stall_silent_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2 correctness: fully-silent window-stall reaped via connection-timeout reaper",
+            try_h2_window_stall_silent_reaped
+        ),
+        State::Success
+    );
+}
+
+/// M4 (bidirectional reap): window-stall reaping is direction-agnostic, so a
+/// request UPLOAD stalled against a slow H2 backend (`Position::Client`) is
+/// reaped too. A real H2 backend (`cluster.http2 = true`) advertises
+/// `SETTINGS_INITIAL_WINDOW_SIZE = 0` and never grants WINDOW_UPDATE, so sozu's
+/// forwarded request body is window-blocked and never delivered. The stalled
+/// stream must be reaped and the client returned a `502` (via
+/// `end_stream_decision` -> `SendDefault(502)`), NOT left hanging.
+///
+/// This exercises the `Position::Client` reap path end-to-end — RST(CANCEL) to
+/// the backend leg, 502 to the client, slot freed — which every H1-backend
+/// upload test misses (the source-trace claim that the Client-side reap yields a
+/// clean 502 rather than a hang). NOTE: the reap is driven by the per-stream
+/// guards (the bidirectional window-stall arm AND the idle guard, which reaps a
+/// silent backend stream regardless), so this asserts the integration OUTCOME of
+/// the Client-position reap rather than isolating the window-stall guard
+/// specifically — the latter is covered deterministically by the
+/// `fc_stall_budget_decision` unit tests.
+fn try_h2_backend_upload_window_stall_reaped() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-BACKEND-UPLOAD-STALL", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    // cluster.http2 = true so sozu speaks H2 to the stall backend.
+    let mut h2_cluster = Worker::default_cluster("cluster_0");
+    h2_cluster.http2 = Some(true);
+    worker.send_proxy_request_type(RequestType::AddCluster(h2_cluster));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    // Hold this binding for the whole test so the stall backend keeps serving;
+    // its Drop joins the thread (releasing the port) at function end.
+    let _stall_backend = RawH2StallBackend::new(back_address);
+    // Let the backend bind before the client drives traffic.
+    thread::sleep(Duration::from_millis(150));
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // POST with a body so sozu has request DATA to forward to the backend; the
+    // backend's zero send window blocks it -> the upload stream window-stalls.
+    let header_block = vec![
+        0x83, // :method POST
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    tls.write_all(&H2Frame::headers(1, header_block, true, false).encode())
+        .unwrap();
+    // ~8 KiB of request body, END_STREAM — buffered at sozu, blocked at backend.
+    let body = vec![0x41u8; 8192];
+    tls.write_all(&H2Frame::new(H2_FRAME_DATA, H2_FLAG_END_STREAM, 1, body).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    // Within the idle deadline + margin the stalled upload must be reaped: the
+    // client sees a 502 response (HEADERS on stream 1) or a RST_STREAM(CANCEL),
+    // never a hang.
+    let mut reaped = false;
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 16384];
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                acc.extend_from_slice(&buf[..n]);
+                let frames = parse_h2_frames(&acc);
+                if !frames.is_empty() {
+                    log_frames("Backend-upload stall", &frames);
+                }
+                let got_response_headers = frames
+                    .iter()
+                    .any(|(t, _f, sid, _p)| *t == H2_FRAME_HEADERS && *sid == 1);
+                let got_rst = extract_rst_streams(&frames)
+                    .iter()
+                    .any(|(sid, ec)| *sid == 1 && *ec == 0x8);
+                if got_response_headers || got_rst {
+                    reaped = true;
+                    break;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    println!("Backend-upload window-stall reaped (502/RST to client): {reaped}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![]);
+    if infra_ok && reaped {
+        State::Success
+    } else {
+        println!("Backend-upload stall - FAIL: reaped={reaped} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_backend_upload_window_stall_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: window-stalled H2-backend upload is reaped (Position::Client, 502 to client)",
+            try_h2_backend_upload_window_stall_reaped
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 5: Active upload survives past idle timeout (trickled DATA resets timer)
+// ============================================================================
+
+/// With h2_stream_idle_timeout_seconds=2, open a POST stream and trickle DATA
+/// frames every 500ms for 5 seconds total (well past the 2s timeout). The
+/// stream must survive and eventually receive a response — NOT a RST_STREAM.
+/// This proves that non-empty DATA frames reset the per-stream idle timer.
+fn try_h2_active_upload_survives_idle_timeout() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-ACTIVE-UPLOAD", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("upload-ok".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Open stream 1 as POST without END_STREAM (body will follow)
+    let header_block = vec![
+        0x83, // :method POST
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Trickle DATA frames every 500ms for 5 seconds (10 chunks).
+    // Each chunk is non-empty (128 bytes of payload).
+    // Total time: ~5s, well past the 2s idle timeout.
+    let chunk = vec![0xABu8; 128];
+    for i in 0..10 {
+        thread::sleep(Duration::from_millis(500));
+        let end_stream = i == 9; // last chunk closes the stream
+        let data_frame = H2Frame::data(1, chunk.clone(), end_stream);
+        if tls.write_all(&data_frame.encode()).is_err() {
+            println!("Write failed at chunk {i} — connection closed prematurely");
+            let _ = teardown(tls, front_port, worker, vec![backend]);
+            return State::Fail;
+        }
+        let _ = tls.flush();
+        println!("Sent DATA chunk {i}/9 (end_stream={end_stream})");
+    }
+
+    // Collect response frames — expect HEADERS response on stream 1, NOT RST_STREAM
+    let frames = collect_response_frames(&mut tls, 500, 10, 500);
+    log_frames("Active upload", &frames);
+
+    let cancel_code: u32 = 0x8; // CANCEL
+    let got_rst_cancel = extract_rst_streams(&frames)
+        .iter()
+        .any(|(sid, ec)| *sid == 1 && *ec == cancel_code);
+    let got_response = frames
+        .iter()
+        .any(|(ft, _, sid, _)| *ft == H2_FRAME_HEADERS && *sid == 1);
+
+    println!("Stream 1 got RST_STREAM(CANCEL): {got_rst_cancel}");
+    println!("Stream 1 got HEADERS response: {got_response}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+
+    // Success: we got a response and did NOT get cancelled
+    if infra_ok && got_response && !got_rst_cancel {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_active_upload_survives_idle_timeout() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: active upload survives past idle timeout",
+            try_h2_active_upload_survives_idle_timeout
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 6: Idle stream (no DATA) is still cancelled after timeout
+// ============================================================================
+
+/// With h2_stream_idle_timeout_seconds=2, open a POST stream without sending
+/// any DATA frames and only keep the connection alive with PINGs. The stream
+/// must receive RST_STREAM(CANCEL) — proving the Slowloris guard still works
+/// even after the idle-timeout-reset-on-DATA fix.
+fn try_h2_idle_stream_no_data_cancelled() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-IDLE-NO-DATA", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("pong".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Open stream 1 as POST without END_STREAM — and send NO DATA at all
+    let header_block = vec![
+        0x83, // :method POST
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Keep the connection alive with PINGs (control frames) for 4 seconds.
+    // PINGs must NOT reset the per-stream idle timer.
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(4_000) {
+        thread::sleep(Duration::from_millis(400));
+        let ping = H2Frame::ping([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        let _ = tls.write_all(&ping.encode());
+        let _ = tls.flush();
+    }
+
+    // Read all frames — should contain RST_STREAM(CANCEL) for stream 1
+    let frames = collect_response_frames(&mut tls, 200, 5, 500);
+    log_frames("Idle no-data stream", &frames);
+
+    let cancel_code: u32 = 0x8; // CANCEL
+    let got_rst_cancel = extract_rst_streams(&frames)
+        .iter()
+        .any(|(sid, ec)| *sid == 1 && *ec == cancel_code);
+    println!("Stream 1 got RST_STREAM(CANCEL): {got_rst_cancel}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+
+    if infra_ok && got_rst_cancel {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_idle_stream_no_data_cancelled() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: idle stream with no DATA is cancelled after timeout",
+            try_h2_idle_stream_no_data_cancelled
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 7: Stranded `expect_write` survives per-stream idle cancellation
+// ============================================================================
+
+/// Regression for the OOB panic in `ConnectionH2::write_streams`
+/// (`lib/src/protocol/mux/h2.rs`):
+/// `index out of bounds: the len is 1 but the index is 1`.
+///
+/// Reproduction sequence (precise ordering matters):
+///
+/// 1. Open **stream 1** (GET) asking a backend that returns a large body.
+///    The client intentionally stops reading from the TLS/TCP socket so the
+///    kernel send buffer and TLS write queue fill, and sozu's write path
+///    stalls mid-frame — parking `self.expect_write = Some(H2StreamId::Other
+///    { id: 1, gid: G })` in the stalled branch of `H2WritePhase::Flush`
+///    in `ConnectionH2::poll_write_target` (`lib/src/protocol/mux/h2.rs`).
+/// 2. Per-stream idle timer fires (>2 s):
+///    `ConnectionH2::cancel_timed_out_streams`
+///    (`lib/src/protocol/mux/h2.rs`) evicts stream 1.
+///    `self.streams.remove(&1)` is called and `context.streams[G].state`
+///    is set to `Recycle`, but `expect_write` still references gid `G`.
+/// 3. Fresh HEADERS opens **stream 3** → `Context::create_stream`
+///    (`lib/src/protocol/mux/mod.rs`) finds the `Recycle` slot at `G`,
+///    reuses it, then runs `Context::shrink_trailing_recycle`
+///    (`lib/src/protocol/mux/mod.rs`). If the recycled slot is the last
+///    element (common in the 1-active-stream case), the shrink may reduce
+///    `context.streams.len()` — leaving the stranded `expect_write`
+///    pointing past the end of the Vec.
+/// 4. Next `writable()` → `ConnectionH2::write_streams`
+///    (`lib/src/protocol/mux/h2.rs`) dereferences
+///    `context.streams[global_stream_id]` → OOB panic.
+///
+/// The fix (see `remove_dead_stream` and the idle-cancellation path) must
+/// clear `expect_write` / `expect_read` whenever the referenced gid is
+/// evicted. With the fix applied, this test's worker stays alive through
+/// the full sequence.
+///
+/// **Trade-off notice**: reliably wedging sozu's write path inside a
+/// single e2e run is timing-dependent — H2 INITIAL_WINDOW_SIZE caps a
+/// single response at 64 KiB, rustls has its own write queue, and the
+/// kernel TCP send buffer absorbs another ~64 KiB. So rather than trying
+/// to force the exact panic signature, this test asserts the **indirect
+/// invariant**: "worker survives a burst of idle-cancelled streams
+/// followed immediately by fresh stream creation that triggers recycle +
+/// trailing-Recycle shrink". Any regression that re-introduces a stranded
+/// `expect_write`/`expect_read` referencing a popped gid would panic on
+/// the next `writable()` tick and kill the worker thread, failing
+/// `verify_sozu_alive`.
+fn try_h2_stranded_expect_write_survives_cancellation() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-COR-STRANDED-EW", config, listeners, state);
+
+    // Short per-stream idle deadline so the timer fires well within the
+    // test budget.
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    // Large enough response body that the converter is likely to fragment it
+    // across frames — makes the stalled-write path more likely while the
+    // client is not reading.
+    let large_body: String = "x".repeat(256 * 1024);
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler(large_body),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let get_headers = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+
+    // Open stream 1 (GET), don't read the response. Sozu starts emitting
+    // H2 DATA, may or may not park `expect_write` depending on buffer
+    // sizes — either way the per-stream idle timer will fire next.
+    let h1 = H2Frame::headers(1, get_headers.clone(), true, true);
+    tls.write_all(&h1.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Wait past the 2 s per-stream idle deadline.
+    thread::sleep(Duration::from_millis(2_400));
+
+    // Wake the readable path so `cancel_timed_out_streams` runs. This
+    // evicts stream 1 and (pre-fix) leaves `expect_write` stranded if it
+    // had parked on stream 1's gid.
+    let ping = H2Frame::ping([0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8]);
+    let _ = tls.write_all(&ping.encode());
+    let _ = tls.flush();
+    thread::sleep(Duration::from_millis(200));
+
+    // Open stream 3 — this is the `Context::create_stream` call that
+    // recycles the just-evicted slot and may pop the trailing Recycle
+    // entry, shrinking `context.streams`. If `expect_write` was still
+    // pointing at the old gid, the next `writable()` tick panics.
+    let h3 = H2Frame::headers(3, get_headers.clone(), true, true);
+    let write3_ok = tls.write_all(&h3.encode()).is_ok() && tls.flush().is_ok();
+    println!("stream 3 write: {write3_ok}");
+
+    // Resume reading: drain any queued frames so sozu runs `writable()`
+    // again — the panic (if any) fires here.
+    let _ = collect_response_frames(&mut tls, 200, 6, 400);
+
+    // Burst three more idle-cancel + new-stream cycles back-to-back to
+    // widen the race window. Each iteration: open a stream, wait past the
+    // idle deadline, open another — exercising the evict-then-shrink path
+    // with different gids.
+    let mut next_sid: u32 = 5;
+    for _ in 0..3 {
+        let hs = H2Frame::headers(next_sid, get_headers.clone(), true, true);
+        let _ = tls.write_all(&hs.encode());
+        let _ = tls.flush();
+        next_sid += 2;
+
+        thread::sleep(Duration::from_millis(2_300));
+        let _ = tls.write_all(&ping.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(100));
+
+        let hn = H2Frame::headers(next_sid, get_headers.clone(), true, true);
+        let _ = tls.write_all(&hn.encode());
+        let _ = tls.flush();
+        next_sid += 2;
+
+        let _ = collect_response_frames(&mut tls, 150, 4, 300);
+    }
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+
+    // Primary assertion: the worker must still be accepting connections.
+    // A panic inside `write_streams` would tear down the worker thread.
+    let still_alive = verify_sozu_alive(front_port);
+    println!("stranded expect_write - sozu alive: {still_alive}");
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let mut backends = vec![backend];
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if still_alive && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_stranded_expect_write_survives_cancellation() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2 correctness: stranded expect_write survives per-stream idle cancellation",
+            try_h2_stranded_expect_write_survives_cancellation
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 8: Stranded expect_write via peer-initiated RST_STREAM — covers the
+//        `ConnectionH2::handle_rst_stream_frame` eviction path in
+//        `lib/src/protocol/mux/h2.rs`
+// ============================================================================
+
+/// Sibling to [`test_h2_stranded_expect_write_survives_cancellation`] — same
+/// invariant, different eviction trigger. Where the original test uses the
+/// per-stream idle timer to evict a stream whose gid may still be cached in
+/// `self.expect_write`, this test drives the **peer-initiated RST_STREAM**
+/// path in `ConnectionH2::handle_rst_stream_frame`
+/// (`lib/src/protocol/mux/h2.rs`),
+/// which was previously an inline `self.streams.remove(...)` that did not
+/// go through `remove_dead_stream` and therefore did not clear
+/// `expect_write`/`expect_read`.
+///
+/// Reproduction shape:
+///
+/// 1. Client opens a GET stream `victim` to a backend returning a large
+///    body — sozu begins emitting HEADERS + DATA on the frontend.
+/// 2. Before the response fully flushes, the client sends RST_STREAM
+///    (error=CANCEL) for `victim`. `handle_rst_stream_frame` evicts the
+///    stream from `self.streams`, transitions `context.streams[gid].state`
+///    to `Recycle`, and (with the fix) invalidates
+///    `expect_write`/`expect_read` if they referenced `gid`.
+/// 3. Client opens a new GET stream — `Context::create_stream`
+///    (`lib/src/protocol/mux/mod.rs`) reuses the recycled slot, then runs
+///    `Context::shrink_trailing_recycle` (`lib/src/protocol/mux/mod.rs`),
+///    potentially shrinking `context.streams.len()`.
+/// 4. Client drains — sozu runs `writable()`. With the fix, no OOB index.
+///    Without the fix (pre-refactor of
+///    `ConnectionH2::handle_rst_stream_frame`), the stranded gid in
+///    `expect_write` would panic in `ConnectionH2::write_streams`
+///    (`lib/src/protocol/mux/h2.rs`).
+///
+/// As with the idle-cancel test, the exact panic conditions depend on
+/// timing (rustls buffering, H2 INITIAL_WINDOW_SIZE, kernel TCP send
+/// buffer), so the primary assertion is the indirect "worker survives
+/// N peer-RST + new-stream cycles" invariant via `verify_sozu_alive`.
+fn try_h2_stranded_expect_write_peer_rst_survives() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-COR-RST-EW", config, listeners, state);
+
+    let listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    // Large body so sozu is likely to emit multiple DATA frames before the
+    // peer RST arrives — maximises the chance of parking expect_write.
+    let large_body: String = "x".repeat(256 * 1024);
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler(large_body),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let get_headers = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+
+    // Four iterations, each: open victim stream → give sozu time to park a
+    // partial write → peer RST the victim → open a fresh stream → drain.
+    let mut next_sid: u32 = 1;
+    for _ in 0..4 {
+        let victim = next_sid;
+        let h_victim = H2Frame::headers(victim, get_headers.clone(), true, true);
+        tls.write_all(&h_victim.encode()).unwrap();
+        tls.flush().unwrap();
+        next_sid += 2;
+
+        // Let sozu start responding. HEADERS + first DATA frame should be
+        // in flight, and expect_write may be parked if the buffer fills.
+        thread::sleep(Duration::from_millis(150));
+
+        // Peer-initiated RST_STREAM(CANCEL = 0x8). Exercises
+        // `ConnectionH2::handle_rst_stream_frame`
+        // (`lib/src/protocol/mux/h2.rs`), which now routes through
+        // remove_dead_stream and must clear expect_write/expect_read if
+        // they reference the evicted gid.
+        let rst = H2Frame::rst_stream(victim, 0x8);
+        let _ = tls.write_all(&rst.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(80));
+
+        // Fresh stream: drives Context::create_stream → recycle +
+        // shrink_trailing_recycle. A stranded expect_write would panic
+        // in `ConnectionH2::write_streams` (`lib/src/protocol/mux/h2.rs`)
+        // on the next writable() tick.
+        let fresh = next_sid;
+        let h_fresh = H2Frame::headers(fresh, get_headers.clone(), true, true);
+        let _ = tls.write_all(&h_fresh.encode());
+        let _ = tls.flush();
+        next_sid += 2;
+
+        // Drain — forces writable() to run, revealing any panic.
+        let _ = collect_response_frames(&mut tls, 200, 8, 400);
+    }
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+
+    let still_alive = verify_sozu_alive(front_port);
+    println!("stranded expect_write peer RST - sozu alive: {still_alive}");
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let mut backends = vec![backend];
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if still_alive && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_stranded_expect_write_peer_rst_survives_cancellation() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2 correctness: stranded expect_write survives peer-initiated RST_STREAM",
+            try_h2_stranded_expect_write_peer_rst_survives
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: RFC 9218 §4 incremental round-robin scheduling
+// ============================================================================
+
+/// Build an HPACK-encoded header block for `GET / HTTP/2 https localhost`
+/// plus an optional literal `priority` header (`u=<urgency>, <inc_token>`).
+///
+/// `inc_token` is inserted as-is after the comma — pass `"i"` for
+/// `incremental=true` and `"i=?0"` to explicitly opt out. The priority header
+/// is encoded as a literal-without-indexing field with a new name so sozu's
+/// HPACK decoder takes the `compare_no_case(&k, b"priority")` branch in
+/// `handle_header` (`lib/src/protocol/mux/pkawa.rs`).
+fn build_get_headers_with_priority(urgency: u8, inc_token: &str) -> Vec<u8> {
+    let mut block = vec![
+        0x82, // :method GET (indexed)
+        0x84, // :path / (indexed)
+        0x87, // :scheme https (indexed)
+        0x41, 0x09, // :authority, value len 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    // Build "u=N, <inc_token>" priority value.
+    let value = format!("u={urgency}, {inc_token}");
+    // Literal Header Field without Indexing — New Name (0x00), name length 8.
+    block.push(0x00);
+    block.push(0x08);
+    block.extend_from_slice(b"priority");
+    // Value length, value bytes.
+    assert!(
+        value.len() < 127,
+        "priority value too long for short encoding"
+    );
+    block.push(value.len() as u8);
+    block.extend_from_slice(value.as_bytes());
+    block
+}
+
+/// Extract DATA frame stream IDs in arrival order, ignoring empty DATA
+/// (END_STREAM markers sometimes emit payload-less DATA frames).
+fn data_frame_stream_order(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<u32> {
+    frames
+        .iter()
+        .filter_map(|(ft, _fl, sid, payload)| {
+            if *ft == H2_FRAME_DATA && !payload.is_empty() {
+                Some(*sid)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// RFC 9218 §4: three same-urgency streams with `priority: u=3, i` must see
+/// their DATA frames **interleaved**, not drained sequentially. The test
+/// starves sozu of per-stream send window during setup so all three
+/// backend responses sit in sozu's kawa buffers, then releases the three
+/// stream windows back-to-back. That forces the scheduler to iterate the
+/// full pass order `[1, 3, 5]` inside a single `writable()` pass,
+/// which is exactly the regime the round-robin logic governs.
+fn try_h2_rfc9218_incremental_round_robin() -> State {
+    // Three backends so each stream is served by a fresh TCP connection to
+    // a dedicated thread — avoids head-of-line blocking on the backend side
+    // that would otherwise serialize responses.
+    let (worker, backends, front_port) = setup_h2_test_with_large_bodies(
+        "H2-COR-RFC9218-INC",
+        3,
+        // Body ≈ 2 × max_frame_size (16384) → each stream emits ≥ 2 DATA
+        // frames so interleaving is observable on the wire.
+        32 * 1024,
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // INITIAL_WINDOW_SIZE=0 → sozu cannot send DATA on a new stream until
+    // we WINDOW_UPDATE that stream explicitly. HEADERS still flow; the
+    // responses accumulate in kawa.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let ids = [1u32, 3, 5];
+    for sid in ids {
+        let block = build_get_headers_with_priority(3, "i");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    // Let the three backends reply and sozu stash responses in stream
+    // kawas. No DATA can egress yet because stream windows are 0.
+    thread::sleep(Duration::from_millis(400));
+
+    // Pack all four WINDOW_UPDATEs into a single TCP write so sozu sees
+    // every stream's window lifted in one `readable()` pass and only runs
+    // `writable()` afterwards — at which point the scheduler iterates a
+    // fully-populated pass order of length 3. If we flush between
+    // frames, sozu's event loop may interleave `readable()` and
+    // `writable()` and emit DATA for stream 1 alone before the other
+    // windows are lifted, producing a non-RR wire trace for timing
+    // reasons unrelated to the scheduler.
+    let mut bulk = Vec::new();
+    for sid in ids {
+        bulk.extend_from_slice(&H2Frame::window_update(sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 1_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 6, 400);
+    log_frames("RFC 9218 incremental RR", &frames);
+
+    let order = data_frame_stream_order(&frames);
+    println!("DATA stream-ID order: {order:?}");
+
+    // Fairness predicate: count "transitions" where adjacent DATA frames
+    // belong to different streams. Sequential drain (the non-incremental
+    // baseline) gives exactly `n_streams - 1` transitions — stream IDs
+    // like [1,1,3,3,5,5] have 2 transitions for 3 streams. Round-robin
+    // produces many more transitions because each stream fires at most
+    // once per scheduling pass before yielding.
+    //
+    // The threshold is relaxed past `n_streams - 1` rather than demanding
+    // a perfect interleave: backend response arrivals are not synchronous,
+    // so the very first few DATA frames may still come from whichever
+    // stream's kawa was populated first. The RR logic must then kick in
+    // and rotate across the remaining streams — which shows up as
+    // *additional* transitions above the sequential baseline.
+    let transitions = order.windows(2).filter(|w| w[0] != w[1]).count();
+    let streams_seen: std::collections::HashSet<u32> = order.iter().copied().collect();
+    let n_streams_seen = streams_seen
+        .intersection(&ids.iter().copied().collect())
+        .count();
+    let each_stream_fired = ids.iter().all(|sid| streams_seen.contains(sid));
+    // Need ≥ 2 transitions on top of the sequential baseline to prove RR
+    // kicked in. A 3-stream round-robin drain of ~10 DATA frames typically
+    // produces ≥ 6 transitions; we demand at least `n_streams` (= 3),
+    // giving noise budget while still excluding the sequential pattern.
+    let interleaved = transitions >= n_streams_seen;
+
+    println!(
+        "each_stream_fired={each_stream_fired} transitions={transitions} \
+         interleaved={interleaved} streams_seen={n_streams_seen} \
+         total_frames={}",
+        order.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && each_stream_fired && interleaved {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_rfc9218_incremental_round_robin() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4: incremental streams interleave DATA frames",
+            try_h2_rfc9218_incremental_round_robin
+        ),
+        State::Success
+    );
+}
+
+/// Split a DATA stream-id trace into per-write-pass segments, keyed on the
+/// leading urgency bucket as a pass marker.
+///
+/// RFC 9218 §4 orders every pass ascending by urgency, so a pass reads
+/// `[<leading bucket>.., <trailing bucket>..]`. A frame from `leading` that
+/// follows a frame from `trailing` is therefore the first frame of the next
+/// pass, and that transition is the only pass boundary observable from the
+/// wire alone.
+fn split_passes_on_leading_bucket(order: &[u32], leading: &[u32]) -> Vec<Vec<u32>> {
+    let mut passes: Vec<Vec<u32>> = Vec::new();
+    let mut previous_was_trailing = false;
+    for &sid in order {
+        let is_leading = leading.contains(&sid);
+        if passes.is_empty() || (is_leading && previous_was_trailing) {
+            passes.push(Vec::new());
+        }
+        passes
+            .last_mut()
+            .expect("a segment was just opened")
+            .push(sid);
+        previous_was_trailing = !is_leading;
+    }
+    passes
+}
+
+/// Which of `a` / `b` appears FIRST in each pass that carries both — used
+/// for the leading and the trailing bucket alike, so it is named for the
+/// question rather than for either one.
+///
+/// A pass carrying only one of them is dropped rather than counted: it is
+/// the start-up window before both backends have answered, or the drain tail
+/// after the shorter stream ended, and neither says anything about the
+/// rotation. Taking the FIRST occurrence rather than the only one keeps the
+/// reading honest when two passes fuse because the leading bucket had
+/// nothing ready between them.
+fn first_of_pair_per_pass(passes: &[Vec<u32>], a: u32, b: u32) -> Vec<u32> {
+    passes
+        .iter()
+        .filter_map(|pass| {
+            let first_a = pass.iter().position(|&sid| sid == a);
+            let first_b = pass.iter().position(|&sid| sid == b);
+            match (first_a, first_b) {
+                (Some(ia), Some(ib)) => Some(if ia < ib { a } else { b }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// RFC 9218 §4, the wire evidence for per-bucket incremental rotation
+/// (sozu-proxy/sozu#1456): on a connection carrying TWO urgency buckets that
+/// each hold two ready incremental peers, BOTH buckets rotate their tail.
+///
+/// This is the e2e half of `h2_scheduler.rs`'s
+/// `every_urgency_bucket_rotates_its_own_incremental_tail`, and it exists
+/// because the change it guards is a change to the bytes on the wire rather
+/// than to an internal data structure. Four streams, `u=0, i` on 1 and 3 and
+/// `u=3, i` on 5 and 7, all with bodies several DATA frames long. The
+/// converter's yield-after-one-DATA (invariant 15) gives each stream one
+/// frame per pass, so the DATA trace is the pass order repeated.
+///
+/// The oracle is the TRAILING bucket's leader per pass. Before the fix a
+/// single connection-global cursor could only ever hold an id from the
+/// leading bucket, `partition_point(|id| *id <= cursor)` over `[5, 7]` with a
+/// cursor of 1 or 3 returned 0 in every pass, and the trace read
+/// `5, 7 / 5, 7 / 5, 7 …` — stream 7 never once led its own bucket, which is
+/// positional starvation that becomes byte starvation as soon as a pass is
+/// cut short. After it, 5 and 7 alternate the lead and BOTH appear in the
+/// per-pass leader list below.
+///
+/// Asserting that both ids lead at least one steady-state pass, rather than
+/// pinning an exact alternating sequence, is deliberate: the backends are
+/// real threads and a stream whose kawa is momentarily empty drops out of a
+/// pass, so an exact sequence would be a timing assertion rather than a
+/// scheduling one. Zero versus non-zero leads for stream 7 is the
+/// discriminator, and it is a hard zero on the pre-fix code.
+///
+/// The window-starving handshake is the same one
+/// `try_h2_rfc9218_incremental_round_robin` uses and for the same reason:
+/// `INITIAL_WINDOW_SIZE=0` holds every response in sozu's kawa buffers until
+/// one bulk `WINDOW_UPDATE` write lifts all five windows together, so the
+/// scheduler sees a fully-populated four-stream pass order instead of
+/// emitting stream 1 alone while the other windows are still closed.
+fn try_h2_per_bucket_incremental_rotation() -> State {
+    // Four backends so each stream is served by its own thread — a shared
+    // backend would serialize the responses and decide the wire order for
+    // reasons that have nothing to do with the scheduler.
+    let (worker, backends, front_port) = setup_h2_test_with_large_bodies(
+        "H2-COR-RFC9218-PERBUCKET",
+        4,
+        // 6 x max_frame_size (16384): six DATA frames per stream, so the
+        // trace carries enough passes for the rotation to show.
+        96 * 1024,
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    // Leading bucket: u=0 incremental. Trailing bucket: u=3 incremental.
+    // Two ready incremental peers in EACH — the shape a single
+    // connection-global cursor cannot serve.
+    const LEADING: [u32; 2] = [1, 3];
+    const TRAILING: [u32; 2] = [5, 7];
+    for (sid, urgency) in [(1u32, 0u8), (3, 0), (5, 3), (7, 3)] {
+        let block = build_get_headers_with_priority(urgency, "i");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    // Let all four backends reply into sozu's kawa buffers. No DATA can
+    // egress yet: every stream window is 0.
+    thread::sleep(Duration::from_millis(500));
+
+    // One TCP write for all five WINDOW_UPDATEs — see the round-robin test
+    // for why splitting them perturbs the pass order.
+    let mut bulk = Vec::new();
+    for sid in LEADING.iter().chain(TRAILING.iter()) {
+        bulk.extend_from_slice(&H2Frame::window_update(*sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 4_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 10, 400);
+    log_frames("RFC 9218 per-bucket rotation", &frames);
+
+    let order = data_frame_stream_order(&frames);
+    let passes = split_passes_on_leading_bucket(&order, &LEADING);
+    let leading_leaders = first_of_pair_per_pass(&passes, LEADING[0], LEADING[1]);
+    let trailing_leaders = first_of_pair_per_pass(&passes, TRAILING[0], TRAILING[1]);
+
+    println!("DATA stream-ID order: {order:?}");
+    println!("passes: {passes:?}");
+    println!("u=0 bucket leader per pass: {leading_leaders:?}");
+    println!("u=3 bucket leader per pass: {trailing_leaders:?}");
+
+    let leading_rotates = LEADING.iter().all(|sid| leading_leaders.contains(sid));
+    let trailing_rotates = TRAILING.iter().all(|sid| trailing_leaders.contains(sid));
+    // Enough passes carrying both trailing peers for "7 never leads" to be a
+    // measurement rather than a small sample.
+    let enough_passes = trailing_leaders.len() >= 3;
+    let every_stream_fired = LEADING
+        .iter()
+        .chain(TRAILING.iter())
+        .all(|sid| order.contains(sid));
+
+    println!(
+        "leading_rotates={leading_rotates} trailing_rotates={trailing_rotates} \
+         enough_passes={enough_passes} every_stream_fired={every_stream_fired} \
+         trailing_passes={} total_data_frames={}",
+        trailing_leaders.len(),
+        order.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && every_stream_fired && enough_passes && leading_rotates && trailing_rotates {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_per_bucket_incremental_rotation() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4: every urgency bucket rotates its own incremental tail",
+            try_h2_per_bucket_incremental_rotation
+        ),
+        State::Success
+    );
+}
+
+/// RFC 9218 §4: three same-urgency streams with `priority: u=3, i=?0` must
+/// drain **sequentially** — the pre-existing behaviour. Uses the same
+/// window-starving handshake as the round-robin test so the scheduler sees
+/// all three streams as eligible in a single `writable()` pass; the only
+/// difference from that test is the `incremental` flag in the priority
+/// header. Each stream's DATA frames must appear as a contiguous run on
+/// the wire (stream order like [1,1,1,3,3,3,5,5,5]).
+fn try_h2_rfc9218_non_incremental_sequential() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-RFC9218-SEQ", 3, 32 * 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // INITIAL_WINDOW_SIZE=0 so the three responses park in kawa before any
+    // DATA is released — keeps the test symmetric with the incremental
+    // round-robin counterpart.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let ids = [1u32, 3, 5];
+    for sid in ids {
+        // `i=?0` = explicit non-incremental (also the RFC 9218 default when
+        // the parameter is absent).
+        let block = build_get_headers_with_priority(3, "i=?0");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(400));
+
+    // Bulk WINDOW_UPDATE so sozu sees all three streams eligible in one
+    // pass — see the round-robin test for the rationale.
+    let mut bulk = Vec::new();
+    for sid in ids {
+        bulk.extend_from_slice(&H2Frame::window_update(sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 1_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 6, 400);
+    log_frames("RFC 9218 non-incremental (baseline)", &frames);
+
+    let order = data_frame_stream_order(&frames);
+    println!("DATA stream-ID order: {order:?}");
+
+    // Sequential-drain assertion: for each stream, all of its DATA frames
+    // should form a contiguous block. Equivalently, the number of
+    // "transitions" (adjacent frames with different stream IDs) equals the
+    // number of streams − 1 — i.e. stream order like [1,1,1,3,3,3,5,5,5]
+    // gives 2 transitions for 3 streams. Round-robin would yield 8.
+    let transitions = order.windows(2).filter(|w| w[0] != w[1]).count();
+    let streams_seen: std::collections::HashSet<u32> = order.iter().copied().collect();
+    let n_streams = streams_seen.len();
+    let sequential = !order.is_empty() && transitions == n_streams.saturating_sub(1);
+
+    println!("transitions={transitions} streams_seen={n_streams} sequential={sequential}");
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && sequential && ids.iter().all(|sid| streams_seen.contains(sid)) {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_rfc9218_non_incremental_sequential() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4: non-incremental streams drain sequentially",
+            try_h2_rfc9218_non_incremental_sequential
+        ),
+        State::Success
+    );
+}
+
+/// Tier 3a — LIFECYCLE §9 invariant 17: RFC 9218 incremental peer count
+/// must be scoped to the same urgency bucket, not the whole connection.
+/// Two incremental streams in DIFFERENT urgency buckets (`u=0, i` and
+/// `u=7, i`) are each solo in their own bucket. With the baseline
+/// connection-global count, both streams would see
+/// `incremental_peer_count >= 2` and yield after every DATA frame,
+/// spuriously triggering the same strand the `finalize_write`
+/// WRITABLE-withdrawal guard was added for. With bucket scoping each
+/// stream sees peer count == 1 and drains sequentially — DATA frames
+/// for stream 1 form a contiguous run, stream 3 likewise.
+fn try_h2_rfc9218_incremental_multi_bucket_drains_sequentially() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-RFC9218-MB", 2, 32 * 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // INITIAL_WINDOW_SIZE=0 so both responses park in kawa before any DATA
+    // is released — ensures the scheduler sees both streams as eligible in
+    // a single `writable()` pass.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    // Stream 1: highest urgency incremental. Stream 3: lowest urgency
+    // incremental. Different urgency buckets on purpose.
+    let request_ids: [(u32, u8); 2] = [(1, 0), (3, 7)];
+    for (sid, urgency) in request_ids {
+        let block = build_get_headers_with_priority(urgency, "i");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(400));
+
+    // Bulk WINDOW_UPDATE — see round-robin test for rationale.
+    let mut bulk = Vec::new();
+    for (sid, _) in request_ids {
+        bulk.extend_from_slice(&H2Frame::window_update(sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 1_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 6, 400);
+    log_frames("RFC 9218 multi-bucket incremental", &frames);
+
+    let order = data_frame_stream_order(&frames);
+    println!("DATA stream-ID order: {order:?}");
+
+    // Each stream is solo in its urgency bucket. `incremental_peer_count`
+    // is 1 per bucket → converter drains sequentially inside each bucket.
+    // Priority sort picks the lower urgency first, so stream 1 drains
+    // before stream 3. Total transitions = 1 (stream 1 block → stream 3
+    // block); baseline (without bucket scoping) would interleave and
+    // produce many more transitions.
+    let transitions = order.windows(2).filter(|w| w[0] != w[1]).count();
+    let streams_seen: std::collections::HashSet<u32> = order.iter().copied().collect();
+    let both_fired = request_ids
+        .iter()
+        .all(|(sid, _)| streams_seen.contains(sid));
+    let sequential_per_bucket =
+        !order.is_empty() && transitions == streams_seen.len().saturating_sub(1);
+
+    println!(
+        "both_fired={both_fired} transitions={transitions} \
+         sequential_per_bucket={sequential_per_bucket} \
+         streams_seen={} total_frames={}",
+        streams_seen.len(),
+        order.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && both_fired && sequential_per_bucket {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_rfc9218_incremental_multi_bucket_drains_sequentially() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4 Tier 3a: incremental_peer_count is bucket-scoped",
+            try_h2_rfc9218_incremental_multi_bucket_drains_sequentially
+        ),
+        State::Success
+    );
+}
+
+/// Tier 3b — RFC 9218 §7.1: a PRIORITY_UPDATE frame for an open stream
+/// with a well-formed priority field value is accepted and does not
+/// terminate the connection. The response must still drain fully with
+/// END_STREAM.
+fn try_h2_priority_update_on_open_stream_is_accepted() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-PU-ACCEPT", 1, 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+
+    // Open stream 1 with a default priority header.
+    let block = build_get_headers_with_priority(3, "i=?0");
+    let headers = H2Frame::headers(1, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    // Re-prioritize stream 1 mid-flight with `u=0, i`.
+    let pu = H2Frame::priority_update(1, "u=0, i");
+    tls.write_all(&pu.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 200, 5, 400);
+    log_frames("PRIORITY_UPDATE accept", &frames);
+
+    // No GOAWAY — the response must deliver normally.
+    let has_goaway = frames.iter().any(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY);
+    let has_end_stream_on_1 = frames.iter().any(|(ft, fl, sid, _)| {
+        (*ft == H2_FRAME_DATA || *ft == H2_FRAME_HEADERS)
+            && *sid == 1
+            && (fl & H2_FLAG_END_STREAM) != 0
+    });
+
+    println!(
+        "has_goaway={has_goaway} has_end_stream_on_1={has_end_stream_on_1} frames={}",
+        frames.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && !has_goaway && has_end_stream_on_1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_priority_update_on_open_stream_is_accepted() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §7.1: PRIORITY_UPDATE accepted + response drains",
+            try_h2_priority_update_on_open_stream_is_accepted
+        ),
+        State::Success
+    );
+}
+
+/// Tier 3b — RFC 9218 §7.1: a PRIORITY_UPDATE frame with
+/// `prioritized_stream_id == 0` is a connection-level PROTOCOL_ERROR.
+/// Sozu must emit GOAWAY(PROTOCOL_ERROR) and close the session rather
+/// than silently ignoring the frame.
+fn try_h2_priority_update_on_stream_zero_is_protocol_error() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-PU-STREAM0", 1, 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+
+    // Send a PRIORITY_UPDATE targeting stream 0 (the connection itself).
+    let pu = H2Frame::priority_update(0, "u=0, i");
+    tls.write_all(&pu.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 200, 4, 300);
+    log_frames("PRIORITY_UPDATE stream0", &frames);
+
+    let has_protocol_error_goaway = frames.iter().any(|(ft, _, _, payload)| {
+        *ft == H2_FRAME_GOAWAY
+            && payload.len() >= 8
+            // bytes 4..8 carry the error code (RFC 9113 §6.8)
+            && u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) == 0x1
+    });
+
+    println!(
+        "has_protocol_error_goaway={has_protocol_error_goaway} frames={}",
+        frames.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && has_protocol_error_goaway {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_priority_update_on_stream_zero_is_protocol_error() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §7.1: PRIORITY_UPDATE on stream 0 → GOAWAY(PROTOCOL_ERROR)",
+            try_h2_priority_update_on_stream_zero_is_protocol_error
+        ),
+        State::Success
+    );
+}
+
+/// Tier 3c — LIFECYCLE §9 invariant 19: the converter must NOT yield
+/// between the last DATA frame and the closing `Block::Flags`
+/// (end_stream = true). Three same-urgency incremental streams drive
+/// the round-robin yield; each response body is small enough that the
+/// scheduler reaches the closing Flags right after its first DATA frame.
+/// With Tier 3c's close-race guard, END_STREAM lands in the same pass
+/// rather than waiting for another writable tick (or — pre-invariant-16
+/// — stranding permanently).
+fn try_h2_incremental_round_robin_closes_every_stream() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-RR-CLOSE", 3, 4 * 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let ids = [1u32, 3, 5];
+    for sid in ids {
+        let block = build_get_headers_with_priority(3, "i");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(400));
+
+    let mut bulk = Vec::new();
+    for sid in ids {
+        bulk.extend_from_slice(&H2Frame::window_update(sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 1_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 6, 400);
+    log_frames("RR close-race", &frames);
+
+    // Every stream must observe at least one frame with END_STREAM set
+    // (either the terminal DATA or an empty DATA marker produced by the
+    // converter's close path).
+    let closed: std::collections::HashSet<u32> = frames
+        .iter()
+        .filter_map(|(ft, fl, sid, _)| {
+            if (*ft == H2_FRAME_DATA || *ft == H2_FRAME_HEADERS) && (fl & H2_FLAG_END_STREAM) != 0 {
+                Some(*sid)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let all_closed = ids.iter().all(|sid| closed.contains(sid));
+
+    println!("closed_streams={closed:?} all_closed={all_closed}");
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && all_closed {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_incremental_round_robin_closes_every_stream() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4 Tier 3c: round-robin drain emits END_STREAM per stream",
+            try_h2_incremental_round_robin_closes_every_stream
+        ),
+        State::Success
+    );
+}
+
+/// RFC 9218 §4 + sozu incremental-scheduling regression (PR #1209 follow-up):
+/// a SOLO stream whose client sent `priority: u=0, i` (Chrome's navigation
+/// default since Chrome 107) must drain its full response body promptly.
+///
+/// With only one stream in the urgency-0 incremental bucket, the round-robin
+/// yield in `H2BlockConverter::call` (`lib/src/protocol/mux/converter.rs`)
+/// has no peer to rotate to; yielding strands the stream because
+/// `ConnectionH2::finalize_write` (`lib/src/protocol/mux/h2.rs`) removes
+/// `Ready::WRITABLE` on a clean drain when `expect_write.is_none()`.
+/// Edge-triggered epoll never re-fires (kernel TCP buffer barely touched)
+/// and no new peer frame is coming (Chrome's 6 MiB per-stream window is not
+/// yet exhausted), so the stream parks silently. `front_timeout` (60 s
+/// default per `DEFAULT_FRONT_TIMEOUT` in `command/src/config.rs`)
+/// eventually tears the TCP connection down and Chrome reports
+/// `ERR_CONNECTION_CLOSED`.
+///
+/// Test shape:
+/// - One backend serving an 80 KB body (= 5 full 16 384-byte DATA frames).
+/// - Single client, single stream id=1 with `priority: u=0, i`.
+/// - Generous initial per-stream + connection windows so flow control is
+///   never the stall reason.
+/// - Assert: full 80 KB body received within 2 s, END_STREAM flag on the
+///   last DATA frame.
+///
+/// MUST FAIL on `feat/h2-mux` HEAD (commit `fe528e75` landed the RFC 9218
+/// scheduling that introduced the strand); MUST PASS once the scheduler
+/// skips its incremental yield when `incremental_peer_count <= 1`.
+fn try_h2_solo_incremental_drains_fully() -> State {
+    const BODY_SIZE: usize = 80 * 1024;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-SOLO-INCREMENTAL", 1, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // Generous initial per-stream window. Chrome advertises 6 MiB; we use
+    // 1 MiB for the test so flow control is demonstrably not the stall.
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    // Chrome's navigation priority: u=0 highest urgency, i (incremental).
+    let block = build_get_headers_with_priority(0, "i");
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Lift the connection-level window so the 80 KB body isn't capped by
+    // the default 65535 conn window — per-stream flow control alone is not
+    // enough when the connection pool needs bandwidth.
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    // Deadline: 2 seconds. A healthy scheduler delivers 80 KB in a few
+    // milliseconds; the bugged scheduler stalls after the first pass and
+    // never emits the final DATA + END_STREAM on this stream.
+    //
+    // We set a 250 ms socket read timeout and stop reading as soon as
+    // END_STREAM is seen on our stream id (or we time out on the 3 s wall
+    // clock). Using a pure `collect_response_frames` call would conflate
+    // "body delivered" with "connection still open and idle" — H2 keeps
+    // the TCP connection around after END_STREAM so the collect loop
+    // would spin on empty reads until its own budget expires, making the
+    // measurement useless for a body-delivery deadline.
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut done = false;
+    while !done && start.elapsed() < Duration::from_secs(3) {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA && *s == sid && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+
+    log_frames("solo incremental 80 KB", &frames);
+
+    // Count body bytes on our stream; track END_STREAM on any DATA frame.
+    let mut body_bytes: usize = 0;
+    let mut end_stream_seen = false;
+    for (ft, fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA && *s == sid {
+            body_bytes += payload.len();
+            if (*fl & H2_FLAG_END_STREAM) != 0 {
+                end_stream_seen = true;
+            }
+        }
+    }
+
+    println!(
+        "solo-incremental: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    let full_body = body_bytes == BODY_SIZE;
+    let in_deadline = elapsed < Duration::from_secs(2);
+
+    if infra_ok && full_body && end_stream_seen && in_deadline {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, elapsed={elapsed:?} (want <2s), \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_solo_incremental_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 solo `priority: u=0, i` stream must drain full body within 2 s",
+            try_h2_solo_incremental_drains_fully
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// H2 large-asset repro suite (Sébastien Brunat 2026-04-23 PHP/Apache report)
+// ============================================================================
+
+/// Firefox-shape header block: same pseudo-headers as
+/// [`build_get_headers_with_priority`] but WITHOUT the `priority` literal.
+/// Firefox does not emit `priority: u=0, i` by default, so any truncation
+/// observable on this shape lives outside the RFC 9218 solo-bucket fix in
+/// the incremental-yield branch of `H2BlockConverter::call`
+/// (`lib/src/protocol/mux/converter.rs`).
+fn build_get_headers_no_priority() -> Vec<u8> {
+    vec![
+        0x82, // :method GET (indexed)
+        0x84, // :path / (indexed)
+        0x87, // :scheme https (indexed)
+        0x41, 0x09, // :authority, value len 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ]
+}
+
+/// Drain one stream until END_STREAM on the given `sid` or the `deadline`
+/// expires. Returns `(body_bytes, end_stream_seen, got_rst_stream_on_sid,
+/// elapsed)`.
+///
+/// Uses an END_STREAM-aware early exit instead of a `collect_response_frames`
+/// elapsed budget, because that budget measures quiet time, not body
+/// delivery. The caller's deadline wall-clock is the source of truth.
+fn drain_h2_stream_until_end_stream(
+    tls: &mut rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+    sid: u32,
+    deadline: Duration,
+) -> (usize, bool, bool, Duration) {
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut done = false;
+    let mut got_rst = false;
+    while !done && start.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA && *s == sid && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        done = true;
+                        break;
+                    }
+                    if *ft == H2_FRAME_HEADERS && *s == sid && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        done = true;
+                        break;
+                    }
+                    if *ft == H2_FRAME_RST_STREAM && *s == sid {
+                        got_rst = true;
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+    let mut body_bytes = 0usize;
+    let mut end_stream_seen = false;
+    for (ft, fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA && *s == sid {
+            body_bytes += payload.len();
+            if (*fl & H2_FLAG_END_STREAM) != 0 {
+                end_stream_seen = true;
+            }
+        }
+    }
+    (body_bytes, end_stream_seen, got_rst, elapsed)
+}
+
+/// Build a full HTTPS listener + cluster + cert + backend stack with a
+/// single configurable backend thread. Returns (worker, front_port,
+/// back_address). The caller spawns the mock backend against `back_address`.
+fn setup_single_h1_backend_listener(
+    name: &str,
+    h2_stream_idle_timeout_seconds: Option<u32>,
+) -> (Worker, u16, SocketAddr) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    if let Some(secs) = h2_stream_idle_timeout_seconds {
+        listener_config.h2_stream_idle_timeout_seconds = Some(secs);
+    }
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+    (worker, front_port, back_address)
+}
+
+// ----------------------------------------------------------------------------
+// (a) test_h2_firefox_shape_h1_cl_drains_fully — Firefox shape + H1 CL
+// ----------------------------------------------------------------------------
+
+/// Firefox shape: no `priority` header, H1 backend with Content-Length,
+/// 80 892 bytes (HAR-exact value from Sébastien Brunat's 2026-04-23 AM
+/// report). Exercises `ConnectionH1::readable`
+/// (`lib/src/protocol/mux/h1.rs`) on the write path — the site where C1
+/// (`signal_pending_write` missing on `Ready::WRITABLE` insert)
+/// historically parked large asset deliveries.
+///
+/// Expected on HEAD (post-C1 fix): PASS within 3 s. Before the fix: would
+/// stall — the test is a lock-in anti-regression for C1 on the Firefox
+/// code path.
+fn try_h2_firefox_shape_h1_cl_drains_fully() -> State {
+    const BODY_SIZE: usize = 80_892;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-LA-FF-CL", 1, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(3));
+
+    println!(
+        "firefox-shape CL: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_firefox_shape_h1_cl_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 Firefox shape (no priority) + H1 CL backend must drain 80892 B within 3 s",
+            try_h2_firefox_shape_h1_cl_drains_fully
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (b) test_h2_chrome_shape_h1_cl_drains_fully — Chrome shape + H1 CL
+// ----------------------------------------------------------------------------
+
+/// Chrome shape: `priority: u=0, i`, H1 backend with Content-Length,
+/// 100 KiB. Locks in the RFC 9218 solo-bucket fix (the incremental-yield
+/// branch of `H2BlockConverter::call` in
+/// `lib/src/protocol/mux/converter.rs`, commit `f6c02912`) on the
+/// H1-backend code path — the existing
+/// `test_h2_solo_incremental_drains_fully` uses an H2 backend via
+/// `setup_h2_test_with_large_bodies`, which internally spawns
+/// `AsyncBackend::http_handler` — so this test adds coverage for the
+/// `mux/h1.rs` → `mux/h2.rs` write-path interaction under the solo
+/// incremental shape.
+fn try_h2_chrome_shape_h1_cl_drains_fully() -> State {
+    const BODY_SIZE: usize = 100 * 1024;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-LA-CH-CL", 1, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_with_priority(0, "i");
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(3));
+
+    println!(
+        "chrome-shape H1 CL: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_chrome_shape_h1_cl_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 Chrome shape (u=0, i) + H1 CL backend must drain 100 KiB within 3 s",
+            try_h2_chrome_shape_h1_cl_drains_fully
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (c) test_h2_php_apache_chunked_flush_drains_fully — chunked + per-chunk
+// ----------------------------------------------------------------------------
+
+/// PHP/Apache shape: chunked + per-chunk `flush()` cadence from
+/// [`ChunkedFlushH1Backend`], 312 215 bytes (HAR-exact `big.svg`). Pre-C1
+/// fix this would park because `ConnectionH1::readable`
+/// (`lib/src/protocol/mux/h1.rs`) flipped `Ready::WRITABLE` on the peer
+/// without `signal_pending_write()` and edge-triggered epoll never
+/// re-fired for the queued bytes. Post-fix the stream drains within 5 s.
+fn try_h2_php_apache_chunked_flush_drains_fully() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+    const BODY_SIZE: usize = 312_215;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-LA-PHP-CHUNKED", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 8 * 1024,
+            inter_chunk_delay: Duration::from_micros(500),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(5));
+
+    println!(
+        "php-apache-chunked: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?} \
+         backend_responses={}",
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_php_apache_chunked_flush_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 PHP/Apache chunked-flush backend must drain 312 KiB within 5 s",
+            try_h2_php_apache_chunked_flush_drains_fully
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (d) test_h2_slow_backend_idle_timeout_cancels — C2 RED/GREEN
+// ----------------------------------------------------------------------------
+
+/// Slow backend shape: chunked body streamed at ~16 KiB per 1-second tick,
+/// across 4 ticks (~64 KiB total, 4-second wall clock). Listener config
+/// sets `h2_stream_idle_timeout_seconds = 2` (well below the total
+/// delivery time). Pre-C2 fix the per-stream idle timer refreshed only on
+/// inbound DATA/HEADERS (`ConnectionH2::handle_data_frame` and
+/// `ConnectionH2::handle_headers_frame` in `lib/src/protocol/mux/h2.rs`) —
+/// a long-running response without any inbound client frames would be
+/// cancelled mid-delivery. Post-fix the outbound write path refreshes the
+/// timer and the response drains to completion.
+fn try_h2_slow_backend_idle_timeout_cancels() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+    const BODY_SIZE: usize = 64 * 1024;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-LA-SLOW-IDLE", Some(2));
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_secs(1),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(10));
+
+    println!(
+        "slow-backend idle: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?} \
+         backend_responses={}",
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_slow_backend_idle_timeout_cancels() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 slow chunked backend must not be cancelled by per-stream idle timer",
+            try_h2_slow_backend_idle_timeout_cancels
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (e) test_h2_chunked_backend_crash_mid_stream_rsts — C3 RED/GREEN
+// ----------------------------------------------------------------------------
+
+/// Chunked backend crashes mid-body: writes ~50 KiB of a 100 KiB body then
+/// drops the TCP connection WITHOUT the terminating `0\r\n\r\n`. Pre-C3
+/// fix the H1 reader path (`mux/h1.rs:terminate_close_delimited`) would
+/// silently mark the stream END_STREAM, so the H2 converter emitted a
+/// truncated DATA frame with END_STREAM — silent corruption. Post-fix the
+/// chunked EOF is demoted to `ParsingPhase::Error` and the H2 converter
+/// emits RST_STREAM(InternalError) per RFC 9112 §7.1.
+fn try_h2_chunked_backend_crash_mid_stream_rsts() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+    const BODY_SIZE: usize = 100 * 1024;
+    const TRUNCATE_AT: usize = 50 * 1024;
+
+    let (worker, front_port, back_address) = setup_single_h1_backend_listener("H2-LA-CRASH", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 8 * 1024,
+            inter_chunk_delay: Duration::from_micros(500),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: Some(TRUNCATE_AT),
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(5));
+
+    println!(
+        "chunked-crash: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    // Success condition: the client must see either RST_STREAM (preferred)
+    // or no END_STREAM (partial delivery without completion). Silent
+    // END_STREAM with body_bytes == BODY_SIZE would be the C3 bug.
+    let c3_guard = got_rst || !end_stream_seen;
+    if infra_ok && c3_guard {
+        State::Success
+    } else {
+        println!(
+            "FAIL (C3 silent truncation): body_bytes={body_bytes}, \
+             end_stream={end_stream_seen}, rst={got_rst}, elapsed={elapsed:?}, \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_chunked_backend_crash_mid_stream_rsts() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 chunked backend crash mid-body must emit RST_STREAM, not silent END_STREAM",
+            try_h2_chunked_backend_crash_mid_stream_rsts
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (f) test_h2_coalesced_chrome_firefox_streams_drain — coalescing lock-in
+// ----------------------------------------------------------------------------
+
+/// Two concurrent streams on the same TLS connection: sid=1 is Chrome shape
+/// (`priority: u=0, i`), sid=3 is Firefox shape (no priority). Both served
+/// by H1 backends at 100 KiB each. Asserts both drain within 5 s. Locks in
+/// the absence of cross-stream interaction that a connection-coalescing
+/// regression (H7) could introduce.
+fn try_h2_coalesced_chrome_firefox_streams_drain() -> State {
+    const BODY_SIZE: usize = 100 * 1024;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-LA-COALESCED", 2, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    // sid=1 Chrome shape
+    let block1 = build_get_headers_with_priority(0, "i");
+    let h1 = H2Frame::headers(1, block1, true, true);
+    tls.write_all(&h1.encode()).unwrap();
+    // sid=3 Firefox shape
+    let block3 = build_get_headers_no_priority();
+    let h3 = H2Frame::headers(3, block3, true, true);
+    tls.write_all(&h3.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    // Custom drain: wait until END_STREAM on both sid=1 AND sid=3.
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let deadline = Duration::from_secs(5);
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut end1 = false;
+    let mut end3 = false;
+    while (!end1 || !end3) && start.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        if *s == 1 {
+                            end1 = true;
+                        }
+                        if *s == 3 {
+                            end3 = true;
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+    let mut body1 = 0usize;
+    let mut body3 = 0usize;
+    for (ft, _fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA {
+            if *s == 1 {
+                body1 += payload.len();
+            } else if *s == 3 {
+                body3 += payload.len();
+            }
+        }
+    }
+    println!(
+        "coalesced: sid1 body={body1}/{BODY_SIZE} end={end1}, \
+         sid3 body={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    if infra_ok && body1 == BODY_SIZE && end1 && body3 == BODY_SIZE && end3 {
+        State::Success
+    } else {
+        println!(
+            "FAIL: sid1={body1}/{BODY_SIZE} end={end1}, \
+             sid3={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}, \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_coalesced_chrome_firefox_streams_drain() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 two streams (Chrome+Firefox shape) must both drain within 5 s",
+            try_h2_coalesced_chrome_firefox_streams_drain
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Customer HAR repro (2026-04-24 selfiexxl): H2 response body never delivered
+// ============================================================================
+//
+// The customer's Axios XHR observed `_transferSize=134`, `receive≈49.6s`,
+// `_error=net::ERR_ABORTED` on a `GET` that returned `200 OK` with
+// `Content-Length: 3752` (see `tasks/wwwselfiexxlfr-debug_7zbkq2.har`).
+// Response headers reached Chrome; the single 3752-byte DATA frame never
+// did. The request carried `priority: u=1, i` on a multiplexed connection.
+//
+// Two independent wake-gap bugs can each produce this shape on
+// `feat/h2-mux`:
+//
+// * **Bug 2 (H2 scheduler)**: the connection-global incremental count
+//   was fed to the converter as `incremental_peer_count` even when a
+//   stream was solo in its own urgency bucket — tripping the
+//   yield-after-one-DATA branch and stranding the rest of the body
+//   because `finalize_write` strips `Ready::WRITABLE` on a voluntary
+//   yield with no `expect_write`. Fixed by `3f9f5e38`, which scopes the
+//   count per urgency bucket and looks it up per-stream by urgency —
+//   today `ReadyIncrementalCensus` in `mux/h2_scheduler.rs`.
+// * **Bug 1 (H1→H2 wake-gap)**: `ConnectionH1::readable`
+//   (`lib/src/protocol/mux/h1.rs`) wraps the Linked-peer
+//   `signal_pending_write()` call inside `if kawa.is_main_phase()`.
+//   kawa 0.6.8 `storage/repr.rs` declares `Terminated` as a main-phase
+//   state (see the `is_main_phase` match arms), so a keep-alive H1
+//   backend that emits headers + small Content-Length body in a single
+//   parse round trip still signals correctly *today*. The historical
+//   regression covered by this test set lives in the `Headers → Body →
+//   Terminated` boundary where an older kawa returned false at that
+//   `kawa.is_main_phase()` guard and skipped the peer wake. The
+//   close-delimited fallback in the same method is gated on
+//   `!is_keep_alive_backend`, so it only papers over the gap on
+//   non-keep-alive backends.
+//
+// The three tests below exercise each bug in isolation, then together.
+
+// ----------------------------------------------------------------------------
+// (g) test_h2_mixed_urgency_incremental_solo_drains — Bug 2 RED
+// ----------------------------------------------------------------------------
+
+/// Two concurrent H2 streams on the same connection, BOTH incremental, in
+/// DIFFERENT urgency buckets:
+/// * sid=1 — `priority: u=0, i` (Chrome navigation shape, solo in bucket 0)
+/// * sid=3 — `priority: u=3, i` (Chrome image/XHR shape, solo in bucket 3)
+///
+/// Pre-`3f9f5e38`, the converter's `incremental_peer_count` read the
+/// connection-global total (2 = one incremental per urgency bucket × 2
+/// buckets), so each stream still tripped the yield-after-one-DATA guard
+/// even though it was solo in its bucket. `finalize_write` stripped
+/// `Ready::WRITABLE` on the voluntary yield, edge-triggered epoll did
+/// not re-fire, and the remaining body bytes stranded in `kawa.out`
+/// until `front_timeout` (60 s default). `3f9f5e38` replaced the global
+/// read with a per-urgency-bucket count — today
+/// `ReadyIncrementalCensus::incremental_peer_count` in
+/// `mux/h2_scheduler.rs` — so a solo-in-bucket incremental stream now
+/// sees `incremental_peer_count = 1` (itself) and does not yield.
+///
+/// Lock-in regression guard: MUST PASS on HEAD post-`3f9f5e38`. A
+/// regression that reintroduces the global-count path would fail this
+/// test within the 3 s deadline.
+fn try_h2_mixed_urgency_incremental_solo_drains() -> State {
+    const BODY_SIZE: usize = 64 * 1024;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-MIXURG-INC", 2, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    // sid=1, u=0, i — solo incremental in urgency-0 bucket
+    let block1 = build_get_headers_with_priority(0, "i");
+    let h1 = H2Frame::headers(1, block1, true, true);
+    tls.write_all(&h1.encode()).unwrap();
+    // sid=3, u=3, i — solo incremental in urgency-3 bucket
+    let block3 = build_get_headers_with_priority(3, "i");
+    let h3 = H2Frame::headers(3, block3, true, true);
+    tls.write_all(&h3.encode()).unwrap();
+    tls.flush().unwrap();
+
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let deadline = Duration::from_secs(5);
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut end1 = false;
+    let mut end3 = false;
+    while (!end1 || !end3) && start.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        if *s == 1 {
+                            end1 = true;
+                        }
+                        if *s == 3 {
+                            end3 = true;
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+    let mut body1 = 0usize;
+    let mut body3 = 0usize;
+    for (ft, _fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA {
+            if *s == 1 {
+                body1 += payload.len();
+            } else if *s == 3 {
+                body3 += payload.len();
+            }
+        }
+    }
+    println!(
+        "mixed-urgency incremental: sid1 body={body1}/{BODY_SIZE} end={end1}, \
+         sid3 body={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    if infra_ok
+        && body1 == BODY_SIZE
+        && end1
+        && body3 == BODY_SIZE
+        && end3
+        && elapsed < Duration::from_secs(3)
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: sid1={body1}/{BODY_SIZE} end={end1}, \
+             sid3={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}, \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_mixed_urgency_incremental_solo_drains() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 two solo-in-bucket incremental streams (u=0,i + u=3,i) must drain within 3 s",
+            try_h2_mixed_urgency_incremental_solo_drains
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (h) test_h2_h1_keepalive_single_read_cl_drains — Bug 1 RED
+// ----------------------------------------------------------------------------
+
+/// Single H2 stream → keep-alive H1 backend that writes the entire
+/// response (headers + 3752-byte `Content-Length` body) in ONE `write_all`
+/// syscall and then waits for the next request. Reproduces the customer
+/// HAR body size exactly.
+///
+/// sōzu's H1 reader at `mux/h1.rs` receives headers+body in a single
+/// `socket_read` cycle. `kawa::h1::parse` transitions kawa from
+/// `Headers` → `Body` → `Terminated` within one call. At the
+/// `kawa.is_main_phase()` guard of `ConnectionH1::readable`
+/// (`lib/src/protocol/mux/h1.rs`), `kawa.is_main_phase() == false` after
+/// the transition, so the Linked-peer `signal_pending_write()` call inside
+/// that guard is skipped. The close-delimited fallback in the same method
+/// requires `status == Closed`, which does not fire for keep-alive
+/// backends. The frontend has DATA+END_STREAM queued in `kawa.out` but
+/// never receives the wake-up; edge-triggered epoll never re-fires; the
+/// body strands until `front_timeout`.
+///
+/// MUST FAIL on HEAD (Bug 1). MUST PASS after the signal-gap fix.
+fn try_h2_h1_keepalive_single_read_cl_drains() -> State {
+    use crate::mock::single_read_h1_backend::{SingleReadConfig, SingleReadH1Backend};
+    const BODY_SIZE: usize = 3752;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-COR-SINGLEREAD-CL", None);
+
+    let backend = SingleReadH1Backend::start(
+        back_address,
+        SingleReadConfig {
+            body_size: BODY_SIZE,
+            content_type: Some("application/json"),
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(3));
+
+    println!(
+        "h1-keepalive-single-read: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?} \
+         backend_responses={}",
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_h1_keepalive_single_read_cl_drains() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 stream → keep-alive H1 backend (CL 3752, single write) must drain within 3 s",
+            try_h2_h1_keepalive_single_read_cl_drains
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (i) test_h2_customer_har_shape_drains — combined HAR repro
+// ----------------------------------------------------------------------------
+
+/// Full customer HAR reproduction: multiplexed H2 connection with two
+/// streams, both incremental, in different urgency buckets, each served by
+/// a keep-alive H1 backend that writes its response in a single syscall.
+/// sid=1 is the customer's stalling XHR (`priority: u=1, i`, 3752-byte
+/// JSON). sid=3 is a concurrent incremental request in urgency bucket 3
+/// (e.g. an image prefetch, RFC 9218 §8 default urgency).
+///
+/// On HEAD this test can fail on either Bug 1 or Bug 2 — both contribute.
+/// After both fixes land, both streams drain within the 3 s deadline.
+fn try_h2_customer_har_shape_drains() -> State {
+    use crate::mock::single_read_h1_backend::{SingleReadConfig, SingleReadH1Backend};
+    const BODY_SIZE: usize = 3752;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-COR-HAR-SHAPE", None);
+
+    let backend = SingleReadH1Backend::start(
+        back_address,
+        SingleReadConfig {
+            body_size: BODY_SIZE,
+            content_type: Some("application/json"),
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    // sid=1 — customer's XHR priority: u=1, i
+    let block1 = build_get_headers_with_priority(1, "i");
+    let h1 = H2Frame::headers(1, block1, true, true);
+    tls.write_all(&h1.encode()).unwrap();
+    // sid=3 — incremental peer in a different urgency bucket
+    let block3 = build_get_headers_with_priority(3, "i");
+    let h3 = H2Frame::headers(3, block3, true, true);
+    tls.write_all(&h3.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let deadline = Duration::from_secs(5);
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut end1 = false;
+    let mut end3 = false;
+    while (!end1 || !end3) && start.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        if *s == 1 {
+                            end1 = true;
+                        }
+                        if *s == 3 {
+                            end3 = true;
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+    let mut body1 = 0usize;
+    let mut body3 = 0usize;
+    for (ft, _fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA {
+            if *s == 1 {
+                body1 += payload.len();
+            } else if *s == 3 {
+                body3 += payload.len();
+            }
+        }
+    }
+    println!(
+        "customer HAR shape: sid1 body={body1}/{BODY_SIZE} end={end1}, \
+         sid3 body={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}, \
+         backend_responses={}",
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok
+        && body1 == BODY_SIZE
+        && end1
+        && body3 == BODY_SIZE
+        && end3
+        && elapsed < Duration::from_secs(3)
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: sid1={body1}/{BODY_SIZE} end={end1}, \
+             sid3={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}, \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_customer_har_shape_drains() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 customer HAR shape (mixed-urgency incremental + single-read CL) must drain within 3 s",
+            try_h2_customer_har_shape_drains
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Customer H2 truncation regression guard (cleverapps.io, 2026-04)
+//
+// A customer reported a ~7.4 MB gzipped chunked JSON response being truncated
+// at ~3 MB through Sōzu's H2 frontend. The stall reproduced only when two
+// cleverapps.io apps communicated (both had H2 enabled via ALPN) and the
+// response travelled over the H1-backend → H2-frontend path with
+// `Content-Encoding: gzip` + `Transfer-Encoding: chunked`. Moving the API to
+// a non-cleverapps.io domain (which disables H2) cleared the symptom.
+//
+// The two tests below lock in the 9-fix chain that closed the report:
+// `040e305f` (H1→H2 wake-gap + outbound idle refresh + chunked-EOF
+// classification), `164ba27a` (`finalize_write` invariant 16), `3f9f5e38`
+// (per-bucket incremental peer count), `8d226b88` (suppress incremental
+// yield before closing flags), `41bc51f2` (`set_default_answer`
+// `signal_pending_write` pairing), `3269dd06` (PRIORITY_UPDATE rearm),
+// `fead8eb0` (DATA/HEADERS handler `signal_pending_write` pairing),
+// `7ddf1f30` (RFC 9218 §7.1 PRIORITY_UPDATE parsing), `1de3faad` (per-bucket
+// incremental count consistency mid-pass).
+//
+// Test A serves a deterministic XorShift-seeded 7.76 MB synthetic payload
+// (high-entropy so gzip cannot collapse it to a trivially tiny wire), gzipped
+// with fast compression, over a TLS H2 front end with a Chromium-146 request
+// shape. It asserts sha256 byte-identity of the gzipped wire bytes within
+// 8 s. Test B is the scale-only smoke: same 7.76 MB total, synthetic 'Z'
+// fill, no gzip. Together they distinguish a "gzip-related regression" from
+// a "scale regression" if one but not the other fails.
+// ============================================================================
+
+/// Deterministic 32-byte seed for the XorShift PRNG driving the synthetic
+/// payload. Keeping it private ensures no test accidentally couples its
+/// sha256 expectation to a shared seed outside this test's scope.
+const CUSTOMER_REPRO_PAYLOAD_SEED: [u8; 32] = [
+    0x53, 0x4f, 0x5a, 0x55, 0x2d, 0x48, 0x32, 0x2d, 0x43, 0x55, 0x53, 0x54, 0x4f, 0x4d, 0x45, 0x52,
+    0x2d, 0x52, 0x45, 0x50, 0x52, 0x4f, 0x2d, 0x50, 0x52, 0x4e, 0x47, 0x2d, 0x32, 0x30, 0x32, 0x36,
+];
+
+/// Customer payload length: 7_763_292 bytes (from
+/// `tasks/outputfuzzed_16zjmiy.json`, the fuzzed sample the customer shared).
+/// Reproduces the "7 MB response" magnitude from the ticket.
+const CUSTOMER_REPRO_PAYLOAD_LEN: usize = 7_763_292;
+
+/// Fill `buf` with a deterministic XorShift-128 stream seeded from `seed`.
+/// High-entropy output — gzip on this stream yields roughly 1:1 size and
+/// therefore a gzipped wire body in the same order of magnitude as the
+/// customer's real (poorly compressible) JSON.
+///
+/// Not cryptographically random — this is a test fixture generator, not a
+/// security primitive. The determinism guarantee (same seed → same bytes)
+/// is what gives the test a stable sha256 expectation.
+fn fill_deterministic_prng(buf: &mut [u8], seed: [u8; 32]) {
+    let mut s0 = u64::from_le_bytes(seed[0..8].try_into().unwrap());
+    let mut s1 = u64::from_le_bytes(seed[8..16].try_into().unwrap());
+    let mut s2 = u64::from_le_bytes(seed[16..24].try_into().unwrap());
+    let mut s3 = u64::from_le_bytes(seed[24..32].try_into().unwrap());
+    let mut i = 0;
+    while i < buf.len() {
+        // xoshiro256++ step — good entropy, small state.
+        let result = s0.wrapping_add(s3).rotate_left(23).wrapping_add(s0);
+        let t = s1 << 17;
+        s2 ^= s0;
+        s3 ^= s1;
+        s1 ^= s2;
+        s0 ^= s3;
+        s2 ^= t;
+        s3 = s3.rotate_left(45);
+        let bytes = result.to_le_bytes();
+        let take = (buf.len() - i).min(8);
+        buf[i..i + take].copy_from_slice(&bytes[..take]);
+        i += take;
+    }
+}
+
+/// Test A — customer-shape gzipped 7.7 MB over TLS H2 with a Chromium-146
+/// request profile. Serves the synthetic payload gzipped + chunked from an
+/// H1 backend and asserts sha256 byte-identity of the gzipped wire body.
+/// Wall-clock budget for the two large-body H2 drain tests, derived from
+/// measurement on 2026-09-21 (sozu-proxy/sozu#1393, cause D).
+///
+/// The previous bound was `Duration::from_secs(8)`. It was never validated
+/// against CI contention: the commit that introduced these tests (`23f5f4f7`,
+/// 2026-04-24) recorded only "typical local run: ~285 ms per iteration", so 8 s
+/// was 28x an idle-only figure with no margin anybody had measured.
+///
+/// It failed on 2026-09-21, on a tree that already contained the #1373 spin fix
+/// `5b83908a`, so the spin fix does not cover it:
+///
+///   body_bytes=3440640/7763292 elapsed=8.036659064s   (44.32% transferred)
+///
+/// That is not a stall. Three things rule one out. Every write-queueing site on
+/// this path in `lib/src/protocol/mux/h1.rs` pairs `arm_writable()` /
+/// `signal_pending_write()` with an explicit edge-triggered-epoll comment, and
+/// `writable()` asserts the invariant. `h2.rs` has a window-stall reaper with
+/// its own passing e2e test. And decisively: in the SAME CI job and the same
+/// ~30 s window, the sibling `test_h2_large_gzipped_chunked_drains_fully` —
+/// same payload, same `drain_h2_stream_streaming` helper, same 8 s bound —
+/// passed all three iterations, with handshake-to-handshake cycles of 6.606 s
+/// and 6.073 s against its own ~285 ms idle baseline. A lost wake-up does not
+/// recover on its own three times; severe scheduling delay does.
+///
+/// Measurements behind the 30 s figure:
+///
+///   idle, 20 cores, crypto-ring and fips      272-287 ms  (11 samples)
+///   full local suite in parallel, 20 cores    697 ms - 1.121 s
+///   h2_ subset, `taskset -c 0-3`              749-793 ms
+///     (4 cores matches `ubuntu-latest`'s actual vCPU count)
+///   CI sibling test, realized cycle           6.073 s, 6.606 s
+///   CI failure, linear extrapolation          ~18.1 s  (8.037 / 0.4432)
+///
+/// 30 s is ~1.7x that extrapolation and ~4.5x the sibling's realized cycle,
+/// while staying well inside `DEFAULT_FRONT_TIMEOUT` (60 s) so the test still
+/// fails rather than tripping the proxy's own timeout first.
+///
+/// The local ceiling reproducible on this hardware is ~1.1 s, an order of
+/// magnitude short of what CI needed that day, so this bound is extrapolated
+/// from one CI snapshot plus a same-run corroborating sibling — not measured
+/// end to end the way `ISSUE_810_SHUTDOWN_BUDGET` was. If this fails again,
+/// the printed `elapsed=` is the datum to tighten it with; do not raise it
+/// further without one.
+const LARGE_BODY_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+
+fn try_h2_large_gzipped_chunked_drains_fully() -> State {
+    use std::io::Write as _;
+
+    use flate2::{Compression, write::GzEncoder};
+    use sha2::{Digest, Sha256};
+
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+
+    // 1. Build the deterministic plaintext payload (uncompressible by design
+    //    — gzip will not collapse high-entropy bytes).
+    let mut plaintext = vec![0u8; CUSTOMER_REPRO_PAYLOAD_LEN];
+    fill_deterministic_prng(&mut plaintext, CUSTOMER_REPRO_PAYLOAD_SEED);
+
+    // 2. Gzip with fast compression (level 1) — keeps test setup under
+    //    ~100 ms without materially changing the output size on a
+    //    high-entropy stream.
+    let mut encoder = GzEncoder::new(Vec::with_capacity(plaintext.len()), Compression::fast());
+    encoder.write_all(&plaintext).unwrap();
+    let gzipped: Vec<u8> = encoder.finish().unwrap();
+    let gzipped_len = gzipped.len();
+
+    // 3. Expected sha256 over the gzipped wire bytes. Drains produce the
+    //    same bytes verbatim (Sōzu does not re-encode or strip gzip on the
+    //    mux path), so byte-identity is the correctness predicate.
+    let mut hasher = Sha256::new();
+    hasher.update(&gzipped);
+    let expected_digest = hasher.finalize();
+    let expected_hex: String = expected_digest.iter().map(|b| format!("{b:02x}")).collect();
+
+    let gzipped_arc = std::sync::Arc::new(gzipped);
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-LA-GZIP-CUSTOMER", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: 0, // ignored when `body` is Some
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_micros(500),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: Some(gzipped_arc),
+            extra_response_headers: vec!["Content-Encoding: gzip".to_owned()],
+            content_type: Some("application/json".to_owned()),
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    let _server_settings = h2_handshake_chromium_146(&mut tls);
+
+    let sid: u32 = 1;
+    let block =
+        build_chrome146_get_headers("localhost", "/agents?organizationId=1", Some("u=3, i"));
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // 1 MiB WU cadence (not 32 KiB): on slow CI runners the per-frame
+    // WINDOW_UPDATE pace can stack late writes past sozu's end-of-stream
+    // close. Each post-close WU increments `H2FloodDetector::glitch_count`
+    // in `ConnectionH2::handle_window_update_frame`
+    // (`lib/src/protocol/mux/h2.rs`) and a cumulative 100+ trips a
+    // GOAWAY(ENHANCE_YOUR_CALM) that truncates the tail of the response.
+    // The 6 MiB initial stream window (CHROME146_INITIAL_WINDOW_SIZE) plus
+    // a single 1 MiB refresh is plenty of credit for a 7.77 MiB body.
+    let outcome = drain_h2_stream_streaming(&mut tls, sid, LARGE_BODY_DRAIN_BUDGET, 1024 * 1024);
+
+    println!(
+        "h2 customer gzipped chunked: body_bytes={}/{gzipped_len} \
+         end_stream={} rst={} elapsed={:?} budget={LARGE_BODY_DRAIN_BUDGET:?} \
+         sha256={} expected={expected_hex} \
+         backend_responses={}",
+        outcome.body_bytes,
+        outcome.end_stream_seen,
+        outcome.got_rst,
+        outcome.elapsed,
+        outcome.sha256_hex,
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok
+        && !outcome.got_rst
+        && outcome.end_stream_seen
+        && outcome.body_bytes == gzipped_len
+        && outcome.sha256_hex == expected_hex
+        && outcome.elapsed < LARGE_BODY_DRAIN_BUDGET
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={} (want {gzipped_len}), end_stream={}, rst={}, \
+             sha256={} (want {expected_hex}), elapsed={:?} (budget {LARGE_BODY_DRAIN_BUDGET:?}), infra_ok={infra_ok}",
+            outcome.body_bytes,
+            outcome.end_stream_seen,
+            outcome.got_rst,
+            outcome.sha256_hex,
+            outcome.elapsed,
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_gzipped_chunked_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 customer-shape 7.7 MB gzipped chunked drain (sha256 byte-identity) within 8 s",
+            try_h2_large_gzipped_chunked_drains_fully
+        ),
+        State::Success
+    );
+}
+
+/// Test B — scale-only smoke. 7.76 MB of `b'Z'` fill, chunked, no gzip.
+/// Isolates "large multi-MB drain + Chromium-146 request shape + per-stream
+/// WINDOW_UPDATE at 32 KiB cadence" from "gzip content-encoding". Length
+/// assertion only — synthetic `b'Z'` is trivially reconstructible.
+fn try_h2_large_chunked_7mb_drains_fully() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+
+    const BODY_SIZE: usize = CUSTOMER_REPRO_PAYLOAD_LEN;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-LA-7MB-SMOKE", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_micros(500),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    let _server_settings = h2_handshake_chromium_146(&mut tls);
+
+    let sid: u32 = 1;
+    let block = build_chrome146_get_headers("localhost", "/", Some("u=3, i"));
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // 1 MiB WU cadence (not 32 KiB): on slow CI runners the per-frame
+    // WINDOW_UPDATE pace can stack late writes past sozu's end-of-stream
+    // close. Each post-close WU increments `H2FloodDetector::glitch_count`
+    // in `ConnectionH2::handle_window_update_frame`
+    // (`lib/src/protocol/mux/h2.rs`) and a cumulative 100+ trips a
+    // GOAWAY(ENHANCE_YOUR_CALM) that truncates the tail of the response.
+    // The 6 MiB initial stream window (CHROME146_INITIAL_WINDOW_SIZE) plus
+    // a single 1 MiB refresh is plenty of credit for a 7.77 MiB body.
+    let outcome = drain_h2_stream_streaming(&mut tls, sid, LARGE_BODY_DRAIN_BUDGET, 1024 * 1024);
+
+    println!(
+        "h2 7MB smoke: body_bytes={}/{BODY_SIZE} \
+         end_stream={} rst={} elapsed={:?} budget={LARGE_BODY_DRAIN_BUDGET:?} \
+         backend_responses={}",
+        outcome.body_bytes,
+        outcome.end_stream_seen,
+        outcome.got_rst,
+        outcome.elapsed,
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok
+        && !outcome.got_rst
+        && outcome.end_stream_seen
+        && outcome.body_bytes == BODY_SIZE
+        && outcome.elapsed < LARGE_BODY_DRAIN_BUDGET
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={} (want {BODY_SIZE}), end_stream={}, rst={}, \
+             elapsed={:?} (budget {LARGE_BODY_DRAIN_BUDGET:?}), infra_ok={infra_ok}",
+            outcome.body_bytes, outcome.end_stream_seen, outcome.got_rst, outcome.elapsed,
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_chunked_7mb_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 7.76 MB chunked-flush drain smoke (scale-only, no gzip) within 8 s",
+            try_h2_large_chunked_7mb_drains_fully
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Peer-initiated GOAWAY-then-close regression guards
+// ============================================================================
+//
+// Regression coverage for the production scenario where a frontend (HAProxy
+// chain) sends `GOAWAY(last_stream_id=0, PROTOCOL_ERROR)` immediately followed
+// by a TCP RST, leaving Sōzu's reciprocal `GOAWAY` + `close_notify` stranded
+// in the TLS write buffer. Three variants:
+//
+// * `try_h2_peer_goaway_protocol_error_then_rst_clean_drain` (3.2.1) -- the
+//   noisy production path. Asserts that the worker stays alive and a fresh
+//   connection succeeds after the abort.
+// * `try_h2_peer_goaway_no_error_clean_close` (3.2.2) -- the orthogonal clean
+//   path. Asserts that Sōzu emits a reciprocal `GOAWAY(NO_ERROR)` before the
+//   peer closes.
+// * `try_h2_peer_goaway_during_response_body` (3.2.3) -- the in-flight variant
+//   that exercises the close-drain `error!` path. Asserts that the in-flight
+//   stream is torn down (RST_STREAM emitted, or no further DATA observed) and
+//   the worker remains healthy.
+
+/// Build a minimal HPACK header block for `GET /` against `localhost`, no
+/// body. Mirrors the static header block used by `try_h2_session_teardown_*`
+/// at the top of this file -- inlined here so the new tests do not depend on
+/// `build_chrome146_get_headers`'s priority encoding.
+fn build_minimal_h2_get_headers() -> Vec<u8> {
+    vec![
+        0x82, // :method GET (static-table 2)
+        0x84, // :path / (static-table 4)
+        0x87, // :scheme https (static-table 7)
+        0x41, 0x09, // :authority literal-with-incremental-indexing, length 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ]
+}
+
+/// Issue a single GET on `sid` and drive the response to completion. Returns
+/// `true` when at least one HEADERS frame is observed on any stream within the
+/// collection window. Used by the peer-abort tests to verify worker liveness
+/// after the abort.
+fn h2_simple_get_succeeds(
+    tls: &mut rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+    sid: u32,
+) -> bool {
+    let block = build_minimal_h2_get_headers();
+    let headers = H2Frame::headers(sid, block, true, true);
+    if tls.write_all(&headers.encode()).is_err() {
+        return false;
+    }
+    if tls.flush().is_err() {
+        return false;
+    }
+    let frames = collect_response_frames(tls, 200, 4, 250);
+    contains_headers_response(&frames)
+}
+
+/// 3.2.1 -- Peer-initiated `GOAWAY(PROTOCOL_ERROR)` immediately followed by
+/// `Shutdown::Both`. Mirrors the production HAProxy-chain trigger that
+/// surfaced the missing `MUX-H2` envelope on the close-drain `error!`. Pass
+/// condition: the worker stays alive and a fresh connection serves a new
+/// stream successfully.
+fn try_h2_peer_goaway_protocol_error_then_rst_clean_drain() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-PEER-ABORT", 1, 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+
+    // Drive a handful of successful streams (1, 3, 5, 7, 9) so
+    // `highest_peer_stream_id` is non-zero on the worker's side. The exact
+    // count is not load-bearing for this test (RFC 9113 §6.8 directionality
+    // means `last_peer_id` is informational here); 5 streams is enough to
+    // observe the close-path codepath without slowing the test.
+    for sid in (1..=9_u32).step_by(2) {
+        let block = build_minimal_h2_get_headers();
+        let headers = H2Frame::headers(sid, block, true, true);
+        if tls.write_all(&headers.encode()).is_err() {
+            return State::Fail;
+        }
+        if tls.flush().is_err() {
+            return State::Fail;
+        }
+        // Drain whatever response is available before moving on so the
+        // worker's `streams` map empties between iterations.
+        let _ = collect_response_frames(&mut tls, 100, 3, 200);
+    }
+
+    // Quiesce: let the worker's event loop finish processing the last
+    // response before we issue the abort.
+    thread::sleep(Duration::from_millis(50));
+
+    // Peer-initiated GOAWAY with `last_stream_id=0` and a 40-byte
+    // `additional_debug_data` payload, mirroring the production wire shape.
+    let abort = H2Frame::goaway_with_debug(
+        0,
+        H2_ERROR_PROTOCOL_ERROR,
+        b"e2e-peer-aborted-protocol-error-test-rep_",
+    );
+    let _ = tls.write_all(&abort.encode());
+    let _ = tls.flush();
+    // Tear the TCP socket down without consuming Sōzu's reciprocal traffic
+    // -- this forces the kernel to RST when Sōzu next attempts a write,
+    // which is the trigger for the close-drain warn/error.
+    let _ = tls.sock.shutdown(Shutdown::Both);
+    drop(tls);
+
+    // Allow the close path to run on the worker's event loop.
+    thread::sleep(Duration::from_millis(200));
+
+    // Liveness: a fresh TLS connection must complete a handshake and serve
+    // a single GET. If the abort had crashed or wedged the worker, this
+    // step would either time out or fail to read any HEADERS frame.
+    let mut tls2 = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls2, 65_535);
+    let alive = h2_simple_get_succeeds(&mut tls2, 1);
+
+    let infra_ok = teardown(tls2, front_port, worker, backends);
+    if alive && infra_ok {
+        State::Success
+    } else {
+        println!("FAIL: alive={alive} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_peer_goaway_protocol_error_then_rst_clean_drain() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 peer GOAWAY(PROTOCOL_ERROR) + Shutdown::Both \u{2014} worker stays healthy",
+            try_h2_peer_goaway_protocol_error_then_rst_clean_drain
+        ),
+        State::Success
+    );
+}
+
+/// 3.2.2 -- Orthogonal clean-close baseline. Peer sends
+/// `GOAWAY(last_stream_id=last_received, NO_ERROR)` and keeps both halves of
+/// the TCP socket open so Sōzu's reciprocal `GOAWAY` can fully flush back to
+/// us. Asserts that the reciprocal `GOAWAY` actually arrives on the wire.
+fn try_h2_peer_goaway_no_error_clean_close() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-PEER-CLEAN", 1, 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+
+    // Drive one successful GET so the worker's `highest_peer_stream_id`
+    // advances to 1.
+    let block = build_minimal_h2_get_headers();
+    let headers = H2Frame::headers(1, block, true, true);
+    if tls.write_all(&headers.encode()).is_err() {
+        return State::Fail;
+    }
+    if tls.flush().is_err() {
+        return State::Fail;
+    }
+    let _ = collect_response_frames(&mut tls, 200, 4, 250);
+
+    // Peer-initiated `GOAWAY(NO_ERROR, last_stream_id=1)` -- announces a
+    // graceful shutdown without aborting any streams. Keep the TCP socket
+    // open in both directions so Sōzu's reciprocal GOAWAY can flush back
+    // to us through the existing TLS session; a `Shutdown::Write` here
+    // would race the kernel and drop the reciprocal frame.
+    let goaway = H2Frame::goaway(1, H2_ERROR_NO_ERROR);
+    if tls.write_all(&goaway.encode()).is_err() {
+        return State::Fail;
+    }
+    let _ = tls.flush();
+
+    // Collect the reciprocal traffic. The window has to be generous enough
+    // for the worker's event loop to flush the reciprocal GOAWAY before
+    // we time out waiting for it.
+    let frames = collect_response_frames(&mut tls, 200, 6, 300);
+    let reciprocal_seen = contains_goaway(&frames);
+
+    drop(tls);
+
+    // Liveness on a fresh connection: the per-connection abort must not
+    // affect the listener.
+    let mut tls2 = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls2, 65_535);
+    let alive = h2_simple_get_succeeds(&mut tls2, 1);
+
+    let infra_ok = teardown(tls2, front_port, worker, backends);
+    if reciprocal_seen && alive && infra_ok {
+        State::Success
+    } else {
+        println!("FAIL: reciprocal_seen={reciprocal_seen} alive={alive} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_peer_goaway_no_error_clean_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 peer GOAWAY(NO_ERROR) keep-open \u{2014} reciprocal GOAWAY arrives",
+            try_h2_peer_goaway_no_error_clean_close
+        ),
+        State::Success
+    );
+}
+
+/// 3.2.3 -- Force the close-drain path. Slow-backend serves a 256 KiB body
+/// in chunked frames with a 50 ms inter-chunk delay; we abort
+/// (GOAWAY + RST) after the first DATA frame on `sid=1` arrives, so the
+/// TLS write buffer is non-empty when close runs. Asserts that the
+/// in-flight stream is torn down -- either Sōzu emits `RST_STREAM` for the
+/// stream before close, or no further DATA appears after the abort -- and
+/// the worker remains healthy on a fresh connection.
+fn try_h2_peer_goaway_during_response_body() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+
+    const BODY_SIZE: usize = 256 * 1024;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-COR-PEER-IN-FLIGHT", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_millis(50),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_048_576);
+
+    let sid: u32 = 1;
+    let block = build_minimal_h2_get_headers();
+    let headers = H2Frame::headers(sid, block, true, true);
+    if tls.write_all(&headers.encode()).is_err() {
+        drop(backend);
+        return State::Fail;
+    }
+    if tls.flush().is_err() {
+        drop(backend);
+        return State::Fail;
+    }
+
+    // Wait for the first DATA frame on `sid` so we know the response is
+    // genuinely in-flight when we abort. `collect_response_frames` runs
+    // multiple short reads to absorb TCP segmentation while the chunked
+    // backend dribbles data.
+    let mut data_frames_seen_pre_abort = 0_usize;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let frames = collect_response_frames(&mut tls, 50, 2, 200);
+        for (t, _, frame_sid, _) in &frames {
+            if *t == H2_FRAME_DATA && *frame_sid == sid {
+                data_frames_seen_pre_abort += 1;
+            }
+        }
+        if data_frames_seen_pre_abort > 0 {
+            break;
+        }
+    }
+
+    // Issue the abort even if no DATA was observed: an absent first DATA
+    // frame means the worker has not yet handed off to the backend, but
+    // the `streams != 0` post-condition is still true on the close path
+    // (the stream is in `Header` parsing-phase). The new `error!` tier
+    // covers both cases.
+    let abort = H2Frame::goaway_with_debug(
+        0,
+        H2_ERROR_PROTOCOL_ERROR,
+        b"e2e-peer-abort-during-response-body-rep_",
+    );
+    let _ = tls.write_all(&abort.encode());
+    let _ = tls.flush();
+    let _ = tls.sock.shutdown(Shutdown::Both);
+
+    // Read whatever Sōzu managed to flush before the RST. We do not assert
+    // on the exact ordering -- the kernel race may swallow the reciprocal
+    // GOAWAY -- but if a `RST_STREAM` for `sid` did make it onto the wire
+    // it is a positive signal that the in-flight stream was torn down.
+    let post_abort_frames = collect_response_frames(&mut tls, 100, 3, 200);
+    let saw_rst_for_sid = post_abort_frames
+        .iter()
+        .any(|(t, _, frame_sid, _)| *t == H2_FRAME_RST_STREAM && *frame_sid == sid);
+    let saw_more_data_for_sid = post_abort_frames
+        .iter()
+        .any(|(t, _, frame_sid, _)| *t == H2_FRAME_DATA && *frame_sid == sid);
+    drop(tls);
+
+    // Allow the close-drain path to run on the worker.
+    thread::sleep(Duration::from_millis(200));
+
+    // Liveness on a fresh connection.
+    let mut tls2 = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls2, 65_535);
+    let alive = h2_simple_get_succeeds(&mut tls2, 1);
+
+    let infra_ok = teardown(
+        tls2,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    // The stream was torn down if either: a RST_STREAM hit the wire before
+    // the kernel RST swallowed everything, OR no further DATA was observed
+    // after the abort (the close path stopped the response).
+    let stream_torn_down = saw_rst_for_sid || !saw_more_data_for_sid;
+
+    if alive && stream_torn_down && infra_ok {
+        State::Success
+    } else {
+        println!(
+            "FAIL: alive={alive} stream_torn_down={stream_torn_down} \
+             (saw_rst_for_sid={saw_rst_for_sid}, saw_more_data_for_sid={saw_more_data_for_sid}) \
+             pre_abort_data_frames={data_frames_seen_pre_abort} infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_peer_goaway_during_response_body() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 peer GOAWAY mid-response \u{2014} stream torn down, worker stays healthy",
+            try_h2_peer_goaway_during_response_body
+        ),
+        State::Success
+    );
+}
+
+/// RFC 9113 §6.8: a client's GOAWAY(NO_ERROR, last_stream_id = 0) bounds
+/// only the streams sozu (the receiver) initiated, and sozu initiates none.
+/// The client's own in-flight request must still be answered in full: the
+/// client keeps granting stream credit after its GOAWAY, and sozu keeps
+/// reading those WINDOW_UPDATEs, delivers the whole body with END_STREAM,
+/// then closes with its own GOAWAY(NO_ERROR).
+fn try_h2_client_goaway_keeps_in_flight_response() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+
+    const BODY_SIZE: usize = 512 * 1024;
+    const STREAM_WINDOW_REFRESH: u32 = 32 * 1024;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-COR-CLIENT-GOAWAY-IN-FLIGHT", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_millis(10),
+            transfer_encoding: TransferEncoding::ContentLength,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // Default 65 535-byte stream window: the body needs stream
+    // WINDOW_UPDATEs sent after the GOAWAY. The connection window is
+    // opened once, for the whole body.
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+    let sid: u32 = 1;
+    let mut request = H2Frame::window_update(0, BODY_SIZE as u32).encode();
+    request.extend(H2Frame::headers(sid, build_minimal_h2_get_headers(), true, true).encode());
+    if tls.write_all(&request).is_err() || tls.flush().is_err() {
+        drop(backend);
+        return State::Fail;
+    }
+
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut carry = Vec::new();
+    let mut rbuf = vec![0u8; 64 * 1024];
+    let mut body_bytes = 0usize;
+    let mut credit = 0u32;
+    let mut goaway_sent = false;
+    let mut end_stream_seen = false;
+    let mut got_rst = false;
+    let mut sozu_goaway: Option<(u32, u32)> = None;
+    let mut eof = false;
+    while sozu_goaway.is_none() && !got_rst && !eof && Instant::now() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => eof = true,
+            Ok(n) => carry.extend_from_slice(&rbuf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => eof = true,
+        }
+        let mut out = Vec::new();
+        while let Some((frame_type, flags, frame_sid, payload)) = advance_one_frame(&mut carry) {
+            match frame_type {
+                H2_FRAME_DATA if frame_sid == sid => {
+                    body_bytes += payload.len();
+                    credit += payload.len() as u32;
+                    if flags & H2_FLAG_END_STREAM != 0 {
+                        end_stream_seen = true;
+                    } else if credit >= STREAM_WINDOW_REFRESH {
+                        out.extend(H2Frame::window_update(sid, credit).encode());
+                        credit = 0;
+                    }
+                    if !goaway_sent {
+                        // The response is in flight: announce the client
+                        // will open no further stream.
+                        out.extend(H2Frame::goaway(0, H2_ERROR_NO_ERROR).encode());
+                        goaway_sent = true;
+                    }
+                }
+                H2_FRAME_RST_STREAM if frame_sid == sid => got_rst = true,
+                H2_FRAME_GOAWAY if payload.len() >= 8 => {
+                    let last = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                        & 0x7FFF_FFFF;
+                    let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    sozu_goaway = Some((last, code));
+                }
+                _ => {}
+            }
+        }
+        if !out.is_empty()
+            && !end_stream_seen
+            && (tls.write_all(&out).is_err() || tls.flush().is_err())
+        {
+            eof = true;
+        }
+    }
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    let closed_gracefully = matches!(sozu_goaway, Some((_, H2_ERROR_NO_ERROR)));
+    if goaway_sent
+        && body_bytes == BODY_SIZE
+        && end_stream_seen
+        && !got_rst
+        && closed_gracefully
+        && infra_ok
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: goaway_sent={goaway_sent} body_bytes={body_bytes}/{BODY_SIZE} \
+             end_stream={end_stream_seen} rst={got_rst} sozu_goaway={sozu_goaway:?} \
+             eof={eof} infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_client_goaway_keeps_in_flight_response() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 client GOAWAY(NO_ERROR, 0) mid-response \u{2014} the response completes, \
+             then sozu closes with GOAWAY(NO_ERROR)",
+            try_h2_client_goaway_keeps_in_flight_response
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// A `Connection: close` H1 backend that closes before its `Content-Length`
+// (sozu-proxy/sozu#1633)
+// ----------------------------------------------------------------------------
+
+/// Serve one H2 GET from an H1 backend that answers with `parts`, sent one
+/// after the other, then closes its connection after a pause, so the H2
+/// frontend has encoded the response head before the close arrives. Returns `(body_bytes,
+/// end_stream_seen, got_rst, infra_ok)` as seen by the H2 client.
+///
+/// RFC 9113 §8.1.1: a response whose DATA lengths do not sum to its
+/// `content-length` is malformed, so a body the backend truncated must end
+/// with RST_STREAM, never a clean END_STREAM. Only a body with neither
+/// `Content-Length` nor chunked coding is delimited by the close (RFC 9112
+/// §6.3 rule 8).
+fn h2_backend_close_scenario(name: &str, parts: &[&str]) -> (usize, bool, bool, bool) {
+    let (worker, front_port, back_address) = setup_single_h1_backend_listener(name, None);
+    let mut backend = SyncBackend::new(format!("{name}-BACKEND"), back_address, "");
+    backend.connect();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+    let sid: u32 = 1;
+    let headers = H2Frame::headers(sid, build_get_headers_no_priority(), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let started = Instant::now();
+    while !backend.accept(0) && started.elapsed() < Duration::from_secs(5) {}
+    backend.receive(0);
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            thread::sleep(Duration::from_millis(50));
+        }
+        backend.set_response(*part);
+        backend.send(0);
+    }
+    thread::sleep(Duration::from_millis(100));
+    backend.close(0);
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(5));
+    println!(
+        "{name}: body_bytes={body_bytes} end_stream={end_stream_seen} rst={got_rst} \
+         elapsed={elapsed:?}"
+    );
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+    (body_bytes, end_stream_seen, got_rst, infra_ok)
+}
+
+fn try_h2_content_length_truncated_by_backend_close_rsts(name: &str, parts: &[&str]) -> State {
+    let (body_bytes, end_stream_seen, got_rst, infra_ok) = h2_backend_close_scenario(name, parts);
+    // Before the fix the 4 bytes left with a clean END_STREAM under
+    // `content-length: 10`.
+    if infra_ok && got_rst && !end_stream_seen && body_bytes < 10 {
+        State::Success
+    } else {
+        println!(
+            "FAIL {name}: body_bytes={body_bytes}, end_stream={end_stream_seen}, \
+             rst={got_rst}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_content_length_truncated_by_backend_close_rsts() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a Content-Length response truncated by a backend close ends \
+             with RST_STREAM, not END_STREAM",
+            || try_h2_content_length_truncated_by_backend_close_rsts(
+                "H2-CL-TRUNC",
+                &["HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\nabcd"],
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_content_length_truncated_after_forwarded_head_rsts() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a Content-Length response whose head was already forwarded, \
+             then truncated by a backend close, ends with RST_STREAM",
+            || try_h2_content_length_truncated_by_backend_close_rsts(
+                "H2-CL-TRUNC-SPLIT",
+                &[
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\n",
+                    "abcd",
+                ],
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_chunked_truncated_by_closing_backend_rsts() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a chunked `Connection: close` response truncated by the backend \
+             close ends with RST_STREAM",
+            || try_h2_content_length_truncated_by_backend_close_rsts(
+                "H2-CHUNKED-TRUNC",
+                &[
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+                    "4\r\nabcd\r\n",
+                ],
+            ),
+        ),
+        State::Success
+    );
+}
+
+/// Non-regression: a whole `Content-Length` body, and a close-delimited body,
+/// end with a clean END_STREAM at the backend close.
+fn try_h2_body_complete_at_backend_close(name: &str, response: &str, want: usize) -> State {
+    let (body_bytes, end_stream_seen, got_rst, infra_ok) =
+        h2_backend_close_scenario(name, &[response]);
+    if infra_ok && end_stream_seen && !got_rst && body_bytes == want {
+        State::Success
+    } else {
+        println!(
+            "FAIL {name}: body_bytes={body_bytes} (want {want}), \
+             end_stream={end_stream_seen}, rst={got_rst}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_content_length_complete_then_backend_close_ends_stream() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a complete Content-Length response followed by a backend close \
+             ends with END_STREAM",
+            || try_h2_body_complete_at_backend_close(
+                "H2-CL-COMPLETE",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\n0123456789",
+                10,
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_close_delimited_body_ends_stream_at_backend_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a close-delimited body ends with END_STREAM at the backend close",
+            || try_h2_body_complete_at_backend_close(
+                "H2-CLOSE-DELIM",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd",
+                4,
+            ),
+        ),
+        State::Success
+    );
+}
+
+/// An HTTP/1.0 response without `Connection: keep-alive` is not persistent
+/// (RFC 9112 §9.3), so its close-delimited body ends at the backend close
+/// with END_STREAM (sozu-proxy/sozu#16). Before the fix the backend
+/// connection was taken for persistent and its EOF did not end the body.
+#[test]
+fn test_h2_http10_close_delimited_body_ends_stream_at_backend_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: an HTTP/1.0 close-delimited body ends with END_STREAM at the backend close",
+            || try_h2_body_complete_at_backend_close(
+                "H2-HTTP10-CLOSE-DELIM",
+                "HTTP/1.0 200 OK\r\n\r\nabcd",
+                4,
+            ),
+        ),
+        State::Success
+    );
+}
+
+/// Non-regression for sozu-proxy/sozu#1642: an H1 frontend closes after a
+/// response carrying the backend's `Connection: close`, an H2 frontend does
+/// not. `Connection` is hop-by-hop (RFC 9110 §7.6.1) and never reaches an H2
+/// client (RFC 9113 §8.2.2), and the close-delimited body ends with
+/// END_STREAM, so the H2 connection keeps serving streams: no GOAWAY after
+/// stream 1, and stream 3 is answered by a fresh backend connection.
+fn try_h2_backend_connection_close_keeps_the_connection(name: &str, response: &str) -> State {
+    let (worker, front_port, back_address) = setup_single_h1_backend_listener(name, None);
+    let mut backend = SyncBackend::new(format!("{name}-BACKEND"), back_address, "");
+    backend.connect();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+    let headers = H2Frame::headers(1, build_get_headers_no_priority(), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let started = Instant::now();
+    while !backend.accept(0) && started.elapsed() < Duration::from_secs(5) {}
+    backend.receive(0);
+    backend.set_response(response);
+    backend.send(0);
+    backend.close(0);
+    let (_, first_ended, first_rst, _) =
+        drain_h2_stream_until_end_stream(&mut tls, 1, Duration::from_secs(5));
+
+    let headers = H2Frame::headers(3, build_get_headers_no_priority(), true, true);
+    let sent = tls.write_all(&headers.encode()).is_ok() && tls.flush().is_ok();
+    let started = Instant::now();
+    let mut accepted = false;
+    while sent && !accepted && started.elapsed() < Duration::from_secs(5) {
+        accepted = backend.accept(1);
+    }
+    if accepted {
+        backend.receive(1);
+        backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\npong1");
+        backend.send(1);
+    }
+    let (second_bytes, second_ended, second_rst, _) =
+        drain_h2_stream_until_end_stream(&mut tls, 3, Duration::from_secs(5));
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+    if first_ended
+        && !first_rst
+        && accepted
+        && second_ended
+        && !second_rst
+        && second_bytes == 5
+        && infra_ok
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL {name}: first_ended={first_ended} first_rst={first_rst} accepted={accepted} \
+             second_ended={second_ended} second_rst={second_rst} second_bytes={second_bytes} \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_close_delimited_body_keeps_the_h2_connection() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a close-delimited H1 response keeps the H2 client connection",
+            || try_h2_backend_connection_close_keeps_the_connection(
+                "H2-CLOSE-DELIM-REUSE",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd",
+            ),
+        ),
+        State::Success
+    );
+}
+
+/// The `Connection: close` Sōzu adds to a non-persistent HTTP/1.0 response
+/// (sozu-proxy/sozu#16) is hop-by-hop: it never reaches an H2 client and
+/// never closes the H2 connection.
+#[test]
+fn test_h2_http10_close_delimited_body_keeps_the_h2_connection() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a close-delimited HTTP/1.0 response keeps the H2 client connection",
+            || try_h2_backend_connection_close_keeps_the_connection(
+                "H2-HTTP10-CLOSE-DELIM-REUSE",
+                "HTTP/1.0 200 OK\r\n\r\nabcd",
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_content_length_with_connection_close_keeps_the_h2_connection() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a Content-Length H1 response carrying Connection: close keeps \
+             the H2 client connection",
+            || try_h2_backend_connection_close_keeps_the_connection(
+                "H2-CL-CLOSE-REUSE",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\n0123456789",
+            ),
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Per-connection stream send windows (RFC 9113 §6.9)
+// ============================================================================
+
+/// RFC 9113 §6.9: flow control is hop-by-hop, so a proxied stream has one
+/// send window on the frontend connection and another on the backend one.
+/// A client and an H2 backend that both advertise
+/// `SETTINGS_INITIAL_WINDOW_SIZE = 2^31-1` are each within the §6.9.2
+/// ceiling; applying both to one shared per-stream window overflows it, and
+/// the backend connection is torn down with a GOAWAY instead of serving the
+/// request.
+#[test]
+fn test_h2_client_and_h2_backend_both_at_max_initial_window() {
+    const MAX_WINDOW: u32 = 0x7fff_ffff;
+    const SETTINGS_INITIAL_WINDOW_SIZE_ID: u16 = 0x4;
+
+    let (mut worker, front_port, _) = setup_h2_listener_only("H2-PER-LEG-WINDOW");
+    let mut h2_cluster = Worker::default_cluster("cluster_0");
+    h2_cluster.http2 = Some(true);
+    worker.send_proxy_request_type(RequestType::AddCluster(h2_cluster));
+    let back_port = crate::tests::provide_unbound_port();
+    let back_address: SocketAddr = format!("127.0.0.1:{back_port}").parse().unwrap();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // A raw H2 backend: advertise the maximum initial window, answer the
+    // first request with an empty 200, and report every frame Sōzu sent.
+    let listener = std::net::TcpListener::bind(back_address).expect("bind the H2 backend");
+    listener.set_nonblocking(true).unwrap();
+    let backend = thread::spawn(move || -> Vec<(u8, u8, u32, Vec<u8>)> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Vec::new();
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("backend accept failed: {e}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let settings = H2Frame::settings(&[(SETTINGS_INITIAL_WINDOW_SIZE_ID, MAX_WINDOW)]);
+        stream.write_all(&settings.encode()).unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 16_384];
+        let mut acked = false;
+        let mut answered = false;
+        while Instant::now() < deadline {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+            let frames = parse_h2_frames(received.get(24..).unwrap_or_default());
+            if !acked
+                && frames
+                    .iter()
+                    .any(|(t, f, _, _)| *t == H2_FRAME_SETTINGS && f & H2_FLAG_ACK == 0)
+            {
+                stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
+                acked = true;
+            }
+            if !answered
+                && frames
+                    .iter()
+                    .any(|(t, _, s, _)| *t == H2_FRAME_HEADERS && *s == 1)
+            {
+                // `:status: 200`, indexed (RFC 7541 Appendix A, index 8).
+                stream
+                    .write_all(&H2Frame::headers(1, vec![0x88], true, true).encode())
+                    .unwrap();
+                answered = true;
+            }
+            if contains_goaway(&frames) {
+                break;
+            }
+        }
+        parse_h2_frames(received.get(24..).unwrap_or_default())
+    });
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, MAX_WINDOW);
+    tls.write_all(&H2Frame::headers(1, build_get_headers_no_priority(), true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 5, 200);
+    log_frames("H2-PER-LEG-WINDOW client", &frames);
+    let backend_frames = backend.join().expect("the backend thread completes");
+    log_frames("H2-PER-LEG-WINDOW backend", &backend_frames);
+    assert!(
+        !backend_frames.is_empty(),
+        "premise: Sōzu dialled the H2 backend"
+    );
+
+    assert!(
+        !contains_goaway(&backend_frames),
+        "Sōzu must not send the backend a GOAWAY for a valid initial window, got {:?}",
+        goaway_error_code(&backend_frames)
+    );
+    assert!(
+        stream_status_matches(&frames, 1, 200),
+        "the client must receive the backend's 200"
+    );
+    assert!(
+        !contains_goaway(&frames),
+        "the client connection must stay up"
+    );
+
+    drop(tls);
+    worker.soft_stop();
+    assert!(worker.wait_for_server_stop());
+}

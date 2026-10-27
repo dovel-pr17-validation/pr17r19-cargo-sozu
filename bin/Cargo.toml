@@ -1,0 +1,129 @@
+[package]
+name = "sozu"
+description = "sozu, a fast, reliable, hot reconfigurable HTTP reverse proxy"
+repository = "https://github.com/sozu-proxy/sozu"
+documentation = "https://docs.rs/sozu"
+homepage = "https://sozu.io"
+version = "2.3.3"
+license = "AGPL-3.0"
+authors = [
+  "Geoffroy Couprie <geo.couprie@gmail.com>",
+  "Eloi Demolis <eloi.demolis@clever-cloud.com>",
+  "Emmanuel Bosquet <emmanuel.bosquet@clever-cloud.com>",
+  "Florentin Dubois <florentin.dubois@clever-cloud.com>",
+]
+categories = ["network-programming"]
+edition = "2024"
+rust-version = "1.93.1"
+include = ["README.md", "Cargo.toml", "build.rs", "src/**/*"]
+
+[lib]
+name = "sozu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sozu"
+path = "src/main.rs"
+
+# `tests/sozu_top_e2e.rs` is `#![cfg(feature = "tui")]`. Declaring the
+# feature here makes Cargo omit the target from non-`tui` builds instead of
+# emitting an empty 0-test executable.
+[[test]]
+name = "sozu_top_e2e"
+path = "tests/sozu_top_e2e.rs"
+required-features = ["tui"]
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+libc = { workspace = true }
+log = { workspace = true }
+mio = { workspace = true, features = ["os-poll", "net"] }
+nix = { workspace = true, features = ["signal", "fs", "process", "socket", "user"] }
+nom = { workspace = true }
+paw = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+prost = { workspace = true }
+rusty_ulid = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+termion = { workspace = true }
+thiserror = { workspace = true }
+
+sozu-command-lib = { workspace = true }
+sozu-lib = { workspace = true }
+
+# `sozu top` TUI dependencies. All optional; activated only by the `tui` Cargo
+# feature below. Default `sozu` builds do not pull any of these in, keeping the
+# production binary lean. None of these crates pull in a `tokio` runtime — the
+# TUI is intentionally built on synchronous transport threads + crossterm
+# events to stay aligned with Sōzu's no-`async` lib/ posture.
+color-eyre           = { workspace = true, optional = true }
+crossbeam-channel    = { workspace = true, optional = true }
+crossterm            = { workspace = true, optional = true, features = ["events", "bracketed-paste"] }
+ctrlc                = { workspace = true, optional = true, features = ["termination"] }
+ratatui              = { workspace = true, optional = true, features = ["crossterm", "macros", "underline-color"] }
+throbber-widgets-tui = { workspace = true, optional = true }
+toml                 = { workspace = true, optional = true }
+tui-big-text         = { workspace = true, optional = true }
+tui-input            = { workspace = true, optional = true }
+tui-popup            = { workspace = true, optional = true }
+tui-scrollview       = { workspace = true, optional = true }
+tui-tree-widget      = { workspace = true, optional = true }
+
+[dev-dependencies]
+regex = { workspace = true }
+tempfile = { workspace = true }
+# `insta` is gated to `cfg(feature = "tui")` snapshot tests under `bin/src/ctl/top/`.
+# Auditor-locked: keep it on `[dev-dependencies]` only — never a production dep.
+# Tests run without `cargo insta review`; snapshots fail loudly the first time.
+insta = { version = "^1.49.0", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+num_cpus = { workspace = true }
+
+# FreeBSD's libc has shipped jemalloc as the default `malloc(3)` since
+# FreeBSD 7.0 (2008); NetBSD has done the same since NetBSD 5.0 (2009).
+# Linking a second jemalloc through `jemallocator` on those platforms is
+# pure redundancy — two jemalloc heaps in one process, ~190 KiB of dead
+# binary text, plus the cost of compiling vendored jemalloc-sys (~47 MiB
+# `libjemalloc.a`). Gate the dep off so a default build on FreeBSD/NetBSD
+# defers to libc's jemalloc. Closes #1076. Other BSDs (DragonFly nmalloc,
+# OpenBSD's own slab malloc) stay in scope of the bundled allocator since
+# their libc isn't jemalloc.
+[target.'cfg(not(any(target_os = "freebsd", target_os = "netbsd")))'.dependencies]
+jemallocator = { workspace = true, optional = true }
+
+[features]
+default = ["jemallocator", "crypto-ring"]
+crypto-ring = ["sozu-lib/crypto-ring"]
+crypto-aws-lc-rs = ["sozu-lib/crypto-aws-lc-rs"]
+crypto-openssl = ["sozu-lib/crypto-openssl"]
+fips = ["crypto-aws-lc-rs", "sozu-lib/fips"]
+unstable = []
+logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
+logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
+opentelemetry = ["sozu-lib/opentelemetry"]
+tolerant-http1-parser = ["sozu-lib/tolerant-http1-parser"]
+simd = ["sozu-lib/simd"]
+splice = ["sozu-lib/splice"]
+
+# `sozu top` btop/htop-style TUI subcommand. Opt-in: production builds typically
+# omit this. Pulls ratatui + crossterm + crossbeam-channel + ctrlc + a curated
+# set of TUI polish crates. Deliberately does NOT pull `tokio` — the TUI runs on
+# two synchronous threads (collector + events) plus the UI thread, matching the
+# existing `bin/` style and avoiding an async runtime for v1.
+tui = [
+  "dep:color-eyre",
+  "dep:crossbeam-channel",
+  "dep:crossterm",
+  "dep:ctrlc",
+  "dep:ratatui",
+  "dep:throbber-widgets-tui",
+  "dep:toml",
+  "dep:tui-big-text",
+  "dep:tui-input",
+  "dep:tui-popup",
+  "dep:tui-scrollview",
+  "dep:tui-tree-widget",
+]

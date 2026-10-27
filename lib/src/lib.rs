@@ -1,0 +1,2410 @@
+//! ## What this library does
+//!
+//! This library provides tools to build and start HTTP, HTTPS and TCP reverse proxies.
+//!
+//! The proxies handles network polling, HTTP parsing, TLS in a fast single threaded event
+//! loop.
+//!
+//! Each proxy is designed to receive configuration changes at runtime instead of
+//! reloading from a file regularly. The event loop runs in its own thread
+//! and receives commands through a message queue.
+//!
+//! ## Difference with the crate `sozu`
+//!
+//! To create several workers and manage them all at once (which is the most common way to
+//! use Sōzu), the crate `sozu` is more indicated than using the lib directly.
+//!
+//! The crate `sozu` provides a binary called the main process.
+//! The main process uses `sozu_lib` to start and manage workers.
+//! Each worker can handle HTTP, HTTPS and TCP traffic.
+//! The main process receives synchronizes the state of all workers, using UNIX sockets
+//! and custom channels to communicate with them.
+//! The main process itself is is configurable with a file, and has a CLI.
+//!
+//! ## How to use this library directly
+//!
+//! This documentation here explains how to write a binary that will start a single Sōzu
+//! worker and give it orders. The method has two steps:
+//!
+//! 1. Starts a Sōzu worker in a distinct thread
+//! 2. sends instructions to the worker on a UNIX socket via a Sōzu channel
+//!
+//! ### How to start a Sōzu worker
+//!
+//! Before creating an HTTP proxy, we first need to create an HTTP listener.
+//! The listener is an abstraction around a TCP socket provided by the kernel.
+//! We need the `sozu_command_lib` to build a listener.
+//!
+//! ```
+//! use sozu_command_lib::{config::ListenerBuilder, proto::command::SocketAddress};
+//!
+//! let address = SocketAddress::new_v4(127,0,0,1,8080);
+//! let http_listener = ListenerBuilder::new_http(address)
+//!     .to_http(None)
+//!     .expect("Could not create HTTP listener");
+//! ```
+//!
+//! The `http_listener` is of the type `HttpListenerConfig`, that we can be sent to the worker
+//! to start the proxy.
+//!
+//! Then create a pair of channels to communicate with the proxy.
+//! The channel is a wrapper around a unix socket.
+//!
+//! ```ignore
+//! use sozu_command_lib::{
+//!     channel::Channel,
+//!     proto::command::{WorkerRequest, WorkerResponse},
+//! };
+//!
+//! let (mut command_channel, proxy_channel): (
+//!     Channel<WorkerRequest, WorkerResponse>,
+//!     Channel<WorkerResponse, WorkerRequest>,
+//! ) = Channel::generate(1000, 10000).expect("should create a channel");
+//!```
+//!
+//! Here, the `command_channel` end is blocking, it sends `WorkerRequest`s and receives
+//! `WorkerResponses`, while the `proxy_channel` end is non-blocking, and the types are reversed.
+//! Writing the types here isn't even necessary thanks to the compiler,
+//! but it brings the point accross.
+//!
+//! You can now launch the worker in a separate thread, providing the HTTP listener config,
+//! the proxy end of the channel, and your custom number of buffers and their size:
+//!
+//! ```ignore
+//! use std::thread;
+//!
+//! let worker_thread_join_handle = thread::spawn(move || {
+//!     let max_buffers = 500;
+//!     let buffer_size = 16384;
+//!     sozu_lib::http::testing::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size);
+//! });
+//! ```
+//!
+//! ### Send orders
+//!
+//! Once the thread is launched, the proxy worker will start its event loop and handle
+//! events on the listening interface and port specified when building the HTTP Listener.
+//! Since no frontends or backends were specified for the proxy, it will receive
+//! the connections, parse the requests, then send a default (but configurable)
+//! answer.
+//!
+//! Before defining a frontend and backends, we need to define a cluster, which describes
+//! a routing configuration. A cluster contains:
+//!
+//! - one frontend
+//! - one or several backends
+//! - routing rules
+//!
+//! A cluster is identified by its `cluster_id`, which will be used to define frontends
+//! and backends later on.
+//!
+//! ```
+//! use sozu_command_lib::proto::command::{Cluster, LoadBalancingAlgorithms};
+//!
+//! let cluster = Cluster {
+//!     cluster_id: "my-cluster".to_string(),
+//!     sticky_session: false,
+//!     https_redirect: false,
+//!     load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+//!     answer_503: Some("A custom forbidden message".to_string()),
+//!     ..Default::default()
+//! };
+//! ```
+//!
+//! The defaults are sensible, so we could define only the `cluster_id`.
+//!
+//! We can now define a frontend. A frontend is a way to recognize a request and match
+//! it to a `cluster_id`, depending on the hostname and the beginning of the URL path.
+//! The `address` field must match the one of the HTTP listener we defined before:
+//!
+//! ```
+//! use std::collections::BTreeMap;
+//!
+//!  use sozu_command_lib::proto::command::{PathRule, RequestHttpFrontend, RulePosition, SocketAddress};
+//!
+//! let http_front = RequestHttpFrontend {
+//!     cluster_id: Some("my-cluster".to_string()),
+//!     address: SocketAddress::new_v4(127,0,0,1,8080),
+//!     hostname: "example.com".to_string(),
+//!     path: PathRule::prefix(String::from("/")),
+//!     position: RulePosition::Pre.into(),
+//!     tags: BTreeMap::from([
+//!         ("owner".to_owned(), "John".to_owned()),
+//!         ("id".to_owned(), "my-own-http-front".to_owned()),
+//!     ]),
+//!     ..Default::default()
+//! };
+//! ```
+//!
+//! The `tags` are keys and values that will appear in the access logs,
+//! which can come in handy.
+//!
+//! Now let's define a backend.
+//! A backend is an instance of a backend application we want to route traffic to.
+//! The `address` field must match the IP and port of the backend server.
+//!
+//! ```
+//! use sozu_command_lib::proto::command::{AddBackend, LoadBalancingParams, SocketAddress};
+//!
+//! let http_backend = AddBackend {
+//!     cluster_id: "my-cluster".to_string(),
+//!     backend_id: "test-backend".to_string(),
+//!     address: SocketAddress::new_v4(127,0,0,1,8000),
+//!     load_balancing_parameters: Some(LoadBalancingParams::default()),
+//!     ..Default::default()
+//! };
+//! ```
+//!
+//! A cluster can have multiple backend servers, and they can be added or
+//! removed while the proxy is running. If a backend is removed from the configuration
+//! while the proxy is handling a request to that server, it will finish that
+//! request and stop sending new traffic to that server.
+//!
+//!
+//! Now we can use the other end of the channel to send all these requests to the worker,
+//! using the WorkerRequest type:
+//!
+//! ```ignore
+//! use sozu_command_lib::{
+//!     proto::command::{Request, request::RequestType, WorkerRequest},
+//! };
+//!
+//! command_channel
+//!     .write_message(&WorkerRequest {
+//!         id: String::from("add-the-cluster"),
+//!         content: RequestType::AddCluster(cluster).into(),
+//!     })
+//!     .expect("Could not send AddHttpFrontend request");
+//!
+//! command_channel
+//!     .write_message(&WorkerRequest {
+//!         id: String::from("add-the-frontend"),
+//!         content: RequestType::AddHttpFrontend(http_front).into(),
+//!     })
+//!     .expect("Could not send AddHttpFrontend request");
+//!
+//! command_channel
+//!     .write_message(&WorkerRequest {
+//!         id: String::from("add-the-backend"),
+//!         content: RequestType::AddBackend(http_backend).into(),
+//!     })
+//!     .expect("Could not send AddBackend request");
+//!
+//! println!("HTTP -> {:?}", command_channel.read_message());
+//! println!("HTTP -> {:?}", command_channel.read_message());
+//! println!("HTTP -> {:?}", command_channel.read_message());
+//! ```
+//!
+//!
+//! The event loop of the worker will process these instructions and add them to
+//! its state, and the worker will send back an acknowledgement
+//! message.
+//!
+//! Now we can let the worker thread run in the background:
+//!
+//! ```ignore
+//! let _ = worker_thread_join_handle.join();
+//! ```
+//!
+//! Here is the complete example for reference, it matches the `examples/http.rs` example:
+//!
+//! ```
+//! #[macro_use]
+//! extern crate sozu_command_lib;
+//!
+//! use std::{collections::BTreeMap, env, io::stdout, thread};
+//!
+//! use anyhow::Context;
+//! use sozu_command_lib::{
+//!     channel::Channel,
+//!     config::ListenerBuilder,
+//!     logging::setup_default_logging,
+//!     proto::command::{
+//!         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
+//!         PathRule, Request, RequestHttpFrontend, RulePosition, SocketAddress,WorkerRequest,
+//!     },
+//! };
+//!
+//! fn main() -> anyhow::Result<()> {
+//!     setup_default_logging(true, "info", "EXAMPLE").with_context(|| "could not setup logging")?;
+//!
+//!     info!("starting up");
+//!
+//!     let http_listener = ListenerBuilder::new_http(SocketAddress::new_v4(127,0,0,1,8080))
+//!         .to_http(None)
+//!         .expect("Could not create HTTP listener");
+//!
+//!     let (mut command_channel, proxy_channel) =
+//!         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
+//!
+//!     let worker_thread_join_handle = thread::spawn(move || {
+//!         let max_buffers = 500;
+//!         let buffer_size = 16384;
+//!         sozu_lib::http::testing::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size)
+//!             .expect("The worker could not be started, or shut down");
+//!     });
+//!
+//!     let cluster = Cluster {
+//!         cluster_id: "my-cluster".to_string(),
+//!         sticky_session: false,
+//!         https_redirect: false,
+//!         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+//!         answer_503: Some("A custom forbidden message".to_string()),
+//!         ..Default::default()
+//!     };
+//!
+//!     let http_front = RequestHttpFrontend {
+//!         cluster_id: Some("my-cluster".to_string()),
+//!         address: SocketAddress::new_v4(127,0,0,1,8080),
+//!         hostname: "example.com".to_string(),
+//!         path: PathRule::prefix(String::from("/")),
+//!         position: RulePosition::Pre.into(),
+//!         tags: BTreeMap::from([
+//!             ("owner".to_owned(), "John".to_owned()),
+//!             ("id".to_owned(), "my-own-http-front".to_owned()),
+//!         ]),
+//!         ..Default::default()
+//!     };
+//!     let http_backend = AddBackend {
+//!         cluster_id: "my-cluster".to_string(),
+//!         backend_id: "test-backend".to_string(),
+//!         address: SocketAddress::new_v4(127,0,0,1,8000),
+//!         load_balancing_parameters: Some(LoadBalancingParams::default()),
+//!         ..Default::default()
+//!     };
+//!
+//!     command_channel
+//!         .write_message(&WorkerRequest {
+//!             id: String::from("add-the-cluster"),
+//!             content: RequestType::AddCluster(cluster).into(),
+//!         })
+//!         .expect("Could not send AddHttpFrontend request");
+//!
+//!     command_channel
+//!         .write_message(&WorkerRequest {
+//!             id: String::from("add-the-frontend"),
+//!             content: RequestType::AddHttpFrontend(http_front).into(),
+//!         })
+//!         .expect("Could not send AddHttpFrontend request");
+//!
+//!     command_channel
+//!         .write_message(&WorkerRequest {
+//!             id: String::from("add-the-backend"),
+//!             content: RequestType::AddBackend(http_backend).into(),
+//!         })
+//!         .expect("Could not send AddBackend request");
+//!
+//!     println!("HTTP -> {:?}", command_channel.read_message());
+//!     println!("HTTP -> {:?}", command_channel.read_message());
+//!
+//!     // uncomment to let it run in the background
+//!     // let _ = worker_thread_join_handle.join();
+//!     info!("good bye");
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Protected health-check headers
+//!
+//! An `HTTP` health check may send custom request headers whose values are
+//! credentials. The ordinary `SetHealthCheck` order does not carry a value: it
+//! names the headers with a keyed fingerprint, and a health check that names
+//! headers whose values the worker does not hold sends no probe. Each skipped
+//! probe is counted by the `health_check.missing_secret` metric; it is neither a
+//! success nor a failure and does not change the health of a backend.
+//!
+//! The values reach a worker only through the protected transaction of
+//! [`protected_health_check`]: a `Prepare` order, the single carrier of the clear
+//! values, then `Commit`, `Abort` or `Release`, each acknowledged. An embedder
+//! that drives a worker directly, as in the example above, is that boundary: it
+//! must ask the worker whether it supports the protocol before it hands it a
+//! value. The values live in memory only, in buffers that Sōzu zeroizes when it
+//! releases them; this does not reach copies the allocator, the kernel, a socket
+//! buffer or swap may hold. They never appear in the configuration, the state, a
+//! query response, a log line or `Debug` output.
+
+#[macro_use]
+extern crate sozu_command_lib as sozu_command;
+
+#[macro_use]
+pub mod util;
+#[macro_use]
+pub mod metrics;
+
+pub mod backends;
+pub mod crypto;
+pub mod features;
+pub mod health_check;
+pub mod http;
+pub mod load_balancing;
+pub mod pool;
+pub mod protected_health_check;
+pub mod protocol;
+pub mod retry;
+pub mod router;
+pub mod socket;
+pub mod timer;
+pub mod tls;
+
+/// Linux zero-copy TCP forwarder. Used by `protocol::pipe::Pipe` when
+/// the listener is `Protocol::TCP` and the `splice` feature is enabled.
+#[cfg(all(target_os = "linux", feature = "splice"))]
+pub(crate) mod splice;
+
+pub mod server;
+pub mod tcp;
+pub mod udp;
+
+pub mod https;
+
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    fmt::{self, Display, Formatter},
+    net::SocketAddr,
+    rc::Rc,
+    str,
+    time::{Duration, Instant, SystemTime},
+};
+
+use backends::BackendError;
+use hex::FromHexError;
+use mio::{Interest, Token, net::TcpStream};
+use protocol::http::{answers::HttpAnswers, answers::TemplateError, parser::Method};
+use router::RouterError;
+use socket::ServerBindError;
+use sozu_command::{
+    AsStr, ObjectKind,
+    logging::{CachedTags, LogContext},
+    proto::command::{
+        Cluster, ForwardedHeaders, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse,
+    },
+    ready::Ready,
+    state::ClusterId,
+};
+use tls::CertificateResolverError;
+
+use crate::{metrics::names, router::RouteResult};
+
+/// Anything that can be registered in mio (subscribe to kernel events)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    HTTP,
+    HTTPS,
+    TCP,
+    UDP,
+    HTTPListen,
+    HTTPSListen,
+    TCPListen,
+    UDPListen,
+    Channel,
+    Metrics,
+    Timer,
+}
+
+/// trait that must be implemented by listeners and client sessions
+pub trait ProxySession {
+    /// indicates the protocol associated with the session
+    ///
+    /// this is used to distinguish sessions from listenrs, channels, metrics
+    /// and timers
+    fn protocol(&self) -> Protocol;
+    /// if a session received an event or can still execute, the event loop will
+    /// call this method. Its result indicates if it can still execute, needs to
+    /// connect to a backend server, close the session
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed;
+    /// if the event loop got an event for a token associated with the session,
+    /// it will call this method on the session
+    fn update_readiness(&mut self, token: Token, events: Ready);
+    /// close a session, frontend and backend sockets,
+    /// remove the entries from the session manager slab
+    fn close(&mut self);
+    /// if a timeout associated with the session triggers, the event loop will
+    /// call this method with the timeout's token
+    fn timeout(&mut self, t: Token) -> SessionIsToBeClosed;
+    /// last time the session got an event
+    fn last_event(&self) -> Instant;
+    /// display the session's internal state (for debugging purpose)
+    fn print_session(&self);
+    /// get the token associated with the frontend
+    fn frontend_token(&self) -> Token;
+    /// tell the session it has to shut down if possible
+    ///
+    /// if the session handles HTTP requests, it will not close until the response
+    /// is completely sent back to the client
+    fn shutting_down(&mut self) -> SessionIsToBeClosed;
+    /// Best-effort identifier of the cluster currently routed to by this
+    /// session. Returns `None` for `ListenSession` (no per-session
+    /// cluster), and for client sessions before routing has resolved.
+    /// H2 sessions multiplex many streams over one frontend token and may
+    /// touch several clusters; the returned value is whichever cluster
+    /// the session most recently keep-alive'd to. Used for log/metric
+    /// attribution, not for accounting (the tracker keeps the canonical
+    /// per-stream `(cluster, IP)` set).
+    fn cluster_id(&self) -> Option<ClusterId> {
+        None
+    }
+    /// Source address as observed by Sōzu, with proxy-protocol awareness.
+    /// HTTP/HTTPS/TCP client sessions return the parsed PROXY-protocol
+    /// source when present, else `peer_addr`. `ListenSession` returns
+    /// `None`. Used to attribute per-(cluster, source-IP) tracking and
+    /// access logs to the real client behind a layer-4 PROXY frontend.
+    fn session_address(&self) -> Option<SocketAddr> {
+        None
+    }
+    /// Whether the session has work that only a [`Self::ready`] pass can do
+    /// although no socket event will arrive to trigger one.
+    ///
+    /// Asked by `Server::timeout` after a timeout that left the session open.
+    /// A backend whose connect timed out is the case: the timer is the only
+    /// signal a blackholed dial ever produces, and failing it over to another
+    /// backend (dialling, registering the new socket) needs the `ready` path
+    /// (sozu-proxy/sozu#1800).
+    fn needs_ready_pass(&self) -> bool {
+        false
+    }
+    /// Whether this session holds a backend connection `target` names, which
+    /// makes it one of the sessions a `CloseSessions` request closes.
+    ///
+    /// `false` for listeners, channels and every session that has no backend
+    /// connection yet, such as one still in its TLS handshake.
+    fn targets(&self, _target: &SessionTarget) -> bool {
+        false
+    }
+}
+
+/// The backend connections a `CloseSessions` request selects: those to
+/// `cluster_id`, narrowed by `backend_id` and `address` when they are set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionTarget {
+    pub cluster_id: String,
+    pub backend_id: Option<String>,
+    pub address: Option<SocketAddr>,
+}
+
+impl SessionTarget {
+    /// Whether a backend connection to `backend_id` at `address` in
+    /// `cluster_id` is one this target selects. Every field the target sets
+    /// must match; a connection that does not know a field the target sets
+    /// does not match.
+    pub fn matches(
+        &self,
+        cluster_id: &str,
+        backend_id: Option<&str>,
+        address: Option<SocketAddr>,
+    ) -> bool {
+        self.cluster_id == cluster_id
+            && self
+                .backend_id
+                .as_deref()
+                .is_none_or(|wanted| backend_id == Some(wanted))
+            && self.address.is_none_or(|wanted| address == Some(wanted))
+    }
+}
+
+impl From<&sozu_command::proto::command::CloseSessions> for SessionTarget {
+    fn from(request: &sozu_command::proto::command::CloseSessions) -> Self {
+        SessionTarget {
+            cluster_id: request.cluster_id.to_owned(),
+            backend_id: request.backend_id.to_owned(),
+            address: request.address.map(SocketAddr::from),
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! branch {
+    (if $($value:ident)? == $expected:ident { $($then:tt)* } else { $($else:tt)* }) => {
+        macro_rules! expect {
+            ($expected) => {$($then)*};
+            ($a:ident) => {$($else)*};
+            () => {$($else)*}
+        }
+        expect!($($value)?);
+    };
+    (if $($value:ident)? == $expected:ident { $($then:tt)* } ) => {
+        macro_rules! expect {
+            ($expected) => {$($then)*};
+        }
+        expect!($($value)?);
+    };
+}
+
+#[macro_export]
+macro_rules! fallback {
+    ({} $($default:tt)*) => {
+        $($default)*
+    };
+    ({$($value:tt)+} $($default:tt)*) => {
+        $($value)+
+    };
+}
+
+#[macro_export]
+macro_rules! StateMachineBuilder {
+    (
+        ($d:tt)
+        $(#[$($state_macros:tt)*])*
+        enum $state_name:ident $(impl $trait:ident)?  {
+            $($(#[$($variant_macros:tt)*])*
+            $variant_name:ident($state:ty$(,$($aux:ty),+)?) $(-> $override:expr)?),+ $(,)?
+        }
+    ) => {
+        /// A summary of the last valid State
+        #[derive(Clone, Copy, Debug)]
+        pub enum StateMarker {
+            $($variant_name,)+
+        }
+
+        $(#[$($state_macros)*])*
+        #[allow(clippy::large_enum_variant)]
+        pub enum $state_name {
+            $(
+                $(#[$($variant_macros)*])*
+                $variant_name($state$(,$($aux),+)?),
+            )+
+            /// Informs about upgrade failure, contains a summary the last valid State
+            FailedUpgrade(StateMarker),
+        }
+
+        macro_rules! _fn_impl {
+            ($function:ident(&$d($mut:ident)?, self $d(,$arg_name:ident: $arg_type:ty)*) $d(-> $ret:ty)? $d(| $marker:tt => $fail:expr)?) => {
+                fn $function(&$d($mut)? self $d(,$arg_name: $arg_type)*) $d(-> $ret)? {
+                    match self {
+                        $($state_name::$variant_name(_state, ..) => $crate::fallback!({$($override)?} _state.$function($d($arg_name),*)),)+
+                        $state_name::FailedUpgrade($crate::fallback!({$d($marker)?} _)) => $crate::fallback!({$d($fail)?} unreachable!())
+                    }
+                }
+            };
+        }
+
+        impl $state_name {
+            /// Informs about the last valid State before upgrade failure
+            fn marker(&self) -> StateMarker {
+                match self {
+                    $($state_name::$variant_name(..) => StateMarker::$variant_name,)+
+                    $state_name::FailedUpgrade(marker) => *marker,
+                }
+            }
+            /// Returns wether or not the State is FailedUpgrade
+            fn failed(&self) -> bool {
+                match self {
+                    $state_name::FailedUpgrade(_) => true,
+                    _ => false,
+                }
+            }
+            /// Gives back an owned version of the State,
+            /// leaving a FailedUpgrade in its place.
+            /// The FailedUpgrade retains the marker of the previous State.
+            fn take(&mut self) -> $state_name {
+                let mut owned_state = $state_name::FailedUpgrade(self.marker());
+                std::mem::swap(&mut owned_state, self);
+                owned_state
+            }
+            _fn_impl!{front_socket(&, self) -> &mio::net::TcpStream}
+        }
+
+        $crate::branch!{
+            if $($trait)? == SessionState {
+                impl SessionState for $state_name {
+                    _fn_impl!{ready(&mut, self, session: Rc<RefCell<dyn ProxySession>>, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) -> SessionResult}
+                    _fn_impl!{update_readiness(&mut, self, token: Token, events: Ready)}
+                    _fn_impl!{timeout(&mut, self, token: Token, metrics: &mut SessionMetrics) -> StateResult}
+                    _fn_impl!{cancel_timeouts(&mut, self)}
+                    _fn_impl!{print_state(&, self, context: &str) | marker => error!("{} Session(FailedUpgrade({:?}))", context, marker)}
+                    _fn_impl!{close(&mut, self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) | _ => {}}
+                    _fn_impl!{shutting_down(&mut, self) -> SessionIsToBeClosed | _ => true}
+                    _fn_impl!{targets(&, self, target: &$crate::SessionTarget) -> bool | _ => false}
+                }
+            } else {}
+        }
+    };
+    ($($tt:tt)+) => {
+        StateMachineBuilder!{($) $($tt)+}
+    }
+}
+
+pub trait ListenerHandler {
+    fn get_addr(&self) -> &SocketAddr;
+
+    fn get_tags(&self, key: &str) -> Option<&CachedTags>;
+
+    fn get_concatenated_tags(&self, key: &str) -> Option<&str> {
+        self.get_tags(key).map(|tags| tags.concatenated.as_str())
+    }
+
+    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
+
+    fn protocol(&self) -> Protocol;
+
+    fn public_address(&self) -> SocketAddr;
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum FrontendFromRequestError {
+    #[error("Could not parse hostname from '{host}': {error}")]
+    HostParse { host: String, error: String },
+    #[error("invalid remaining chars after hostname. Host: {0}")]
+    InvalidCharsAfterHost(String),
+    #[error("no cluster: {0}")]
+    NoClusterFound(RouterError),
+}
+
+pub trait L7ListenerHandler {
+    fn get_sticky_name(&self) -> &str;
+
+    /// Name of the correlation header Sozu injects into every request and
+    /// response body. Default: `"Sozu-Id"`. Operators can rebrand via the
+    /// `sozu_id_header` listener config knob.
+    fn get_sozu_id_header(&self) -> &str {
+        "Sozu-Id"
+    }
+
+    fn get_connect_timeout(&self) -> u32;
+
+    /// retrieve a frontend by parsing a request's hostname, uri and method,
+    /// with its headers for the frontends that carry header predicates
+    /// (sozu-proxy/sozu#1253)
+    fn frontend_from_request(
+        &self,
+        host: &str,
+        uri: &str,
+        method: &Method,
+        headers: &dyn router::RequestHeaders,
+    ) -> Result<RouteResult, FrontendFromRequestError>;
+
+    /// retrieve the listener's configured HTTP answers (templates)
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>>;
+
+    /// H2 flood detection thresholds from the listener config.
+    /// Returns the default config when the listener does not provide custom values.
+    fn get_h2_flood_config(&self) -> protocol::mux::H2FloodConfig {
+        protocol::mux::H2FloodConfig::default()
+    }
+
+    /// H2 connection tuning from the listener config.
+    /// Returns the default config when the listener does not provide custom values.
+    fn get_h2_connection_config(&self) -> protocol::mux::H2ConnectionConfig {
+        protocol::mux::H2ConnectionConfig::default()
+    }
+
+    /// Whether requests must have their `:authority` / `Host` exact-match
+    /// the TLS SNI negotiated at handshake (CWE-346 / CWE-444).
+    ///
+    /// Defaults to `true` — the safe setting that closes the
+    /// CWE-346 / CWE-444 cross-SNI smuggling vector. Operators can opt
+    /// out per-listener via `HttpsListenerConfig::strict_sni_binding =
+    /// false` when cross-SNI routing is explicitly required. Plaintext
+    /// HTTP listeners return the default value; they never have an SNI
+    /// to compare against, so the routing-layer check short-circuits on
+    /// `tls_server_name: None`.
+    fn get_strict_sni_binding(&self) -> bool {
+        true
+    }
+
+    /// Whether to strip any client-supplied `X-Real-IP` header from
+    /// forwarded requests (anti-spoofing).
+    ///
+    /// Defaults to `false` — preserves the historical pass-through
+    /// behaviour. Operators opt in via
+    /// `HttpListenerConfig::elide_x_real_ip = true` (and the equivalent on
+    /// HTTPS listeners). Independent of [`Self::get_send_x_real_ip`]: the
+    /// two flags can be combined freely (anti-spoof only, send only, both,
+    /// or neither). The elision branch lives in
+    /// `HttpContext::on_request_headers`, so it covers H1 and H2 alike.
+    fn get_elide_x_real_ip(&self) -> bool {
+        false
+    }
+
+    /// Whether to append a proxy-generated `X-Real-IP` header carrying the
+    /// connection peer IP (post-PROXY-v2 unwrap, i.e. the original client
+    /// IP) to every forwarded request.
+    ///
+    /// Defaults to `false` — preserves the historical no-injection
+    /// behaviour. Operators opt in via
+    /// `HttpListenerConfig::send_x_real_ip = true` (and the equivalent on
+    /// HTTPS listeners). Independent of [`Self::get_elide_x_real_ip`]: the
+    /// two flags can be combined freely. The injection branch lives next
+    /// to the existing X-Forwarded-For / Forwarded synthesis in
+    /// `HttpContext::on_request_headers`.
+    fn get_send_x_real_ip(&self) -> bool {
+        false
+    }
+
+    /// Which forwarding header family to add to every forwarded request:
+    /// `X-Forwarded-*`, RFC 7239 `Forwarded`, both, or none.
+    ///
+    /// Defaults to [`ForwardedHeaders::Both`] — the historical behaviour.
+    /// Operators choose another mode via
+    /// `HttpListenerConfig::forwarded_headers` (and the equivalent on HTTPS
+    /// listeners). Independent of [`Self::get_elide_x_real_ip`] and
+    /// [`Self::get_send_x_real_ip`]. The emission and elision branches live
+    /// in `HttpContext::on_request_headers`, so they cover H1 and H2 alike.
+    fn get_forwarded_headers(&self) -> ForwardedHeaders {
+        ForwardedHeaders::Both
+    }
+
+    /// Per-stream idle timeout for H2 connections. An open stream that makes
+    /// no forward progress for this duration is cancelled (RST_STREAM / CANCEL).
+    /// Mitigates slow-multiplex Slowloris where a client keeps connection-level
+    /// activity high (resetting the connection idle timer on every frame) while
+    /// pinning streams for the full nominal connection timeout.
+    ///
+    /// Listeners inherit `max(30s, back_timeout)` when `h2_stream_idle_timeout_seconds`
+    /// is absent so operators who raised the socket-level backend budget do not
+    /// have to duplicate the value here; the 30 s floor preserves the baseline
+    /// slow-multiplex mitigation when `back_timeout` is shorter. Set the knob
+    /// explicitly to cap the per-stream deadline below `back_timeout` (useful
+    /// when under a slow-multiplex attack).
+    fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
+
+    /// Wall-clock budget granted to in-flight H2 streams after soft-stop sent
+    /// the initial `GOAWAY(NO_ERROR)`. Once the deadline elapses the mux
+    /// transitions to a forced close (final GOAWAY + session teardown).
+    ///
+    /// Returning `None` disables the forced close entirely — shutdown waits
+    /// for every stream to drain naturally. Returning `Some(d)` enforces the
+    /// budget. Default: `Some(Duration::from_secs(5))` (matches the historic
+    /// hard-coded 5 s deadline). Listeners expose the
+    /// `h2_graceful_shutdown_deadline_seconds` knob; value `0` maps to `None`.
+    fn get_h2_graceful_shutdown_deadline(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(5))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendConnectionStatus {
+    NotConnected,
+    Connecting(Instant),
+    Connected,
+}
+
+impl BackendConnectionStatus {
+    pub fn is_connecting(&self) -> bool {
+        matches!(self, BackendConnectionStatus::Connecting(_))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackendConnectAction {
+    New,
+    Reuse,
+    Replace,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum BackendConnectionError {
+    #[error("Not found: {0:?}")]
+    NotFound(ObjectKind),
+    #[error("Too many connections on cluster {0:?}")]
+    MaxConnectionRetries(Option<ClusterId>),
+    #[error("the sessions slab has reached maximum capacity")]
+    MaxSessionsMemory,
+    #[error("error from the backend: {0}")]
+    Backend(BackendError),
+    #[error("failed to retrieve the cluster: {0}")]
+    RetrieveClusterError(RetrieveClusterError),
+    #[error("maximum number of buffers reached")]
+    MaxBuffers,
+    /// Per-(cluster, source-IP) connection limit reached. The protocol
+    /// layer translates this into HTTP 429 Too Many Requests (with an
+    /// optional `Retry-After`) for HTTP/HTTPS sessions, or a graceful TCP
+    /// close for raw TCP. The `cluster_id` is included so log/metric
+    /// pipelines can attribute the rejection.
+    #[error("per-(cluster, source-IP) connection limit reached for cluster {cluster_id:?}")]
+    TooManyConnectionsPerIp { cluster_id: ClusterId },
+    /// A stale-upstream replay could not be carried out. `Stream::retry_buffer`
+    /// holds H1 wire bytes captured under the FIRST attempt's routing
+    /// decision, so the replay is valid only while that decision still holds:
+    /// the cluster must still be known and must still speak H1. When it does
+    /// not, the protocol layer answers 502 Bad Gateway — the same answer the
+    /// stream received before the replay existed (sozu-proxy/sozu#1442) —
+    /// rather than framing raw H1 text as an HTTP/2 DATA payload or
+    /// re-routing a front kawa whose blocks are already drained.
+    #[error("stale-upstream replay refused: {0}")]
+    ReplayRefused(&'static str),
+}
+
+/// Route-extraction failures raised by `kawa_h1::editor::HttpContext` and
+/// consumed by the mux router.
+#[derive(thiserror::Error)]
+pub enum RetrieveClusterError {
+    #[error("No method given")]
+    NoMethod,
+    #[error("No host given")]
+    NoHost,
+    #[error("No path given")]
+    NoPath,
+    #[error("unauthorized route")]
+    UnauthorizedRoute,
+    #[error("{0}")]
+    RetrieveFrontend(FrontendFromRequestError),
+    #[error("HTTPS redirect required")]
+    HttpsRedirect,
+    /// The frontend's `RedirectPolicy::SilentClose` asks for no response at
+    /// all (sozu-proxy/sozu#767): the H1 connection is closed, the H2 stream
+    /// reset.
+    #[error("silent close requested by the frontend")]
+    SilentClose,
+    /// The HTTP `:authority` / `Host` host does not match the TLS SNI that was
+    /// negotiated for this connection, which would cross the TLS trust boundary.
+    /// Maps to HTTP 421 Misdirected Request (RFC 9110 §15.5.20).
+    #[error("TLS SNI does not match HTTP authority: sni_bytes={} authority_bytes={}", .sni.len(), .authority.len())]
+    SniAuthorityMismatch { sni: String, authority: String },
+}
+
+impl fmt::Debug for RetrieveClusterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// Used in sessions
+#[derive(Debug, PartialEq, Eq)]
+pub enum AcceptError {
+    IoError,
+    TooManySessions,
+    WouldBlock,
+    RegisterError,
+    WrongSocketAddress,
+    BufferCapacityReached,
+}
+
+/// What a proxy would do with a listening socket handed to its
+/// `activate_listener(address)`.
+///
+/// `Server::notify_activate_listener` asks BEFORE it pulls a descriptor out of
+/// the SCM table, because `Listeners::get_*` removes the entry as it hands it
+/// over while `activate()` returns on its `if self.active` guard without
+/// consuming anything. Taking a descriptor that nothing will consume drops the
+/// owning wrapper on the floor and closes the inherited socket unused — the
+/// accept backlog or receive buffer with it (sozu#1342).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InheritedSocketFate {
+    /// A listener exists at the address and is not active: it adopts the
+    /// socket. Take the descriptor.
+    Adopted,
+    /// A listener exists at the address and is already active on a socket of
+    /// its own. `activate()` short-circuits, so nothing consumes this
+    /// descriptor **now**. Close it deliberately.
+    ///
+    /// Not because it could never be adopted: `give_back_listener` clears
+    /// `active` and keeps the listener object, so `DeactivateListener` followed
+    /// by `ActivateListener` — an operator-reachable feature, covered by
+    /// `e2e/src/tests/listener_reactivation_tests.rs` — brings this address back
+    /// to [`Adopted`](Self::Adopted). Closing here is therefore irreversible:
+    /// `scm_listeners` is filled once in `Server::new` and never refilled, so a
+    /// reactivation after this point binds a fresh socket.
+    ///
+    /// It is a deliberate trade, not a claim about the lifetime. The only thing
+    /// this descriptor carries is the connections queued on it at hand-off, and
+    /// their value decays — the peers behind them time out or reset while the
+    /// address is served by the listener's own socket. The cost of keeping it is
+    /// continuous instead: the descriptor is the retiring worker's listening
+    /// socket, still bound with `SO_REUSEPORT` and registered with no event
+    /// loop, so the kernel is expected to keep giving it a share of incoming
+    /// connections that nobody accepts. (That last step follows from
+    /// `SO_REUSEPORT` load-balancing semantics; nothing here measures it.) A
+    /// decaying backlog is not worth an indefinite share of new connections.
+    Refused,
+    /// No listener at the address yet. Keep the descriptor in the table: an
+    /// `AddListener` + `ActivateListener` pair can still arrive and adopt it,
+    /// which is exactly what an upgrade does when the initial state carries the
+    /// listeners inactive and activates them afterwards.
+    Unclaimed,
+}
+
+/// returned by the HTTP, HTTPS and TCP listeners
+#[derive(thiserror::Error)]
+pub enum ListenerError {
+    #[error("failed to handle certificate request, got a resolver error, {0}")]
+    Resolver(CertificateResolverError),
+    #[error("failed to parse pem, {0}")]
+    PemParse(String),
+    #[error(
+        "failed to parse template key_bytes={key_bytes}: {1}",
+        key_bytes = .0.len()
+    )]
+    TemplateParse(String, TemplateError),
+    #[error("failed to build rustls context, {0}")]
+    BuildRustls(String),
+    #[error("failed to configure client certificate authentication (mTLS): {0}")]
+    ClientAuth(String),
+    #[error("could not activate listener with address {address:?}: {error}")]
+    Activation { address: SocketAddr, error: String },
+    #[error("Could not register listener socket: {0}")]
+    SocketRegistration(std::io::Error),
+    #[error("could not add frontend: {0}")]
+    AddFrontend(RouterError),
+    #[error("could not remove frontend: {0}")]
+    RemoveFrontend(RouterError),
+    #[error("invalid value for field '{field}': {reason}")]
+    InvalidValue {
+        field: &'static str,
+        reason: &'static str,
+    },
+    /// `UpdateHttpsListenerConfig.hsts` was present but its `enabled`
+    /// field was unset. Per the partial-update contract, `enabled` is
+    /// the explicit-disambiguator between "explicit disable" (false) and
+    /// "explicit enable" (true); the patch handler refuses an
+    /// `enabled = None` block rather than silently picking one.
+    #[error(
+        "UpdateHttpsListenerConfig.hsts is present but `enabled` is unset; the partial-update \
+         contract requires `enabled` whenever the `hsts` block is present"
+    )]
+    HstsEnabledRequired,
+}
+
+impl fmt::Debug for ListenerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// Lift control-plane validation errors into listener-level errors so the
+/// worker can surface the same message without duplicating the match.
+/// Non-`InvalidValue` variants fall back to a generic `InvalidValue` — they
+/// are not expected on the worker's `update_config` path (state lookups
+/// happen on the master) but we avoid panicking if one slips through.
+impl From<sozu_command::state::StateError> for ListenerError {
+    fn from(err: sozu_command::state::StateError) -> Self {
+        match err {
+            sozu_command::state::StateError::InvalidValue { field, reason } => {
+                ListenerError::InvalidValue { field, reason }
+            }
+            _ => ListenerError::InvalidValue {
+                field: "state",
+                reason: "unexpected state error on worker path",
+            },
+        }
+    }
+}
+
+/// Returned by the HTTP, HTTPS and TCP proxies
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyError {
+    #[error("error while soft stopping {proxy_protocol} proxy: {error}")]
+    SoftStop {
+        proxy_protocol: String,
+        error: String,
+    },
+    #[error("error while hard stopping {proxy_protocol} proxy: {error}")]
+    HardStop {
+        proxy_protocol: String,
+        error: String,
+    },
+    /// Names the listener key: the address, plus `%<interface>` for a
+    /// listener bound to one.
+    #[error("found no listener at {0}")]
+    NoListenerFound(sozu_command::listener_key::ListenerKey),
+    #[error("a listener is already present for this token")]
+    ListenerAlreadyPresent,
+    #[error("could not add listener: {0}")]
+    AddListener(ListenerError),
+    #[error("could not add cluster: {0}")]
+    AddCluster(ListenerError),
+    #[error("failed to activate listener with address {address:?}: {listener_error}")]
+    ListenerActivation {
+        address: SocketAddr,
+        listener_error: ListenerError,
+    },
+    #[error("can not add frontend {front:?}: {error}")]
+    WrongInputFrontend {
+        front: Box<RequestHttpFrontend>,
+        error: String,
+    },
+    #[error("could not add frontend: {0}")]
+    AddFrontend(ListenerError),
+    #[error("could not remove frontend: {0}")]
+    RemoveFrontend(ListenerError),
+    #[error("could not add certificate: {0}")]
+    AddCertificate(CertificateResolverError),
+    #[error("could not remove certificate: {0}")]
+    RemoveCertificate(CertificateResolverError),
+    #[error("could not replace certificate: {0}")]
+    ReplaceCertificate(CertificateResolverError),
+    #[error("wrong certificate fingerprint: {0}")]
+    WrongCertificateFingerprint(FromHexError),
+    #[error("this request is not supported by the proxy")]
+    UnsupportedMessage,
+    #[error("failed to acquire the lock, {0}")]
+    Lock(String),
+    #[error("could not bind to socket {0:?}: {1}")]
+    BindToSocket(SocketAddr, ServerBindError),
+    #[error("error registering socket of listener: {0}")]
+    RegisterListener(std::io::Error),
+    #[error("the listener is not activated")]
+    UnactivatedListener,
+    /// HSTS (RFC 6797) was attached to a frontend on a plain-HTTP
+    /// listener. RFC 6797 §7.2 forbids `Strict-Transport-Security` on
+    /// plaintext-HTTP responses; the worker rejects the request rather
+    /// than ship a non-conformant policy. The TOML loader rejects the
+    /// same shape at config-load time
+    /// (`command/src/config.rs::ConfigError::HstsOnPlainHttp`); this
+    /// arm catches the same misconfiguration when the request reaches
+    /// the worker over the IPC channel without going through the TOML
+    /// path (e.g. via `sozu frontend http add`).
+    #[error(
+        "HSTS is only valid on HTTPS frontends; rejecting AddHttpFrontend with hsts.enabled = \
+         true on address {0:?} (RFC 6797 §7.2)"
+    )]
+    HstsOnPlainHttp(SocketAddr),
+    /// A TCP `AddTcpFrontend` would corrupt this listener's SNI/ALPN
+    /// routing invariants (sozu-proxy/sozu#1279): mixing a no-SNI
+    /// catch-all with SNI-scoped routes, an `alpn`-scoped frontend with no
+    /// `sni` to preread against, or an ALPN protocol / catch-all that
+    /// overlaps an existing route on the same `(address, sni)`. TOML
+    /// config-load already rejects the same shapes
+    /// (`command/src/config.rs::ConfigError`), but `AddTcpFrontend` can
+    /// also arrive directly over the command socket or via `LoadState`
+    /// replay of a hand-edited/stale state file, bypassing config.rs
+    /// entirely — see `TcpListener::validate_new_tcp_front`
+    /// (`lib/src/tcp.rs`).
+    #[error("rejected AddTcpFrontend on listener {address:?}: {reason}")]
+    InvalidTcpFrontend { address: SocketAddr, reason: String },
+}
+
+use self::server::ListenToken;
+pub trait ProxyConfiguration {
+    fn notify(&mut self, message: WorkerRequest) -> WorkerResponse;
+    /// Accept one connection on the listener behind `token`, returning the
+    /// socket together with the peer address `accept(2)` reported for it.
+    fn accept(&mut self, token: ListenToken) -> Result<(TcpStream, SocketAddr), AcceptError>;
+    /// Build the session for a socket [`Self::accept`] returned. `peer` is the
+    /// address `accept(2)` returned with it, so the session never has to ask
+    /// the kernel again with `getpeername(2)`.
+    fn create_session(
+        &mut self,
+        socket: TcpStream,
+        peer: SocketAddr,
+        token: ListenToken,
+        wait_time: Duration,
+        proxy: Rc<RefCell<Self>>,
+        // should we insert the tags here?
+    ) -> Result<(), AcceptError>;
+}
+
+pub trait L7Proxy {
+    fn kind(&self) -> ListenerType;
+
+    fn register_socket(
+        &self,
+        socket: &mut TcpStream,
+        token: Token,
+        interest: Interest,
+    ) -> Result<(), std::io::Error>;
+
+    fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token;
+
+    /// Remove the session from the session manager slab.
+    /// Returns true if the session was actually there before deletion
+    fn remove_session(&self, token: Token) -> bool;
+
+    fn clusters(&self) -> &HashMap<ClusterId, Cluster>;
+
+    /// Access the worker's [`crate::server::SessionManager`] for per-(cluster, source-IP)
+    /// connection-limit accounting. The mux uses this to track / untrack
+    /// stream-granular `(cluster_id, ip)` entries and consult the
+    /// `cluster_ip_at_limit` gate before each backend connect.
+    fn sessions(&self) -> Rc<RefCell<crate::server::SessionManager>>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RequiredEvents {
+    FrontReadBackNone,
+    FrontWriteBackNone,
+    FrontReadWriteBackNone,
+    FrontNoneBackNone,
+    FrontReadBackRead,
+    FrontWriteBackRead,
+    FrontReadWriteBackRead,
+    FrontNoneBackRead,
+    FrontReadBackWrite,
+    FrontWriteBackWrite,
+    FrontReadWriteBackWrite,
+    FrontNoneBackWrite,
+    FrontReadBackReadWrite,
+    FrontWriteBackReadWrite,
+    FrontReadWriteBackReadWrite,
+    FrontNoneBackReadWrite,
+}
+
+impl RequiredEvents {
+    pub fn front_readable(&self) -> bool {
+        matches!(
+            *self,
+            RequiredEvents::FrontReadBackNone
+                | RequiredEvents::FrontReadWriteBackNone
+                | RequiredEvents::FrontReadBackRead
+                | RequiredEvents::FrontReadWriteBackRead
+                | RequiredEvents::FrontReadBackWrite
+                | RequiredEvents::FrontReadWriteBackWrite
+                | RequiredEvents::FrontReadBackReadWrite
+                | RequiredEvents::FrontReadWriteBackReadWrite
+        )
+    }
+
+    pub fn front_writable(&self) -> bool {
+        matches!(
+            *self,
+            RequiredEvents::FrontWriteBackNone
+                | RequiredEvents::FrontReadWriteBackNone
+                | RequiredEvents::FrontWriteBackRead
+                | RequiredEvents::FrontReadWriteBackRead
+                | RequiredEvents::FrontWriteBackWrite
+                | RequiredEvents::FrontReadWriteBackWrite
+                | RequiredEvents::FrontWriteBackReadWrite
+                | RequiredEvents::FrontReadWriteBackReadWrite
+        )
+    }
+
+    pub fn back_readable(&self) -> bool {
+        matches!(
+            *self,
+            RequiredEvents::FrontReadBackRead
+                | RequiredEvents::FrontWriteBackRead
+                | RequiredEvents::FrontReadWriteBackRead
+                | RequiredEvents::FrontNoneBackRead
+                | RequiredEvents::FrontReadBackReadWrite
+                | RequiredEvents::FrontWriteBackReadWrite
+                | RequiredEvents::FrontReadWriteBackReadWrite
+                | RequiredEvents::FrontNoneBackReadWrite
+        )
+    }
+
+    pub fn back_writable(&self) -> bool {
+        matches!(
+            *self,
+            RequiredEvents::FrontReadBackWrite
+                | RequiredEvents::FrontWriteBackWrite
+                | RequiredEvents::FrontReadWriteBackWrite
+                | RequiredEvents::FrontNoneBackWrite
+                | RequiredEvents::FrontReadBackReadWrite
+                | RequiredEvents::FrontWriteBackReadWrite
+                | RequiredEvents::FrontReadWriteBackReadWrite
+                | RequiredEvents::FrontNoneBackReadWrite
+        )
+    }
+}
+
+/// Signals transitions between states of a given Protocol
+#[derive(Debug, PartialEq, Eq)]
+pub enum StateResult {
+    /// Signals to the Protocol to close its backend
+    CloseBackend,
+    /// Signals to the parent Session to close itself
+    CloseSession,
+    /// Signals to the Protocol to connect to backend
+    ConnectBackend,
+    /// Signals to the Protocol to continue
+    Continue,
+    /// Signals to the parent Session to upgrade to the next Protocol
+    Upgrade,
+}
+
+/// Signals transitions between states of a given Session
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResult {
+    /// Signals to the Session to close itself
+    Close,
+    /// Signals to the Session to continue
+    Continue,
+    /// Signals to the Session to upgrade its Protocol
+    Upgrade,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SocketType {
+    Listener,
+    FrontClient,
+}
+
+type SessionIsToBeClosed = bool;
+
+#[derive(Clone)]
+pub struct Readiness {
+    /// the current readiness
+    pub event: Ready,
+    /// the readiness we wish to attain
+    pub interest: Ready,
+}
+
+impl Display for Readiness {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let i = &mut [b'-'; 5];
+        let r = &mut [b'-'; 5];
+        let mixed = &mut [b'-'; 5];
+
+        display_ready(i, self.interest);
+        display_ready(r, self.event);
+        display_ready(mixed, self.interest & self.event);
+
+        write!(
+            f,
+            "I({:?})&R({:?})=M({:?})",
+            String::from_utf8_lossy(i),
+            String::from_utf8_lossy(r),
+            String::from_utf8_lossy(mixed)
+        )
+    }
+}
+
+impl Default for Readiness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Readiness {
+    /// Mask of every bit `Ready` defines (READABLE | WRITABLE | ERROR | HUP |
+    /// WRITE_CLOSED).
+    /// Any bit outside this set in `event` or `interest` is a corrupted
+    /// readiness word — checked by [`Self::check_invariants`]. Not
+    /// `#[cfg(debug_assertions)]`-gated: it is read from inside `debug_assert!`s
+    /// whose arguments must still compile in release (HARD RULE 2 / E0425).
+    const KNOWN_BITS: Ready = Ready(
+        Ready::READABLE.0
+            | Ready::WRITABLE.0
+            | Ready::ERROR.0
+            | Ready::HUP.0
+            | Ready::WRITE_CLOSED.0,
+    );
+
+    pub const fn new() -> Readiness {
+        Readiness {
+            event: Ready::EMPTY,
+            interest: Ready::EMPTY,
+        }
+    }
+
+    /// Cross-field invariant sweep: neither `event` nor `interest` may carry a
+    /// bit `Ready` does not define. A stray bit would silently widen
+    /// `filter_interest`'s mask and wake (or starve) a session on a phantom
+    /// readiness. Cheap enough to call as a postcondition from every mutator.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        debug_assert_eq!(
+            self.event & Self::KNOWN_BITS,
+            self.event,
+            "Readiness.event carries a bit outside READABLE|WRITABLE|ERROR|HUP|WRITE_CLOSED"
+        );
+        debug_assert_eq!(
+            self.interest & Self::KNOWN_BITS,
+            self.interest,
+            "Readiness.interest carries a bit outside READABLE|WRITABLE|ERROR|HUP|WRITE_CLOSED"
+        );
+    }
+
+    pub fn reset(&mut self) {
+        self.event = Ready::EMPTY;
+        self.interest = Ready::EMPTY;
+        // Post-condition: a reset clears *both* words — a half-reset leaves a
+        // session armed on stale interest after teardown.
+        debug_assert!(
+            self.event.is_empty() && self.interest.is_empty(),
+            "reset must clear both event and interest"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// filters the readiness we actually want
+    pub fn filter_interest(&self) -> Ready {
+        // Pre-condition: both source words must be well-formed before we mask —
+        // a stray bit upstream would leak through the intersection and wake (or
+        // starve) a session on a phantom readiness.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        let filtered = self.event & self.interest;
+        // Post-condition: the result is a subset of the recognized bits and can
+        // only contain bits the session both saw AND asked for.
+        debug_assert_eq!(
+            filtered & Self::KNOWN_BITS,
+            filtered,
+            "filter_interest must not yield an unknown bit"
+        );
+        debug_assert!(
+            self.interest.contains(filtered) && self.event.contains(filtered),
+            "filtered readiness must be present in both interest and event"
+        );
+        filtered
+    }
+
+    /// Signal that the socket has buffered data to write (e.g., TLS internal
+    /// buffers) that won't generate a new epoll WRITABLE event.
+    pub fn signal_pending_write(&mut self) {
+        // Snapshot the unrelated bits (everything but WRITABLE) so we can prove
+        // we flipped exactly the WRITABLE bit. `Ready` exposes no `!`, so mask on
+        // the public `.0` word.
+        let other_event_before = Ready(self.event.0 & !Ready::WRITABLE.0);
+        self.event.insert(Ready::WRITABLE);
+        debug_assert!(
+            self.event.is_writable(),
+            "signal_pending_write must set the WRITABLE event bit"
+        );
+        debug_assert_eq!(
+            Ready(self.event.0 & !Ready::WRITABLE.0),
+            other_event_before,
+            "signal_pending_write must touch only the WRITABLE bit"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// Signal that the socket has buffered data to read (e.g., TLS plaintext
+    /// buffer after a 1xx clear) that won't generate a new epoll READABLE event.
+    pub fn signal_pending_read(&mut self) {
+        let other_event_before = Ready(self.event.0 & !Ready::READABLE.0);
+        self.event.insert(Ready::READABLE);
+        debug_assert!(
+            self.event.is_readable(),
+            "signal_pending_read must set the READABLE event bit"
+        );
+        debug_assert_eq!(
+            Ready(self.event.0 & !Ready::READABLE.0),
+            other_event_before,
+            "signal_pending_read must touch only the READABLE bit"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// Pair `Ready::WRITABLE` insert with `signal_pending_write` — the canonical
+    /// invariant-15 form for any path that writes bytes to sozu-owned buffers
+    /// under edge-triggered epoll. See `lib/src/protocol/mux/LIFECYCLE.md`.
+    #[inline]
+    pub fn arm_writable(&mut self) {
+        // Snapshot the non-WRITABLE bits of both words: arm_writable must set the
+        // WRITABLE bit in *both* interest and event and leave everything else as-is.
+        let other_interest_before = Ready(self.interest.0 & !Ready::WRITABLE.0);
+        let other_event_before = Ready(self.event.0 & !Ready::WRITABLE.0);
+        self.interest.insert(Ready::WRITABLE);
+        self.signal_pending_write();
+        debug_assert!(
+            self.interest.is_writable() && self.event.is_writable(),
+            "arm_writable must set WRITABLE in both interest and event"
+        );
+        debug_assert_eq!(
+            Ready(self.interest.0 & !Ready::WRITABLE.0),
+            other_interest_before,
+            "arm_writable must touch only the WRITABLE interest bit"
+        );
+        debug_assert_eq!(
+            Ready(self.event.0 & !Ready::WRITABLE.0),
+            other_event_before,
+            "arm_writable must touch only the WRITABLE event bit"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+}
+
+#[cfg(test)]
+mod session_target_tests {
+    use std::net::SocketAddr;
+
+    use sozu_command::proto::command::CloseSessions;
+
+    use super::SessionTarget;
+
+    const ADDRESS: &str = "10.0.0.1:8080";
+
+    fn target(backend_id: Option<&str>, address: Option<&str>) -> SessionTarget {
+        SessionTarget::from(&CloseSessions {
+            cluster_id: "cluster".to_owned(),
+            backend_id: backend_id.map(ToOwned::to_owned),
+            address: address.map(|a| a.parse::<SocketAddr>().unwrap().into()),
+        })
+    }
+
+    #[test]
+    fn a_cluster_target_selects_every_backend_of_the_cluster_only() {
+        let address = ADDRESS.parse().ok();
+        let cluster = target(None, None);
+        assert!(cluster.matches("cluster", Some("a"), address));
+        assert!(cluster.matches("cluster", None, None));
+        assert!(!cluster.matches("other", Some("a"), address));
+        assert!(!cluster.matches("cluster-2", Some("a"), address));
+    }
+
+    #[test]
+    fn a_backend_target_selects_only_what_matches_every_field_it_sets() {
+        let address = ADDRESS.parse().ok();
+        let elsewhere = "10.0.0.2:8080".parse().ok();
+
+        let by_id = target(Some("a"), None);
+        assert!(by_id.matches("cluster", Some("a"), elsewhere));
+        assert!(!by_id.matches("cluster", Some("b"), address));
+        assert!(!by_id.matches("cluster", None, address));
+        assert!(!by_id.matches("other", Some("a"), address));
+
+        let by_address = target(None, Some(ADDRESS));
+        assert!(by_address.matches("cluster", Some("b"), address));
+        assert!(!by_address.matches("cluster", Some("a"), elsewhere));
+        assert!(!by_address.matches("cluster", Some("a"), None));
+
+        let by_both = target(Some("a"), Some(ADDRESS));
+        assert!(by_both.matches("cluster", Some("a"), address));
+        assert!(!by_both.matches("cluster", Some("b"), address));
+        assert!(!by_both.matches("cluster", Some("a"), elsewhere));
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::{Readiness, Ready};
+
+    #[test]
+    fn arm_writable_sets_interest_and_event() {
+        let mut r = Readiness::new();
+        r.arm_writable();
+        assert!(r.interest.is_writable());
+        assert!(r.event.is_writable());
+    }
+
+    #[test]
+    fn arm_writable_is_idempotent() {
+        let mut r = Readiness::new();
+        r.arm_writable();
+        r.arm_writable();
+        assert_eq!(r.interest, Ready::WRITABLE);
+        assert_eq!(r.event, Ready::WRITABLE);
+    }
+
+    /// A trace line tells a half-close from a hang-up: WRITE_CLOSED renders
+    /// as `C` beside HUP's `H`.
+    #[test]
+    fn readiness_rendering_tells_a_hang_up_from_a_half_close() {
+        assert_eq!(
+            super::ready_to_string(Ready::READABLE | Ready::HUP),
+            "R--H-"
+        );
+        assert_eq!(
+            super::ready_to_string(Ready::READABLE | Ready::HUP | Ready::WRITE_CLOSED),
+            "R--HC"
+        );
+        let readiness = Readiness {
+            event: Ready::HUP | Ready::WRITE_CLOSED,
+            interest: Ready::READABLE | Ready::HUP,
+        };
+        assert_eq!(
+            readiness.to_string(),
+            "I(\"R--H-\")&R(\"---HC\")=M(\"---H-\")"
+        );
+        assert_eq!(
+            format!("{readiness:?}"),
+            "Readiness { interest: R--H-, readiness: ---HC, mixed: ---H- }"
+        );
+    }
+}
+
+pub fn display_ready(s: &mut [u8], readiness: Ready) {
+    if readiness.is_readable() {
+        s[0] = b'R';
+    }
+    if readiness.is_writable() {
+        s[1] = b'W';
+    }
+    if readiness.is_error() {
+        s[2] = b'E';
+    }
+    if readiness.is_hup() {
+        s[3] = b'H';
+    }
+    // `H` alone is a half-close or a hang-up; `C` says the peer can receive
+    // nothing more (WRITE_CLOSED), which only a hang-up raises.
+    if readiness.is_write_closed() {
+        s[4] = b'C';
+    }
+}
+
+pub fn ready_to_string(readiness: Ready) -> String {
+    let s = &mut [b'-'; 5];
+    display_ready(s, readiness);
+    String::from_utf8(s.to_vec()).unwrap()
+}
+
+impl fmt::Debug for Readiness {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let i = &mut [b'-'; 5];
+        let r = &mut [b'-'; 5];
+        let mixed = &mut [b'-'; 5];
+
+        display_ready(i, self.interest);
+        display_ready(r, self.event);
+        display_ready(mixed, self.interest & self.event);
+
+        write!(
+            f,
+            "Readiness {{ interest: {}, readiness: {}, mixed: {} }}",
+            str::from_utf8(i).unwrap(),
+            str::from_utf8(r).unwrap(),
+            str::from_utf8(mixed).unwrap()
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionMetrics {
+    /// date at which we started handling that request
+    pub start: Option<Instant>,
+    /// wall-clock timestamp captured alongside `start`, for access-log
+    /// consumers that need an absolute start time (e.g. OTel span
+    /// reconstruction) without subtracting a monotonic duration from a
+    /// wall-clock end time — which mixes two unsynchronised clock sources.
+    pub start_wall: Option<SystemTime>,
+    /// time actually spent handling the request
+    pub service_time: Duration,
+    /// time spent waiting for its turn
+    pub wait_time: Duration,
+    /// bytes received by the frontend
+    pub bin: usize,
+    /// bytes sent by the frontend
+    pub bout: usize,
+
+    /// date at which we started working on the request
+    pub service_start: Option<Instant>,
+    pub wait_start: Instant,
+
+    /// The id of the backend serving this request. An `Rc<str>` so the mux
+    /// shares the one its `BackendId` carries instead of copying it (#1579).
+    pub backend_id: Option<Rc<str>>,
+    pub backend_start: Option<Instant>,
+    pub backend_connected: Option<Instant>,
+    /// date at which the backend's response headers finished parsing — the
+    /// time-to-first-header-byte anchor nginx calls `$upstream_header_time`.
+    /// Set by the L7 read paths only; raw TCP has no headers and leaves it
+    /// `None` (see [`SessionMetrics::backend_header_time`]).
+    pub backend_headers_received: Option<Instant>,
+    pub backend_stop: Option<Instant>,
+    pub backend_bin: usize,
+    pub backend_bout: usize,
+}
+
+impl SessionMetrics {
+    pub fn new(wait_time: Option<Duration>) -> SessionMetrics {
+        SessionMetrics {
+            start: Some(Instant::now()),
+            start_wall: Some(SystemTime::now()),
+            service_time: Duration::from_secs(0),
+            wait_time: wait_time.unwrap_or_else(|| Duration::from_secs(0)),
+            bin: 0,
+            bout: 0,
+            service_start: None,
+            wait_start: Instant::now(),
+            backend_id: None,
+            backend_start: None,
+            backend_connected: None,
+            backend_headers_received: None,
+            backend_stop: None,
+            backend_bin: 0,
+            backend_bout: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.start = None;
+        self.start_wall = None;
+        self.service_time = Duration::from_secs(0);
+        self.wait_time = Duration::from_secs(0);
+        self.bin = 0;
+        self.bout = 0;
+        self.service_start = None;
+        self.backend_start = None;
+        self.backend_connected = None;
+        self.backend_headers_received = None;
+        self.backend_stop = None;
+        self.backend_bin = 0;
+        self.backend_bout = 0;
+    }
+
+    pub fn service_start(&mut self) {
+        let now = if self.start.is_none() {
+            self.mark_request_start()
+        } else {
+            Instant::now()
+        };
+        self.service_start = Some(now);
+        self.wait_time += now - self.wait_start;
+    }
+
+    pub fn service_stop(&mut self) {
+        if let Some(start) = self.service_start.take() {
+            let duration = Instant::now() - start;
+            self.service_time += duration;
+        }
+    }
+
+    pub fn wait_start(&mut self) {
+        self.wait_start = Instant::now();
+    }
+
+    pub fn service_time(&self) -> Duration {
+        match self.service_start {
+            Some(start) => {
+                let last_duration = Instant::now() - start;
+                self.service_time + last_duration
+            }
+            None => self.service_time,
+        }
+    }
+
+    /// Arm both the monotonic and wall-clock start timestamps together.
+    /// This must be the single place that sets `start` + `start_wall` outside
+    /// of `new()`, so the two fields can never desynchronize.
+    /// Returns the monotonic instant so callers that need it (e.g.
+    /// `service_start`) can reuse it without a second syscall.
+    pub fn mark_request_start(&mut self) -> Instant {
+        let now = Instant::now();
+        self.start = Some(now);
+        self.start_wall = Some(SystemTime::now());
+        now
+    }
+
+    /// time elapsed since the beginning of the session
+    pub fn request_time(&self) -> Duration {
+        match self.start {
+            Some(start) => Instant::now() - start,
+            None => Duration::from_secs(0),
+        }
+    }
+
+    /// Wall-clock start time as nanoseconds since the Unix epoch, or `None`
+    /// if the monotonic start has not been set yet (post-`reset()`, pre-`service_start()`).
+    pub fn start_wall_ns(&self) -> Option<i128> {
+        self.start_wall.and_then(|t| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_nanos() as i128)
+        })
+    }
+
+    pub fn backend_start(&mut self) {
+        self.backend_start = Some(Instant::now());
+    }
+
+    pub fn backend_connected(&mut self) {
+        self.backend_connected = Some(Instant::now());
+    }
+
+    /// The backend's response headers have just finished parsing. Called from
+    /// the L7 read paths at the header -> body transition, once per response.
+    ///
+    /// Overwrites, exactly like [`Self::backend_stop`] and for the same
+    /// reason: a 1xx informational response is forwarded and the back buffer
+    /// is then cleared — `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`)
+    /// in its 100-Continue and other-interim (102-199) arms, `ConnectionH2::handle_1xx_reset`
+    /// (`lib/src/protocol/mux/h2.rs`) — so the final response re-enters that
+    /// transition from the initial parsing phase. Last write wins, which anchors
+    /// this on the FINAL response headers — the same response `backend_stop`
+    /// anchors on, and what nginx reports in `$upstream_header_time`. A
+    /// set-once guard would anchor the pair on two different responses and
+    /// floor the metric at ~0ms for every `Expect: 100-continue` client,
+    /// hiding the upstream think time the metric exists to expose.
+    pub fn backend_headers_received(&mut self) {
+        self.backend_headers_received = Some(Instant::now());
+    }
+
+    pub fn backend_stop(&mut self) {
+        self.backend_stop = Some(Instant::now());
+    }
+
+    pub fn backend_response_time(&self) -> Option<Duration> {
+        match (self.backend_connected, self.backend_stop) {
+            (Some(start), Some(end)) => Some(end - start),
+            (Some(start), None) => Some(Instant::now() - start),
+            _ => None,
+        }
+    }
+
+    pub fn backend_connection_time(&self) -> Option<Duration> {
+        match (self.backend_start, self.backend_connected) {
+            (Some(start), Some(end)) => Some(end - start),
+            _ => None,
+        }
+    }
+
+    /// Time from the established backend connection to the moment its response
+    /// headers finished parsing — nginx's `$upstream_header_time`, the third
+    /// of the three upstream timings of sozu-proxy/sozu#426.
+    ///
+    /// Deliberately WITHOUT the elapsed-so-far fallback that
+    /// [`Self::backend_response_time`] carries for its `backend_stop`-is-None
+    /// case. That fallback serves a live read of a response still streaming;
+    /// a time-to-first-header-byte has no in-flight meaning, because no header
+    /// byte has arrived. Returning `Instant::now() - connected` anyway would
+    /// publish a value that grows with the wait and then freezes wherever the
+    /// session ended — indistinguishable, on a dashboard, from a slow backend
+    /// that did answer. `None` is the honest answer, and it is also what keeps
+    /// raw TCP (`lib/src/tcp.rs`, no headers at all) recording nothing here
+    /// instead of recording a zero.
+    pub fn backend_header_time(&self) -> Option<Duration> {
+        match (self.backend_connected, self.backend_headers_received) {
+            (Some(connected), Some(headers)) => Some(headers - connected),
+            _ => None,
+        }
+    }
+
+    pub fn register_end_of_session(&self, context: &LogContext) {
+        let request_time = self.request_time();
+        let service_time = self.service_time();
+
+        if let Some(cluster_id) = context.cluster_id {
+            time!(
+                names::event_loop::REQUEST_TIME,
+                cluster_id,
+                request_time.as_millis()
+            );
+            time!(
+                names::event_loop::SERVICE_TIME,
+                cluster_id,
+                service_time.as_millis()
+            );
+        }
+        time!(names::event_loop::REQUEST_TIME, request_time.as_millis());
+        time!(names::event_loop::SERVICE_TIME, service_time.as_millis());
+
+        if let Some(backend_id) = self.backend_id.as_ref()
+            && let Some(backend_response_time) = self.backend_response_time()
+        {
+            record_backend_metrics!(
+                context.cluster_id.as_str_or("-"),
+                backend_id,
+                backend_response_time.as_millis(),
+                self.backend_connection_time(),
+                self.backend_header_time(),
+                self.backend_bin,
+                self.backend_bout
+            );
+        }
+
+        incr!(
+            names::access_logs::COUNT,
+            context.cluster_id,
+            context.backend_id
+        );
+    }
+
+    pub(crate) fn register_end_of_session_for_incarnation(
+        &self,
+        context: &LogContext,
+        incarnation: metrics::ClusterMetricsCapture,
+    ) {
+        let request_time = self.request_time();
+        let service_time = self.service_time();
+
+        if let Some(cluster_id) = context.cluster_id {
+            time!(
+                names::event_loop::REQUEST_TIME,
+                cluster_id,
+                request_time.as_millis(),
+                incarnation
+            );
+            time!(
+                names::event_loop::SERVICE_TIME,
+                cluster_id,
+                service_time.as_millis(),
+                incarnation
+            );
+        }
+        time!(names::event_loop::REQUEST_TIME, request_time.as_millis());
+        time!(names::event_loop::SERVICE_TIME, service_time.as_millis());
+
+        if let Some(backend_id) = self.backend_id.as_ref()
+            && let Some(backend_response_time) = self.backend_response_time()
+        {
+            record_backend_metrics!(
+                context.cluster_id.as_str_or("-"),
+                backend_id,
+                backend_response_time.as_millis(),
+                self.backend_connection_time(),
+                self.backend_header_time(),
+                self.backend_bin,
+                self.backend_bout,
+                incarnation
+            );
+        }
+
+        incr!(
+            names::access_logs::COUNT,
+            context.cluster_id,
+            context.backend_id,
+            incarnation
+        );
+    }
+}
+
+/// exponentially weighted moving average with high sensibility to latency bursts
+///
+/// It reads no clock: construction, [`Self::observe`] and [`Self::get`] each
+/// take the instant they happen at, so the decay a simulator observes is a
+/// function of the instants it supplies (#1684).
+///
+/// cf Finagle for the original implementation: <https://github.com/twitter/finagle/blob/9cc08d15216497bb03a1cafda96b7266cfbbcff1/finagle-core/src/main/scala/com/twitter/finagle/loadbalancer/PeakEwma.scala>
+#[derive(Debug, PartialEq, Clone)]
+pub struct PeakEWMA {
+    /// decay in nanoseconds
+    ///
+    /// higher values will make the EWMA decay slowly to 0
+    pub decay: f64,
+    /// estimated RTT in nanoseconds
+    ///
+    /// must be set to a high enough default value so that new backends do not
+    /// get all the traffic right away
+    pub rtt: f64,
+    /// last modification
+    pub last_event: Instant,
+}
+
+impl PeakEWMA {
+    /// A fresh average created at `now`, which the first decay is measured
+    /// from. Hardcoded default values for now.
+    pub fn new(now: Instant) -> Self {
+        PeakEWMA {
+            // 1s
+            decay: 1_000_000_000f64,
+            // 50ms
+            rtt: 50_000_000f64,
+            last_event: now,
+        }
+    }
+
+    /// Fold an observed `rtt` (in nanoseconds) made at `now` into the average.
+    ///
+    /// An instant earlier than the last event decays nothing: the elapsed
+    /// time saturates at zero.
+    pub fn observe(&mut self, rtt: f64, now: Instant) {
+        let dur = now.saturating_duration_since(self.last_event);
+
+        // if latency is rising, we will immediately raise the cost
+        if rtt > self.rtt {
+            self.rtt = rtt;
+        } else {
+            // new_rtt = old_rtt * e^(-elapsed/decay) + observed_rtt * (1 - e^(-elapsed/decay))
+            let weight = (-(dur.as_nanos() as f64) / self.decay).exp();
+            self.rtt = self.rtt * weight + rtt * (1.0 - weight);
+        }
+
+        self.last_event = now;
+    }
+
+    /// The cost of a backend with `active_requests` in flight, as seen at
+    /// `now`.
+    pub fn get(&mut self, active_requests: usize, now: Instant) -> f64 {
+        // decay the current value
+        // (we might not have seen a request in a long time)
+        self.observe(0.0, now);
+
+        (active_requests + 1) as f64 * self.rtt
+    }
+}
+
+pub mod testing {
+    pub use std::{cell::RefCell, os::fd::IntoRawFd, rc::Rc};
+
+    pub use anyhow::Context;
+    pub use mio::{Poll, Registry, Token, net::UnixStream};
+    pub use slab::Slab;
+    pub use sozu_command::{
+        proto::command::{
+            HttpListenerConfig, HttpsListenerConfig, ServerConfig, TcpListenerConfig,
+        },
+        scm_socket::{Listeners, ScmSocket},
+    };
+
+    pub use crate::{
+        Protocol, ProxySession,
+        backends::BackendMap,
+        http::HttpProxy,
+        https::HttpsProxy,
+        pool::Pool,
+        server::{ListenSession, ProxyChannel, Server, SessionManager},
+        tcp::TcpProxy,
+    };
+
+    use std::{
+        collections::VecDeque,
+        net::{SocketAddr, UdpSocket},
+        sync::{Mutex, PoisonError},
+    };
+
+    use socket2::{Domain, Socket, Type};
+
+    /// Ports handed to lib tests, below Linux's default ephemeral range
+    /// (32768–60999) so no `127.0.0.1:0` client socket is auto-bound onto one
+    /// between allocation and use, and above the fixed 10000-based sequence
+    /// older revisions of this function used. The e2e suite draws from
+    /// 20000–65000 through its own registry (`e2e/src/port_registry.rs`),
+    /// which reserves through [`reserve_port`] too.
+    const TEST_PORT_FIRST: u16 = 12_000;
+    const TEST_PORT_LAST: u16 = 19_999;
+
+    /// Next candidate for [`provide_port`].
+    static NEXT_TEST_PORT: Mutex<u16> = Mutex::new(TEST_PORT_FIRST);
+
+    /// How many reservations [`reserve_port`] holds at once. Each one is a
+    /// descriptor: the full e2e suite reserves thousands of ports, which would
+    /// exceed a default soft `RLIMIT_NOFILE` of 1024 if every reservation
+    /// lived until the process exits. The oldest reservation is dropped to
+    /// make room, so a test that releases its listener and binds it again
+    /// only after this process has reserved this many further ports has lost
+    /// its reservation in between.
+    const MAX_HELD_RESERVATIONS: usize = 256;
+
+    /// The sockets [`reserve_port`] holds, oldest first.
+    static PORT_RESERVATIONS: Mutex<VecDeque<Socket>> = Mutex::new(VecDeque::new());
+
+    /// Reserve `127.0.0.1:port` against the other processes on this machine
+    /// that also reserve their ports through this function, until this
+    /// process has reserved 256 more ports. Returns `false`, reserving
+    /// nothing, when the port is already in use.
+    ///
+    /// A port counter alone is unique within one test binary only: two
+    /// binaries running concurrently (several worktrees, parallel CI jobs,
+    /// pre-push hooks) walked the same sequence, and since `server_bind` and
+    /// `udp_bind` set `SO_REUSEPORT`, both processes bound the same address
+    /// without error and the kernel split connections and datagrams between
+    /// them. A port a test releases on purpose, for instance by deactivating
+    /// a listener before activating it again, could likewise be taken by
+    /// another process in between.
+    ///
+    /// The port is reserved only when an exclusive TCP bind (no
+    /// `SO_REUSEADDR`, no `SO_REUSEPORT`) and an exclusive UDP bind on it both
+    /// succeed. The TCP socket is then kept, bound and not listening, with
+    /// `SO_REUSEADDR` and `SO_REUSEPORT` set so this process's own
+    /// `server_bind`, `std::net::TcpListener::bind` and their equivalents
+    /// still succeed on the port. Another process's exclusive TCP bind fails
+    /// on it, so a process reserving through this function skips it; the
+    /// reservation never listens, so it accepts no connection and a connect
+    /// to an otherwise unused reserved port is still refused.
+    ///
+    /// Those same socket options mean the reservation does not stop a process
+    /// that binds without reserving first: a `server_bind` (`SO_REUSEPORT`)
+    /// from a test binary built before this function existed, or a
+    /// `std::net::TcpListener::bind` (`SO_REUSEADDR`) while nothing listens on
+    /// the port, still succeeds on it, including between a deactivate and the
+    /// re-activate of a test's listener. The guarantee holds only between
+    /// processes that all reserve their ports through this function, and only
+    /// while the reservation is held (see `MAX_HELD_RESERVATIONS`). The UDP
+    /// side is only probed, never held: a bound UDP socket sharing the port
+    /// through `SO_REUSEPORT` would receive a share of the datagrams.
+    pub fn reserve_port(port: u16) -> bool {
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let reservation = Socket::new(Domain::IPV4, Type::STREAM, None)
+            .expect("could not create a port reservation socket");
+        if reservation.bind(&address.into()).is_err() || UdpSocket::bind(address).is_err() {
+            return false;
+        }
+        reservation
+            .set_reuse_address(true)
+            .and_then(|()| reservation.set_reuse_port(true))
+            .expect("could not share the port reservation with this process");
+        let mut reservations = PORT_RESERVATIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if reservations.len() == MAX_HELD_RESERVATIONS {
+            reservations.pop_front();
+        }
+        reservations.push_back(reservation);
+        true
+    }
+
+    /// Get a localhost port for a test listener, held by [`reserve_port`]:
+    /// unique across concurrent processes that all allocate their ports
+    /// through [`reserve_port`], within that function's limits.
+    pub fn provide_port() -> u16 {
+        let mut next_port = NEXT_TEST_PORT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for _ in TEST_PORT_FIRST..=TEST_PORT_LAST {
+            let candidate = *next_port;
+            *next_port = if candidate == TEST_PORT_LAST {
+                TEST_PORT_FIRST
+            } else {
+                candidate + 1
+            };
+            if reserve_port(candidate) {
+                return candidate;
+            }
+        }
+        panic!("no free localhost port left in {TEST_PORT_FIRST}..={TEST_PORT_LAST}");
+    }
+
+    /// Everything needed to create a Server
+    pub struct ServerParts {
+        pub event_loop: Poll,
+        pub registry: Registry,
+        pub sessions: Rc<RefCell<SessionManager>>,
+        pub pool: Rc<RefCell<Pool>>,
+        pub backends: Rc<RefCell<BackendMap>>,
+        pub client_scm_socket: ScmSocket,
+        pub server_scm_socket: ScmSocket,
+        pub server_config: ServerConfig,
+    }
+
+    /// Setup a standalone server, for testing purposes
+    pub fn prebuild_server(
+        max_buffers: usize,
+        buffer_size: usize,
+        send_scm: bool,
+    ) -> anyhow::Result<ServerParts> {
+        let event_loop = Poll::new().with_context(|| "Failed at creating event loop")?;
+        let backends = Rc::new(RefCell::new(BackendMap::new()));
+        let server_config = ServerConfig {
+            max_connections: max_buffers as u64,
+            ..Default::default()
+        };
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(
+            1,
+            max_buffers,
+            buffer_size,
+        )));
+
+        let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>> = Slab::with_capacity(max_buffers);
+        {
+            let entry = sessions.vacant_entry();
+            info!("taking token {:?} for channel", entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Channel,
+            })));
+        }
+        {
+            let entry = sessions.vacant_entry();
+            info!("taking token {:?} for timer", entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Timer,
+            })));
+        }
+        {
+            let entry = sessions.vacant_entry();
+            info!("taking token {:?} for metrics", entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Metrics,
+            })));
+        }
+        // Test fixture: both limiters disabled (max_connections_per_ip
+        // = 0, max_connections_per_subnet = 0) and the subnet prefixes
+        // at their no-op widths.
+        let sessions = SessionManager::new(sessions, max_buffers, 0, 0, 0, 32, 128);
+
+        let registry = event_loop
+            .registry()
+            .try_clone()
+            .with_context(|| "Failed at creating a registry")?;
+
+        let (scm_server, scm_client) =
+            UnixStream::pair().with_context(|| "Failed at creating scm unix stream")?;
+        let client_scm_socket = ScmSocket::new(scm_client.into_raw_fd())
+            .with_context(|| "Failed at creating the scm client socket")?;
+        let server_scm_socket = ScmSocket::new(scm_server.into_raw_fd())
+            .with_context(|| "Failed at creating the scm server socket")?;
+        if send_scm {
+            client_scm_socket
+                .send_listeners(&Listeners::default())
+                .with_context(|| "Failed at sending empty listeners")?;
+        }
+
+        Ok(ServerParts {
+            event_loop,
+            registry,
+            sessions,
+            pool,
+            backends,
+            client_scm_socket,
+            server_scm_socket,
+            server_config,
+        })
+    }
+}
+
+/// The counting global allocator of this crate's unit-test binary, so a test
+/// can pin how many heap allocations a hot-path call makes.
+///
+/// A binary has exactly one global allocator, so every unit test in
+/// `sozu-lib` that counts allocations goes through this module: read
+/// [`allocations`] before and after the code under test and assert on the
+/// difference. Never declare a second `#[global_allocator]` under
+/// `#[cfg(test)]`; the test build then fails with "cannot define multiple
+/// global allocators". [`bytes`] counts the sizes those allocations asked
+/// for, for the code whose cost is the size of one allocation rather than
+/// their number.
+///
+/// Every method forwards to [`std::alloc::System`] unchanged; the counter is
+/// thread-local, so the harness's other test threads cannot pollute a
+/// measurement. Same shape as the allocator `lib/tests/backend_selection.rs`
+/// installs in its own binary.
+#[cfg(test)]
+pub(crate) mod test_allocations {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    struct CountingAllocator;
+
+    thread_local! {
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        static BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn record_allocation(size: usize) {
+        // `try_with`: the slot may already be torn down while a thread exits.
+        let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        let _ = BYTES.try_with(|bytes| bytes.set(bytes.get() + size));
+    }
+
+    // SAFETY: every method forwards to `System` unchanged; the only addition
+    // is a thread-local counter increment, which neither allocates nor unwinds.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_allocation(new_size);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+
+    /// Heap allocations the calling thread has made so far.
+    pub(crate) fn allocations() -> usize {
+        ALLOCATIONS.with(Cell::get)
+    }
+
+    /// Bytes the calling thread's allocations have asked for so far: the
+    /// requested size of each allocation, and the new size of each
+    /// reallocation.
+    pub(crate) fn bytes() -> usize {
+        BYTES.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn capture_test_logs(run: impl FnOnce() + Send + 'static) -> String {
+    capture_test_logs_at_level("info", run)
+}
+
+#[cfg(test)]
+pub(crate) fn capture_test_logs_at_level(
+    level: &'static str,
+    run: impl FnOnce() + Send + 'static,
+) -> String {
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("test log receiver must bind to a loopback port");
+    let target = format!(
+        "udp://{}",
+        receiver
+            .local_addr()
+            .expect("test log receiver must have a local address")
+    );
+
+    std::thread::spawn(move || {
+        sozu_command::logging::Logger::init(
+            "log-redaction-test".to_owned(),
+            level,
+            &target,
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("test logger must initialize");
+        run();
+    })
+    .join()
+    .expect("log-producing test thread must not panic");
+
+    receiver
+        .set_nonblocking(true)
+        .expect("test log receiver must become nonblocking");
+    let mut output = String::new();
+    let mut datagram = vec![0; 65_507];
+    loop {
+        match receiver.recv(&mut datagram) {
+            Ok(length) => output.push_str(&String::from_utf8_lossy(&datagram[..length])),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("test log receiver failed: {error}"),
+        }
+    }
+    assert!(!output.is_empty(), "test log capture received no datagrams");
+    output
+}
+
+#[cfg(test)]
+mod log_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn listener_template_parse_error_redacts_custom_answer_key() {
+        const KEY_SECRET: &str = "CUSTOM_ANSWER_KEY_SECRET_SENTINEL";
+
+        let key = format!("{KEY_SECRET}{}", "x".repeat(4096));
+        let key_len = key.len();
+        let error = ListenerError::TemplateParse(key, TemplateError::InvalidType);
+
+        for (label, output) in [
+            ("Display", error.to_string()),
+            ("Debug", format!("{error:?}")),
+        ] {
+            assert!(
+                !output.contains(KEY_SECRET),
+                "ListenerError {label} leaked custom-answer key {KEY_SECRET}"
+            );
+            assert!(
+                output.contains(&format!("key_bytes={key_len}")),
+                "ListenerError {label} omitted the bounded key length: {output}"
+            );
+            assert!(
+                output.len() <= 256,
+                "ListenerError {label} output is not bounded: {} bytes",
+                output.len()
+            );
+        }
+    }
+
+    #[test]
+    fn sni_authority_mismatch_retains_inputs_but_bounds_textual_formatting() {
+        const SNI_SECRET: &str = "SNI_MISMATCH_SECRET_SENTINEL";
+        const AUTHORITY_SECRET: &str = "AUTHORITY_MISMATCH_SECRET_SENTINEL";
+
+        let sni = format!("{SNI_SECRET}{}", "x".repeat(4096));
+        let authority = format!("{AUTHORITY_SECRET}{}", "x".repeat(4096));
+        let error = RetrieveClusterError::SniAuthorityMismatch {
+            sni: sni.clone(),
+            authority: authority.clone(),
+        };
+
+        match &error {
+            RetrieveClusterError::SniAuthorityMismatch {
+                sni: retained_sni,
+                authority: retained_authority,
+            } => {
+                assert_eq!(retained_sni, &sni);
+                assert_eq!(retained_authority, &authority);
+            }
+            other => panic!("expected SniAuthorityMismatch, got {other:?}"),
+        }
+
+        for output in [error.to_string(), format!("{error:?}")] {
+            for secret in [SNI_SECRET, AUTHORITY_SECRET] {
+                assert!(
+                    !output.contains(secret),
+                    "SNI mismatch formatting leaked {secret}: {output}"
+                );
+            }
+            for metadata in [
+                format!("sni_bytes={}", sni.len()),
+                format!("authority_bytes={}", authority.len()),
+            ] {
+                assert!(
+                    output.contains(&metadata),
+                    "SNI mismatch formatting omitted {metadata}: {output}"
+                );
+            }
+            assert!(
+                output.len() <= 256,
+                "SNI mismatch formatting is not bounded: {} bytes",
+                output.len()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod backend_header_time_tests {
+    use super::*;
+
+    /// A protocol with no response headers at all — raw TCP
+    /// (`sozu_lib::tcp::TcpSession`, which calls
+    /// `SessionMetrics::register_end_of_session` like the L7 paths do) — must
+    /// record NOTHING under `backend_header_time`, not a zero and not an
+    /// elapsed-so-far value.
+    ///
+    /// This is the whole of the `None`-fallback decision, in its only
+    /// observable shape: `backend_response_time` deliberately answers
+    /// `Instant::now() - connected` when `backend_stop` is absent, and
+    /// `backend_header_time` deliberately does not. Without the distinction a
+    /// TCP session would publish a header time that is really its whole
+    /// lifetime, under a key whose name promises a time to first header byte.
+    ///
+    /// To SEE THIS RED: add `(Some(connected), None) => Some(Instant::now() -
+    /// connected),` to the match in `SessionMetrics::backend_header_time`,
+    /// mirroring the arm `SessionMetrics::backend_response_time` carries.
+    #[test]
+    fn a_session_that_received_no_response_headers_reports_no_header_time() {
+        let mut metrics = SessionMetrics::new(None);
+        metrics.backend_start();
+        metrics.backend_connected();
+        metrics.backend_stop();
+
+        // Premise: this session is otherwise fully timed, so a `None` below
+        // cannot come from a missing connection instant.
+        assert!(
+            metrics.backend_connection_time().is_some(),
+            "premise: the connection time must be available"
+        );
+        assert!(
+            metrics.backend_response_time().is_some(),
+            "premise: the response time must be available"
+        );
+
+        assert_eq!(
+            metrics.backend_header_time(),
+            None,
+            "a session whose backend produced no response headers must report \
+             no header time"
+        );
+    }
+
+    /// `SessionMetrics::reset` recycles one `SessionMetrics` across the
+    /// requests of an H1 keep-alive connection, so a field it forgets is a
+    /// field the NEXT request inherits. `backend_response_time` was miscounted
+    /// exactly this way once (commit `5f3371b7`); this pins that the new
+    /// instant joins the three it sits beside.
+    ///
+    /// To SEE THIS RED: drop `self.backend_headers_received = None;` from
+    /// `SessionMetrics::reset`.
+    #[test]
+    fn reset_clears_the_backend_headers_instant_with_its_siblings() {
+        let mut metrics = SessionMetrics::new(None);
+        metrics.backend_start();
+        metrics.backend_connected();
+        metrics.backend_headers_received();
+        assert!(
+            metrics.backend_header_time().is_some(),
+            "premise: the first request must have a header time to forget"
+        );
+
+        metrics.reset();
+
+        assert_eq!(
+            metrics.backend_headers_received, None,
+            "reset must clear the headers instant, or the next keep-alive \
+             request inherits the previous response's headers"
+        );
+        // Restaged as a fresh request would: connected now, no headers yet.
+        metrics.backend_connected();
+        assert_eq!(
+            metrics.backend_header_time(),
+            None,
+            "a recycled SessionMetrics must not report a header time earned by \
+             the previous request"
+        );
+    }
+}

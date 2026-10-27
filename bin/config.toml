@@ -1,0 +1,762 @@
+# sozu proxy test config file
+
+# top level options
+
+# path to a file sozu can use to load an initial configuration state for its
+# routing. You can generate this file from sozu's current routing by running
+# the command `sozu state save -f state.json`
+# this must be RELATIVE to config.toml
+# saved_state = "./state.json"
+
+# save the configuration to the saved_state file every time we receive a
+# configuration message on the configuration socket
+# defaults to false, and will not work if the 'saved_state' option is not set
+# automatic_state_save = false
+
+# logging verbosity. Possible values are "error", "warn", "info", "debug" and
+# "trace". For performance reasons, the logs at "debug" or "trace" level are
+# not compiled by default. To activate them, pass the "logs-debug" and
+# "logs-trace" compilation options to cargo
+log_level = "info"
+
+# where the logs will be sent. It defaults to sending the logs on standard output,
+# but they could be written to a UDP address:
+# log_target     = "udp://127.0.0.1:9876"
+# to a TCP address:
+# log_target     = "tcp://127.0.0.1:9876"
+# to a unix socket
+# log_target = "unix:///var/sozu/logs
+# to a file
+# log_target = "file:///var/log/sozu.log"
+# to_stdout
+log_target = "stdout"
+
+# enable ANSI colour codes on the main log stream. Only honoured when
+# log_target is "stdout"; TCP / UDP / file sinks ignore this flag.
+# Defaults to false.
+# log_colored = true
+
+# optional different target for access logs (IP addresses, domains, URI, HTTP status, etc)
+# It supports the same options as log_target
+# access_logs_target = "file:///var/logs/sozu-access.log"
+
+# optional dedicated file path for the control-plane audit log (every
+# `AUDIT\tCommand(...)` line sozu emits on privileged mutations). When set,
+# the line is ALSO appended to this file opened `O_APPEND | O_CREAT` with
+# mode 0o640 (owner read+write, group read). Lets operators:
+#   - separate the audit trail from the main log stream (which may include
+#     stack traces, TLS errors, protocol chatter),
+#   - grant an `audit` group tail-only access via filesystem ACL without
+#     opening up the rest of sozu's logs,
+#   - rotate the audit file independently of the main log.
+# `None` (the default) leaves audit lines routed only through log_target.
+# Accepts a plain filesystem path (no URI scheme).
+# audit_logs_target = "/var/log/sozu/audit.log"
+
+# optional JSON mirror of the audit log — one JSON object per line so SIEM
+# pipelines (Wazuh, Elastic, Loki, Splunk HEC) ingest without bespoke parser
+# code. Same `O_APPEND | O_CREAT | 0o640` semantics as audit_logs_target.
+# Schema is stable: every key always present, missing values rendered as
+# JSON `null`. Independent of the human-readable sink — set both for
+# operator-friendly tail + machine-parseable archive.
+# audit_logs_json_target = "/var/log/sozu/audit.jsonl"
+
+# format of the access logs. Defaults to ascii.
+# - ascii
+# - protobuf (defined in [sozu_command_lib::proto::command::ProtobufAccessLog])
+# access_logs_format = "ascii"
+
+# enable ANSI colour codes on access logs. Only honoured when the access-log
+# target is "stdout". If unset, inherits log_colored. Defaults to false.
+# access_logs_colored = true
+
+# path to the unix socket file used to send commands to sozu
+# default value points to "sozu.sock" file in the current directory
+command_socket = "./sozu.sock"
+
+# permission bits of the command socket, as an octal string ("0660" or "660"),
+# at most "0777". Defaults to "0600": only sozu's own user can connect.
+# A client that can connect can drive the proxy (routes, certificates, shutdown,
+# upgrade): "0660" with a dedicated group limits that to chosen users, "0666"
+# opens it to every local account. Sozu does not set the group: use a setgid
+# parent directory, or chgrp the socket after each start. The added user needs
+# search (x) permission on every parent directory of the socket. Its sozu client
+# loads its whole -c configuration, TLS certificate and key paths included, and
+# fails on an unreadable one: give it a minimal configuration with only
+# command_socket (plus the command buffer sizes when not default).
+# A mode without owner read and write (e.g. "0066") is refused.
+# command_socket_mode = "0660"
+
+# initial size in bytes of a command channel's buffers: the supervisor<->worker
+# channels and sozu ctl's own end of the command socket. It does NOT size the main
+# process's end of the command socket, which no key configures -- see
+# doc/configure_admin_ops.md section 5.2. If the message sent to sozu is too large,
+# or the data that sozu must return is too large, the buffer will grow up to
+# max_command_buffer_size. A frame declaring a length above that ceiling is
+# rejected; what happens to the connection afterwards is the subject of
+# sozu-proxy/sozu#1428
+# defaults to 1000000
+command_buffer_size = 16384
+# defaults to 2000000
+max_command_buffer_size = 163840
+
+# the number of worker processes that will handle traffic
+# defaults to 2 workers
+worker_count = 2
+
+# indicates if workers should be automatically restarted if they crash / hang
+# should be true for production and false for development
+# defaults to true
+worker_automatic_restart = true
+
+# maximum time to wait for a worker to respond, until it is deemed NotAnswering (10 seconds).
+# Beware that if this duration is bigger than ctl_command timeout (that defaults to 1 second),
+# and if a worker is not responding,
+# you may not receive a reply from Sōzu at all when doing "sozu status"
+worker_timeout = 10
+
+# indicates if worker process will be pinned on a core. If you activate this, be sure
+# that you do not have more workers than CPU cores (and leave at least one core for
+# the kernel and the main process)
+handle_process_affinity = false
+
+# maximum number of connections to a worker. If it reached that number and
+# there are new connections available, the worker (by default) will accept and
+# close them immediately to indicate it is too busy to handle traffic. See
+# `evict_on_queue_full` below for the alternative mitigation.
+# defaults to 10000 maximum connections
+max_connections = 500
+
+# when the accept queue is full (max_connections reached), evict the
+# least-recently-active sessions to make room for new connections.
+# defaults to false: during a DDoS, existing connections are more likely
+# to be legitimate clients — evicting them would serve attackers instead.
+# enable this if your workload is dominated by normal traffic spikes.
+# At small max_connections (< 100) the 1% eviction batch clamps to 1, so
+# the per-round share grows; the worker logs a config-load warning then.
+# evict_on_queue_full = false
+
+# Default per-(cluster, source-IP) connection limit. `0` disables the
+# feature (default). The source IP is taken from the parsed PROXY-protocol
+# header when present, else `peer_addr`. When the limit is reached:
+#   - HTTP/HTTPS clients receive `429 Too Many Requests` (with optional
+#     `Retry-After`).
+#   - TCP clients see a graceful FIN before any backend connect.
+#   - UDP listeners ignore this global default: only a cluster's own
+#     `max_connections_per_ip` limits its UDP flows.
+# Each cluster may override this default via its own `max_connections_per_ip`
+# field. Counts are kept per `(cluster_id, source_ip)`, so two clusters never
+# share a counter even from the same IP.
+# max_connections_per_ip = 0
+
+# Default `Retry-After` header value (seconds) emitted on HTTP 429
+# responses. `0` omits the header — `Retry-After: 0` invites an
+# immediate retry that defeats the limit. TCP listeners ignore this
+# value (no HTTP envelope).
+# retry_after = 60
+
+# Default per-(cluster, source-SUBNET) connection limit. `0` disables the
+# feature (default), leaving the per-IP behaviour above strictly unchanged.
+#
+# This is a SECOND, INDEPENDENT counter beside `max_connections_per_ip`,
+# not a replacement for it. The per-IP cap serves the API-gateway case:
+# one abusive client on one address. The per-subnet cap serves the
+# denial-of-service case, where an attacker holding a routed prefix — an
+# ordinary residential IPv6 /64 — defeats a per-address counter outright
+# by taking a fresh address for every connection (issue #1270). Both
+# gates are consulted and BOTH must admit, so the two lines
+#   max_connections_per_ip     = 10
+#   max_connections_per_subnet = 100
+# together mean "10 per IP AND 100 per subnet".
+#
+# Each cluster may override via its own `max_connections_per_subnet`.
+# UDP listeners ignore this global default, as for `max_connections_per_ip`.
+# max_connections_per_subnet = 0
+
+# Prefix lengths, in bits, that define a "subnet" for the counter above.
+# Out-of-range values are rejected at config-load time, never clamped.
+# The defaults mask nothing (/32 and /128), so enabling only
+# `max_connections_per_subnet` gives a per-address counter rather than a
+# surprising aggregation.
+#
+# RECOMMENDED starting point for a public-facing listener: /24 and /56.
+# An IPv4-mapped IPv6 source (`::ffff:a.b.c.d`) is canonicalised to IPv4
+# and charged to `subnet_ipv4_prefix`.
+#
+# Boot-time only: changing a mask re-keys every live counter, so it takes
+# a restart. Only the limit itself has a runtime setter.
+# subnet_ipv4_prefix = 32
+# subnet_ipv6_prefix = 128
+
+# Upper bound, in bytes, on the **base64-decoded** `Authorization: Basic`
+# payload sōzu is willing to canonicalize per request. Set once at worker
+# boot from `ServerConfig::basic_auth_max_credential_bytes` and read on
+# every Basic-auth probe. The cap protects against per-request memory
+# amplification (a peer sending an oversized Basic token); raise it only
+# if your operator-supplied usernames or passwords legitimately exceed
+# the default. Setting this to `0` keeps the built-in default (4096) —
+# explicitly setting `0` does NOT disable the cap.
+# basic_auth_max_credential_bytes = 4096
+
+# Linux-only kernel-pipe capacity, in bytes, requested for the
+# `splice(2)` zero-copy fast path on TCP listeners (feature `splice`).
+# Larger pipes mean fewer syscalls under bulk-transfer load at the
+# cost of more kernel memory per active session. Realised size may
+# differ: the kernel rounds up to a page boundary and clamps at
+# `/proc/sys/fs/pipe-max-size`. Linux-only; ignored on builds without
+# the `splice` feature. Setting this to `0` keeps the built-in default
+# (65536, matching the historical pre-knob value) — explicitly setting
+# `0` does NOT collapse the pipe to PAGE_SIZE.
+# splice_pipe_capacity_bytes = 65536
+
+# maximum number of buffers in the pool used by the protocol implementations
+# for active connections (ie currently serving a request). For now, you should
+# estimate that max_buffers = number of concurrent requests * 2
+# defaults to 1000
+# max_buffers = 1000
+
+# minimum number of buffers preallocated in the pool
+# cannot be larger than max_buffers
+# defaults to 1
+# min_buffers = 1
+
+# size of the buffers used by the protocol implementations. Each worker will
+# preallocate max_buffers * 2 * buffer_size bytes, so you should plan for this
+# memory usage. If you plan to use sozu's runtime upgrade feature, you should
+# leave enough memory for one more worker (also for the kernel, etc), so total
+# RAM should be larger than (worker count + 1) * max_buffers * 2 * buffer_size bytes
+# defaults to 16393 (minimum size for HTTP/2 is a 16384 bytes frame + 9 bytes of header
+buffer_size = 16393
+
+# how much time (in milliseconds) sozu command line will wait for a command to complete.
+# 0 disables the timeout. Defaults to 1000 milliseconds
+# ctl_command_timeout = 1000
+
+# PID file is a file containing the PID of the main process of sozu.
+# It can be helpful to help systemd or any other service system to keep track
+# of the main process across upgrades. PID file is not created unless this option
+# is set or if SOZU_PID_FILE_PATH environment variable was defined at build time.
+# pid_file_path = "/run/sozu/sozu.pid"
+
+# maximum time of inactivity for a frontend socket, in seconds
+# defaults to 60 seconds, can be specified at the listener level
+# front_timeout = 60
+
+# maximum time of inactivity for a backend socket, in seconds
+# defaults to 30 seconds, can be specified at the listener level
+# back_timeout = 30
+
+# maximum time to connect to a backend server, in seconds
+# defaults to 3 seconds, can be specified at the listener level
+# connect_timeout = 3
+
+# how many backend connections a request may try, the first included, before
+# it is answered 503 (HTTP) or closed (TCP). A connection that is refused,
+# times out on connect_timeout or reports a socket error counts against its
+# backend, and the request goes to another backend while attempts remain
+# (a TCP session whose connect times out is closed instead).
+# 1 to 255, defaults to 5 (earlier versions hard-coded 3). Each cluster may
+# override it; `sozu connection-attempts set` changes it at runtime.
+# max_connection_attempts = 5
+
+# maximum time to receive a request since the connection started
+# defaults to 10 seconds, can be specified at the listener level
+# request_timeout = 10
+#
+# duration between zombie checks, in seconds
+# defaults to 30 minutes
+# in case of bugs in sozu's event loop and protocol implementations, some client
+# sessions could be stuck, not receiving any more event, and consuming resources.
+# sozu verifies regularly if there are such zombie sessions, logs their state
+# and removes them
+# zombie_check_interval = 1800
+
+# maximum time (in seconds) a TCP connection stays in sozu's accept queue
+# before being dropped. Raising this helps absorb accept-queue bursts at the
+# cost of slower rejection of overloaded listeners. Defaults to 60.
+# accept_queue_timeout = 60
+
+# by default, all listeners start a TCP listen socket o startup
+# if set to false, this option will prevent them from listening. You can then add
+# the complete configuration, and send an ActivateListener message afterwards
+activate_listeners = true
+
+# various statistics can be sent to a server that supports the statsd protocol
+# You can see those statistics with the command line, like this: `sozu metrics get` or
+# `sozu metrics get --json` for machine consumption
+#
+#[metrics]
+# address = "127.0.0.1:8125"
+# use InfluxDB's statsd protocol flavor to add tags
+# tagged_metrics = false
+# metrics key prefix
+# prefix = "sozu"
+# by default, sozu register metrics for clusters, unless you want to spare ressources
+# disable_cluster_metrics = true
+
+# Listeners
+# configuration options specific to a TCP listen socket
+
+# Example for a HTTP (plaintext) listener
+[[listeners]]
+protocol = "http"
+
+# listening address
+address = "0.0.0.0:8080"
+
+# bind the listening socket to one network interface (SO_BINDTODEVICE, Linux
+# only), e.g. a WireGuard interface whose address is not known ahead. The
+# interface must exist, and kernels before 5.7 require CAP_NET_RAW. Part of the
+# listener identity: listeners may share an address on different interfaces.
+# See `doc/configure.md`.
+# interface = "wg0"
+
+# specify a different IP than the one the socket sees, for logs and forwarded headers
+# this option is incompatible with expect_proxy
+# public_address = "1.2.3.4:80"
+
+# For details about custom HTTP answers, see `doc/configure.md`,
+# and for defaults, check out `/lib/src/protocol/kawa_h1/answers.rs`
+# a 401 response is sent when a frontend has a Deny rule
+# answer_401 = "/absolute/path/to/custom_401.http"
+# a 404 response is sent when sozu does not know about the requested domain or path
+# answer_404 = "/absolute/path/to/custom_404.http"
+# a 408 response is sent when a frontend has a Deny rule (unusual)
+# answer_408 = "/absolute/path/to/custom_408.http"
+# a 413 response is sent when a request was too large
+# answer_413 = "/absolute/path/to/custom_413.http"
+# a 502 response means the response sent by a backend could not be parsed by Sōzu
+# answer_502 = "/absolute/path/to/custom_502.http"
+# a 503 response is sent if there are no backend servers available, or if
+# every backend connection attempt of the request failed
+# answer_503 = "/absolute/path/to/custom_503.http"
+# a 504 response means a connected backend sent no response in time, or the
+# frontend timed out while waiting on a backend (a connect timeout fails over
+# to another backend and ends in 503 once attempts are spent)
+# answer_504 = "/absolute/path/to/custom_504.http"
+# a 507 response occurs when the response sent by a backend is too big
+# answer_507 = "/absolute/path/to/custom_507.http"
+
+# defines the sticky session cookie's name, if `sticky_session` is activated for
+# a cluster. Defaults to "SOZUBALANCEID"
+# sticky_name = "SOZUBALANCEID"
+#
+# Configures the client socket to receive a PROXY protocol header
+# this option is incompatible with public_address
+# expect_proxy = false
+
+# When true, strip any client-supplied `X-Real-IP` header from forwarded
+# requests (anti-spoofing). Independently combinable with `send_x_real_ip`.
+# Default: false.
+# elide_x_real_ip = false
+
+# When true, append a proxy-generated `X-Real-IP` header carrying the
+# connection peer IP (post-PROXY-v2 unwrap, i.e. the original client IP)
+# to every forwarded request. Independently combinable with
+# `elide_x_real_ip`. Default: false.
+# send_x_real_ip = false
+
+# Forwarding header family added to every forwarded request (doc/configure.md,
+# "Forwarding headers"). Default: "both".
+# - "both": X-Forwarded-For/-Proto/-Port and RFC 7239 Forwarded
+# - "x_forwarded": only X-Forwarded-*; a client Forwarded passes through
+# - "rfc7239": only Forwarded; client X-Forwarded-For/-Proto/-Port/-Host removed
+# - "none": nothing added; client headers pass through untrusted and untouched
+# Independent of `elide_x_real_ip` and `send_x_real_ip`.
+# forwarded_headers = "both"
+
+# Example for a HTTPS listener
+[[listeners]]
+protocol = "https"
+
+# listening address
+address = "0.0.0.0:8443"
+
+# specify a different IP than the one the socket sees, for logs and forwarded headers
+# this option is incompatible with expect_proxy
+# public_address = "1.2.3.4:80"
+
+# For details about custom HTTP answers, see `doc/configure.md`,
+# and for defaults, check out `/lib/src/protocol/kawa_h1/answers.rs`
+# a 401 response is sent when a frontend has a Deny rule
+# answer_401 = "/absolute/path/to/custom_401.http"
+# a 404 response is sent when sozu does not know about the requested domain or path
+# answer_404 = "/absolute/path/to/custom_404.http"
+# a 408 response is sent when a frontend has a Deny rule (unusual)
+# answer_408 = "/absolute/path/to/custom_408.http"
+# a 413 response is sent when a request was too large
+# answer_413 = "/absolute/path/to/custom_413.http"
+# a 502 response means the response sent by a backend could not be parsed by Sōzu
+# answer_502 = "/absolute/path/to/custom_502.http"
+# a 503 response is sent if there are no backend servers available, or if
+# every backend connection attempt of the request failed
+# answer_503 = "/absolute/path/to/custom_503.http"
+# a 504 response means a connected backend sent no response in time, or the
+# frontend timed out while waiting on a backend (a connect timeout fails over
+# to another backend and ends in 503 once attempts are spent)
+# answer_504 = "/absolute/path/to/custom_504.http"
+# a 507 response occurs when the response sent by a backend is too big
+# answer_507 = "/absolute/path/to/custom_507.http"
+
+# defines the sticky session cookie's name, if `sticky_session` is activated for
+# a cluster. Defaults to "SOZUBALANCEID"
+# sticky_name = "SOZUBALANCEID"
+
+# Configures the client socket to receive a PROXY protocol header
+# this option is incompatible with public_address
+# expect_proxy = false
+
+# When true, strip any client-supplied `X-Real-IP` header from forwarded
+# requests (anti-spoofing). Independently combinable with `send_x_real_ip`.
+# Default: false.
+# elide_x_real_ip = false
+
+# When true, append a proxy-generated `X-Real-IP` header carrying the
+# connection peer IP (post-PROXY-v2 unwrap, i.e. the original client IP)
+# to every forwarded request. Independently combinable with
+# `elide_x_real_ip`. Default: false.
+# send_x_real_ip = false
+
+# Forwarding header family added to every forwarded request (doc/configure.md,
+# "Forwarding headers"). Default: "both".
+# - "both": X-Forwarded-For/-Proto/-Port and RFC 7239 Forwarded
+# - "x_forwarded": only X-Forwarded-*; a client Forwarded passes through
+# - "rfc7239": only Forwarded; client X-Forwarded-For/-Proto/-Port/-Host removed
+# - "none": nothing added; client headers pass through untrusted and untouched
+# Independent of `elide_x_real_ip` and `send_x_real_ip`.
+# forwarded_headers = "both"
+
+# HSTS = HTTP Strict Transport Security (RFC 6797). Listener-level default
+# inherited by every HTTPS frontend on this listener that does not declare
+# its own `[hsts]` block. Per RFC 6797 §7.2 this section is only valid on
+# HTTPS listeners — sozu refuses HSTS on a plain-HTTP listener at config
+# load. Per-frontend overrides live under
+# `[clusters.<id>.frontends.hsts]`.
+#
+# `enabled` is REQUIRED whenever the block is present so partial-update
+# semantics can distinguish "preserve current" / "explicit disable" /
+# "enable" on hot-reconfig.
+#
+# When `enabled = true` and `max_age` is omitted, sozu substitutes
+# 31_536_000 seconds (1 year) — the HSTS preload list minimum.
+#
+# `max_age = 0` is the RFC 6797 §11.4 kill switch and instructs the UA to
+# stop treating the host as a Known HSTS Host. Allowed silently.
+#
+# `preload = true` is opt-in only; it appends `; preload` so the host can
+# be submitted to the Chrome HSTS preload list (https://hstspreload.org/).
+# Sozu warns at config load when `preload = true` is paired with
+# `include_subdomains != true` or with `max_age < 31_536_000` because the
+# preload list will reject the host.
+#
+# [hsts]
+# enabled = true
+# max_age = 31536000
+# include_subdomains = true
+# preload = false
+# # Operator opt-in to override any backend-supplied
+# # `Strict-Transport-Security` header (instead of preserving it per
+# # RFC 6797 §6.1). Use when upstream backends emit a stale or weak
+# # HSTS policy that the operator wants to harden centrally.
+# force_replace_backend = false
+
+# Client certificate authentication (mTLS), see "mTLS — client certificate
+# authentication" in `doc/configure.md`. `none` (the default) asks for no
+# client certificate; `optional` asks for one but admits clients without;
+# `required` aborts the handshake of a client without a certificate issued by
+# one of `client_ca_certificates`. The CA and CRL files are read at config-load
+# and refreshed by `sozu reload`; CA or CRL files with no `client_auth` are
+# rejected.
+# client_auth = "required"
+# client_ca_certificates = ["/etc/sozu/client-ca.pem"]
+# client_ca_crls = ["/etc/sozu/client-ca.crl.pem"]
+
+# Supported TLS versions. Possible values are "SSL_V2", "SSL_V3", "TLSv1", "TLS_V11", "TLS_V12", "TLS_V13".
+# Defaults to `["TLS_V12", "TLS_V13"]`. Besides, `rustls` tls provider only support "TLS_V12" and "TLS_V13" values.
+tls_versions = ["TLS_V12", "TLS_V13"]
+
+# TLS ciphers considered as secure can be retrieved on the ANSSI document located here:
+# https://www.ssi.gouv.fr/uploads/2020/03/anssi-guide-recommandations_de_securite_relatives_a_tls-v1.2.pdf
+#
+# When using `Rustls` TLS provider:
+# * Sets the lists of availables ciphers (TLSv1.2 and TLSv1.3). Supported ciphers names are specified at
+#   https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html
+#
+cipher_list = [
+    # TLS 1.3 cipher suites
+    "TLS13_AES_256_GCM_SHA384",
+    "TLS13_AES_128_GCM_SHA256",
+    "TLS13_CHACHA20_POLY1305_SHA256",
+    # TLS 1.2 cipher suites
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+]
+
+# TLS key exchange groups, in order of preference.
+# Controls which key exchange algorithms are offered during the TLS handshake.
+# Supported group names:
+#   - "x25519" / "X25519"       — Curve25519 ECDHE (fast, widely supported)
+#   - "secp256r1" / "P-256"     — NIST P-256 ECDHE
+#   - "secp384r1" / "P-384"     — NIST P-384 ECDHE
+#   - "X25519MLKEM768"          — Post-quantum hybrid (X25519 + ML-KEM 768)
+#                                 Only available with crypto-aws-lc-rs or crypto-openssl (OpenSSL 3.5+).
+#                                 Silently skipped if the compiled provider does not support it.
+#
+# Defaults to ["X25519MLKEM768", "x25519", "P-256", "P-384"].
+# The default order prioritizes post-quantum protection when the provider supports it,
+# with automatic fallback to classical key exchange otherwise.
+#
+# groups_list = ["X25519MLKEM768", "x25519", "P-256", "P-384"]
+#
+# For FIPS 140-3 compliance (--features fips), only NIST curves are allowed:
+# groups_list = ["P-256", "P-384"]
+#
+# To explicitly disable post-quantum key exchange:
+# groups_list = ["x25519", "P-256", "P-384"]
+
+# default certificate and key
+# in case you want to set up TLS without SNI, you can define the default
+# certificate here
+#certificate = "../lib/assets/cert_test.pem"
+#key = "../lib/assets/key_test.pem"
+#certificate_chain = "../lib/assets/certificate_chain.pem"
+
+# ALPN (Application-Layer Protocol Negotiation) protocols to advertise
+# during the TLS handshake, in order of server preference.
+# The server selects the first protocol from this list that the client also supports.
+# Valid values: "h2" (HTTP/2), "http/1.1" (HTTP/1.1)
+# Defaults to ["h2", "http/1.1"] (prefer HTTP/2).
+#
+# alpn_protocols = ["h2", "http/1.1"]
+#
+# To disable HTTP/2 and force HTTP/1.1 only:
+# alpn_protocols = ["http/1.1"]
+#
+# To require HTTP/2 (clients without H2 support will fail TLS negotiation):
+# alpn_protocols = ["h2"]
+
+# H2 connection tuning (optional, defaults shown)
+# h2_initial_connection_window = 16777216 # 16 MiB, min 65535, max 2147483647
+# h2_max_concurrent_streams = 100         # min 1
+# h2_stream_shrink_ratio = 2              # min 2
+
+# H2 RST_STREAM caps. See `doc/configure.md` for the full flood-detection
+# surface; these three catch patient-attacker patterns that stay under the
+# per-window counters. Each value is a floor: past it, the received cap trips
+# once the resets after a response or on a closed stream exceed the streams a
+# backend answered, the other two once the pre-response resets (received plus
+# provoked) exceed them, so benign cancels on a long-lived connection never
+# add up to a cap.
+# h2_max_rst_stream_lifetime = 200000         # received RST (CVE-2023-44487)
+# h2_max_rst_stream_abusive_lifetime = 1000   # received pre-response RST (Rapid Reset)
+# h2_max_rst_stream_emitted_lifetime = 10000  # peer-provoked server RST (CVE-2025-8671 MadeYouReset)
+
+# Before the pre-response RST_STREAM cap trips, refuse new streams with
+# RST_STREAM(REFUSED_STREAM) (retryable, RFC 9113 §8.7) once a connection is
+# past this percentage of h2_max_rst_stream_abusive_lifetime; open streams
+# keep being served and the cap still sends GOAWAY(ENHANCE_YOUR_CALM).
+# 0 disables.
+# h2_stream_refusal_percent = 50
+
+# H2 catch-all protocol-drift budget. 1-second sliding window with half-decay,
+# default 2000 (a burst of 2000, or about 1000 per second sustained). See
+# `doc/configure.md` (Tuning h2_max_glitch_count) for the decision matrix;
+# never raise to u32::MAX.
+# h2_max_glitch_count = 2000
+
+# Number of TLS 1.3 tickets to send to a client when establishing a connection.
+# The tickets allow the client to resume a session. This protects the client
+# agains session tracking. Increases the number of getrandom syscalls,
+# with little influence on performance. Defaults to 4.
+# send_tls13_tickets = 4
+
+# options specific to a TCP proxy listener
+#[[listeners]]
+# protocol = "tcp"
+# address = "127.0.0.1:8081"
+#
+# specify a different IP than the one the socket sees, for logs and forwarded headers
+# this option is incompatible with expect_proxy
+# public_address = "1.2.3.4:81"
+#
+# Configures the client socket to receive a PROXY protocol header
+# this option is incompatible with public_address
+# expect_proxy = false
+
+# static configuration for cluster
+#
+# A cluster is a set of frontends, routing rules, and backends.
+# These clusters will be routed by sozu directly from start
+[clusters]
+
+# every cluster has a "cluster id", here it is "MyCluster"
+# this is an example of a routing configuration for the HTTP and HTTPS proxies
+[clusters.MyCluster]
+
+# the protocol option indicates if we will use HTTP or TCP proxying
+# possible options are "http" or "tcp"
+protocol = "http"
+
+# per cluster load balancing algorithm. The possible values are
+# "ROUND_ROBIN", "RANDOM", "LEAST_LOADED", "POWER_OF_TWO", "HRW" and "MAGLEV".
+#
+#   ROUND_ROBIN  - next backend in declaration order, each picked in
+#                  proportion to `weight` (smooth weighted round robin).
+#                  No load reads.
+#   RANDOM       - one backend drawn at random, weighted by `weight`.
+#   LEAST_LOADED - reads the load of EVERY backend and takes the minimum
+#                  load per unit of `weight`.
+#                  The best balance a single worker can compute.
+#   POWER_OF_TWO - draws two backends at random and keeps the one with less
+#                  load per unit of `weight`, so it reads two backend loads
+#                  instead of every one. Close to LEAST_LOADED's balance without ever
+#                  computing a global minimum, which is what stops several
+#                  independently seeded workers from converging on the same
+#                  "least loaded" backend.
+#   HRW, MAGLEV  - client-affine policies: each pins a client to one backend
+#                  on a key — on UDP the source IP, or source IP and port
+#                  per `[clusters.<id>.udp] affinity_key`; on HTTP, HTTPS
+#                  and TCP the client source IP (the PROXY-protocol source
+#                  when the listener expects one), or `affinity_header` /
+#                  `affinity_cookie` below. Both read `weight` — HRW scales
+#                  its rendezvous score by it, MAGLEV gives each backend a
+#                  proportional share of lookup-table slots. A request with
+#                  no key (no source address) falls back to ROUND_ROBIN.
+#
+# `weight` is honoured by every policy and defaults to 100. A weight of 0
+# counts as 1 everywhere but under RANDOM, which never draws it while another
+# backend has a positive weight.
+#
+# The load-read counts above are NOT the per-request cost of the policy:
+# every selection first walks the backend list to build the candidate set,
+# whatever the policy, so all six are O(n) per request and POWER_OF_TWO does
+# not shorten that walk. Choose between LEAST_LOADED and POWER_OF_TWO on
+# balance, not on an expected latency win. See doc/configure.md.
+#
+# LEAST_LOADED, POWER_OF_TWO and the load_metric below are the only settings
+# here that read backend load.
+# Defaults to "ROUND_ROBIN"
+load_balancing = "ROUND_ROBIN"
+# metric evaluating the load on the backend. available options: connections, requests, connection_time
+# load_metric = "connections"
+# With HRW or MAGLEV on an HTTP cluster, key each client on the value of a
+# request header (name matched case-insensitively) or of a cookie (name matched
+# exactly) instead of its source IP; a request that does not carry it is keyed
+# on its source IP. At most one of the two; refused on a TCP cluster.
+# affinity_header = "X-Tenant"
+# affinity_cookie = "tenant"
+# backend connection attempts of a request to this cluster, overriding the
+# global max_connection_attempts (1 to 255)
+# max_connection_attempts = 5
+# Shuffle sharding (off when unset): serve each client from a shard of
+# max(2, ceil(shard_percent x N / 100)) of the N primary backends, the top of
+# the HRW ranking of its key (source IP, or the header/cookie above). The
+# load_balancing policy picks inside the shard. Applies from
+# shard_min_backends (default 8) backends. shard_mode "FALLBACK" (default)
+# spills an exhausted shard over to the rest of the cluster, "STRICT" refuses
+# (503). See "Shuffle sharding" in doc/configure.md.
+# shard_percent = 25
+# shard_min_backends = 8
+# shard_mode = "FALLBACK"
+
+# frontends configuration
+# this specifies which listeners; domains, certificates that will be configured for a cluster
+# each element of the array must be specified on one line (toml format limitation)
+# possible frontend options:
+# - address: TCP listener
+# - hostname: host name of the cluster
+# - path = "/api" # optional. A routing rule for incoming requests. The path of the request must match it. Can be a prefix (default), a regex, or a strictly equal path.
+# - path_type = PREFIX | REGEX | EQUALS # defaults to PREFIX
+# - position = TREE | PRE | POST # defaults to TREE, upper case only. PRE rules are tried before the
+#   routing tree, POST rules after it. `hostname = "*"` with `position = "POST"` is a catch-all
+#   that answers every request no other frontend matched (IP literals and single-label hosts included)
+#   Within PRE or POST the first matching rule wins, in the order the worker received the rules;
+#   a reload never re-applies an existing frontend, and a new worker receives them sorted by
+#   address, hostname and path, so keep overlapping PRE (or POST) rules mutually exclusive.
+#   TREE rules follow hostname and path specificity instead. See "Rule order within `PRE` and
+#   `POST`" in doc/configure.md
+# - sticky_session = false # activates sticky sessions for this cluster
+# - https_redirect = false #  activates automatic redirection to HTTPS for this cluster
+# - custom_tag: a tag to retrieve a frontend with the CLI or in the logs
+#
+# use HTTP/2 for backend connections (h2c). Defaults to false.
+# http2 = true
+frontends = [
+    { address = "0.0.0.0:8080", hostname = "lolcatho.st", tags = { key = "value" }, path = "/api" },
+    # HTTPS frontends also have an optional `tls_versions` key like the HTTPS listeners
+    { address = "0.0.0.0:8443", hostname = "lolcatho.st", tags = { key = "value" }, certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" },
+    # catch-all: answers every request no other frontend matched, see "Catch-all hostname" in doc/configure.md
+    # { address = "0.0.0.0:8080", hostname = "*", position = "POST" },
+]
+
+# backends configuration
+# this indicates the backend servers used by the cluster
+# possible options:
+# - address: IP and port of the backend server
+# - weight: weight used by the load balancing algorithm
+# - sticky-id: sticky session identifier
+backends = [
+    { address = "127.0.0.1:1026", backend_id = "the-backend-to-my-app" }
+]
+
+# optional: active health checks for backends in this cluster
+# see doc/health_checks.md for details
+# [clusters.MyCluster.health_check]
+# mode = "HTTP"          # "HTTP" (default) probes uri; "TCP" only checks the
+#                        # TCP connection is established, nothing is sent
+# uri = "/health"        # HTTP mode only (default: "/")
+# interval = 10          # seconds between check cycles (default: 10)
+# timeout = 5            # seconds to wait for a response, or for the TCP
+#                        # connection in TCP mode (default: 5)
+# healthy_threshold = 3  # consecutive successes to mark UP (default: 3)
+# unhealthy_threshold = 3 # consecutive failures to mark DOWN (default: 3)
+# expected_status = 0    # 0 = any 2xx, or a specific status code (default: 0)
+# accepted_statuses = ["200-399"] # HTTP mode: codes ("404"), ranges ("200-399"),
+#                        # classes ("2xx") or "any"; replaces expected_status,
+#                        # which must then stay 0
+# port = 9090            # both modes: probe this port on the backend's IP
+#                        # address, 1-65535 (default: the backend's data port);
+#                        # refused for a cluster with a `unix_path` backend
+#
+# HTTP mode only (refused with mode = "TCP"): custom request headers, sent in
+# this order, at most 32. Each table takes `name` and `value_file` and nothing
+# else: there is no inline value. The configuration keeps the reference as
+# written, parsing it opens no file, so write an absolute path. The value is
+# read only by the protected activation, which may happen in the hardened main
+# process before it launches the workers, and then stays in protected memory:
+# the saved state and `sozu cluster health-check list` show the ordered header
+# names and keyed fingerprints only. A saved state is authoritative for the
+# clusters it adds, removes or rewrites: a foreign or stale epoch never
+# activates a value by name, and this table cannot resurrect a removal. Such a
+# health check sends no probe until `sozu cluster health-check set ...
+# --header-file NAME=PATH` re-injects the same ordered headers. Release 2.3.1
+# refuses a configuration that holds these tables.
+# The probe is plain HTTP/1.1 or h2c, not encrypted: use a dedicated,
+# least-privilege, probe-only credential and a protected network path to the
+# backend. See doc/health_checks.md#custom-request-headers.
+# [[clusters.MyCluster.health_check.headers]]
+# name = "Authorization"
+# value_file = "/run/secrets/sozu-probe-authorization"
+# [[clusters.MyCluster.health_check.headers]]
+# name = "X-Probe-Token"
+# value_file = "/run/secrets/sozu-probe-token"
+
+# this is an example of a routing configuration for the TCP proxy
+[clusters.TcpTest]
+protocol = "tcp"
+
+frontends = [
+    { address = "0.0.0.0:8081", tags = { owner = "John", uuid = "3f740af1-45fd-45ce-b61f-17bf1a51505f" } }
+]
+
+# activates the proxy protocol to send IP information to the backend
+# send_proxy = false
+
+backends = [
+    { address = "127.0.0.1:4000", weight = 100 },
+    { address = "127.0.0.1:4001", weight = 50 }
+]

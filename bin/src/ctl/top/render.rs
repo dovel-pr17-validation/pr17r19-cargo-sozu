@@ -1,0 +1,682 @@
+//! Render loop for `sozu top`. Synchronous (no tokio): the UI thread owns
+//! the terminal, polls crossterm events with `event::poll(timeout)`, and
+//! drains snapshot + event channels between input ticks.
+//!
+//! Frame cap: 30 fps. Data ticks fire as snapshots arrive on the
+//! collector channel. Synchronized output (DEC mode 2026 via
+//! `BeginSynchronizedUpdate` / `EndSynchronizedUpdate`) wraps each frame
+//! so tmux + iTerm2 see a single atomic paint instead of per-cell flicker.
+
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::Receiver;
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, poll, read,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Tabs};
+use ratatui::{Terminal, TerminalOptions, Viewport};
+use tui_big_text::{BigText, PixelSize};
+use tui_input::backend::crossterm::EventHandler;
+
+use super::app::{ActiveTab, App};
+use super::panes;
+use super::theme::{GlyphMode, Skin};
+use super::transport::{CertsSnapshot, ListenersSnapshot, Snapshot, TopEvent};
+
+/// Cap the redraw rate at 30 fps regardless of how often new snapshots /
+/// events arrive. Higher rates only burn CPU on tmux + non-Sixel
+/// terminals; 33 ms is the documented btop-style upper bound.
+const RENDER_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Fixed frame size for `--snapshot` runs, which render to stdout without
+/// terminal control: stdout may be a pipe or a file, so there is no terminal
+/// to ask for its size. 80x24 matches the smaller of the two sizes the
+/// `insta` snapshot tests render every pane at.
+const SNAPSHOT_AREA: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: 80,
+    height: 24,
+};
+
+pub struct RenderConfig {
+    pub mouse: bool,
+    pub tick_once: bool,
+    pub snapshot_frames: Option<u32>,
+    /// Optional `--skin <name>` override, threaded through from clap so
+    /// the renderer can call `Skin::resolve` once at startup. `None`
+    /// resolves to the built-in default unless `SOZU_TOP_SKIN` overrides.
+    pub skin: Option<String>,
+    /// Optional `--glyphs` clap override. `None` runs `GlyphMode::resolve`
+    /// auto-detect against `TERM` / `LC_ALL` / `LC_CTYPE` / `LANG`.
+    pub glyphs: Option<crate::cli::TopGlyphs>,
+    /// Pre-seed for `App.status`. The caller threads any
+    /// terminal-entry-time diagnostic (e.g. lease elevation failure)
+    /// through here so the renderer surfaces it on the first frame
+    /// instead of writing to `stderr` (which the alt-screen wipes).
+    pub initial_status: Option<String>,
+    /// Shared status slot the lease renewer (and, in the future, the
+    /// four transport collectors) push degraded-mode notes into. The
+    /// render loop drains it once per tick and feeds `App::status` so
+    /// the operator sees the message on the F-key bar instead of the
+    /// wiped alt-screen. See `cardinality::StatusSlot` for the type.
+    pub lease_status: crate::ctl::top::cardinality::StatusSlot,
+}
+
+/// Drive the TUI to completion. Returns when the user quits, the data
+/// channels close, or `tick_once` / `snapshot_frames` exhausts.
+pub fn run(
+    cfg: RenderConfig,
+    snapshots: Receiver<Snapshot>,
+    events: Receiver<TopEvent>,
+    listeners: Receiver<ListenersSnapshot>,
+    certs: Receiver<CertsSnapshot>,
+) -> io::Result<()> {
+    // Panic hook: explicitly leave alternate screen and disable raw mode
+    // before the prior hook prints the panic message. The `RawModeGuard`
+    // Drop also restores the terminal on the unwinding path, but installing
+    // the hook here means the panic banner lands in the operator's normal
+    // shell scrollback instead of inside the alt-screen (which the OS
+    // discards when the program exits).
+    //
+    // `PanicHookGuard` restores the prior hook on clean return so repeated
+    // `run` calls in the same process (tests, embedded callers) do not
+    // stack hook layers indefinitely.
+    //
+    // `--snapshot` takes no terminal control (see `cli.rs`): it enters
+    // neither raw mode nor the alternate screen, reads no input, and renders
+    // fixed-size frames to stdout, so it runs without a controlling terminal
+    // (CI, a pipe, `ssh -T`). There is nothing to restore, so no hook either.
+    let snapshot_mode = cfg.snapshot_frames.is_some();
+    let _panic_guard = (!snapshot_mode).then(|| {
+        PanicHookGuard::install(|| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        })
+    });
+
+    // SIGINT/SIGTERM handler: flips a shared flag the loop checks every
+    // tick. The terminal restore happens via `RawModeGuard::Drop` regardless
+    // of how we exit (clean quit, panic, or signal-driven exit). A failed
+    // install is degraded gracefully — the crossterm event loop already
+    // observes Ctrl-C as a keypress, so the handler is belt-and-braces
+    // rather than the primary path. The previous `.expect` aborted the
+    // TUI on programmatic re-entry (a second `run` in the same process
+    // address space returned `MultipleHandlers`); falling through with a
+    // status-bar note preserves Ctrl-C-as-keypress and keeps embedded
+    // callers viable.
+    let signal_quit = Arc::new(AtomicBool::new(false));
+    let mut signal_handler_status: Option<String> = None;
+    if let Err(err) = ctrlc::set_handler({
+        let signal_quit = Arc::clone(&signal_quit);
+        move || signal_quit.store(true, Ordering::SeqCst)
+    }) {
+        signal_handler_status = Some(format!(
+            "ctrlc handler install failed ({err}); Ctrl-C via keypress still works"
+        ));
+    }
+
+    let mut app = App::new();
+    let (skin, skin_status) = Skin::resolve(cfg.skin.as_deref());
+    let glyphs = GlyphMode::resolve(cfg.glyphs);
+    app.glyphs = glyphs;
+    // Status-bar precedence: an `--skin` parse failure is a direct
+    // response to the operator's explicit override and overrides the
+    // pre-seeded lease diagnostic; otherwise the lease-elevation note
+    // wins. Either way we never reach `enable_raw_mode` without a
+    // chance to surface the message on frame one.
+    // Precedence: skin status > lease-elevation note > signal-handler
+    // diagnostic. Status-bar real estate is one line; we surface the
+    // signal-handler issue only when nothing more operator-relevant is
+    // queued.
+    if let Some(msg) = skin_status {
+        app.status = msg;
+    } else if let Some(msg) = cfg.initial_status {
+        app.status = msg;
+    } else if let Some(msg) = signal_handler_status {
+        app.status = msg;
+    }
+
+    let _guard = if snapshot_mode {
+        None
+    } else {
+        Some(RawModeGuard::install(cfg.mouse)?)
+    };
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = if snapshot_mode {
+        // A fixed viewport is never sized from, nor resized to, the terminal.
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(SNAPSHOT_AREA),
+            },
+        )?
+    } else {
+        Terminal::new(backend)?
+    };
+
+    // Opt-out for terminals that don't speak DEC mode 2026 synchronised
+    // output. `SOZU_TOP_SYNC=0` skips the `BeginSynchronizedUpdate` /
+    // `EndSynchronizedUpdate` frame wrap; the default behaviour stays
+    // wrapped because every modern terminal either honours the
+    // sequence or silently ignores it.
+    let sync_output = std::env::var("SOZU_TOP_SYNC").ok().as_deref() != Some("0");
+
+    let mut last_render = Instant::now() - RENDER_INTERVAL;
+    let mut frames_drawn: u32 = 0;
+    let snapshot_frames_target = cfg.snapshot_frames;
+
+    loop {
+        if signal_quit.load(Ordering::SeqCst) || app.should_quit {
+            break;
+        }
+
+        // Drain snapshots: keep the freshest one (the channel is
+        // bounded(1), so at most a handful are buffered).
+        while let Ok(snap) = snapshots.try_recv() {
+            app.ingest_snapshot(&snap);
+        }
+        while let Ok(ev) = events.try_recv() {
+            app.ingest_event(ev);
+        }
+        while let Ok(listeners) = listeners.try_recv() {
+            app.ingest_listeners(listeners);
+        }
+        while let Ok(certs) = certs.try_recv() {
+            app.ingest_certs(certs);
+        }
+
+        // Drain any renewer-published status. The renewer thread writes
+        // here when its channel open fails or its send loop errors; the
+        // operator sees the resulting message on the F-key bar instead
+        // of the wiped alt-screen.
+        if let Some(msg) = crate::ctl::top::cardinality::take_status(&cfg.lease_status) {
+            app.status = msg;
+            app.mark_dirty();
+        }
+
+        // Poll for input or sleep until the next render tick. The timeout
+        // is whichever is sooner: the next render or 50 ms (so we drain
+        // channels at least 20 times per second when the user is idle).
+        let now = Instant::now();
+        let next_render = last_render + RENDER_INTERVAL;
+        let timeout = next_render
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(50));
+
+        if snapshot_mode {
+            // crossterm's event reader opens the controlling terminal, so a
+            // snapshot run reads no input and only paces the loop.
+            std::thread::sleep(timeout);
+        } else if poll(timeout)? {
+            match read()? {
+                CtEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(&mut app, key);
+                }
+                CtEvent::Resize(_, _) => {
+                    // ratatui re-queries the size on the next draw, but the
+                    // render loop's dirty-gate (`take_dirty || pulse.has_active`)
+                    // would otherwise skip that draw on a quiet system — the
+                    // resize event itself does not advance the snapshot tick
+                    // or any pulse. Mark the App dirty so the next frame
+                    // re-flows every pane into the new terminal area.
+                    app.mark_dirty();
+                }
+                _ => {}
+            }
+        }
+
+        // Frame cap: only redraw if RENDER_INTERVAL has elapsed since the
+        // last paint. Synchronized output wraps the draw to give tmux a
+        // single atomic frame.
+        if last_render.elapsed() >= RENDER_INTERVAL {
+            // Age each active pulse before the dirty check so a pulse that
+            // just decremented contributes to "is the frame dirty?". Calling
+            // tick_pulses unconditionally also keeps animations fading
+            // smoothly when no fresh snapshot arrived this frame.
+            app.tick_pulses();
+            // Dirty-gate: skip the synchronized-update + draw when nothing
+            // visible changed AND no pulse is mid-animation. `take_dirty`
+            // is read-and-clear so the flag won't strand for the next
+            // frame; `has_active` keeps the fading tint painting until
+            // the pulse retires. Quiet-system CPU drops from ~2-3 % to
+            // near-zero between snapshots.
+            let dirty = app.take_dirty() || app.pulse.has_active();
+            if !dirty {
+                continue;
+            }
+            if sync_output {
+                execute!(io::stdout(), BeginSynchronizedUpdate)?;
+            }
+            terminal.draw(|f| draw(f, &app, &skin))?;
+            if sync_output {
+                execute!(io::stdout(), EndSynchronizedUpdate)?;
+            }
+            last_render = Instant::now();
+            frames_drawn += 1;
+
+            if cfg.tick_once && frames_drawn >= 1 {
+                break;
+            }
+            if let Some(target) = snapshot_frames_target
+                && frames_drawn >= target
+            {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) {
+    // Palette mode swallows almost every key so the operator can type
+    // command text freely. Only Enter / Escape / Ctrl-C escape back to
+    // the normal handler.
+    if app.palette_open {
+        match key.code {
+            KeyCode::Enter => app.apply_palette(),
+            KeyCode::Esc => app.cancel_palette(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cancel_palette()
+            }
+            _ => {
+                // Forward editing keys (backspace, arrows, character input)
+                // to the tui-input widget so it maintains its own cursor.
+                // The widget mutates its internal buffer (palette_input)
+                // without setting our dirty flag; mark dirty unconditionally
+                // so the next frame repaints the typed text instead of
+                // waiting for the next snapshot tick (~1 s on a quiet
+                // system).
+                app.palette_input.handle_event(&CtEvent::Key(key));
+                app.mark_dirty();
+            }
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Char(':') => app.open_palette(),
+        KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true
+        }
+        KeyCode::F(10) => app.should_quit = true,
+        KeyCode::Char('?') | KeyCode::F(1) => {
+            app.help_visible = !app.help_visible;
+            app.mark_dirty();
+        }
+        // F2 Theme: cycle the resolved glyph mode (Block → Braille → Tty).
+        // The skin's gradient colours don't have a CLI override yet, so the
+        // closest visible "theme switch" is the bar alphabet.
+        KeyCode::F(2) => {
+            app.glyphs = app.glyphs.cycle();
+            app.mark_dirty();
+        }
+        // F3 Find / F4 Filter — both open the colon palette so the
+        // operator can type `:cluster <id>` / `:backend <id>` / `:help`.
+        // No dedicated find/filter widget yet; the palette is the
+        // closest behaviour and matches the rest of the binding.
+        KeyCode::F(3) | KeyCode::F(4) => app.open_palette(),
+        // F5 Pause: hold the snapshot ingest in place. Transport keeps
+        // polling so we don't drop the lease, but the App ignores
+        // incoming snapshots until F5 is pressed again.
+        KeyCode::F(5) => {
+            app.paused = !app.paused;
+            app.mark_dirty();
+        }
+        // F6 Sort: cycle the active pane's sort column. Mirrors `s`.
+        KeyCode::F(6) => match app.active_tab {
+            ActiveTab::Clusters => {
+                app.cluster_sort = app.cluster_sort.cycle();
+                app.mark_dirty();
+            }
+            ActiveTab::Backends => {
+                app.backend_sort = app.backend_sort.cycle();
+                app.mark_dirty();
+            }
+            _ => {}
+        },
+        KeyCode::Tab => {
+            app.active_tab = app.active_tab.cycle(true);
+            app.mark_dirty();
+        }
+        KeyCode::BackTab => {
+            app.active_tab = app.active_tab.cycle(false);
+            app.mark_dirty();
+        }
+        KeyCode::Char(c @ '1'..='7') => {
+            if let Some(tab) = ActiveTab::from_digit(c.to_digit(10).unwrap_or(0) as u8) {
+                app.active_tab = tab;
+                app.mark_dirty();
+            }
+        }
+        // CLUSTERS sort cycle / reverse; mirror procs / k9s muscle memory.
+        KeyCode::Char('s') if app.active_tab == ActiveTab::Clusters => {
+            app.cluster_sort = app.cluster_sort.cycle();
+            app.mark_dirty();
+        }
+        KeyCode::Char('S') if app.active_tab == ActiveTab::Clusters => {
+            app.cluster_sort_reverse = !app.cluster_sort_reverse;
+            app.mark_dirty();
+        }
+        KeyCode::Char('s') if app.active_tab == ActiveTab::Backends => {
+            app.backend_sort = app.backend_sort.cycle();
+            app.mark_dirty();
+        }
+        KeyCode::Char('S') if app.active_tab == ActiveTab::Backends => {
+            app.backend_sort_reverse = !app.backend_sort_reverse;
+            app.mark_dirty();
+        }
+        // Pause toggle via 'p' as well, matching htop / btop muscle memory.
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            app.paused = !app.paused;
+            app.mark_dirty();
+        }
+        _ => {}
+    }
+}
+
+fn draw(f: &mut ratatui::Frame<'_>, app: &App, skin: &Skin) {
+    let area = f.area();
+    let alert = app.thresholds.critical_message(&app.overview);
+    let constraints: Vec<Constraint> = match alert {
+        Some(_) => vec![
+            Constraint::Length(3), // tabs row
+            Constraint::Length(5), // big-text alert banner
+            Constraint::Min(8),    // active pane
+            Constraint::Length(1), // function-key bar
+        ],
+        None => vec![
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ],
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    draw_tabs(f, chunks[0], app, skin);
+    if let Some(headline) = alert {
+        draw_alert(f, chunks[1], skin, headline);
+        draw_pane(f, chunks[2], app, skin);
+        draw_fkey_bar(f, chunks[3], app, skin);
+    } else {
+        draw_pane(f, chunks[1], app, skin);
+        draw_fkey_bar(f, chunks[2], app, skin);
+    }
+}
+
+fn draw_alert(f: &mut ratatui::Frame<'_>, area: Rect, skin: &Skin, headline: &str) {
+    // Two-column layout: big-text headline on the left, narrow context
+    // strip on the right with the headline label so screen-readers /
+    // tmux-buffer scrollers still get a copyable string.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(area);
+    let big = BigText::builder()
+        .pixel_size(PixelSize::Quadrant)
+        .style(Style::default().fg(skin.hot).add_modifier(Modifier::BOLD))
+        .lines(vec![Line::from(headline.to_owned())])
+        .build();
+    f.render_widget(big, cols[0]);
+    let side = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "ALERT",
+            Style::default().fg(skin.hot).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            headline.to_owned(),
+            Style::default().fg(skin.primary),
+        )),
+        Line::from(Span::styled(
+            "see OVERVIEW for context",
+            Style::default().fg(skin.secondary),
+        )),
+    ])
+    .alignment(Alignment::Left);
+    f.render_widget(side, cols[1]);
+}
+
+fn draw_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
+    let titles: Vec<Line<'_>> = ActiveTab::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let n = i + 1;
+            Line::from(vec![Span::styled(
+                format!(" {n} {} ", t.label()),
+                if *t == app.active_tab {
+                    skin.tab_focused()
+                } else {
+                    skin.tab_unfocused()
+                },
+            )])
+        })
+        .collect();
+    let selected = ActiveTab::ALL
+        .iter()
+        .position(|t| *t == app.active_tab)
+        .unwrap_or(0);
+    let title = format!(
+        " sōzu top · {} ",
+        app.last_snapshot_at
+            .map(|_| "live".to_owned())
+            .unwrap_or_else(|| "no snapshot yet".into())
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .style(Style::default().fg(skin.muted));
+    let tabs = Tabs::new(titles)
+        .select(selected)
+        .block(block)
+        .divider(Span::raw(" "));
+    f.render_widget(tabs, area);
+}
+
+fn draw_pane(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
+    match app.active_tab {
+        ActiveTab::Overview => panes::overview::render(f, area, app, skin),
+        ActiveTab::Clusters => panes::clusters::render(f, area, app, skin),
+        ActiveTab::Backends => panes::backends::render(f, area, app, skin),
+        ActiveTab::Listeners => panes::listeners::render(f, area, app, skin),
+        ActiveTab::Certs => panes::certs::render(f, area, app, skin),
+        ActiveTab::H2 => panes::h2::render(f, area, app, skin),
+        ActiveTab::Events => panes::events::render(f, area, app, skin),
+    }
+}
+
+fn draw_fkey_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
+    // Palette mode replaces the F-key bar with a one-line input so the
+    // operator types `:cluster` / `:backend` / … inline. Drop back to
+    // the htop-style strip otherwise.
+    if app.palette_open {
+        draw_palette(f, area, app, skin);
+        return;
+    }
+    // htop-style F-key strip: alternating label/action so muscle memory
+    // works without reading the keys explicitly. Labels match the keys
+    // wired in `handle_key`: F1 Help, F2 Glyphs (cycle Block/Braille/Tty),
+    // F3/F4 Palette (open `:`), F5 Pause (also `p`), F6 Sort (per active
+    // pane), F10 Quit. F7/F8/F9 remain visible as reserved slots so the
+    // bar width stays stable across builds; they are no-ops today.
+    let bindings: &[(&str, &str)] = &[
+        ("F1", "Help"),
+        ("F2", "Glyphs"),
+        ("F3", "Find"),
+        ("F4", "Filter"),
+        ("F5", if app.paused { "Resume" } else { "Pause" }),
+        ("F6", "Sort"),
+        ("F7", "·"),
+        ("F8", "·"),
+        ("F9", "·"),
+        ("F10", "Quit"),
+    ];
+    let mut spans: Vec<Span<'_>> = Vec::new();
+    for (k, a) in bindings {
+        spans.push(Span::styled(format!(" {k} "), skin.fkey_label()));
+        spans.push(Span::styled(format!(" {a} "), skin.fkey_action()));
+    }
+    spans.push(Span::raw("  "));
+    if let Some(err) = app.palette_error.as_ref() {
+        spans.push(Span::styled(
+            format!(" {err} "),
+            Style::default().fg(skin.hot).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::styled(
+            " : palette ",
+            Style::default()
+                .fg(skin.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" sort: {} ", app.cluster_sort.label()),
+            Style::default()
+                .fg(skin.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let para = Paragraph::new(Line::from(spans)).alignment(Alignment::Left);
+    f.render_widget(para, area);
+}
+
+fn draw_palette(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
+    // Single-line `:cmd_here_` input. Prefixed `:` is implicit (the
+    // operator presses `:` to enter palette mode, so the rendered text
+    // does NOT include the colon — `apply_palette` strips any leading
+    // colon defensively so paste-from-clipboard still works).
+    let value = app.palette_input.value();
+    let line = Line::from(vec![
+        Span::styled(
+            " :",
+            Style::default()
+                .fg(skin.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            value.to_owned(),
+            Style::default()
+                .fg(skin.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "_  ", // poor man's cursor; ratatui doesn't render the OS cursor
+            Style::default()
+                .fg(skin.accent)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+        Span::styled(
+            "Enter apply · Esc cancel · :cluster :backend :listener :cert :h2 :event :help :quit",
+            Style::default().fg(skin.secondary),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
+}
+
+/// RAII guard that restores the terminal on drop, panic, or signal exit.
+/// Combines: `enable_raw_mode`, `EnterAlternateScreen`, optional
+/// `EnableMouseCapture`, and cursor hide. Drop reverses the same sequence
+/// so a panic mid-render doesn't leave the user's shell in raw mode with
+/// the cursor hidden.
+///
+/// Install ordering matters: every step that succeeds MUST be matched
+/// by a Drop branch that reverses it, even if a later step fails. The
+/// guard is therefore constructed AFTER `enable_raw_mode` succeeds and
+/// progressively flips `alt_entered` / `mouse_enabled` flags as the
+/// follow-on `execute!` calls succeed. Any `?` after that point still
+/// triggers Drop on the unwinding return — so a failure in
+/// `EnableMouseCapture` cleanly leaves raw mode and the alt-screen,
+/// not "raw mode on, alt-screen on, no Drop scheduled".
+struct RawModeGuard {
+    mouse_enabled: bool,
+    alt_entered: bool,
+}
+
+impl RawModeGuard {
+    fn install(mouse: bool) -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut guard = Self {
+            mouse_enabled: false,
+            alt_entered: false,
+        };
+        let mut out = io::stdout();
+        execute!(out, EnterAlternateScreen, Hide)?;
+        guard.alt_entered = true;
+        if mouse {
+            execute!(out, EnableMouseCapture)?;
+            guard.mouse_enabled = true;
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let mut out = io::stdout();
+        if self.mouse_enabled {
+            let _ = execute!(out, DisableMouseCapture);
+        }
+        if self.alt_entered {
+            let _ = execute!(out, Show, LeaveAlternateScreen);
+        }
+        let _ = disable_raw_mode();
+    }
+}
+
+type BoxedPanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+/// RAII guard around `std::panic::set_hook` so that repeated calls to
+/// `render::run` in the same process (tests, embedded callers) do not
+/// stack hook layers indefinitely. The installed hook chains the prior
+/// hook for banner emission, and Drop restores the prior hook so the
+/// next install starts from the same baseline.
+struct PanicHookGuard {
+    prior: std::sync::Arc<std::sync::Mutex<Option<BoxedPanicHook>>>,
+}
+
+impl PanicHookGuard {
+    fn install<F>(restore: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let prior = std::sync::Arc::new(std::sync::Mutex::new(Some(std::panic::take_hook())));
+        let prior_for_hook = std::sync::Arc::clone(&prior);
+        std::panic::set_hook(Box::new(move |info| {
+            restore();
+            if let Ok(g) = prior_for_hook.lock()
+                && let Some(h) = g.as_ref()
+            {
+                h(info);
+            }
+        }));
+        Self { prior }
+    }
+}
+
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.prior.lock()
+            && let Some(prior) = g.take()
+        {
+            std::panic::set_hook(prior);
+        }
+    }
+}

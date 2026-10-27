@@ -1,0 +1,164 @@
+Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.93.1, matching the `1.93.1` toolchain pinned in `rust-toolchain`; bumped from 1.88.0 for the `sim/` crate's moonpool-sim dependency). Upstream: `github.com/sozu-proxy/sozu`. The H2 multiplexer rewrite landed on `main` via PR #1209 (merged commit `98c56a4c`); subsequent hardening (parser, command IPC, metrics, audit fixes) builds on it.
+
+This file is the primary agent instruction for the repo. It is symlinked to `AGENTS.md` so OpenAI Codex picks up the same content. Anthropic's global `~/.claude/CLAUDE.md` conventions (worktree-first, GPG sign-off, commitizen style) still apply and are not duplicated here.
+
+# Workspace
+
+Cargo workspace with five members (`resolver = "2"`):
+
+- `command/` — `sozu-command-lib` (LGPL-3.0). Protobuf IPC schema, config parser, state, logging macros, channel + SCM FD passing. Control-plane library.
+- `lib/` — `sozu-lib` (AGPL-3.0). Event loop, protocols (H1, H2, TCP, TLS, proxy-protocol), routing, sockets, metrics, buffer pool. Single-threaded mio runtime.
+- `bin/` — `sozu` binary + internal lib. Master/worker multiprocess supervisor, CLI (clap), config loader, hot-upgrade orchestrator, unix-socket command server.
+- `e2e/` — `sozu-e2e`. Integration tests that spawn real workers + mock clients/backends. Enables `sozu-lib`'s `e2e-hooks` feature.
+- `sim/` — `sozu-sim` (AGPL-3.0, `publish = false`). Test-only home for moonpool-sim-driven deterministic simulations of the sans-io cores. The harness lives in `sim/tests/udp_simulation.rs`; moonpool-sim + tokio are **dev-dependencies** so the async closure never enters `sozu-lib`/`sozu` (the no-`async fn`-in-`lib/` rule holds). Requires `--cfg tokio_unstable` (moonpool's `RngSeed` runtime seeding), but **scoped to the sim build only** — the moonpool dev-deps live under `[target.'cfg(tokio_unstable)'.dev-dependencies]` and the test is `#![cfg(tokio_unstable)]`-gated, so a plain `cargo test --workspace` compiles `sozu-sim` to an empty 0-test binary and never sets the flag anywhere else. Run the sweep with `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim`.
+
+`fuzz/` is an out-of-workspace cargo-fuzz crate with six targets: `fuzz_frame_parser`, `fuzz_hpack_decoder`, `fuzz_hpack_roundtrip`, `fuzz_udp_flow`, `fuzz_tcp_clienthello`, `fuzz_command_channel`.
+
+Dependency graph: `lib → command`; `bin → lib + command`; `e2e → lib + command` (`e2e-hooks`); `sim → lib` (dev-only, + moonpool-sim).
+
+# Build
+
+`protoc` (protobuf-compiler) is a hard prerequisite — `command/build.rs` runs `prost-build` and no Rust file compiles before `protoc` succeeds. There is no `.envrc` or `mise.toml` at the repo root; the toolchain is selected by `rust-toolchain`.
+
+```bash
+cargo build --locked                            # debug, all workspace members
+cargo build --all-features --locked             # all features on main (verified 2026-05)
+cargo build -p sozu --release --locked          # production binary (release = lto + codegen-units=1)
+cargo +nightly fmt --all -- --check             # nightly REQUIRED: rustfmt.toml uses `ignore = [...]` which stable treats as nightly-only
+cargo clippy --all-targets --locked -- -D warnings  # clean on main; keep it that way
+cargo test --workspace --locked                 # unit + e2e
+cargo test -p sozu-e2e -- h2_                   # filter to H2 e2e tests (~181 tests across h2_*.rs)
+cargo +nightly fuzz run fuzz_frame_parser       # from fuzz/, requires cargo-fuzz + nightly
+```
+
+No CI clippy/fmt job runs automatically — run both locally before pushing. CI (`.github/workflows/ci.yml`) matrixes stable/beta/nightly build + test; nightly is allowed to fail. The benchmark workflow builds `bombardier` and `lagging_server` from upstream repos — don't expect it to work in a fresh clone.
+
+# Feature flags
+
+| Flag | Crate | Effect |
+|---|---|---|
+| `default = ["jemallocator", "crypto-ring"]` | `bin` | jemalloc as global allocator (filtered out on FreeBSD/NetBSD where libc malloc is jemalloc; bundled on Linux/macOS/OpenBSD/DragonFly/Windows) + ring crypto provider |
+| `crypto-ring` (default) | bin, lib | rustls + ring crypto provider |
+| `crypto-aws-lc-rs` | bin, lib | rustls + aws-lc-rs crypto provider |
+| `crypto-openssl` | bin, lib | rustls + openssl crypto provider (`rustls-openssl`) |
+| `fips` | bin, lib | implies `crypto-aws-lc-rs` + activates `rustls/fips`. Precedence chain `fips > ring > aws-lc-rs > openssl` when several are enabled together |
+| `e2e-hooks` | `lib` | Exposes test-injection APIs. **Never enable in production builds.** |
+| `logs-debug`, `logs-trace` | all | Compile in `DEBUG`/`TRACE` levels (release strips them otherwise) |
+| `tolerant-http1-parser` | lib, bin | Relaxes H1 parsing via `kawa/tolerant-parsing` |
+| `simd` | lib, bin | Enables `kawa/simd` |
+| `splice` | lib | Linux `splice(2)` fast path |
+| `opentelemetry` | lib, bin | OTel export |
+
+Crypto-provider features live in `bin/Cargo.toml` + `lib/Cargo.toml`; CI exercises all four cells (`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `fips`) plus the bare default-features baseline. Provider precedence at runtime is resolved in `lib/src/crypto.rs::default_provider()`.
+
+# Code style
+
+- **Edition 2024**, MSRV 1.91. Use 2024-only idioms freely.
+- **Errors**: `thiserror` for library error enums, `anyhow` at binary boundaries. Follow the nearest existing `thiserror::Error` enum; don't introduce new error crates.
+- **No panic on network-facing input.** In parser, socket, mux, TLS, command-channel, and config paths, convert invalid traffic into `SessionResult` / H2 `GOAWAY` / `RST_STREAM` / default HTTP answer + metric + contextual log. `unwrap`/`expect`/`panic!`/`unreachable!` are acceptable in tests and in hard internal invariants with useful messages.
+- **Ownership**: prefer `ToOwned::to_owned()` over `Clone::clone()` when going `&str → String` or `&[u8] → Vec<u8>` (clearer intent). Stick with `.clone()` when the type is already `Clone + !ToOwned`.
+- **Logging**: every protocol module defines its own `macro_rules! log_context!` / `log_context_lite!` / `log_module_context!` (grep `macro_rules! log_` in `protocol/mux/mod.rs`, `protocol/mux/router.rs`, `protocol/mux/connection.rs`, `protocol/mux/parser.rs`, `protocol/mux/pkawa.rs`, `protocol/mux/stream.rs`, `protocol/mux/converter.rs`, `protocol/rustls.rs`, `protocol/pipe.rs`, `protocol/proxy_protocol/{expect,relay,send}.rs`, `tcp.rs`, `socket.rs`, `tls.rs`, `http.rs`, `https.rs`). Prefix tags `MUX`, `MUX-H1`, `MUX-H2`, `MUX-CONN`, `MUX-ROUTER`, `MUX-PARSER`, `MUX-PKAWA`, `MUX-STREAM`, `MUX-CONV`, `RUSTLS`, `SOCKET`, `PIPE`, `TCP`, `HTTP`, `HTTPS`, `TLS-RESOLVER`, `PROXY-EXPECT`, `PROXY-RELAY`, `PROXY-SEND` are load-bearing for log-search. Use the macros — do NOT call `log::info!`/`log::error!` directly from protocol code. When a macro has an `HttpContext` in scope, prefer `$http_ctx.log_context()` (`HttpContext::log_context` in `protocol/kawa_h1/editor.rs`) over hand-rolling a `LogContext { ... }` struct literal — the helper is canonical (it is what `log_context!` in `protocol/rustls.rs` and `log_module_context!` in `protocol/mux/router.rs` interpolate as `ctx`) and renders the same `[session req cluster backend]` bracket as RUSTLS/PIPE/TCP. A regression guard at `lib/tests/log_layout.rs` (with a non-fatal `cargo:warning=` echo from `lib/build.rs`) catches drift; new sites must use the canonical envelope or join the `KNOWN_PREEXISTING_VIOLATIONS` allowlist if the legacy site is out of scope.
+- **Log levels**: `debug!`/`trace!` for expected idle closes, timeouts, noisy state. `warn!`/`error!` for real protocol errors or invariant breaks.
+- **Worker runtime is single-threaded per worker** — no `Arc<Mutex>` inside the event loop. Session state is slab-allocated.
+- **No `async fn` in `lib/`.** `lib/` is pure mio + edge-triggered epoll; introducing tokio/futures there is a design violation. `e2e/` may use tokio because it hosts hyper-based mock clients, and `sim/` may use tokio (via moonpool-sim, dev-only) because it hosts the deterministic-simulation harness. `lib/` and `bin/` stay async-free.
+- **Metrics macros** live in `lib/src/metrics/mod.rs`: `incr!`, `count!`, `gauge!`, `gauge_add!`, `time!`. Update `doc/configure.md` when adding or renaming a public metric. Gauge underflow is a correctness bug, not a rounding issue.
+- **Edit `command/src/command.proto`, never generated `command.rs` files.** `prost-build` writes them to Cargo's `OUT_DIR` at build time.
+- **New `unsafe` in hot paths needs an invariant comment + a test.** Existing `unsafe` in socket and H2 code is gated by explicit local invariants; new usage follows suit.
+- **A citation in a comment names a symbol, never a line.** In `//`, `///` and `//!` comments cite the symbol qualified as `Type::method`, with a repo-root-relative path and no line number — `` `ConnectionH2::write_streams` (`lib/src/protocol/mux/h2.rs`) `` — and where the prose means one branch, name that branch in words. A bare basename is ambiguous in this tree, so write the path out. The `Doc citations` gate resolves `doc/**` and `**/LIFECYCLE.md` only, so nothing checks a `path.rs:NNN` inside a comment. Rule, rationale and the measurements behind it: `doc/README.md#citing-code-from-a-rust-comment`.
+
+# Testing
+
+**Canonical guide: `doc/testing.md`** — Sōzu's testing doctrine (assertion-first à la TigerBeetle TigerStyle +
+deterministic simulation à la FoundationDB). Read it before adding tests or test infrastructure. The rules below are
+the load-bearing summary; `doc/testing.md` is authoritative and `CONTRIBUTING.md#testing` carries the contributor checklist.
+
+Five categories: **unit** (`#[cfg(test)] mod tests` beside modules in `lib/src/**` / `command/src/**`), **integration/e2e**
+(`e2e/src/tests/`, registered in `e2e/src/tests/mod.rs`), **fuzz** (`fuzz/`), **deterministic simulation**
+(`sim/tests/udp_simulation.rs` — the `sozu-sim` crate, moonpool-driven), and **regression guards** (`lib/tests/log_layout.rs`).
+
+E2E suites (non-exhaustive): `h2_tests.rs` + `h2_correctness_tests.rs` + `h2_security_{tests,parser,session,sni,header_injection}.rs`
++ `h2_priority_rearm_tests.rs` (~181 H2 tests); `mux_tests.rs` (H1 + proxy-protocol + keepalive/hup); `h1_security_tests.rs`,
+`tls_tests.rs`, `tcp_tests.rs`, `hsts_tests.rs`, `udp_tests.rs`; `command_channel_security_tests.rs` (SCM/length-prefix
+hardening); `cluster_ip_limit_tests.rs`, `eviction_tests.rs`, `listener_update_tests.rs`, `protocol_pair_matrix.rs`,
+`redirect_rewrite_auth_tests.rs`; `fuzz_tests.rs` (graceful-runtime-skip wrappers when nightly/cargo-fuzz are absent —
+CI skips them via `--skip tests::fuzz_tests::`); `h2_utils.rs`/`udp_utils` shared helpers; `tests.rs` harness
+(`setup_sync_test`, `setup_async_test`, port registry). Mock backends/clients live in `e2e/src/mock/`.
+
+**Assertion-first (TigerStyle) — required for sans-io cores / parsers / state machines:**
+
+- ≥2 meaningful `debug_assert!`s per non-trivial function: pre/post-conditions + **pair assertions** (assert what you
+  expect AND what you don't — positive + negative space). They compile out in release and run live in every
+  test/e2e/fuzz/dev build, turning silent correctness bugs into loud crashes.
+- A private `check_invariants()` full-sweep run as a post-condition at the end of every public state-machine entry
+  point (worked example: `lib/src/protocol/udp/manager.rs` + `flow.rs`).
+- **Never `assert!`/`panic!` on network-controlled input on the release path** — adversarial input → drop + metric +
+  log + `SessionResult`/`GOAWAY`/`RST_STREAM`. `debug_assert!` is for invariant violations only.
+
+**Deterministic simulation (FoundationDB/VOPR style):** the sans-io UDP core is driven under a seeded RNG + virtual
+clock + adversarial workload + buggify fault injection in `sim/tests/udp_simulation.rs` (the `sozu-sim` crate) via the
+moonpool-sim engine. It needs `--cfg tokio_unstable` (moonpool's tokio `RngSeed`), scoped to the `sozu-sim` build only
+(cfg-gated dev-deps + `#![cfg(tokio_unstable)]` test), so a plain `cargo test --workspace` builds it as an empty 0-test
+binary; run it with `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim` (`SOZU_UDP_SIM_SEED`/`SOZU_UDP_SIM_SEEDS`/`SOZU_UDP_SIM_STEPS`
+for replay/sweep). New sans-io state machines (the H2 mux is the next candidate) should get a simulator on the same
+pattern — see `doc/udp_simulation.md`.
+
+**E2E conventions:**
+
+- **Never hardcode ports.** Allocate via `e2e/src/port_registry.rs`.
+- **Always `loop_read_*` / `receive_until_eof` when asserting on TCP responses.** A single `read()` sees one segment under load. Commits `7a7e87d9`, `6bd85a3f`, `73341f4f` exist only to paper over this being skipped.
+- **Prefer `repeat_until_error_or` / explicit deadlines over `sleep`** for timing-sensitive tests. `repeat_until_error_or(n, ..)` is a stability check, not a retry: it requires `n` *consecutive* clean runs and fails on the first bad trial, so pick `n` for what the test proves rather than copying a neighbour's — see `doc/testing.md` and issue #1410. Assert *provable* invariants, not statistical fractions, when an input (e.g. dynamically-allocated ports) varies between runs.
+- **Upgrade work**: read `doc/upgrade_e2e_tests.md` and run `cargo test -p sozu-e2e test_upgrade`.
+- **H2 parser / HPACK changes**: run the focused e2e tests plus the cargo-fuzz targets.
+- **`#[ignore]` must carry a reason string** and only gate an environment dependency or a tracked follow-up — never hide a failing test.
+
+# H2 architecture (what reading code won't tell you)
+
+- **Two-crate session split.** `ConnectionH2<Front>` in `mux/h2.rs` holds wire state (HPACK coders, flow window, flood counters). `Context<L>` in `mux/mod.rs` holds the buffer-owning `Vec<Stream>`. Streams are referenced across the two by a `GlobalStreamId = usize`. Relevant files: `mux/mod.rs`, `mux/connection.rs`, `mux/h1.rs`, `mux/h2.rs`, `mux/parser.rs` (nom-based frame parser), `mux/pkawa.rs` (HPACK decode into kawa + pseudo-header validation + RFC 9218 priorities), `mux/hpack/` (the sans-io RFC 7541 codec itself), `mux/stream.rs`, `mux/router.rs`, `mux/converter.rs`, `mux/serializer.rs`, `mux/answers.rs`, `mux/shared.rs`, `mux/debug.rs`.
+- **Canonical on-branch reference: `lib/src/protocol/mux/LIFECYCLE.md`** (actively maintained) covers the stream/slot lifecycle with symbol citations. Read this first for any mux change. `doc/h2_mux_internals.md` is the second source. `doc/lifetime_of_a_session.md` is the per-protocol overview (H1, H2, TCP, UDP), with the system calls and allocations each step still pays; `doc/hot_path_zero_copy.md` records how those were measured and cut, and which tests hold them.
+- **Edge-triggered epoll via mio.** When you queue bytes from the read path, you MUST call `signal_pending_write` on the readiness tracker — there is no wake-up for free. Forgetting this produces "stuck session" bugs that only manifest at exact byte boundaries.
+- **Never `shutdown(Shutdown::Both)` on a TLS frontend socket.** It emits a TCP RST which truncates the already-queued response. Use write-only shutdown; the peer close arrives via the normal read path.
+- **`socket_write` and `socket_write_vectored` must stay structurally symmetric.** Past divergence (one retry-looped, the other didn't) caused the 4.5 MB truncation bug on this branch.
+- **Buffer-pool sizing**: `buffer_size` must be >= 16393 (16384 max H2 frame + 9-byte header) globally when H2 is enabled. Smaller values deadlock the mux on large frames.
+- **H2 config knobs** agents typically touch: `alpn_protocols`, `strict_sni_binding`, `disable_http11`, `h2_stream_idle_timeout_seconds`, `h2_max_header_table_size`, plus the flood thresholds in `doc/configure.md`. Frontend H2 is TLS ALPN-driven; `cluster.http2 = true` is a backend-capability hint (does NOT gate frontend H2).
+- **Flood detection**: `H2FloodDetector` in `mux/h2.rs` mitigates CVE-2023-44487 (Rapid Reset), CVE-2024-27316 (CONTINUATION flood), CVE-2025-8671 (MadeYouReset), plus PING/SETTINGS/priority floods. Thresholds are listener-config knobs.
+- **Master/worker model**: one supervisor forks `N` workers, each a single-threaded event loop over shared listener fds. Hot reconfig: unix socket → validate in master → fan out to workers via anonymous unix socket pairs. Upgrades re-exec and hand off fds (`bin/src/upgrade.rs`).
+
+# Security-sensitive areas
+
+Conservative changes + tests required in:
+
+- `lib/src/tls.rs`, `lib/src/https.rs`, `lib/src/protocol/rustls.rs` — rustls config, ALPN, SNI binding, cert loading, close-notify.
+- `lib/src/protocol/mux/` — parser, HPACK, pseudo-header ordering, request smuggling, content-length reconciliation, flow control, GOAWAY/RST_STREAM semantics, edge-triggered readiness.
+- `lib/src/protocol/kawa_h1/editor.rs` — the H1 request path never forwards a `Transfer-Encoding` that differs from the framing it applied: it normalizes, or it rejects (400) — more than one surviving TE header, or a final coding that is not `chunked` (CL.TE smuggling guard in `on_request_headers`, CWE-444). Whitespace around a coding is not ambiguity: kawa >= 0.7.1 excludes OWS from field values (RFC 9112 §5), so `chunked\t` frames as chunked and is forwarded as canonical `chunked`. A request with neither `Content-Length` nor `Transfer-Encoding` ends after its headers (RFC 9112 §6.3 rule 7), never close-delimited, or the request pipelined behind it is forwarded raw as its body (#1650). A `Content-Length` that is not `1*DIGIT` is never forwarded: 400 on a request, 502 on a backend response (RFC 9110 §8.6, #1652). kawa >= 0.7.2 enforces both itself before the header callback (CleverCloud/kawa#26, #27); the `on_request_headers` rule-7 branch and the `has_non_digit_content_length` clauses stay as defense in depth, so deleting one alone turns no parse-driven test red — see `kawa_h1/LIFECYCLE.md` §2.1–§2.2 for how to reproduce against kawa 0.7.1.
+- `lib/src/protocol/proxy_protocol/` — partial headers, oversized headers, TCP health checks.
+- `command/src/channel.rs`, `command/src/scm_socket.rs`, `command/src/command.proto`, `bin/src/command/` — message framing, buffer sizing, FD passing, state replay.
+- Metrics / logs — never leak sensitive values; counters/gauges must stay correct on error paths and shutdown.
+
+Crypto-provider features (`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `fips`) live in `bin/Cargo.toml` + `lib/Cargo.toml`; CI exercises all four cells.
+
+# Branching & commits
+
+- **Branch naming**: `feat/<scope>`, `fix/<scope>`, `refactor/<scope>`, `chore/<scope>`, `docs/<scope>`, `test/<scope>`, `perf/<scope>`, `style/<scope>`, `ci/<scope>`, `bench/<scope>`.
+- **Conventional commits** with scope: `feat(h2): ...`, `fix(mux): ...`, `test(e2e): ...`, etc. No commitizen config — follow the existing `git log` style manually.
+- **Sign + GPG**: `git commit -s -S` for new commits. History on this branch has a minority of unsigned/unsignedoff commits; keep new ones signed.
+- **PR base is `main`.** Default-branch development now — `feat/h2-mux` was merged via PR #1209 and is no longer a long-lived integration branch. `wt merge -y` defaults to `main`; confirm the target before using it for the rare follow-up forked off another in-flight branch.
+- **After committing: push.** On this repo, `git push` is part of the commit task; don't stop at `git commit`. Post the resulting `github.com/sozu-proxy/sozu/actions` run URL.
+- **PRs** are reviewed by CODEOWNERS (`@FlorentinDUBOIS @Wonshtrum @llenotre`) and gated by the CLA in `CONTRIBUTING.md`. PR descriptions should call out protocol/security impact, commands run, tests added, and doc updates.
+
+# Gotchas
+
+- **`protoc` missing** = `command/build.rs` fails before any Rust compiles. CI installs `protobuf-compiler` explicitly.
+- **`rust-toolchain` pins `1.93.1`** — local builds must match (bumped from 1.88.0; `Duration::from_hours`/`from_mins` used transitively via moonpool-sim are const-stable only since 1.91). CI still exercises stable/beta/nightly.
+- **Release strips `DEBUG`/`TRACE` logs** unless built with `--features logs-debug,logs-trace`.
+- **Repro for event-loop / zombie bugs**: `worker_count = 1`, `worker_automatic_restart = false`, `RUST_BACKTRACE=1`.
+- **`CHANGELOG.md` follows Keep-a-Changelog.** Update it when a change ships user-visible behavior (config keys, metrics, CLI flags).
+- **Cross-check non-trivial changes with Codex** (`/codex` skill): the user habitually validates analyses, fixes, and PR descriptions with a second model before shipping.
+
+# Deployment
+
+```bash
+cargo build -p sozu --release --locked
+target/release/sozu start -c /path/to/config.toml
+```
+
+Container: `docker build -t sozu:local .` (builder is the digest-pinned official `rust:1.93.1-alpine3.23` image — bump it with `rust-toolchain`; it installs `build-base`, `cmake`, `pkgconf`, `protobuf`, `protobuf-dev`, plus static OpenSSL for `CRYPTO_PROVIDER=crypto-openssl` or Go and Perl for `fips`, and uses `cargo build --release --frozen`; runtime is `alpine:${ALPINE_VERSION}`, default `3.24`, never edge). Release images push as `clevercloud/sozu:${GITHUB_SHA}`. OS packaging in `os-build/` (systemd, RPM, Arch). Upgrade + release guidance: `RELEASE.md` + `doc/upgrade_e2e_tests.md`.

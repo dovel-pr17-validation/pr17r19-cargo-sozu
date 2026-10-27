@@ -1,0 +1,3298 @@
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, hash_map::Entry},
+    io::ErrorKind,
+    net::SocketAddr,
+    rc::{Rc, Weak},
+    str::from_utf8_unchecked,
+    time::{Duration, Instant},
+};
+
+use mio::{
+    Interest, Registry, Token,
+    net::{TcpListener as MioTcpListener, TcpStream},
+};
+use rusty_ulid::Ulid;
+use socket2::SockRef;
+use sozu_command::{
+    listener_key::ListenerKey,
+    logging::CachedTags,
+    proto::command::{
+        Cluster, ForwardedHeaders, HttpListenerConfig, ListenerType, RemoveListener,
+        RequestHttpFrontend, UpdateHttpListenerConfig, WorkerRequest, WorkerResponse,
+        request::RequestType,
+    },
+    ready::Ready,
+    response::HttpFrontend,
+    state::{
+        ClusterId, validate_forwarded_headers, validate_h2_flood_knobs_http,
+        validate_sozu_id_header,
+    },
+};
+
+use crate::metrics::names;
+use crate::{
+    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    backends::BackendMap,
+    pool::Pool,
+    protocol::{
+        Pipe, SessionState,
+        http::{
+            answers::HttpAnswers,
+            parser::{Method, hostname_and_port},
+        },
+        mux::{self, Mux, MuxClear},
+        proxy_protocol::expect::ExpectProxyProtocol,
+    },
+    router::{RequestHeaders, RouteResult, Router},
+    server::{ListenToken, SessionManager},
+    socket::server_bind,
+    timer::TimeoutContainer,
+};
+
+#[derive(PartialEq, Eq)]
+pub enum SessionStatus {
+    Normal,
+    DefaultAnswer,
+}
+
+StateMachineBuilder! {
+    /// The various Stages of an HTTP connection:
+    ///
+    /// 1. optional (ExpectProxyProtocol)
+    /// 2. HTTP (via Mux in H1 mode)
+    /// 3. WebSocket (passthrough)
+    enum HttpStateMachine impl SessionState {
+        Expect(ExpectProxyProtocol<TcpStream>),
+        Mux(MuxClear),
+        WebSocket(Pipe<crate::socket::SessionTcpStream, HttpListener>),
+    }
+}
+
+/// Module-level prefix for log lines emitted from this file when no session
+/// is in scope. Produces a bold bright-white `HTTP` label in colored mode.
+/// Used by [`HttpProxy`] / [`HttpListener`] callbacks (notify, add_cluster,
+/// add_*_frontend, accept, soft_stop, hard_stop, etc.) which own a token map
+/// keyed by listener and have no `frontend_token` of their own.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = sozu_command::logging::ansi_palette();
+        format!("{open}HTTP{reset}\t >>>", open = open, reset = reset)
+    }};
+}
+
+/// Per-session prefix for log lines emitted with an [`HttpSession`] in
+/// scope. Renders the canonical `\tHTTP\tSession(...)\t >>>` envelope from
+/// the session's `frontend_token` (mirrors the bracket convention used by
+/// `MUX-*`, `RUSTLS`, `PIPE`). Operators can grep-correlate against the
+/// token id across log lines for the same H1 connection.
+macro_rules! log_context {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = sozu_command::logging::ansi_palette();
+        format!(
+            "{open}HTTP{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            frontend = $self.frontend_token.0,
+        )
+    }};
+}
+
+/// HTTP Session to insert in the SessionManager
+///
+/// 1 session <=> 1 HTTP connection (client to sozu)
+pub struct HttpSession {
+    configured_backend_timeout: Duration,
+    configured_connect_timeout: Duration,
+    configured_frontend_timeout: Duration,
+    frontend_token: Token,
+    last_event: Instant,
+    listener: Rc<RefCell<HttpListener>>,
+    metrics: SessionMetrics,
+    pool: Weak<RefCell<Pool>>,
+    proxy: Rc<RefCell<HttpProxy>>,
+    state: HttpStateMachine,
+    has_been_closed: bool,
+}
+
+impl HttpSession {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
+        configured_frontend_timeout: Duration,
+        configured_request_timeout: Duration,
+        expect_proxy: bool,
+        listener: Rc<RefCell<HttpListener>>,
+        pool: Weak<RefCell<Pool>>,
+        proxy: Rc<RefCell<HttpProxy>>,
+        backends: Rc<RefCell<BackendMap>>,
+        public_address: SocketAddr,
+        sock: TcpStream,
+        peer: SocketAddr,
+        token: Token,
+        wait_time: Duration,
+    ) -> Result<Self, AcceptError> {
+        let request_id = Ulid::generate();
+        let container_frontend_timeout = TimeoutContainer::new(configured_request_timeout, token);
+
+        let state = if expect_proxy {
+            trace!("{} starting in expect proxy state", log_module_context!());
+            gauge_add!(names::protocol::PROXY_EXPECT, 1);
+
+            HttpStateMachine::Expect(ExpectProxyProtocol::new(
+                container_frontend_timeout,
+                sock,
+                token,
+                request_id,
+            ))
+        } else {
+            gauge_add!(names::protocol::HTTP, 1);
+            // The address `accept(2)` returned. On an expect-proxy listener
+            // the other branch ignores it: the session address comes from the
+            // PROXY header at `upgrade_expect`.
+            let session_address = Some(peer);
+            let session_ulid = rusty_ulid::Ulid::generate();
+            let sock = crate::socket::SessionTcpStream::new(sock, session_ulid, session_address);
+
+            let frontend = mux::Connection::new_h1_server(
+                session_ulid,
+                sock,
+                container_frontend_timeout.duration(),
+            );
+            let router = mux::Router::new(configured_backend_timeout, configured_connect_timeout);
+            let mut context = mux::Context::new(
+                session_ulid,
+                pool.clone(),
+                listener.clone(),
+                session_address,
+                public_address,
+            );
+            context
+                .create_stream(request_id, 1 << 16)
+                .ok_or(AcceptError::BufferCapacityReached)?;
+            HttpStateMachine::Mux(Mux {
+                configured_frontend_timeout,
+                frontend_token: token,
+                frontend,
+                router,
+                context,
+                session_ulid,
+                // Carry the already-armed handshake entry into the adapter
+                // rather than dropping it and arming a fresh one: the session's
+                // request timeout started when the socket was accepted.
+                timeouts: mux::MuxTimeouts::new(container_frontend_timeout),
+                backend_registry: mux::BackendRegistry::default(),
+                backends,
+            })
+        };
+
+        // Invariant: `create_session` allocates `token` from the session slab
+        // and registers the frontend socket under it before constructing us.
+        // A session whose frontend token aliased the listen-socket token (0)
+        // would route listener readiness into a session — a state-machine bug.
+        // (`Token(0)` is reserved in real workers; the test harness in this
+        // file builds listeners directly without going through `new`.)
+        debug_assert_eq!(
+            state.marker() as u8,
+            if expect_proxy {
+                StateMarker::Expect as u8
+            } else {
+                StateMarker::Mux as u8
+            },
+            "constructed state must match the expect_proxy branch"
+        );
+        // The freshly-built state can never be a FailedUpgrade: that marker
+        // only appears after a real upgrade attempt drains the state via
+        // `take()`. Catch a future refactor that constructs one by accident.
+        debug_assert!(
+            !state.failed(),
+            "a newly created session must not start in FailedUpgrade"
+        );
+
+        let metrics = SessionMetrics::new(Some(wait_time));
+        let session = HttpSession {
+            configured_backend_timeout,
+            configured_connect_timeout,
+            configured_frontend_timeout,
+            frontend_token: token,
+            has_been_closed: false,
+            last_event: Instant::now(),
+            listener,
+            metrics,
+            pool,
+            proxy,
+            state,
+        };
+        debug_assert_eq!(
+            session.frontend_token, token,
+            "frontend token must be the slab token used for registration"
+        );
+        #[cfg(debug_assertions)]
+        session.check_invariants();
+        Ok(session)
+    }
+
+    /// Full cross-field invariant sweep for the session state machine, used as
+    /// a run-to-completion postcondition. Compiled out in release.
+    ///
+    /// Strong invariants asserted here:
+    /// - the frontend token is always present (slab key is never sentinel);
+    /// - once `close()` has run the state has been drained / cancelled, so the
+    ///   session is terminal and must not be re-driven (callers gate on the
+    ///   returned `SessionIsToBeClosed`);
+    /// - the live state marker is one of the three legal H1 stages — the
+    ///   `FailedUpgrade` marker is only transient (between `take()` and the
+    ///   `close()` that immediately follows a failed upgrade), so it is the
+    ///   single tolerated exception on a still-open session.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        let marker = self.state.marker();
+        debug_assert!(
+            matches!(
+                marker,
+                StateMarker::Expect | StateMarker::Mux | StateMarker::WebSocket
+            ),
+            "session marker must be a legal H1 stage (Expect/Mux/WebSocket), got {marker:?}"
+        );
+        // A failed state is only ever observed transiently between a failed
+        // upgrade and the close() that reaps it; if it survives to a postcondition
+        // sweep on a not-yet-closed session, a close path was skipped.
+        debug_assert!(
+            !self.state.failed() || self.has_been_closed,
+            "FailedUpgrade state must be reaped by close(), never left live"
+        );
+    }
+
+    pub fn upgrade(&mut self) -> SessionIsToBeClosed {
+        debug!("{} upgrade", log_context!(self));
+        // Record the stage we are leaving so we can assert the transition is
+        // legal (no stage-skipping) after the handoff resolves. `take()`
+        // installs a `FailedUpgrade(marker)` placeholder carrying this same
+        // marker, so the session is never left in a half-moved state if an
+        // upgrade_* helper bails out.
+        let from_marker = self.state.marker();
+        let new_state = match self.state.take() {
+            HttpStateMachine::Mux(mux) => self.upgrade_mux(mux),
+            HttpStateMachine::Expect(expect) => self.upgrade_expect(expect),
+            HttpStateMachine::WebSocket(ws) => self.upgrade_websocket(ws),
+            HttpStateMachine::FailedUpgrade(_) => {
+                // Reaching this arm means a prior upgrade already returned
+                // `None` and the session should have been closed. Fall back
+                // to closing cleanly instead of panicking the worker.
+                error!(
+                    "{} upgrade called on FailedUpgrade state; closing session",
+                    log_context!(self)
+                );
+                None
+            }
+        };
+
+        match new_state {
+            Some(state) => {
+                // Legal transitions only: Expect→Mux, Mux→WebSocket, or the
+                // WebSocket self-loop (upgrade_websocket is a no-op guard). Any
+                // other pair means a stage was skipped or reversed.
+                debug_assert!(
+                    matches!(
+                        (from_marker, state.marker()),
+                        (StateMarker::Expect, StateMarker::Mux)
+                            | (StateMarker::Mux, StateMarker::WebSocket)
+                            | (StateMarker::WebSocket, StateMarker::WebSocket)
+                    ),
+                    "illegal protocol-upgrade transition {from_marker:?} -> {:?}",
+                    state.marker()
+                );
+                debug_assert!(
+                    !state.failed(),
+                    "a successful upgrade must not install a FailedUpgrade state"
+                );
+                self.state = state;
+                #[cfg(debug_assertions)]
+                self.check_invariants();
+                false
+            }
+            // The state stays FailedUpgrade, but the Session should be closed right after
+            None => {
+                // On failure `take()` left a FailedUpgrade placeholder behind;
+                // the caller (`ready`) must close the session on the returned
+                // `true`, so we do not run the still-open invariant sweep here.
+                debug_assert!(
+                    self.state.failed(),
+                    "a failed upgrade must leave the session in FailedUpgrade"
+                );
+                true
+            }
+        }
+    }
+
+    fn upgrade_expect(
+        &mut self,
+        expect: ExpectProxyProtocol<TcpStream>,
+    ) -> Option<HttpStateMachine> {
+        debug!("{} switching to HTTP", log_context!(self));
+        match expect
+            .addresses
+            .as_ref()
+            .map(|add| (add.destination(), add.source()))
+        {
+            Some((Some(public_address), Some(session_address))) => {
+                let session_ulid = rusty_ulid::Ulid::generate();
+                let frontend = mux::Connection::new_h1_server(
+                    session_ulid,
+                    crate::socket::SessionTcpStream::new(
+                        expect.frontend,
+                        session_ulid,
+                        Some(session_address),
+                    ),
+                    expect.container_frontend_timeout.duration(),
+                );
+                let router = mux::Router::new(
+                    self.configured_backend_timeout,
+                    self.configured_connect_timeout,
+                );
+                let mut context = mux::Context::new(
+                    session_ulid,
+                    self.pool.clone(),
+                    self.listener.clone(),
+                    Some(session_address),
+                    public_address,
+                );
+                if context.create_stream(expect.request_id, 1 << 16).is_none() {
+                    error!(
+                        "{} expect upgrade failed: could not create stream",
+                        log_context!(self)
+                    );
+                    return None;
+                }
+                let mut mux = Mux {
+                    configured_frontend_timeout: self.configured_frontend_timeout,
+                    frontend_token: self.frontend_token,
+                    frontend,
+                    router,
+                    context,
+                    session_ulid,
+                    timeouts: mux::MuxTimeouts::new(expect.container_frontend_timeout),
+                    backend_registry: mux::BackendRegistry::default(),
+                    // Read once, at the upgrade: the proxy is not borrowed
+                    // while a session runs, and `HttpProxy::backends` is never
+                    // reassigned, so this is the map the session would have
+                    // reached on every dial.
+                    backends: Rc::clone(&self.proxy.borrow().backends),
+                };
+                mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
+
+                // The Expect→Mux handoff must carry the session's frontend
+                // token across unchanged: the slab slot and epoll registration
+                // are keyed by it, so a mismatch would misroute readiness.
+                debug_assert_eq!(
+                    mux.frontend_token, self.frontend_token,
+                    "expect upgrade must preserve the frontend token"
+                );
+                // Fresh Mux: exactly one stream was just created above, and no
+                // backend is connected yet (back token is set iff linked).
+                debug_assert_eq!(
+                    mux.context.streams.len(),
+                    1,
+                    "a freshly upgraded Mux owns exactly the request stream"
+                );
+
+                // Gauge pairing: this connection leaves PROXY_EXPECT and enters
+                // HTTP. The two adjustments must stay together so the live-state
+                // gauges sum to the session count (no double-count, no leak).
+                gauge_add!(names::protocol::PROXY_EXPECT, -1);
+                gauge_add!(names::protocol::HTTP, 1);
+                Some(HttpStateMachine::Mux(mux))
+            }
+            _ => {
+                debug!(
+                    "{} expect upgrade failed: bad header {:?}",
+                    log_context!(self),
+                    expect.addresses
+                );
+                None
+            }
+        }
+    }
+
+    fn upgrade_mux(&mut self, mut mux: MuxClear) -> Option<HttpStateMachine> {
+        debug!("{} mux switching to ws", log_context!(self));
+        let Some(stream) = mux.context.streams.pop() else {
+            error!(
+                "{} upgrade_mux: no stream attached to the mux session, closing",
+                log_context!(self)
+            );
+            return None;
+        };
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs before MuxResult::Upgrade was returned to us.
+
+        // The cores no longer own a wheel handle; the `Mux` adapter does. Move
+        // the frontend's out of the adapter before dismantling the
+        // connection, so the WebSocket `Pipe` inherits the same live entry it
+        // used to inherit from `ConnectionH1`.
+        let mut container_frontend_timeout = mux.timeouts.frontend;
+        let (frontend_readiness, frontend_socket) = match mux.frontend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                readiness, socket, ..
+            }) => (readiness, socket),
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
+
+        let mux::StreamState::Linked(back_token) = stream.state else {
+            error!(
+                "{} upgrading stream should be linked to a backend",
+                log_context!(self)
+            );
+            return None;
+        };
+        // Invariant (back token set iff backend connected): a Linked stream
+        // names a backend token that must exist in the router's backend map.
+        // We assert the map is non-empty here, then prove membership by the
+        // `remove` below — a Linked token absent from the map would be a
+        // book-keeping desync between stream state and the backend map.
+        debug_assert!(
+            mux.router.backends.contains_key(&back_token),
+            "a Linked stream's back token must index a connected backend"
+        );
+        let backends_before = mux.router.backends.len();
+        let Some(backend) = mux.router.backends.remove(&back_token) else {
+            error!(
+                "{} upgrade_mux: backend for token {:?} is missing (already disconnected?), closing",
+                log_context!(self),
+                back_token
+            );
+            return None;
+        };
+        let mut container_backend_timeout = mux
+            .timeouts
+            .backends
+            .remove(&back_token)
+            .unwrap_or_else(|| TimeoutContainer::new_empty(mux.router.configured_backend_timeout));
+        let (cluster_id, backend_id, backend_readiness, backend_socket) = match backend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                position: mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
+                readiness,
+                socket,
+                ..
+            }) => (cluster_id, backend, readiness, socket),
+            mux::Connection::H1(_) => {
+                error!(
+                    "{} the backend disconnected just after upgrade, abort",
+                    log_context!(self)
+                );
+                return None;
+            }
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
+
+        // The mux core carries an opaque `BackendId` (#1340, Q12); the
+        // WebSocket `Pipe` that takes this backend over still owns the
+        // registry handle, so resolve it here, on the embedder's side of that
+        // perimeter, through the one accessor there is.
+        let Some(backend) = mux.backend_registry.handle(&backend_id).cloned() else {
+            error!(
+                "{} upgrade_mux: backend {:?} names a slot this session never minted, closing",
+                log_context!(self),
+                backend_id.backend_id
+            );
+            return None;
+        };
+        let metric_incarnation = backend_id.metric_incarnation();
+        let backend_id = backend_id.backend_id.to_string();
+
+        // Post-removal book-keeping: the backend is gone from the map and the
+        // count dropped by exactly one (the `remove` matched a present key).
+        debug_assert!(
+            !mux.router.backends.contains_key(&back_token),
+            "the upgraded backend must be evicted from the router map"
+        );
+        debug_assert_eq!(
+            mux.router.backends.len(),
+            backends_before - 1,
+            "removing the backend must drop the backend count by exactly one"
+        );
+
+        let ws_context = stream.context.websocket_context();
+
+        container_frontend_timeout.reset();
+        container_backend_timeout.reset();
+
+        // `Pipe::backend_socket` is typed `Option<TcpStream>` (raw, pre-mux).
+        // The mux wraps every backend TCP socket in `SessionTcpStream` so
+        // SOCKET-layer errors carry the session ULID; unwrap back to the
+        // plain `TcpStream` here to feed Pipe's legacy shape.
+        let backend_socket = backend_socket.stream;
+        let mut pipe = Pipe::new(
+            stream.back.storage.buffer,
+            Some(backend_id),
+            Some(backend_socket),
+            Some(backend),
+            Some(container_backend_timeout),
+            Some(container_frontend_timeout),
+            Some(cluster_id),
+            stream.front.storage.buffer,
+            self.frontend_token,
+            frontend_socket,
+            self.listener.clone(),
+            Protocol::HTTP,
+            stream.context.session_id,
+            stream.context.id,
+            stream.context.session_address,
+            ws_context,
+        );
+        pipe.set_cluster_metrics_incarnation(metric_incarnation);
+
+        pipe.restore_readiness_events(frontend_readiness.event, backend_readiness.event);
+        // The WebSocket pipe inherits the live backend connection, so its back
+        // token must be set (back token present iff a backend is connected).
+        pipe.set_back_token(back_token);
+        debug_assert_eq!(
+            pipe.back_token(),
+            vec![back_token],
+            "websocket pipe must carry exactly the upgraded backend token"
+        );
+
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
+        //
+        // Gauge pairing (Mux→WebSocket): leave HTTP, enter WS, and start
+        // accounting one active websocket request. These three must move
+        // together so the protocol gauges stay consistent with the session set.
+        gauge_add!(names::protocol::HTTP, -1);
+        gauge_add!(names::protocol::WS, 1);
+        gauge_add!(names::websocket::ACTIVE_REQUESTS, 1);
+        Some(HttpStateMachine::WebSocket(pipe))
+    }
+
+    fn upgrade_websocket(
+        &self,
+        ws: Pipe<crate::socket::SessionTcpStream, HttpListener>,
+    ) -> Option<HttpStateMachine> {
+        // what do we do here?
+        error!(
+            "{} upgrade called on WS, this should not happen",
+            log_context!(self)
+        );
+        Some(HttpStateMachine::WebSocket(ws))
+    }
+}
+
+impl ProxySession for HttpSession {
+    fn close(&mut self) {
+        if self.has_been_closed {
+            return;
+        }
+        // Reaching here means we are about to do the one-and-only teardown.
+        debug_assert!(
+            !self.has_been_closed,
+            "close past the guard must run on a not-yet-closed session"
+        );
+
+        trace!("{} closing HTTP session", log_context!(self));
+        self.metrics.service_stop();
+
+        // Restore gauges
+        match self.state.marker() {
+            StateMarker::Expect => gauge_add!(names::protocol::PROXY_EXPECT, -1),
+            StateMarker::Mux => gauge_add!(names::protocol::HTTP, -1),
+            StateMarker::WebSocket => {
+                gauge_add!(names::protocol::WS, -1);
+                gauge_add!(names::websocket::ACTIVE_REQUESTS, -1);
+            }
+        }
+
+        if self.state.failed() {
+            match self.state.marker() {
+                StateMarker::Expect => incr!(names::http::UPGRADE_EXPECT_FAILED),
+                StateMarker::Mux => incr!(names::http::UPGRADE_MUX_FAILED),
+                StateMarker::WebSocket => incr!(names::http::UPGRADE_WS_FAILED),
+            }
+            // FailedUpgrade means the socket was consumed by a failed upgrade
+            // attempt, so we can only close the state (no-op) and remove the
+            // session — cancel_timeouts / front_socket are unreachable.
+            self.state.close(self.proxy.clone(), &mut self.metrics);
+            self.proxy.borrow().remove_session(self.frontend_token);
+            self.has_been_closed = true;
+            debug_assert!(
+                self.has_been_closed,
+                "failed-upgrade close path must mark the session closed"
+            );
+            return;
+        }
+
+        self.state.cancel_timeouts();
+        // defer backend closing to the state
+        self.state.close(self.proxy.clone(), &mut self.metrics);
+
+        // Skipped once the client has closed its side: the close that follows
+        // sends the same FIN or RST on its own (`mux::shutdown_write`).
+        let peer_closed =
+            matches!(&self.state, HttpStateMachine::Mux(mux) if mux.frontend_peer_closed());
+        let front_socket = self.state.front_socket();
+        // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
+        // discards the receive buffer and elicits TCP RST, truncating the
+        // already-queued response. Canonical write-up: the `Shutdown::Write`
+        // block of `HttpsSession::close` (`lib/src/https.rs`). Backend sockets
+        // follow the same discipline for symmetry.
+        if let Err(e) = mux::shutdown_write(front_socket, peer_closed) {
+            // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
+            if e.kind() != ErrorKind::NotConnected {
+                error!(
+                    "{} error shutting down front socket({:?}): {:?}",
+                    log_context!(self),
+                    front_socket,
+                    e
+                )
+            }
+        }
+
+        // No `EPOLL_CTL_DEL` for the front socket: its only descriptor closes
+        // when this session drops, which `shut_down_sessions_by_frontend_tokens`
+        // (`lib/src/server.rs`) does before the event loop's next `epoll_wait`,
+        // and Linux removes a file from every epoll set on its last close.
+        // That holds because nothing duplicates a session socket: no `dup` or
+        // `try_clone`, no fork from a worker, and SCM_RIGHTS only carries
+        // listeners. The explicit deregister was one syscall per connection
+        // that bought nothing; see §11 of `doc/lifetime_of_a_session.md`.
+        let proxy = self.proxy.borrow();
+        proxy.remove_session(self.frontend_token);
+
+        self.has_been_closed = true;
+        debug_assert!(
+            self.has_been_closed,
+            "close must leave the session marked closed (idempotency latch)"
+        );
+    }
+
+    fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
+        let state_result = self.state.timeout(token, &mut self.metrics);
+        state_result == StateResult::CloseSession
+    }
+
+    fn needs_ready_pass(&self) -> bool {
+        matches!(&self.state, HttpStateMachine::Mux(mux) if mux.has_pending_backend_failure())
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTP
+    }
+
+    fn update_readiness(&mut self, token: Token, events: Ready) {
+        trace!(
+            "{} token {:?} got event {}",
+            log_context!(self),
+            token,
+            super::ready_to_string(events)
+        );
+        self.last_event = Instant::now();
+        self.metrics.wait_start();
+        self.state.update_readiness(token, events);
+    }
+
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+        self.metrics.service_start();
+
+        let session_result =
+            self.state
+                .ready(session.clone(), self.proxy.clone(), &mut self.metrics);
+
+        let to_be_closed = match session_result {
+            SessionResult::Close => true,
+            SessionResult::Continue => false,
+            SessionResult::Upgrade => match self.upgrade() {
+                false => self.ready(session),
+                true => true,
+            },
+        };
+
+        self.metrics.service_stop();
+        // Run-to-completion postcondition: a session that is being kept alive
+        // must still satisfy its cross-field invariants. When `to_be_closed`
+        // is true the state may be a transient FailedUpgrade or already torn
+        // down, so the sweep only applies to the still-open path.
+        #[cfg(debug_assertions)]
+        if !to_be_closed {
+            self.check_invariants();
+        }
+        to_be_closed
+    }
+
+    fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        self.state.shutting_down()
+    }
+
+    fn targets(&self, target: &crate::SessionTarget) -> bool {
+        self.state.targets(target)
+    }
+
+    fn last_event(&self) -> Instant {
+        self.last_event
+    }
+
+    fn print_session(&self) {
+        self.state.print_state("HTTP");
+        error!("{} Metrics: {:?}", log_context!(self), self.metrics);
+    }
+
+    fn frontend_token(&self) -> Token {
+        self.frontend_token
+    }
+}
+
+pub type Hostname = String;
+
+/// Cleartext HTTP/1.x listener.
+///
+/// # HTTP/2 over cleartext (h2c) is NOT supported
+///
+/// RFC 7540 §3.2 specified an `Upgrade: h2c` mechanism to negotiate HTTP/2
+/// over a cleartext TCP connection, with a companion prior-knowledge
+/// variant in §3.4. Both paths are intentionally absent from this listener:
+///
+/// - No `Upgrade: h2c` handler: the HTTP/1.1 state machine forwards
+///   `Upgrade` headers to the backend but never responds `101 Switching
+///   Protocols` with an HTTP/2 connection preface.
+/// - No prior-knowledge detection: the listener does not sniff the
+///   24-byte `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` magic string; a client
+///   that opens a TCP connection and immediately sends the preface will
+///   be interpreted as a malformed HTTP/1 request and rejected with 400.
+///
+/// RFC 9113 (the current HTTP/2 RFC, obsoleting 7540) formally deprecates
+/// the `Upgrade: h2c` mechanism. Clients that want HTTP/2 MUST use the
+/// TLS ALPN path (`HttpsListener`, selector `h2`) instead. This is
+/// consistent with the industry consensus (nginx, envoy, cloudflare) and
+/// removes an entire class of cleartext-preface smuggling primitives.
+pub struct HttpListener {
+    active: bool,
+    address: SocketAddr,
+    answers: Rc<RefCell<HttpAnswers>>,
+    config: HttpListenerConfig,
+    fronts: Router,
+    listener: Option<MioTcpListener>,
+    /// A socket this listener holds but has NOT registered.
+    ///
+    /// `activate()` parks an inherited socket here when `Registry::register`
+    /// fails, instead of letting the `?` drop and close a descriptor
+    /// `Listeners::get_*` has already removed from the SCM table (sozu#1342).
+    /// The next activation reuses it rather than binding a second one.
+    ///
+    /// Deliberately NOT `listener`: every other consumer reads that field's
+    /// `Some` as "registered and live" — `soft_stop` and `hard_stop`
+    /// deregister it and report the failure, `give_back_listener` hands it
+    /// back as an activated socket, `accept` accepts on it. A parked socket is
+    /// none of those things, and putting it there made a failed registration
+    /// answer `ENOENT` from `deregister` and fail the whole soft stop.
+    parked_listener: Option<MioTcpListener>,
+    /// Set by `activate()`, cleared by the first `accept()` that answers
+    /// `WouldBlock`: while set, `accept()` sets `TCP_NODELAY` on each socket
+    /// it returns.
+    ///
+    /// `activate()` sets `TCP_NODELAY` on the listening socket, and the kernel
+    /// copies it to every socket whose handshake completes afterwards, so a
+    /// steady-state accept needs no `setsockopt(2)` of its own
+    /// (sozu-proxy/sozu#1586). A connection that completed its handshake
+    /// BEFORE that call does not get it: the flag is copied when the
+    /// handshake completes, not when the socket is accepted. That is the
+    /// backlog of a socket inherited from a worker that never set the flag,
+    /// and whatever a fresh socket queued between `listen(2)` and
+    /// `activate()`. The first accept drain takes exactly that backlog.
+    nodelay_backlog: bool,
+    tags: BTreeMap<String, CachedTags>,
+    token: Token,
+}
+
+impl ListenerHandler for HttpListener {
+    fn get_addr(&self) -> &SocketAddr {
+        &self.address
+    }
+
+    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
+        self.tags.get(key)
+    }
+
+    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
+        match tags {
+            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
+            None => self.tags.remove(&key),
+        };
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTP
+    }
+
+    fn public_address(&self) -> SocketAddr {
+        self.config
+            .public_address
+            .map(|addr| addr.into())
+            .unwrap_or(self.address)
+    }
+}
+
+impl L7ListenerHandler for HttpListener {
+    fn get_sticky_name(&self) -> &str {
+        &self.config.sticky_name
+    }
+
+    fn get_sozu_id_header(&self) -> &str {
+        self.config
+            .sozu_id_header
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Sozu-Id")
+    }
+
+    fn get_connect_timeout(&self) -> u32 {
+        self.config.connect_timeout
+    }
+
+    // redundant, already called once in extract_route
+    fn frontend_from_request(
+        &self,
+        host: &str,
+        uri: &str,
+        method: &Method,
+        headers: &dyn RequestHeaders,
+    ) -> Result<RouteResult, FrontendFromRequestError> {
+        let start = Instant::now();
+        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
+            Ok(tuple) => tuple,
+            Err(parse_error) => {
+                // parse_error contains a slice of given_host, which should NOT escape this scope
+                return Err(FrontendFromRequestError::HostParse {
+                    host: host.to_owned(),
+                    error: parse_error.to_string(),
+                });
+            }
+        };
+        if remaining_input != &b""[..] {
+            return Err(FrontendFromRequestError::InvalidCharsAfterHost(
+                host.to_owned(),
+            ));
+        }
+
+        /*if port == Some(&b"80"[..]) {
+        // it is alright to call from_utf8_unchecked,
+        // we already verified that there are only ascii
+        // chars in there
+          unsafe { from_utf8_unchecked(hostname) }
+        } else {
+          host
+        }
+        */
+        // SAFETY: `hostname` was just produced by `hostname_and_port`
+        // (`lib/src/protocol/kawa_h1/parser.rs`), which only accepts
+        // bytes matching `is_hostname_char` (alphanumeric, `-`, `.`, plus
+        // `_` under the tolerant-http1-parser feature). All accepted
+        // bytes are ASCII (≤ 0x7F), so the slice is valid single-byte UTF-8.
+        let host = unsafe { from_utf8_unchecked(hostname) };
+
+        let route = self
+            .fronts
+            .lookup_with_headers(host, uri, method, headers)
+            .map_err(|e| {
+                incr!(names::http::FAILED_BACKEND_MATCHING);
+                FrontendFromRequestError::NoClusterFound(e)
+            })?;
+
+        let now = Instant::now();
+
+        if let Some(cluster) = route.cluster_id.as_deref() {
+            time!(
+                names::event_loop::FRONTEND_MATCHING_TIME,
+                cluster,
+                (now - start).as_millis()
+            );
+        }
+
+        Ok(route)
+    }
+
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
+        &self.answers
+    }
+
+    fn get_h2_flood_config(&self) -> crate::protocol::mux::H2FloodConfig {
+        // `H2FloodConfig`'s fields are private and `from_optional` applies the
+        // `.max(1)` clamp `new` carries (sozu-proxy/sozu#1418). This used to be
+        // a raw struct literal, which skipped that clamp on the only path that
+        // carries operator-set thresholds: config load rejects an out-of-range
+        // knob (`ConfigError::H2ThresholdBelowMinimum`), and the clamp is the
+        // structural backstop for a raw protobuf `AddHttpListener` or a
+        // state file saved before that gate existed.
+        crate::protocol::mux::H2FloodConfig::from_optional(
+            self.config.h2_max_rst_stream_per_window,
+            self.config.h2_max_ping_per_window,
+            self.config.h2_max_settings_per_window,
+            self.config.h2_max_empty_data_per_window,
+            self.config.h2_max_window_update_stream0_per_window,
+            self.config.h2_max_continuation_frames,
+            self.config.h2_max_glitch_count,
+            self.config.h2_max_rst_stream_lifetime,
+            self.config.h2_max_rst_stream_abusive_lifetime,
+            self.config.h2_max_rst_stream_emitted_lifetime,
+            self.config.h2_max_header_list_size,
+            self.config.h2_max_header_table_size,
+            self.config.h2_max_header_fields,
+            self.config.h2_stream_refusal_percent,
+        )
+    }
+
+    fn get_h2_connection_config(&self) -> crate::protocol::mux::H2ConnectionConfig {
+        crate::protocol::mux::H2ConnectionConfig::from_optional(
+            self.config.h2_initial_connection_window,
+            self.config.h2_max_concurrent_streams,
+            self.config.h2_stream_shrink_ratio,
+        )
+    }
+
+    fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
+        // Inherit `back_timeout` when the knob is unset so listeners tuned for
+        // long-running backends do not cancel streams at the 30 s security
+        // floor. The `max(30, …)` keeps the baseline slow-multiplex mitigation
+        // when `back_timeout` is shorter than 30 s. Explicit values (including
+        // ones below 30 s) win — operators under a slow-multiplex attack can
+        // lower the per-stream deadline to cap buffer pinning.
+        let seconds = self
+            .config
+            .h2_stream_idle_timeout_seconds
+            .map(|s| u64::from(s.max(1)))
+            .unwrap_or_else(|| u64::from(self.config.back_timeout).max(30));
+        std::time::Duration::from_secs(seconds)
+    }
+
+    fn get_h2_graceful_shutdown_deadline(&self) -> Option<std::time::Duration> {
+        match self.config.h2_graceful_shutdown_deadline_seconds {
+            None => Some(std::time::Duration::from_secs(5)),
+            Some(0) => None,
+            Some(s) => Some(std::time::Duration::from_secs(u64::from(s))),
+        }
+    }
+
+    fn get_elide_x_real_ip(&self) -> bool {
+        self.config.elide_x_real_ip.unwrap_or(false)
+    }
+
+    fn get_send_x_real_ip(&self) -> bool {
+        self.config.send_x_real_ip.unwrap_or(false)
+    }
+
+    fn get_forwarded_headers(&self) -> ForwardedHeaders {
+        // An unknown wire value reads as the default, like prost's own
+        // getter; `update_config` and the main-process state refuse one.
+        self.config.forwarded_headers()
+    }
+}
+
+pub struct HttpProxy {
+    backends: Rc<RefCell<BackendMap>>,
+    clusters: HashMap<ClusterId, Cluster>,
+    listeners: HashMap<Token, Rc<RefCell<HttpListener>>>,
+    pool: Rc<RefCell<Pool>>,
+    registry: Registry,
+    sessions: Rc<RefCell<SessionManager>>,
+}
+
+impl HttpProxy {
+    pub fn new(
+        registry: Registry,
+        sessions: Rc<RefCell<SessionManager>>,
+        pool: Rc<RefCell<Pool>>,
+        backends: Rc<RefCell<BackendMap>>,
+    ) -> HttpProxy {
+        HttpProxy {
+            backends,
+            clusters: HashMap::new(),
+            listeners: HashMap::new(),
+            pool,
+            registry,
+            sessions,
+        }
+    }
+
+    pub fn add_listener(
+        &mut self,
+        config: HttpListenerConfig,
+        token: Token,
+    ) -> Result<Token, ProxyError> {
+        if self.listeners.contains_key(&token) {
+            return Err(ProxyError::ListenerAlreadyPresent);
+        }
+        let mut http_listener =
+            HttpListener::new(config, token).map_err(ProxyError::AddListener)?;
+        // Frontends name their listener by address alone, so a listener added
+        // next to one already on its address (on another interface) takes
+        // over the routes that one serves: every listener on an address holds
+        // the same routes, whenever it was added (sozu-proxy/sozu#719).
+        if let Some(sibling) = self
+            .listeners_at(http_listener.address)
+            .ok()
+            .and_then(|l| l.into_iter().next())
+        {
+            let sibling = sibling.borrow();
+            http_listener.fronts = sibling.fronts.clone();
+            http_listener.tags = sibling.tags.clone();
+        }
+        match self.listeners.entry(token) {
+            Entry::Vacant(entry) => {
+                entry.insert(Rc::new(RefCell::new(http_listener)));
+                Ok(token)
+            }
+            _ => Err(ProxyError::ListenerAlreadyPresent),
+        }
+    }
+
+    /// Add one listener and restore routes retained in the worker state when
+    /// no live sibling can provide them.
+    ///
+    /// A sibling already carries the address-wide routes and `add_listener`
+    /// clones them. When the last listener on an address was removed, the
+    /// control-plane state deliberately kept its frontends; replay them onto
+    /// the new listener before the server commits its session slot. Any
+    /// failure drops only that new listener.
+    pub(crate) fn add_listener_with_retained_frontends(
+        &mut self,
+        config: HttpListenerConfig,
+        token: Token,
+        retained_frontends: Vec<RequestHttpFrontend>,
+    ) -> Result<Token, ProxyError> {
+        let address = config.address.into();
+        let had_sibling = self.listeners_at(address).is_ok();
+        self.add_listener(config, token)?;
+
+        if !had_sibling {
+            for frontend in retained_frontends {
+                if let Err(error) = self.add_http_frontend(frontend) {
+                    self.listeners.remove(&token);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(token)
+    }
+
+    pub fn get_listener(&self, token: &Token) -> Option<Rc<RefCell<HttpListener>>> {
+        self.listeners.get(token).cloned()
+    }
+
+    pub fn remove_listener(&mut self, remove: RemoveListener) -> Result<(), ProxyError> {
+        let len = self.listeners.len();
+        let remove_address = remove.listener_key();
+        self.listeners
+            .retain(|_, l| !l.borrow().is(&remove_address));
+
+        if !self.listeners.len() < len {
+            info!(
+                "{} no HTTP listener to remove at {}",
+                log_module_context!(),
+                remove_address
+            );
+        }
+        Ok(())
+    }
+
+    /// What this proxy would do with a socket handed to
+    /// [`activate_listener`](Self::activate_listener) for `addr`. See
+    /// [`crate::InheritedSocketFate`].
+    ///
+    /// The event loop is single-threaded, so nothing can change the listener's
+    /// `active` flag between this answer and the `activate_listener` call that
+    /// acts on it.
+    pub fn inherited_socket_fate(&self, addr: &ListenerKey) -> crate::InheritedSocketFate {
+        use crate::InheritedSocketFate;
+        match self
+            .listeners
+            .values()
+            .find(|listener| listener.borrow().is(addr))
+        {
+            None => InheritedSocketFate::Unclaimed,
+            Some(listener) if listener.borrow().active => InheritedSocketFate::Refused,
+            Some(_) => InheritedSocketFate::Adopted,
+        }
+    }
+
+    pub fn activate_listener(
+        &self,
+        addr: &ListenerKey,
+        tcp_listener: Option<MioTcpListener>,
+    ) -> Result<Token, ProxyError> {
+        let listener = self
+            .listeners
+            .values()
+            .find(|listener| listener.borrow().is(addr))
+            .ok_or(ProxyError::NoListenerFound(addr.clone()))?;
+
+        listener
+            .borrow_mut()
+            .activate(&self.registry, tcp_listener)
+            .map_err(|listener_error| ProxyError::ListenerActivation {
+                address: addr.address,
+                listener_error,
+            })
+    }
+
+    /// The slab token reserved for the listener at `address`, if this proxy
+    /// holds one.
+    ///
+    /// A listener owns exactly one slab slot for its whole `AddListener` ->
+    /// `RemoveListener` lifetime, and no `remove_listener` implementation
+    /// touches the session slab. `Server` therefore reads the token here
+    /// BEFORE dropping the listener, so that reserved slot is released exactly
+    /// once, at the end of the lifetime.
+    pub fn listener_token(&self, address: &ListenerKey) -> Option<Token> {
+        self.listeners
+            .iter()
+            .find(|(_, listener)| listener.borrow().is(address))
+            .map(|(token, _)| *token)
+    }
+
+    pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, MioTcpListener)> {
+        self.listeners
+            .values()
+            .filter_map(|listener| {
+                let mut owned = listener.borrow_mut();
+                if let Some(listener) = owned.listener.take() {
+                    // Reset `active` so a subsequent `activate()` re-binds
+                    // instead of short-circuiting on the stale flag.
+                    owned.active = false;
+                    return Some((owned.key(), listener));
+                }
+
+                None
+            })
+            .collect()
+    }
+
+    pub fn give_back_listener(
+        &mut self,
+        address: &ListenerKey,
+    ) -> Result<(Token, MioTcpListener), ProxyError> {
+        let listener = self
+            .listeners
+            .values()
+            .find(|listener| listener.borrow().is(address))
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
+
+        let mut owned = listener.borrow_mut();
+
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
+
+        // Reset `active` so a subsequent `activate()` re-binds instead of
+        // short-circuiting on the stale flag.
+        owned.active = false;
+
+        Ok((owned.token, taken_listener))
+    }
+
+    /// Every listener on `address`, whatever its interface. Frontends and
+    /// certificates name their listener by address alone, so they apply to
+    /// all the listeners sharing that address on different interfaces.
+    fn listeners_at(
+        &self,
+        address: SocketAddr,
+    ) -> Result<Vec<Rc<RefCell<HttpListener>>>, ProxyError> {
+        let mut listeners: Vec<_> = self
+            .listeners
+            .iter()
+            .filter(|(_, listener)| listener.borrow().address == address)
+            .map(|(token, listener)| (*token, listener.clone()))
+            .collect();
+        // Token order, so a failure is reported the same way on every run.
+        listeners.sort_by_key(|(token, _)| *token);
+        let listeners: Vec<_> = listeners
+            .into_iter()
+            .map(|(_, listener)| listener)
+            .collect();
+        if listeners.is_empty() {
+            return Err(ProxyError::NoListenerFound(address.into()));
+        }
+        Ok(listeners)
+    }
+
+    /// Apply a partial-update patch to the identified HTTP listener.
+    pub fn update_listener(&mut self, patch: UpdateHttpListenerConfig) -> Result<(), ProxyError> {
+        let address: std::net::SocketAddr = patch.address.into();
+        let listener = self
+            .listeners
+            .values()
+            .find(|l| l.borrow().address == address)
+            .ok_or(ProxyError::NoListenerFound(address.into()))?;
+        listener
+            .borrow_mut()
+            .update_config(&patch)
+            .map_err(|listener_error| ProxyError::ListenerActivation {
+                address,
+                listener_error,
+            })
+    }
+
+    pub fn add_cluster(&mut self, mut cluster: Cluster) -> Result<(), ProxyError> {
+        // Reconcile the legacy single-status `answer_503` field with the
+        // new map. The new map wins on collision.
+        let mut overrides = cluster.answers.clone();
+        if let Some(answer_503) = cluster.answer_503.take() {
+            overrides.entry("503".to_owned()).or_insert(answer_503);
+        }
+        if !overrides.is_empty() {
+            for listener in self.listeners.values() {
+                listener
+                    .borrow()
+                    .answers
+                    .borrow_mut()
+                    .add_cluster_answers(&cluster.cluster_id, &overrides)
+                    .map_err(|(name, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
+                    })?;
+            }
+        }
+        self.clusters
+            .insert(cluster.cluster_id.as_str().into(), cluster);
+        Ok(())
+    }
+
+    pub fn remove_cluster(&mut self, cluster_id: &str) -> Result<(), ProxyError> {
+        self.clusters.remove(cluster_id);
+
+        for listener in self.listeners.values() {
+            listener
+                .borrow()
+                .answers
+                .borrow_mut()
+                .remove_cluster_answers(cluster_id);
+        }
+        Ok(())
+    }
+
+    pub fn add_http_frontend(&mut self, front: RequestHttpFrontend) -> Result<(), ProxyError> {
+        // RFC 6797 §7.2: `Strict-Transport-Security` MUST NOT be sent over
+        // plaintext HTTP. Reject any AddHttpFrontend that ships an enabled
+        // HSTS policy before it ever touches the routing trie. This is
+        // defense in depth on top of the TOML config-load reject in
+        // `command/src/config.rs`; sites that build a `RequestHttpFrontend`
+        // outside the TOML path (`sozu frontend http add`, programmatic
+        // IPC senders) are caught here.
+        // Reject ANY hsts field on a plain-HTTP frontend, not just
+        // `enabled = true`. There is no listener-default HSTS to inherit
+        // on an HTTP listener (the field doesn't exist on
+        // `HttpListenerConfig`), so the explicit-disable signal
+        // (`enabled = false`) has nothing to suppress on this surface.
+        // Carrying any `hsts` field here is a misconfiguration rather
+        // than a deliberate choice.
+        if front.hsts.is_some() {
+            incr!(names::http::HSTS_SUPPRESSED_PLAINTEXT);
+            return Err(ProxyError::HstsOnPlainHttp(front.address.into()));
+        }
+
+        let front = front.clone().to_frontend().map_err(|request_error| {
+            ProxyError::WrongInputFrontend {
+                front: Box::new(front),
+                error: request_error.to_string(),
+            }
+        })?;
+
+        for listener in self.listeners_at(front.address)? {
+            let mut listener = listener.borrow_mut();
+            let hostname = front.hostname.to_owned();
+            let tags = front.tags.to_owned();
+
+            listener
+                .add_http_front(front.clone())
+                .map_err(ProxyError::AddFrontend)?;
+            listener.set_tags(hostname, tags);
+        }
+        Ok(())
+    }
+
+    pub fn remove_http_frontend(&mut self, front: RequestHttpFrontend) -> Result<(), ProxyError> {
+        let front = front.clone().to_frontend().map_err(|request_error| {
+            ProxyError::WrongInputFrontend {
+                front: Box::new(front),
+                error: request_error.to_string(),
+            }
+        })?;
+
+        // Every listener on the address drops the route, even when another
+        // one fails: a sibling must never keep a route the others removed.
+        // The first failure, in token order, is the one reported.
+        let mut result = Ok(());
+        for listener in self.listeners_at(front.address)? {
+            let mut listener = listener.borrow_mut();
+            let hostname = front.hostname.to_owned();
+
+            let removed = listener
+                .remove_http_front(front.clone())
+                .map_err(ProxyError::RemoveFrontend);
+            if result.is_ok() {
+                result = removed;
+            }
+
+            if !listener.fronts.has_hostname(&hostname) {
+                listener.set_tags(hostname, None);
+            }
+        }
+        result
+    }
+
+    pub fn soft_stop(&mut self) -> Result<(), ProxyError> {
+        let listeners = std::mem::take(&mut self.listeners);
+        let mut socket_errors = vec![];
+        for l in listeners.values() {
+            if let Some(mut sock) = l.borrow_mut().listener.take() {
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
+                if let Err(e) = self.registry.deregister(&mut sock) {
+                    let error = format!("socket {sock:?}: {e:?}");
+                    socket_errors.push(error);
+                }
+            }
+        }
+
+        if !socket_errors.is_empty() {
+            return Err(ProxyError::SoftStop {
+                proxy_protocol: "HTTP".to_string(),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn hard_stop(&mut self) -> Result<(), ProxyError> {
+        let mut listeners = std::mem::take(&mut self.listeners);
+        let mut socket_errors = vec![];
+        for (_, l) in listeners.drain() {
+            if let Some(mut sock) = l.borrow_mut().listener.take() {
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
+                if let Err(e) = self.registry.deregister(&mut sock) {
+                    let error = format!("socket {sock:?}: {e:?}");
+                    socket_errors.push(error);
+                }
+            }
+        }
+
+        if !socket_errors.is_empty() {
+            return Err(ProxyError::HardStop {
+                proxy_protocol: "HTTP".to_string(),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+impl HttpListener {
+    /// This listener's identity: its address, plus the network interface its
+    /// socket is bound to when it has one.
+    pub fn key(&self) -> ListenerKey {
+        ListenerKey::new(self.address, self.config.interface.as_deref())
+    }
+
+    /// Whether this listener is the one `key` names.
+    pub fn is(&self, key: &ListenerKey) -> bool {
+        key.matches(&self.address, self.config.interface.as_deref())
+    }
+
+    pub fn new(config: HttpListenerConfig, token: Token) -> Result<HttpListener, ListenerError> {
+        // Defense in depth, as `update_config`: the main-process state
+        // refuses an unknown mode, a raw protobuf client may not.
+        if let Some(v) = config.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+        let answers = Self::build_answers(&config)?;
+        Ok(HttpListener {
+            active: false,
+            address: config.address.into(),
+            answers: Rc::new(RefCell::new(answers)),
+            config,
+            fronts: Router::new(),
+            listener: None,
+            parked_listener: None,
+            nodelay_backlog: false,
+            tags: BTreeMap::new(),
+            token,
+        })
+    }
+
+    /// Build the listener's HTTP answer templates from its config, reconciling
+    /// the legacy `http_answers` per-status fields with the new `answers`
+    /// template map (the new map wins on collision; legacy fields fill any
+    /// status not yet migrated). Shared by [`Self::new`] and
+    /// [`Self::validate_config`] so the master-side pre-commit check cannot
+    /// drift from worker construction.
+    fn build_answers(config: &HttpListenerConfig) -> Result<HttpAnswers, ListenerError> {
+        let mut answers_map = config.answers.clone();
+        if let Some(ref legacy) = config.http_answers {
+            crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+        }
+        HttpAnswers::new(&answers_map)
+            .map_err(|(name, error)| ListenerError::TemplateParse(name, error))
+    }
+
+    /// Validate that a worker can build this HTTP listener configuration (its
+    /// answer templates) WITHOUT constructing the full listener or binding a
+    /// socket. The main process calls this before committing an
+    /// `AddHttpListener` to its `ConfigState` and fanning it out, so an invalid
+    /// listener never reserves its address and blocks a corrected reload
+    /// (sozu#1301).
+    ///
+    /// Buildability only. The H2 knob floors are deliberately NOT checked
+    /// here (sozu#1418): a worker *can* build a listener whose threshold is
+    /// out of range — `H2FloodConfig::from_optional` clamps it — so refusing
+    /// it is a policy the command socket applies to what an operator is
+    /// authoring, not a statement about what a worker can construct. That
+    /// gate lives beside its audience, in
+    /// `bin/src/command/requests.rs::validate_h2_knob_floors`.
+    pub fn validate_config(config: &HttpListenerConfig) -> Result<(), ListenerError> {
+        Self::build_answers(config)?;
+        Ok(())
+    }
+
+    pub fn activate(
+        &mut self,
+        registry: &Registry,
+        tcp_listener: Option<MioTcpListener>,
+    ) -> Result<Token, ListenerError> {
+        if self.active {
+            return Ok(self.token);
+        }
+        let address: SocketAddr = self.config.address.into();
+
+        // Reuse a socket a previous attempt parked here after a failed
+        // registration, rather than binding a second one. Taking it
+        // unconditionally is what keeps the two from coexisting: if the caller
+        // ALSO handed one over, the parked socket is disposed of deliberately
+        // below instead of being silently overwritten.
+        let parked = self.parked_listener.take();
+        let mut listener = match (tcp_listener, parked) {
+            (Some(inherited), Some(parked)) => {
+                // Not reachable while `Listeners::get_*` removes the entry it
+                // hands over and `scm_listeners` is written once: a parked
+                // socket means this address's entry was already consumed, so
+                // the caller cannot have another. Neither of those is enforced
+                // here, so dispose of the loser explicitly and loudly rather
+                // than letting an assignment close it — that silent close is
+                // sozu#1342 itself.
+                warn!(
+                    "{} closing the socket parked on the HTTP listener for {}: an \
+                     inherited socket arrived for the same address and is the one being \
+                     activated",
+                    log_module_context!(),
+                    address
+                );
+                drop(parked);
+                inherited
+            }
+            (Some(inherited), None) => inherited,
+            (None, Some(parked)) => parked,
+            (None, None) => server_bind(address, self.config.interface.as_deref()).map_err(
+                |server_bind_error| ListenerError::Activation {
+                    address,
+                    error: server_bind_error.to_string(),
+                },
+            )?,
+        };
+
+        // Once per listener, on whichever socket won above — freshly bound,
+        // inherited over SCM_RIGHTS from a worker that may never have set it,
+        // or parked by a failed registration. Every socket this listener
+        // accepts from now on inherits it; see `nodelay_backlog` for the ones
+        // already queued.
+        if let Err(e) = SockRef::from(&listener).set_tcp_nodelay(true) {
+            error!(
+                "{} error setting nodelay on listen socket({:?}): {:?}",
+                log_module_context!(),
+                listener,
+                e
+            );
+        }
+
+        let registration = registry
+            .register(&mut listener, self.token, Interest::READABLE)
+            .map_err(ListenerError::SocketRegistration);
+        if let Err(error) = registration {
+            // Park the socket instead of letting the `?` drop it. `register`
+            // is fallible (EEXIST for a descriptor still registered because
+            // `notify_deactivate_listener` only logs a failed deregister,
+            // EBADF, ENOMEM), and a socket still held in a local is dropped —
+            // and closed — on the way out. For an SCM-inherited socket that is
+            // the sozu#1342 close in a second place: `Listeners::get_*` has
+            // already removed the entry, so nothing else owns the descriptor.
+            // It goes to `parked_listener`, never to `listener`, because every other
+            // consumer of that field reads `Some` as "registered and live".
+            self.parked_listener = Some(listener);
+            return Err(error);
+        }
+
+        self.listener = Some(listener);
+        self.nodelay_backlog = true;
+        self.active = true;
+        Ok(self.token)
+    }
+
+    /// Apply a partial-update patch to this listener's live configuration.
+    ///
+    /// Fields absent in the patch (i.e. `None`) are preserved unchanged.
+    /// If `http_answers` is present only the listener-default templates are
+    /// replaced; per-cluster overrides in `cluster_custom_answers` are kept.
+    ///
+    /// All-or-nothing (sozu-proxy/sozu#1703): the patch is validated, then
+    /// applied to a copy of the configuration, and every fallible artifact
+    /// (the rebuilt answer registry) is built from that copy. Only once all
+    /// of it succeeded are the copy and the artifacts committed, so a refused
+    /// patch leaves the listener exactly as it was. The copy is one
+    /// `HttpListenerConfig` clone per patch, on the command path only.
+    pub fn update_config(&mut self, patch: &UpdateHttpListenerConfig) -> Result<(), ListenerError> {
+        // Defense-in-depth validation: main-process ConfigState::dispatch
+        // validates before scatter, but a raw protobuf client or state replay
+        // may reach the worker without that check. `StateError` lifts into
+        // `ListenerError` via `From` so `?` suffices. The main process runs
+        // the same checks (`ConfigState::update_http_listener` and, for the
+        // templates, `validate_listener_request` in
+        // `bin/src/command/requests.rs`), so both refuse the same patches.
+        validate_h2_flood_knobs_http(patch)?;
+        if let Some(ref hdr) = patch.sozu_id_header {
+            validate_sozu_id_header(hdr)?;
+        }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+        HttpAnswers::validate_patch_templates(patch.http_answers.as_ref(), &patch.answers)
+            .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
+
+        let mut config = self.config.clone();
+
+        if let Some(v) = patch.public_address {
+            config.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            config.expect_proxy = v;
+        }
+        if let Some(ref v) = patch.sticky_name {
+            config.sticky_name = v.to_owned();
+        }
+        if let Some(v) = patch.front_timeout {
+            config.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            config.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            config.connect_timeout = v;
+        }
+        if let Some(v) = patch.request_timeout {
+            config.request_timeout = v;
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            config.sozu_id_header = Some(v.to_owned());
+        }
+        if let Some(v) = patch.elide_x_real_ip {
+            config.elide_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.send_x_real_ip {
+            config.send_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.forwarded_headers {
+            config.forwarded_headers = Some(v);
+        }
+
+        // H2 flood knobs
+        if let Some(v) = patch.h2_max_rst_stream_per_window {
+            config.h2_max_rst_stream_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_ping_per_window {
+            config.h2_max_ping_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_settings_per_window {
+            config.h2_max_settings_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_empty_data_per_window {
+            config.h2_max_empty_data_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_continuation_frames {
+            config.h2_max_continuation_frames = Some(v);
+        }
+        if let Some(v) = patch.h2_max_glitch_count {
+            config.h2_max_glitch_count = Some(v);
+        }
+        if let Some(v) = patch.h2_initial_connection_window {
+            config.h2_initial_connection_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_concurrent_streams {
+            config.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_shrink_ratio {
+            config.h2_stream_shrink_ratio = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_lifetime {
+            config.h2_max_rst_stream_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
+            config.h2_max_rst_stream_abusive_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
+            config.h2_max_rst_stream_emitted_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_list_size {
+            config.h2_max_header_list_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_table_size {
+            config.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_fields {
+            config.h2_max_header_fields = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_refusal_percent {
+            config.h2_stream_refusal_percent = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_idle_timeout_seconds {
+            config.h2_stream_idle_timeout_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
+            config.h2_graceful_shutdown_deadline_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_max_window_update_stream0_per_window {
+            config.h2_max_window_update_stream0_per_window = Some(v);
+        }
+
+        // HTTP answers: merge legacy `http_answers` and the new `answers`
+        // map on top of the candidate config, then build the listener-level
+        // template registry from it. It is fallible, so it is built here and
+        // published below with the config, never before.
+        let answers_changed = patch.http_answers.is_some() || !patch.answers.is_empty();
+        let new_answers = if answers_changed {
+            if let Some(ref new_answers) = patch.http_answers {
+                crate::sozu_command::state::merge_custom_http_answers(
+                    &mut config.http_answers,
+                    new_answers,
+                );
+            }
+            for (code, body) in &patch.answers {
+                if !body.is_empty() {
+                    config.answers.insert(code.clone(), body.clone());
+                }
+            }
+
+            let mut answers_map = config.answers.clone();
+            if let Some(ref legacy) = config.http_answers {
+                crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+            }
+            Some(
+                HttpAnswers::new(&answers_map)
+                    .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?,
+            )
+        } else {
+            None
+        };
+
+        // Commit: nothing below can fail.
+        self.config = config;
+        if let Some(mut new_answers) = new_answers {
+            // Per-cluster overrides in `HttpAnswers::cluster_answers` are
+            // preserved across the rebuild.
+            //
+            // The rebuilt registry is PUBLISHED under a new `Rc`, not written
+            // through the old one. Every request already in flight captured
+            // the old handle when it arrived (`mux::Context::create_stream`)
+            // and renders its default answers from that, so a reload landing
+            // mid-request cannot change the page that request is about to
+            // emit; requests arriving after this point capture the new handle.
+            // That is the one-request staleness window of
+            // `lib/src/protocol/mux/LIFECYCLE.md` §2.5.
+            //
+            // The per-cluster overrides are therefore COPIED, not
+            // `mem::take`n: taking them would empty the registry those
+            // in-flight requests still hold and strip their cluster templates
+            // mid-response. The copy is a map clone over `Rc<Template>`, so
+            // both registries share the compiled templates themselves.
+            new_answers.cluster_answers = self.answers.borrow().cluster_answers.clone();
+            self.answers = Rc::new(RefCell::new(new_answers));
+        }
+
+        Ok(())
+    }
+
+    pub fn add_http_front(&mut self, http_front: HttpFrontend) -> Result<(), ListenerError> {
+        self.fronts
+            .add_http_front(&http_front)
+            .map_err(ListenerError::AddFrontend)
+    }
+
+    pub fn remove_http_front(&mut self, http_front: HttpFrontend) -> Result<(), ListenerError> {
+        debug!(
+            "{} removing http_front {:?}",
+            log_module_context!(),
+            http_front
+        );
+        self.fronts
+            .remove_http_front(&http_front)
+            .map_err(ListenerError::RemoveFrontend)
+    }
+
+    fn accept(&mut self) -> Result<(TcpStream, SocketAddr), AcceptError> {
+        if let Some(ref sock) = self.listener {
+            match sock.accept() {
+                Ok((frontend_sock, peer)) => {
+                    if self.nodelay_backlog
+                        && let Err(e) = frontend_sock.set_nodelay(true)
+                    {
+                        error!(
+                            "{} error setting nodelay on front socket({:?}): {:?}",
+                            log_module_context!(),
+                            frontend_sock,
+                            e
+                        );
+                    }
+                    Ok((frontend_sock, peer))
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // The backlog queued before `activate()` is drained.
+                    self.nodelay_backlog = false;
+                    Err(AcceptError::WouldBlock)
+                }
+                Err(e) => {
+                    error!("{} accept() IO error: {:?}", log_module_context!(), e);
+                    Err(AcceptError::IoError)
+                }
+            }
+        } else {
+            error!(
+                "{} cannot accept connections, no listening socket available",
+                log_module_context!()
+            );
+            Err(AcceptError::IoError)
+        }
+    }
+}
+
+impl ProxyConfiguration for HttpProxy {
+    fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
+        let request_id = request.id.clone();
+
+        let result = match request.content.request_type {
+            Some(RequestType::AddCluster(cluster)) => {
+                debug!(
+                    "{} {} add cluster {:?}",
+                    log_module_context!(),
+                    request.id,
+                    cluster
+                );
+                self.add_cluster(cluster)
+            }
+            Some(RequestType::RemoveCluster(cluster_id)) => {
+                debug!(
+                    "{} {} remove cluster {:?}",
+                    log_module_context!(),
+                    request_id,
+                    cluster_id
+                );
+                self.remove_cluster(&cluster_id)
+            }
+            Some(
+                RequestType::AddHttpFrontend(front)
+                | RequestType::AddHttpFrontendWithSilentClose(front)
+                | RequestType::AddHttpFrontendWithHeaderPredicates(front),
+            ) => {
+                debug!(
+                    "{} {} add front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
+                self.add_http_frontend(front)
+            }
+            Some(
+                RequestType::RemoveHttpFrontend(front)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(front),
+            ) => {
+                debug!(
+                    "{} {} remove front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
+                self.remove_http_frontend(front)
+            }
+            Some(RequestType::RemoveListener(remove)) => {
+                debug!(
+                    "{} removing HTTP listener at address {:?}",
+                    log_module_context!(),
+                    remove.address
+                );
+                self.remove_listener(remove)
+            }
+            Some(RequestType::SoftStop(_)) => {
+                debug!(
+                    "{} {} processing soft shutdown",
+                    log_module_context!(),
+                    request_id
+                );
+                match self.soft_stop() {
+                    Ok(()) => {
+                        info!(
+                            "{} {} soft stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
+                        return WorkerResponse::processing(request.id);
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Some(RequestType::HardStop(_)) => {
+                debug!(
+                    "{} {} processing hard shutdown",
+                    log_module_context!(),
+                    request_id
+                );
+                match self.hard_stop() {
+                    Ok(()) => {
+                        info!(
+                            "{} {} hard stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
+                        return WorkerResponse::processing(request.id);
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Some(RequestType::Status(_)) => {
+                debug!("{} {} status", log_module_context!(), request_id);
+                Ok(())
+            }
+            other_command => {
+                debug!(
+                    "{} {} unsupported message for HTTP proxy, ignoring: {:?}",
+                    log_module_context!(),
+                    request.id,
+                    other_command
+                );
+                Err(ProxyError::UnsupportedMessage)
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                debug!("{} {} successful", log_module_context!(), request_id);
+                WorkerResponse::ok(request_id)
+            }
+            Err(proxy_error) => {
+                debug!(
+                    "{} {} unsuccessful: {}",
+                    log_module_context!(),
+                    request_id,
+                    proxy_error
+                );
+                WorkerResponse::error(request_id, proxy_error)
+            }
+        }
+    }
+
+    fn accept(&mut self, token: ListenToken) -> Result<(TcpStream, SocketAddr), AcceptError> {
+        if let Some(listener) = self.listeners.get(&Token(token.0)) {
+            listener.borrow_mut().accept()
+        } else {
+            Err(AcceptError::IoError)
+        }
+    }
+
+    fn create_session(
+        &mut self,
+        mut frontend_sock: TcpStream,
+        peer: SocketAddr,
+        listener_token: ListenToken,
+        wait_time: Duration,
+        proxy: Rc<RefCell<Self>>,
+    ) -> Result<(), AcceptError> {
+        let listener = self
+            .listeners
+            .get(&Token(listener_token.0))
+            .cloned()
+            .ok_or(AcceptError::IoError)?;
+
+        // No `set_nodelay` here: the socket has `TCP_NODELAY` from its
+        // listener, or from `HttpListener::accept` if it was queued before the
+        // listener set it.
+        let mut session_manager = self.sessions.borrow_mut();
+        let slab_len_before = session_manager.slab.len();
+        let session_entry = session_manager.slab.vacant_entry();
+        let session_token = Token(session_entry.key());
+        // The token handed to the new session, used for epoll registration and
+        // every `remove_session(frontend_token)` call, MUST be the very slab
+        // key this entry will occupy. A drift here would deregister/free the
+        // wrong slot on close.
+        debug_assert_eq!(
+            session_token.0,
+            session_entry.key(),
+            "session token must equal the slab vacant-entry key"
+        );
+        let owned = listener.borrow();
+
+        if let Err(register_error) = self.registry.register(
+            &mut frontend_sock,
+            session_token,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            error!(
+                "{} error registering listen socket({:?}): {:?}",
+                log_module_context!(),
+                frontend_sock,
+                register_error
+            );
+            return Err(AcceptError::RegisterError);
+        }
+
+        let public_address: SocketAddr = match owned.config.public_address {
+            Some(pub_addr) => pub_addr.into(),
+            None => owned.config.address.into(),
+        };
+
+        let session = HttpSession::new(
+            Duration::from_secs(owned.config.back_timeout as u64),
+            Duration::from_secs(owned.config.connect_timeout as u64),
+            Duration::from_secs(owned.config.front_timeout as u64),
+            Duration::from_secs(owned.config.request_timeout as u64),
+            owned.config.expect_proxy,
+            listener.clone(),
+            Rc::downgrade(&self.pool),
+            proxy,
+            // `create_session` runs under the proxy's `borrow_mut`, so the
+            // session cannot read the map through `proxy`; hand it over here.
+            Rc::clone(&self.backends),
+            public_address,
+            frontend_sock,
+            peer,
+            session_token,
+            wait_time,
+        )?;
+
+        // The session's frontend token must be exactly the slab key we are
+        // about to fill — the registration above and all later token lookups
+        // depend on it.
+        debug_assert_eq!(
+            session.frontend_token, session_token,
+            "session must own the frontend token it was created with"
+        );
+
+        let session = Rc::new(RefCell::new(session));
+        session_entry.insert(session);
+        // Inserting into the previously-vacant entry grows the live session
+        // count by exactly one (gauge-like ±1 pairing against close()'s
+        // try_remove). `len()` is the count of occupied slots.
+        debug_assert_eq!(
+            session_manager.slab.len(),
+            slab_len_before + 1,
+            "creating a session must occupy exactly one new slab slot"
+        );
+
+        Ok(())
+    }
+}
+
+impl L7Proxy for HttpProxy {
+    fn kind(&self) -> ListenerType {
+        ListenerType::Http
+    }
+
+    fn register_socket(
+        &self,
+        source: &mut TcpStream,
+        token: Token,
+        interest: Interest,
+    ) -> Result<(), std::io::Error> {
+        self.registry.register(source, token, interest)
+    }
+
+    fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token {
+        let mut session_manager = self.sessions.borrow_mut();
+        let len_before = session_manager.slab.len();
+        let entry = session_manager.slab.vacant_entry();
+        let token = Token(entry.key());
+        let _entry = entry.insert(session);
+        // The returned token is the slab key callers use to later remove this
+        // session, and the insert occupied exactly one new slot.
+        debug_assert_eq!(
+            session_manager.slab.len(),
+            len_before + 1,
+            "add_session must occupy exactly one new slab slot"
+        );
+        debug_assert!(
+            session_manager.slab.contains(token.0),
+            "the returned token must index the freshly inserted session"
+        );
+        token
+    }
+
+    fn remove_session(&self, token: Token) -> bool {
+        let mut sessions = self.sessions.borrow_mut();
+        let was_present = sessions.slab.contains(token.0);
+        let len_before = sessions.slab.len();
+        // Drain the session's `(cluster, ip)` accounting before the slab
+        // slot is freed — once the slot is reused for a new session the
+        // token would otherwise alias an unrelated set of entries. No-op
+        // when the session never tracked anything (feature disabled, or
+        // no request reached `Router::plan_connect`).
+        sessions.untrack_all_cluster_ip(token);
+        let removed = sessions.slab.try_remove(token.0).is_some();
+        // Removal must report exactly whether the slot was occupied, and the
+        // live count drops by one iff something was actually removed (±1
+        // pairing against add_session / create_session). The slot is gone.
+        debug_assert_eq!(
+            removed, was_present,
+            "try_remove reports presence iff the slot was occupied"
+        );
+        debug_assert_eq!(
+            sessions.slab.len(),
+            len_before - removed as usize,
+            "slab len drops by exactly one iff a session was removed"
+        );
+        debug_assert!(
+            !sessions.slab.contains(token.0),
+            "the slot must be free after remove_session"
+        );
+        removed
+    }
+
+    fn clusters(&self) -> &HashMap<ClusterId, Cluster> {
+        &self.clusters
+    }
+
+    fn sessions(&self) -> Rc<RefCell<SessionManager>> {
+        self.sessions.clone()
+    }
+}
+
+pub mod testing {
+    use crate::testing::*;
+
+    /// this function is not used, but is available for example and testing purposes
+    pub fn start_http_worker(
+        config: HttpListenerConfig,
+        channel: ProxyChannel,
+        max_buffers: usize,
+        buffer_size: usize,
+    ) -> anyhow::Result<()> {
+        let address = config.address.into();
+
+        let ServerParts {
+            event_loop,
+            registry,
+            sessions,
+            pool,
+            backends,
+            client_scm_socket: _,
+            server_scm_socket,
+            server_config,
+        } = prebuild_server(max_buffers, buffer_size, true)?;
+
+        let token = {
+            let mut sessions = sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            let _ = entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::HTTPListen,
+            })));
+            Token(key)
+        };
+
+        let mut proxy = HttpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+        proxy
+            .add_listener(config, token)
+            .with_context(|| "Failed at creating adding the listener")?;
+        proxy
+            .activate_listener(&address, None)
+            .with_context(|| "Failed at creating activating the listener")?;
+
+        let mut server = Server::new(
+            event_loop,
+            channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            Some(proxy),
+            None,
+            None,
+            server_config,
+            None,
+            false,
+        )
+        .with_context(|| "Failed at creating server")?;
+
+        debug!("{} starting event loop", log_module_context!());
+        server.run();
+        debug!("{} ending event loop", log_module_context!());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate tiny_http;
+
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        str,
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
+
+    use sozu_command::proto::command::SocketAddress;
+
+    use super::{testing::start_http_worker, *};
+    use crate::sozu_command::{
+        channel::Channel,
+        config::ListenerBuilder,
+        proto::command::{
+            CustomHttpAnswers, LoadBalancingParams, PathRule, RulePosition, SoftStop,
+            WorkerRequest, request::RequestType,
+        },
+        response::{Backend, HttpFrontend},
+    };
+
+    /// Regression for sozu-proxy/sozu#1418: `get_h2_flood_config` built
+    /// `H2FloodConfig` with a raw struct literal, so `H2FloodConfig::new`'s
+    /// `.max(1)` clamp never ran on the only path that carries
+    /// operator-configured thresholds. A `HttpListenerConfig` reaching the
+    /// worker with `h2_max_rst_stream_per_window = Some(0)` — from a raw
+    /// protobuf `AddHttpListener`, or a state file saved before config load
+    /// gained its gate — handed that zero straight to `H2FloodDetector::new`,
+    /// whose `check_flood` compares `count > threshold`: the first counted
+    /// RST_STREAM of every H2 connection tripped the detector and the listener
+    /// answered `ENHANCE_YOUR_CALM` to every client. In a debug build the
+    /// detector's own pre-condition `debug_assert!` fired instead, at
+    /// connection setup.
+    ///
+    /// Config load now rejects the value outright
+    /// (`ConfigError::H2ThresholdBelowMinimum`); this is the structural
+    /// backstop for anything that never passed through it.
+    #[test]
+    fn get_h2_flood_config_clamps_a_zero_threshold_that_bypassed_config_load() {
+        let mut config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8080))
+            .to_http(None)
+            .expect("could not create listener config");
+        // Exactly what a raw protobuf `AddHttpListener` or a replayed state
+        // file can still carry — `to_http` itself now refuses this value.
+        config.h2_max_rst_stream_per_window = Some(0);
+        config.h2_max_glitch_count = Some(0);
+
+        let listener =
+            HttpListener::new(config, Token(0)).expect("could not build the HTTP listener");
+        let flood_config = listener.get_h2_flood_config();
+
+        assert!(
+            flood_config.max_rst_stream_per_window() >= 1,
+            "max_rst_stream_per_window must be clamped to >= 1, got {}",
+            flood_config.max_rst_stream_per_window()
+        );
+        assert!(
+            flood_config.max_glitch_count() >= 1,
+            "max_glitch_count must be clamped to >= 1, got {}",
+            flood_config.max_glitch_count()
+        );
+    }
+
+    /// Pin the listener-config → [`H2FloodConfig`] mapping, field by field
+    /// (sozu-proxy/sozu#1418). `get_h2_flood_config` hands
+    /// `H2FloodConfig::from_optional` thirteen positional arguments — ten
+    /// `Option<u32>` and three `Option<u64>` — so a transposition inside
+    /// either group compiles silently and quietly re-points a CVE mitigation
+    /// at the wrong counter. `from_optional`'s own tests cover its internals;
+    /// nothing covered the wiring into it until here. Every value is distinct,
+    /// so any swap fails an assertion.
+    #[test]
+    fn get_h2_flood_config_maps_every_listener_knob_to_its_own_threshold() {
+        let mut config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8080))
+            .to_http(None)
+            .expect("could not create listener config");
+        config.h2_max_rst_stream_per_window = Some(101);
+        config.h2_max_ping_per_window = Some(102);
+        config.h2_max_settings_per_window = Some(103);
+        config.h2_max_empty_data_per_window = Some(104);
+        config.h2_max_window_update_stream0_per_window = Some(105);
+        config.h2_max_continuation_frames = Some(106);
+        config.h2_max_glitch_count = Some(107);
+        config.h2_max_rst_stream_lifetime = Some(108);
+        config.h2_max_rst_stream_abusive_lifetime = Some(109);
+        config.h2_max_rst_stream_emitted_lifetime = Some(110);
+        config.h2_max_header_list_size = Some(111);
+        config.h2_max_header_table_size = Some(112);
+        config.h2_max_header_fields = Some(113);
+        config.h2_stream_refusal_percent = Some(114);
+
+        let listener =
+            HttpListener::new(config, Token(0)).expect("could not build the HTTP listener");
+        let flood = listener.get_h2_flood_config();
+
+        assert_eq!(flood.max_rst_stream_per_window(), 101);
+        assert_eq!(flood.max_ping_per_window(), 102);
+        assert_eq!(flood.max_settings_per_window(), 103);
+        assert_eq!(flood.max_empty_data_per_window(), 104);
+        assert_eq!(flood.max_window_update_stream0_per_window(), 105);
+        assert_eq!(flood.max_continuation_frames(), 106);
+        assert_eq!(flood.max_glitch_count(), 107);
+        assert_eq!(flood.max_rst_stream_lifetime(), 108);
+        assert_eq!(flood.max_rst_stream_abusive_lifetime(), 109);
+        assert_eq!(flood.max_rst_stream_emitted_lifetime(), 110);
+        assert_eq!(flood.max_header_list_size(), 111);
+        assert_eq!(flood.max_header_table_size(), 112);
+        assert_eq!(flood.max_header_fields(), 113);
+        assert_eq!(flood.stream_refusal_percent(), 114);
+    }
+
+    #[test]
+    fn round_trip() {
+        setup_test_logger!();
+        let front_port = crate::testing::provide_port();
+        let backend_server = Arc::new(
+            tiny_http::Server::http("127.0.0.1:0").expect("could not create tiny_http server"),
+        );
+        let backend_port = backend_server
+            .server_addr()
+            .to_ip()
+            .expect("tiny_http server should bind to IP address")
+            .port();
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, front_port))
+            .to_http(None)
+            .expect("could not create listener config");
+
+        let (mut command, channel) =
+            Channel::generate(1000, 10000).expect("should create a channel");
+
+        thread::scope(|s| {
+            let backend_handle = backend_server.clone();
+            let barrier_clone = barrier.to_owned();
+            s.spawn(move || {
+                setup_test_logger!();
+                start_server(&backend_handle, barrier_clone);
+            });
+            barrier.wait();
+
+            s.spawn(move || {
+                setup_test_logger!();
+                start_http_worker(config, channel, 10, 16384)
+                    .expect("could not start the http server");
+            });
+
+            let front = RequestHttpFrontend {
+                cluster_id: Some("cluster_1".to_owned()),
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port),
+                hostname: "localhost".to_owned(),
+                path: PathRule::prefix("/".to_owned()),
+                ..Default::default()
+            };
+            // A backend belongs to its cluster: add the cluster first.
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_CLUSTER".to_owned(),
+                    content: RequestType::AddCluster(Cluster {
+                        cluster_id: "cluster_1".to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                })
+                .expect("could not send AddCluster");
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_ABCD".to_owned(),
+                    content: RequestType::AddHttpFrontend(front).into(),
+                })
+                .expect("could not send AddHttpFrontend");
+            let backend = Backend {
+                cluster_id: "cluster_1".into(),
+                backend_id: "cluster_1-0".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+                unix_path: None,
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_EFGH".to_owned(),
+                    content: RequestType::AddBackend(backend.to_add_backend()).into(),
+                })
+                .expect("could not send AddBackend");
+
+            println!("test received: {:?}", command.read_message());
+            println!("test received: {:?}", command.read_message());
+            println!("test received: {:?}", command.read_message());
+
+            let mut client =
+                TcpStream::connect(("127.0.0.1", front_port)).expect("could not connect to sozu");
+
+            client
+                .set_read_timeout(Some(Duration::new(1, 0)))
+                .expect("could not set read timeout");
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: localhost:{front_port}\r\nConnection: Close\r\n\r\n"
+            );
+            let w = client.write(request.as_bytes());
+            println!("http client write: {w:?}");
+
+            barrier.wait();
+            let mut buffer = [0; 4096];
+            let mut index = 0;
+
+            // tiny_http responds with exactly 191 bytes for a "hello world" body
+            // (headers + body). This is deterministic for a given tiny_http version.
+            let expected_len = 191;
+
+            loop {
+                assert!(index <= expected_len);
+                if index == expected_len {
+                    break;
+                }
+
+                let r = client.read(&mut buffer[index..]);
+                println!("http client read: {r:?}");
+                match r {
+                    Err(e) => panic!("client request should not fail. Error: {e:?}"),
+                    Ok(sz) => {
+                        index += sz;
+                    }
+                }
+            }
+            println!(
+                "Response: {}",
+                str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
+            );
+
+            // Gracefully stop the sozu worker so the scoped thread can join
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_STOP".to_owned(),
+                    content: RequestType::SoftStop(SoftStop {}).into(),
+                })
+                .expect("could not send SoftStop");
+            // Unblock the backend server so its thread can exit
+            backend_server.unblock();
+        });
+    }
+
+    #[test]
+    fn keep_alive() {
+        setup_test_logger!();
+        let front_port = crate::testing::provide_port();
+        let backend_server = Arc::new(
+            tiny_http::Server::http("127.0.0.1:0").expect("could not create tiny_http server"),
+        );
+        let backend_port = backend_server
+            .server_addr()
+            .to_ip()
+            .expect("tiny_http server should bind to IP address")
+            .port();
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, front_port))
+            .to_http(None)
+            .expect("could not create listener config");
+
+        let (mut command, channel) =
+            Channel::generate(1000, 10000).expect("should create a channel");
+
+        thread::scope(|s| {
+            let backend_handle = backend_server.clone();
+            let barrier_clone = barrier.to_owned();
+            s.spawn(move || {
+                setup_test_logger!();
+                start_server(&backend_handle, barrier_clone);
+            });
+            barrier.wait();
+
+            s.spawn(move || {
+                setup_test_logger!();
+                start_http_worker(config, channel, 10, 16384)
+                    .expect("could not start the http server");
+            });
+
+            let front = RequestHttpFrontend {
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port),
+                hostname: "localhost".to_owned(),
+                path: PathRule::prefix("/".to_owned()),
+                cluster_id: Some("cluster_1".to_owned()),
+                ..Default::default()
+            };
+            // A backend belongs to its cluster: add the cluster first.
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_CLUSTER".to_owned(),
+                    content: RequestType::AddCluster(Cluster {
+                        cluster_id: "cluster_1".to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                })
+                .expect("could not send AddCluster");
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_ABCD".to_owned(),
+                    content: RequestType::AddHttpFrontend(front).into(),
+                })
+                .expect("could not send AddHttpFrontend");
+            let backend = Backend {
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
+                backend_id: "cluster_1-0".to_owned(),
+                backup: None,
+                cluster_id: "cluster_1".into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                unix_path: None,
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_EFGH".to_owned(),
+                    content: RequestType::AddBackend(backend.to_add_backend()).into(),
+                })
+                .expect("could not send AddBackend");
+
+            println!("test received: {:?}", command.read_message());
+            println!("test received: {:?}", command.read_message());
+            println!("test received: {:?}", command.read_message());
+
+            let mut client =
+                TcpStream::connect(("127.0.0.1", front_port)).expect("could not connect to sozu");
+            client
+                .set_read_timeout(Some(Duration::new(5, 0)))
+                .expect("could not set read timeout");
+
+            // tiny_http responds with exactly 191 bytes for a "hello world" body
+            // (headers + body). This is deterministic for a given tiny_http version.
+            let expected_len = 191;
+
+            let request = format!("GET / HTTP/1.1\r\nHost: localhost:{front_port}\r\n\r\n");
+            let w = client
+                .write(request.as_bytes())
+                .expect("could not write first request");
+            println!("http client write: {w:?}");
+            barrier.wait();
+
+            let mut buffer = [0; 4096];
+            let mut index = 0;
+
+            loop {
+                assert!(index <= expected_len);
+                if index == expected_len {
+                    break;
+                }
+
+                let r = client.read(&mut buffer[index..]);
+                println!("http client read: {r:?}");
+                match r {
+                    Err(e) => panic!("client request should not fail. Error: {e:?}"),
+                    Ok(sz) => {
+                        index += sz;
+                    }
+                }
+            }
+
+            println!(
+                "Response: {}",
+                str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
+            );
+
+            println!("first request ended, will send second one");
+            let request2 = format!("GET / HTTP/1.1\r\nHost: localhost:{front_port}\r\n\r\n");
+            let w2 = client.write(request2.as_bytes());
+            println!("http client write: {w2:?}");
+            barrier.wait();
+
+            let mut buffer2 = [0; 4096];
+            let mut index = 0;
+
+            loop {
+                assert!(index <= expected_len);
+                if index == expected_len {
+                    break;
+                }
+
+                let r2 = client.read(&mut buffer2[index..]);
+                println!("http client read: {r2:?}");
+                match r2 {
+                    Err(e) => panic!("client request should not fail. Error: {e:?}"),
+                    Ok(sz) => {
+                        index += sz;
+                    }
+                }
+            }
+            println!(
+                "Response: {}",
+                str::from_utf8(&buffer2[..index]).expect("could not make string from buffer")
+            );
+
+            // Gracefully stop the sozu worker so the scoped thread can join
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_STOP".to_owned(),
+                    content: RequestType::SoftStop(SoftStop {}).into(),
+                })
+                .expect("could not send SoftStop");
+            // Unblock the backend server so its thread can exit
+            backend_server.unblock();
+        });
+    }
+
+    use self::tiny_http::Response;
+
+    fn start_server(server: &tiny_http::Server, barrier: Arc<Barrier>) {
+        let addr = server.server_addr();
+        info!("starting web server on {:?}", addr);
+        barrier.wait();
+
+        for request in server.incoming_requests() {
+            info!(
+                "backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
+                request.method(),
+                request.url(),
+                request.headers()
+            );
+
+            let response = Response::from_string("hello world");
+            request
+                .respond(response)
+                .expect("could not respond to request");
+            info!("backend web server sent response");
+            barrier.wait();
+            info!("server session stopped");
+        }
+
+        println!("server on {addr:?} closed");
+    }
+
+    #[test]
+    fn frontend_from_request_test() {
+        let cluster_id1 = ClusterId::from("cluster_1");
+        let cluster_id2 = ClusterId::from("cluster_2");
+        let cluster_id3 = ClusterId::from("cluster_3");
+        let uri1 = "/".to_owned();
+        let uri2 = "/yolo".to_owned();
+        let uri3 = "/yolo/swag".to_owned();
+
+        let mut fronts = Router::new();
+        fronts
+            .add_http_front(&HttpFrontend {
+                address: "0.0.0.0:80".parse().unwrap(),
+                hostname: "lolcatho.st".to_owned(),
+                method: None,
+                path: PathRule::prefix(uri1),
+                position: RulePosition::Tree,
+                cluster_id: Some(cluster_id1),
+                tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
+                hsts: None,
+                header_predicates: Vec::new(),
+            })
+            .expect("Could not add http frontend");
+        fronts
+            .add_http_front(&HttpFrontend {
+                address: "0.0.0.0:80".parse().unwrap(),
+                hostname: "lolcatho.st".to_owned(),
+                method: None,
+                path: PathRule::prefix(uri2),
+                position: RulePosition::Tree,
+                cluster_id: Some(cluster_id2),
+                tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
+                hsts: None,
+                header_predicates: Vec::new(),
+            })
+            .expect("Could not add http frontend");
+        fronts
+            .add_http_front(&HttpFrontend {
+                address: "0.0.0.0:80".parse().unwrap(),
+                hostname: "lolcatho.st".to_owned(),
+                method: None,
+                path: PathRule::prefix(uri3),
+                position: RulePosition::Tree,
+                cluster_id: Some(cluster_id3),
+                tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
+                hsts: None,
+                header_predicates: Vec::new(),
+            })
+            .expect("Could not add http frontend");
+        fronts
+            .add_http_front(&HttpFrontend {
+                address: "0.0.0.0:80".parse().unwrap(),
+                hostname: "other.domain".to_owned(),
+                method: None,
+                path: PathRule::prefix("/test".to_owned()),
+                position: RulePosition::Tree,
+                cluster_id: Some("cluster_1".into()),
+                tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
+                hsts: None,
+                header_predicates: Vec::new(),
+            })
+            .expect("Could not add http frontend");
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1030);
+
+        let default_config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("Could not create default HTTP listener config");
+
+        let listener = HttpListener {
+            parked_listener: None,
+            nodelay_backlog: false,
+            listener: None,
+            address: address.into(),
+            fronts,
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&BTreeMap::new()).unwrap())),
+            config: default_config,
+            token: Token(0),
+            active: true,
+            tags: BTreeMap::new(),
+        };
+
+        let frontend1 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        let frontend2 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/test",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        let frontend3 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/yolo/test",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        let frontend4 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/yolo/swag",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        let frontend5 =
+            listener.frontend_from_request("domain", "/", &Method::Get, &crate::router::NoHeaders);
+        assert_eq!(
+            frontend1
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
+        );
+        assert_eq!(
+            frontend2
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
+        );
+        assert_eq!(
+            frontend3
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_2")
+        );
+        assert_eq!(
+            frontend4
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_3")
+        );
+        assert!(frontend5.is_err());
+    }
+
+    /// sozu#322: the worker refuses a listener whose `forwarded_headers`
+    /// wire value names no `ForwardedHeaders` variant — a raw protobuf
+    /// `AddHttpListener` must not silently run the default — and honours a
+    /// known one.
+    #[test]
+    fn a_listener_with_an_unknown_forwarded_headers_value_is_refused() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1041);
+        let build = |forwarded_headers: Option<i32>| {
+            let mut cfg = ListenerBuilder::new_http(address)
+                .to_http(None)
+                .expect("default HTTP listener config");
+            cfg.forwarded_headers = forwarded_headers;
+            HttpListener::new(cfg, Token(0))
+        };
+        assert!(build(Some(42)).is_err(), "an unknown mode must be refused");
+        let listener = build(Some(ForwardedHeaders::Rfc7239 as i32)).expect("a known mode");
+        assert_eq!(listener.get_forwarded_headers(), ForwardedHeaders::Rfc7239);
+    }
+
+    #[test]
+    fn h2_stream_idle_timeout_inherits_back_timeout() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1040);
+        let build = |back_timeout: u32, explicit: Option<u32>| -> HttpListener {
+            let mut cfg = ListenerBuilder::new_http(address)
+                .to_http(None)
+                .expect("default HTTP listener config");
+            cfg.back_timeout = back_timeout;
+            cfg.h2_stream_idle_timeout_seconds = explicit;
+            HttpListener::new(cfg, Token(0)).expect("build listener")
+        };
+
+        // Knob unset: inherit back_timeout when it exceeds the 30s floor.
+        assert_eq!(
+            build(180, None).get_h2_stream_idle_timeout(),
+            Duration::from_secs(180)
+        );
+
+        // Knob unset, back_timeout below floor: stay at 30s to preserve the
+        // slow-multiplex Slowloris mitigation.
+        assert_eq!(
+            build(5, None).get_h2_stream_idle_timeout(),
+            Duration::from_secs(30)
+        );
+
+        // Explicit values win in both directions — including below the floor,
+        // so operators under attack can tighten the deadline.
+        assert_eq!(
+            build(180, Some(10)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            build(5, Some(600)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(600)
+        );
+
+        // `Some(0)` is clamped to 1s to keep the deadline non-degenerate.
+        assert_eq!(
+            build(180, Some(0)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(1)
+        );
+    }
+
+    /// A listener answer reload PUBLISHES a new registry; it does not rewrite
+    /// the one in-flight requests are holding.
+    ///
+    /// `mux::Context::create_stream` captures `HttpAnswers` by handle when a
+    /// request arrives, and every `set_default_answer` site in the mux renders
+    /// from that captured handle (`lib/src/protocol/mux/LIFECYCLE.md` §2.5).
+    /// The capture is only a snapshot if a reload installs a *new* registry —
+    /// rewriting the old one through its `RefCell` would reach every request
+    /// already in flight and hand it a page its client never asked for.
+    ///
+    /// The second assertion guards the trap in the obvious implementation of
+    /// the first: migrating the per-cluster overrides with `mem::take` empties
+    /// the registry the in-flight requests still hold, stripping their cluster
+    /// templates mid-response. They must be copied.
+    ///
+    /// To SEE THIS RED: in `HttpListener::update_config`, put the two publish
+    /// lines back to their pre-fix form —
+    /// `let preserved = std::mem::take(&mut self.answers.borrow_mut().cluster_answers);`
+    /// `new_answers.cluster_answers = preserved;`
+    /// `*self.answers.borrow_mut() = new_answers;`
+    #[test]
+    fn a_listener_answers_reload_publishes_a_new_registry() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1041);
+        let config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        let mut listener = HttpListener::new(config, Token(0)).expect("build listener");
+
+        // A cluster override, as `HttpProxy::add_cluster` would install it.
+        listener
+            .answers
+            .borrow_mut()
+            .add_cluster_answers(
+                "cluster_1",
+                &BTreeMap::from([(
+                    "503".to_owned(),
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                )]),
+            )
+            .expect("the cluster override must compile");
+
+        // What a request arriving now would capture.
+        let captured = listener.get_answers().clone();
+
+        listener
+            .update_config(&UpdateHttpListenerConfig {
+                address,
+                answers: BTreeMap::from([(
+                    "404".to_owned(),
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                )]),
+                ..Default::default()
+            })
+            .expect("the answers patch must apply");
+
+        assert!(
+            !Rc::ptr_eq(&captured, listener.get_answers()),
+            "a reload must publish a NEW answer registry: rewriting the captured \
+             one reaches every request already in flight"
+        );
+        assert!(
+            captured.borrow().cluster_answers.contains_key("cluster_1"),
+            "the registry captured before the reload must keep its cluster \
+             overrides: a request in flight would otherwise lose its custom \
+             pages mid-response"
+        );
+        assert!(
+            listener
+                .get_answers()
+                .borrow()
+                .cluster_answers
+                .contains_key("cluster_1"),
+            "the published registry must carry the cluster overrides forward"
+        );
+    }
+
+    /// A patch the worker refuses leaves the listener exactly as it was
+    /// (sozu-proxy/sozu#1703): its configuration and its published answer
+    /// registry. Each patch carries fields that validate, then an answer
+    /// template that does not parse — the failure the old code only hit
+    /// after writing every other field into `self.config`, so the listener
+    /// kept a patch it had refused, and a config its templates no longer
+    /// matched.
+    ///
+    /// To SEE THIS RED: in `HttpListener::update_config`, drop the
+    /// `validate_patch_templates` call from the up-front checks and write the
+    /// fields into `self.config` instead of the candidate copy.
+    #[test]
+    fn a_rejected_patch_leaves_the_listener_unchanged() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1042);
+        let config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        let mut listener = HttpListener::new(config, Token(0)).expect("build listener");
+
+        let valid_prefix = UpdateHttpListenerConfig {
+            address,
+            front_timeout: Some(99),
+            sozu_id_header: Some("X-Edge-Id".to_owned()),
+            forwarded_headers: Some(ForwardedHeaders::Rfc7239 as i32),
+            h2_max_rst_stream_per_window: Some(7),
+            ..Default::default()
+        };
+        let rejected = [
+            UpdateHttpListenerConfig {
+                answers: BTreeMap::from([(
+                    "404".to_owned(),
+                    "not a valid http response".to_owned(),
+                )]),
+                ..valid_prefix.clone()
+            },
+            UpdateHttpListenerConfig {
+                http_answers: Some(CustomHttpAnswers {
+                    answer_503: Some("not a valid http response".to_owned()),
+                    ..Default::default()
+                }),
+                ..valid_prefix.clone()
+            },
+        ];
+        for patch in rejected {
+            let config_before = listener.config.clone();
+            let answers_before = listener.get_answers().clone();
+            let error = listener
+                .update_config(&patch)
+                .expect_err("an unparseable template must be refused");
+            assert!(
+                matches!(error, ListenerError::TemplateParse(..)),
+                "expected TemplateParse, got {error:?}"
+            );
+            assert_eq!(
+                listener.config, config_before,
+                "a refused patch must leave the listener configuration unchanged"
+            );
+            assert!(
+                Rc::ptr_eq(&answers_before, listener.get_answers()),
+                "a refused patch must not publish a new answer registry"
+            );
+        }
+
+        listener
+            .update_config(&valid_prefix)
+            .expect("the valid prefix alone must apply");
+        assert_eq!(listener.config.front_timeout, 99);
+        assert_eq!(listener.config.sozu_id_header.as_deref(), Some("X-Edge-Id"));
+    }
+
+    /// A closed session issues no `EPOLL_CTL_DEL` for its front socket: the
+    /// socket stays in the epoll set until the session drops, and its last
+    /// close is what removes it. The second assertion is the half that makes
+    /// skipping the deregister safe — nothing else holds the descriptor, so
+    /// dropping the session really does take it out of the epoll set before
+    /// its slab token can be handed to a new connection.
+    ///
+    /// To SEE THIS RED: in `HttpSession::close`, put back
+    /// `let _ = proxy.registry.deregister(&mut mio::unix::SourceFd(&front_socket.as_raw_fd()));`
+    /// before `proxy.remove_session`. The first assertion then fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_sessions_leave_their_sockets_to_close() {
+        use std::os::fd::AsRawFd;
+
+        use crate::protocol::mux::test_support::epoll_watches;
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
+        let parts = crate::testing::prebuild_server(4, 16_384, false)
+            .expect("test server parts must build");
+        let registry = parts
+            .registry
+            .try_clone()
+            .expect("the test registry must clone");
+        let sessions = parts.sessions.clone();
+        let listener_token = {
+            let mut sessions = sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::HTTPListen,
+            })));
+            Token(key)
+        };
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        proxy
+            .add_listener(
+                ListenerBuilder::new_http(address)
+                    .to_http(None)
+                    .expect("test listener config must build"),
+                listener_token,
+            )
+            .expect("test listener must register");
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        let peer_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind the test peer listener");
+        let _client = TcpStream::connect(
+            peer_listener
+                .local_addr()
+                .expect("the test peer listener has an address"),
+        )
+        .expect("connect the test client");
+        let (accepted, peer) = peer_listener.accept().expect("accept the test client");
+        accepted
+            .set_nonblocking(true)
+            .expect("the front socket must go non-blocking");
+        let front = mio::net::TcpStream::from_std(accepted);
+        let front_fd = front.as_raw_fd();
+
+        let session_token = sessions.borrow().slab.vacant_key();
+        proxy
+            .borrow_mut()
+            .create_session(
+                front,
+                peer,
+                ListenToken(listener_token.0),
+                Duration::ZERO,
+                proxy.clone(),
+            )
+            .expect("the session must be created");
+        assert!(
+            sessions.borrow().slab.contains(session_token),
+            "the session takes the slot that was vacant"
+        );
+        assert!(
+            epoll_watches(&registry, front_fd),
+            "precondition: the front socket is in the epoll set"
+        );
+
+        // What `Server::shut_down_sessions_by_frontend_tokens` does.
+        let session = sessions.borrow_mut().slab.remove(session_token);
+        session.borrow_mut().close();
+        assert!(
+            epoll_watches(&registry, front_fd),
+            "HttpSession::close must not deregister a front socket it is about \
+             to close: the close removes it, the EPOLL_CTL_DEL is a wasted syscall"
+        );
+
+        drop(session);
+        assert!(
+            !epoll_watches(&registry, front_fd),
+            "dropping the session closes the front socket's only descriptor, \
+             which must take it out of the epoll set"
+        );
+        drop(parts.event_loop);
+    }
+
+    /// A connection accepted once the listener is live carries `TCP_NODELAY`
+    /// without a per-connection `setsockopt(2)`, and is handed over with the
+    /// peer address `accept(2)` returned (sozu-proxy/sozu#1586).
+    ///
+    /// The kernel copies `TCP_NODELAY` from a listening socket to each socket
+    /// it accepts, at the moment the handshake completes. The listener sets it
+    /// once in `activate`. The first accept drain still sets it per connection
+    /// for whatever was already in the backlog, so this test drains that pass
+    /// first, until `WouldBlock`, and only then opens the connection whose flag
+    /// it reads: that one can only have it from the listener.
+    ///
+    /// To SEE THIS RED: in `HttpListener::activate`, delete the
+    /// `SockRef::from(&listener).set_tcp_nodelay(true)` block. The listener then
+    /// has no flag to pass on and the accepted socket reads `false`.
+    #[test]
+    fn a_steady_state_accepted_socket_inherits_nodelay_and_its_peer_address() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
+        let parts = crate::testing::prebuild_server(4, 16_384, false)
+            .expect("test server parts must build");
+        let listener_token = {
+            let mut sessions = parts.sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::HTTPListen,
+            })));
+            Token(key)
+        };
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        proxy
+            .add_listener(
+                ListenerBuilder::new_http(address)
+                    .to_http(None)
+                    .expect("test listener config must build"),
+                listener_token,
+            )
+            .expect("test listener must register");
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("test listener must activate");
+
+        // The first drain after the activation, with an empty backlog.
+        assert!(
+            matches!(
+                proxy.accept(ListenToken(listener_token.0)),
+                Err(AcceptError::WouldBlock)
+            ),
+            "precondition: nothing is queued on a freshly bound listener"
+        );
+
+        let client =
+            TcpStream::connect(SocketAddr::from(address)).expect("connect the test client");
+        let (accepted, peer) = proxy
+            .accept(ListenToken(listener_token.0))
+            .expect("the completed connection must be accepted");
+
+        assert_eq!(
+            socket2::SockRef::from(&accepted).tcp_nodelay().ok(),
+            Some(true),
+            "a socket accepted in steady state must inherit TCP_NODELAY from its listener"
+        );
+        assert_eq!(
+            peer,
+            client.local_addr().expect("the test client has an address"),
+            "the peer address handed over must be the client's"
+        );
+        drop(parts.event_loop);
+    }
+}
+
+#[cfg(test)]
+mod listener_sibling_tests {
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{HstsConfig, PathRule, RequestHttpFrontend, RulePosition, SocketAddress},
+    };
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+    fn proxy() -> HttpProxy {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        HttpProxy::new(registry, sessions, pool, backends)
+    }
+
+    fn add(proxy: &mut HttpProxy, address: SocketAddress, interface: Option<&str>, token: usize) {
+        let config = ListenerBuilder::new_http(address)
+            .with_interface(interface)
+            .to_http(None)
+            .expect("could not build the listener config");
+        proxy
+            .add_listener(config, Token(token))
+            .expect("could not add the listener");
+    }
+
+    fn front(address: SocketAddress) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some("cluster-a".to_owned()),
+            address,
+            hostname: "example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn routes(proxy: &HttpProxy, token: usize) -> bool {
+        proxy.listeners[&Token(token)]
+            .borrow()
+            .fronts
+            .lookup("example.com", "/", &Method::Get)
+            .is_ok()
+    }
+
+    /// A listener added on an address that already serves frontends — `sozu
+    /// listener http add --interface`, or a reload adding one — takes them
+    /// over from the listener already there: frontends name their listener by
+    /// address, so it must route what its sibling routes from its first
+    /// connection (sozu-proxy/sozu#719).
+    #[test]
+    fn a_listener_added_next_to_a_sibling_takes_over_its_frontends() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, address, None, 0);
+        proxy
+            .add_http_frontend(front(address))
+            .expect("add the frontend");
+        add(&mut proxy, address, Some("lo"), 1);
+
+        assert!(routes(&proxy, 0));
+        assert!(
+            routes(&proxy, 1),
+            "the listener added after the frontend must route it too"
+        );
+
+        proxy
+            .remove_http_frontend(front(address))
+            .expect("remove the frontend");
+        assert!(!routes(&proxy, 0));
+        assert!(!routes(&proxy, 1));
+    }
+
+    #[test]
+    fn retained_frontends_are_not_replayed_when_a_sibling_already_has_them() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, address, None, 0);
+        proxy
+            .add_http_frontend(front(address))
+            .expect("add the frontend");
+        let sibling = ListenerBuilder::new_http(address)
+            .with_interface(Some("lo"))
+            .to_http(None)
+            .expect("build sibling listener config");
+
+        proxy
+            .add_listener_with_retained_frontends(sibling, Token(1), vec![front(address)])
+            .expect("the sibling must clone routes without replaying duplicates");
+
+        assert!(routes(&proxy, 0));
+        assert!(routes(&proxy, 1));
+    }
+
+    #[test]
+    fn failed_retained_frontend_replay_discards_only_the_new_listener() {
+        let mut proxy = proxy();
+        let kept_address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        let rejected_address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, kept_address, None, 0);
+        let rejected = ListenerBuilder::new_http(rejected_address)
+            .to_http(None)
+            .expect("build rejected listener config");
+        let invalid_plaintext_hsts = RequestHttpFrontend {
+            hsts: Some(HstsConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..front(rejected_address)
+        };
+
+        assert!(
+            proxy
+                .add_listener_with_retained_frontends(
+                    rejected,
+                    Token(1),
+                    vec![invalid_plaintext_hsts],
+                )
+                .is_err()
+        );
+        assert!(proxy.listeners.contains_key(&Token(0)));
+        assert!(!proxy.listeners.contains_key(&Token(1)));
+    }
+
+    /// Removing a frontend reaches every listener on the address even when one
+    /// of them fails, and reports that failure: a sibling must never keep a
+    /// route the others dropped.
+    #[test]
+    fn removing_a_frontend_reaches_every_listener_and_reports_a_failure() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, address, None, 0);
+        add(&mut proxy, address, Some("lo"), 1);
+        // Only the second listener holds the route, so removing it from the
+        // first one fails (a `Pre` rule that is not there is an error).
+        let pre = RequestHttpFrontend {
+            position: RulePosition::Pre.into(),
+            ..front(address)
+        };
+        let frontend = pre
+            .clone()
+            .to_frontend()
+            .expect("the test frontend must convert");
+        proxy.listeners[&Token(1)]
+            .borrow_mut()
+            .add_http_front(frontend)
+            .expect("add the route to one listener");
+
+        assert!(
+            proxy.remove_http_frontend(pre).is_err(),
+            "the listener that lacked the route must report it"
+        );
+        assert!(
+            !routes(&proxy, 1),
+            "the failure on one listener must not spare its sibling's route"
+        );
+    }
+}

@@ -1,0 +1,683 @@
+//! Canonical metric-name constants.
+//!
+//! Every metric string emitted by Sōzu and consumed by the StatsD/Prometheus/
+//! TUI surface should reference a constant declared here rather than being
+//! repeated as a literal. The constants intentionally preserve the dotted
+//! string values byte-for-byte so dashboards and scrapers stay valid.
+//!
+//! Layout: one submodule per metric family (`http`, `h2`, `tcp`, `tls`, …),
+//! constants inside are `UPPER_SNAKE_CASE` derived from the dotted suffix.
+//! E.g. `h2.frames.tx.data` lives at [`h2::FRAMES_TX_DATA`].
+//!
+//! When adding a new metric:
+//! 1. Add the constant in the matching submodule (create one if needed).
+//! 2. Reference the constant from the emission site
+//!    (`incr!(names::h2::FRAMES_TX_DATA)`) instead of repeating the literal.
+//! 3. If the TUI or any scraper reads this metric, reference the same
+//!    constant on the read side too.
+
+/// Accept-queue counters and gauges, fed by the worker accept loop in
+/// `lib/src/server.rs`.
+pub mod accept_queue {
+    pub const BACKPRESSURE: &str = "accept_queue.backpressure";
+    pub const CONNECTIONS: &str = "accept_queue.connections";
+    pub const SATURATED_SECONDS: &str = "accept_queue.saturated_seconds";
+    pub const TIMEOUT: &str = "accept_queue.timeout";
+    pub const WAIT_TIME: &str = "accept_queue.wait_time";
+}
+
+/// Access-log infrastructure counters.
+pub mod access_logs {
+    pub const COUNT: &str = "access_logs.count";
+    pub const UNSENT: &str = "unsent-access-logs";
+}
+
+/// Per-backend bandwidth + connection counters emitted by both H1 and the
+/// H2 mux. Front-bytes and back-bytes are accounted separately so dashboards
+/// can compare upstream vs downstream traffic.
+pub mod backend {
+    pub const BYTES_IN: &str = "bytes_in";
+    pub const BYTES_OUT: &str = "bytes_out";
+    pub const BACK_BYTES_IN: &str = "back_bytes_in";
+    pub const BACK_BYTES_OUT: &str = "back_bytes_out";
+    pub const AVAILABLE: &str = "backend.available";
+    pub const CONNECTIONS: &str = "backend.connections";
+    pub const FLOW_CONTROL_PAUSED: &str = "backend.flow_control.paused";
+    pub const POOL_HIT: &str = "backend.pool.hit";
+    pub const POOL_MISS: &str = "backend.pool.miss";
+    pub const POOL_SIZE: &str = "backend.pool.size";
+    pub const CONNECTIONS_PER_BACKEND: &str = "connections_per_backend";
+    pub const CONNECTION_TIME: &str = "backend_connection_time";
+    /// Backend time-to-first-header-byte: established connection -> response
+    /// headers parsed. nginx's `$upstream_header_time` (sozu-proxy/sozu#426).
+    /// L7 only — raw TCP has no headers and emits nothing under this key.
+    pub const HEADER_TIME: &str = "backend_header_time";
+    pub const RESPONSE_TIME: &str = "backend_response_time";
+    pub const REQUESTS: &str = "requests";
+    pub const FAIL_OPEN: &str = "backends.fail_open";
+    /// Shuffle sharding (sozu-proxy/sozu#524), per cluster: a selection whose
+    /// client shard had no backend able to take a connection, and which the
+    /// cluster's `FALLBACK` mode sent to a backend outside the shard.
+    pub const SHARD_SPILLOVER: &str = "backend.shard.spillover";
+    /// Shuffle sharding, per cluster: a selection whose client shard had no
+    /// backend able to take a connection, refused by the cluster's `STRICT`
+    /// mode (HTTP answers 503, TCP closes).
+    pub const SHARD_EXHAUSTED: &str = "backend.shard.exhausted";
+
+    // Connection-lifecycle transition counters, emitted per
+    // `(cluster_id, backend_id)` from both proxies: the mux (H1 and H2) and
+    // raw TCP.
+    pub const UP: &str = "backend.up";
+    pub const DOWN: &str = "backend.down";
+    pub const CONNECTIONS_ERROR: &str = "backend.connections.error";
+    pub const CONNECT_RETRIES_EXHAUSTED: &str = "backend.connect.retries_exhausted";
+
+    /// An idempotent request written onto a pooled keep-alive upstream that
+    /// then closed without answering was replayed on a fresh backend instead
+    /// of being answered `502 Bad Gateway` (sozu-proxy/sozu#1442). Labelled
+    /// with the cluster and the STALE backend — the one that did not answer.
+    ///
+    /// One request can increment this more than once: the replay goes back
+    /// through `Router::plan_connect`, so the cluster's
+    /// `max_connection_attempts` bounds the total, not this counter.
+    ///
+    /// Read it as "an upstream went away before answering", NOT as "the pool
+    /// held a closed socket". sozu cannot tell those apart: a backend that
+    /// half-closes after processing a request, and one that crashes
+    /// mid-request, both land here. Raising the upstream keep-alive idle
+    /// timeout above sozu's is the right fix only for the first reading, so
+    /// check the backends' own error rate and restart/OOM history before
+    /// reaching for it — if they are dying mid-request, this counter is
+    /// reporting that, and the idle timeout will not move it.
+    pub const RETRY_STALE_UPSTREAM: &str = "backend.retry.stale_upstream";
+
+    /// Gauge: request captures currently armed for a stale-upstream replay,
+    /// summed over every live stream of this worker (sozu-proxy/sozu#1450).
+    ///
+    /// A capture is armed when an IDEMPOTENT request is written onto a POOLED
+    /// keep-alive upstream, and released the moment the attempt stops being
+    /// replayable — the upstream answered, the request overflowed one front
+    /// buffer, the replay was queued, or the stream was torn down. Emitted as
+    /// a signed `gauge_add!` delta from `ReplayCapture`'s constructor and its
+    /// `impl Drop`, so teardown is symmetric whichever of those paths ran.
+    ///
+    /// To read the capture heap from it, the bound is `2 * gauge *
+    /// buffer_size`, NOT `gauge * buffer_size`. Each capture's CONTENT is
+    /// bounded by one front kawa's `storage.capacity()`, but the write path
+    /// grows it with `Vec::reserve`, which allocates
+    /// `max(2 * old_capacity, required)`: a capture written in one pass has
+    /// `capacity == len`, and one assembled over several partial writes can
+    /// have twice it. The single-write case is the common one, so the true
+    /// figure sits between the two.
+    pub const RETRY_CAPTURES_ARMED: &str = "backend.retry.captures_armed";
+
+    /// An IDEMPOTENT request written onto a pooled keep-alive upstream was NOT
+    /// captured, because `MAX_ARMED_REPLAY_CAPTURES` captures were already
+    /// armed on this worker (sozu-proxy/sozu#1450).
+    ///
+    /// Nothing is refused and no frontend parks: the request proceeds
+    /// un-replayable, and if its upstream turns out to be stale it answers the
+    /// same `502 Bad Gateway` it answered before the replay existed.
+    ///
+    /// It is an UPPER BOUND on lost retries, not a count of them. It counts
+    /// requests that were left un-replayable; the overwhelming majority of
+    /// them get a normal answer from an upstream that was not stale at all,
+    /// and would never have used the capture. Only the fraction that then hit
+    /// the stale-pool race becomes a `502` that the ceiling turned into a lost
+    /// retry. Compare it against `backend.retry.stale_upstream` to see how
+    /// often that race actually fires on this worker before reading anything
+    /// into this counter's rate.
+    ///
+    /// Non-idempotent requests are not counted here. They are never captured
+    /// and never charged (`Stream::arm_upstream_replay`), so a POST-heavy
+    /// workload does not inflate this counter.
+    ///
+    /// Read it against [`RETRY_CAPTURES_ARMED`]: this counter only moves while
+    /// that gauge sits at the ceiling.
+    pub const RETRY_CAPTURES_DECLINED: &str = "backend.retry.captures_declined";
+}
+
+/// Buffer-pool gauges and counters.
+pub mod buffer {
+    pub const CAPACITY: &str = "buffer.capacity";
+    pub const IN_USE: &str = "buffer.in_use";
+    pub const USAGE_PERCENT: &str = "buffer.usage_percent";
+}
+
+/// Client-side connection gauges, populated by the worker accept loop.
+pub mod client {
+    pub const CONNECTIONS: &str = "client.connections";
+    pub const CONNECTIONS_MAX: &str = "client.connections_max";
+    pub const CONNECTIONS_PERCENT: &str = "client.connections_percent";
+}
+
+/// Per-cluster aggregate gauges.
+pub mod cluster {
+    pub const AVAILABLE_BACKENDS: &str = "cluster.available_backends";
+    pub const AVAILABLE_RECOVERED: &str = "cluster.available_recovered";
+    pub const NO_AVAILABLE_BACKENDS: &str = "cluster.no_available_backends";
+    pub const TOTAL_BACKENDS: &str = "cluster.total_backends";
+}
+
+/// Configuration-state inventory gauges, refreshed when the master
+/// fans out a state change.
+pub mod configuration {
+    pub const BACKENDS: &str = "configuration.backends";
+    pub const CLUSTERS: &str = "configuration.clusters";
+    pub const FRONTENDS: &str = "configuration.frontends";
+}
+
+/// Per-source connection-admission counters. Distinct from `client`, which
+/// gauges the worker-wide connection population.
+pub mod connections {
+    pub const REJECTED_PER_CLUSTER_IP: &str = "connections.rejected_per_cluster_ip";
+}
+
+/// Event-loop timing counters.
+pub mod event_loop {
+    pub const EPOLL_TIME: &str = "epoll_time";
+    pub const EVENT_LOOP_TIME: &str = "event_loop_time";
+    pub const FRONTEND_MATCHING_TIME: &str = "frontend_matching_time";
+    pub const REGEX_MATCHING_TIME: &str = "regex_matching_time";
+    pub const REQUEST_TIME: &str = "request_time";
+    pub const SERVICE_TIME: &str = "service_time";
+}
+
+/// Health-check transition counters.
+pub mod health_check {
+    pub const UP: &str = "health_check.up";
+    pub const DOWN: &str = "health_check.down";
+    pub const SUCCESS: &str = "health_check.success";
+    pub const FAILURE: &str = "health_check.failure";
+    pub const HEALTHY_BACKENDS: &str = "health_check.healthy_backends";
+    /// Probes not sent because the configuration names headers whose values
+    /// this worker does not hold. Neither a success nor a failure.
+    pub const MISSING_SECRET: &str = "health_check.missing_secret";
+}
+
+/// H1 protocol counters.
+pub mod h1 {
+    pub const BACKEND_EOF_BEFORE_MESSAGE_COMPLETE: &str = "h1.backend_eof_before_message_complete";
+}
+
+/// H2 multiplexer counters — frame TX, flood mitigations, header policy
+/// rejections, signal-writable rearm sites, and other H2-specific buckets.
+pub mod h2 {
+    pub const CLOSE_WITH_ACTIVE_STREAMS: &str = "h2.close_with_active_streams";
+    pub const COALESCING_ACCEPTED: &str = "h2.coalescing.accepted";
+    pub const CONNECTION_ACTIVE_STREAMS: &str = "h2.connection.active_streams";
+    pub const CONNECTION_PENDING_WINDOW_UPDATES: &str = "h2.connection.pending_window_updates";
+    pub const CONNECTION_WINDOW_BYTES: &str = "h2.connection.window_bytes";
+    pub const FLOW_CONTROL_STALL: &str = "h2.flow_control_stall";
+
+    // Per-stream reap counters — `cancel_timed_out_streams` breaks reaps down by
+    // which guard tripped (M1), plus a stall-budget subset for the
+    // `WINDOW_UPDATE`-drip vector the cumulative-stall budget closes (M2).
+    // `reaped.stall_budget` is a subset of `reaped.window_stall`.
+    pub const STREAMS_REAPED_IDLE_TIMEOUT: &str = "h2.streams.reaped.idle_timeout";
+    pub const STREAMS_REAPED_WINDOW_STALL: &str = "h2.streams.reaped.window_stall";
+    pub const STREAMS_REAPED_STALL_BUDGET: &str = "h2.streams.reaped.stall_budget";
+
+    /// Streams that were ready to emit AND marked incremental (RFC 9218 §4),
+    /// summed over the urgency buckets of one write pass and aggregated across
+    /// every live H2 connection. Emitted as a signed delta that
+    /// `ConnectionH2::gauge_connection_state` returns as a `MetricEvent`, with
+    /// the matching teardown in `impl Drop for H2Shell`, exactly like the
+    /// `CONNECTION_*` trio below it.
+    pub const STREAMS_READY_INCREMENTAL_BY_URGENCY: &str =
+        "h2.streams.ready_incremental.by_urgency";
+
+    // Frame-TX counters (frame type fanout).
+    pub const FRAMES_TX_CONTINUATION: &str = "h2.frames.tx.continuation";
+    pub const FRAMES_TX_DATA: &str = "h2.frames.tx.data";
+    pub const FRAMES_TX_GOAWAY: &str = "h2.frames.tx.goaway";
+    pub const FRAMES_TX_HEADERS: &str = "h2.frames.tx.headers";
+    pub const FRAMES_TX_PING_ACK: &str = "h2.frames.tx.ping_ack";
+    pub const FRAMES_TX_RST_STREAM: &str = "h2.frames.tx.rst_stream";
+    pub const FRAMES_TX_SETTINGS: &str = "h2.frames.tx.settings";
+    pub const FRAMES_TX_WINDOW_UPDATE: &str = "h2.frames.tx.window_update";
+
+    // Header-policy rejections (the `h2.headers.rejected.*` family).
+    pub const HEADERS_NO_STREAM_ERROR: &str = "h2.headers_no_stream.error";
+    pub const HEADERS_REJECTED_BUDGET_OVERRUN: &str = "h2.headers.rejected.budget_overrun";
+    pub const HEADERS_REJECTED_TOTAL: &str = "h2.headers.rejected.total";
+
+    pub const RST_STREAM_RECEIVED_PRE_RESPONSE_START: &str =
+        "h2.rst_stream.received.pre_response_start";
+
+    /// A proxy-emitted RST_STREAM that was never queued because
+    /// `pending_rst_streams` was already at its bound (`pending_rst_bound`,
+    /// at least `MIN_PENDING_RST_STREAMS`).
+    /// Sibling of `WINDOW_UPDATE_DROPPED` below, same "control queue full"
+    /// semantics; a non-zero value means the connection is on its way to
+    /// `GOAWAY(ENHANCE_YOUR_CALM)`.
+    pub const RST_STREAM_DROPPED: &str = "h2.rst_stream_dropped";
+
+    // Writable-rearm signal counters — one per rearm reason.
+    pub const SIGNAL_WRITABLE_REARMED_CONTROL_QUEUE: &str =
+        "h2.signal.writable.rearmed.control_queue";
+    pub const SIGNAL_WRITABLE_REARMED_DEFAULT_ANSWER: &str =
+        "h2.signal.writable.rearmed.default_answer";
+    pub const SIGNAL_WRITABLE_REARMED_FORCEFULLY_TERMINATE_ANSWER: &str =
+        "h2.signal.writable.rearmed.forcefully_terminate_answer";
+    pub const SIGNAL_WRITABLE_REARMED_PEER_DATA: &str = "h2.signal.writable.rearmed.peer_data";
+    pub const SIGNAL_WRITABLE_REARMED_PEER_HEADERS: &str =
+        "h2.signal.writable.rearmed.peer_headers";
+    pub const SIGNAL_WRITABLE_REARMED_PRIORITY_UPDATE: &str =
+        "h2.signal.writable.rearmed.priority_update";
+
+    pub const TRAILERS_DROPPED_CONTENT_LENGTH: &str = "h2.trailers_dropped_content_length";
+    /// H2 trailer blocks of a response to HEAD, a 204 or a 304 dropped by
+    /// `ConnectionH1::writable` towards an H1 client, which reads such a
+    /// response as ending with its header section (RFC 9112 §6.3).
+    pub const TRAILERS_DROPPED_NO_BODY: &str = "h2.trailers_dropped_no_body";
+    /// Backend streams reset by `ConnectionH2::handle_data_frame` because a
+    /// 204 or a 304 response carried a DATA payload (RFC 9110 §15.3.5,
+    /// §15.4.5; RFC 9113 §8.1.1).
+    pub const BODILESS_RESPONSE_DATA_RESET: &str = "h2.bodiless_response_data_reset";
+    /// Request trailer fields elided by `pkawa::handle_trailer` because their
+    /// name is one of `editor::TRAILER_FORBIDDEN_FIELDS` (sozu-proxy/sozu#1714).
+    /// One increment per field; the request is still forwarded. The H1
+    /// frontend counts the same drop in `http::TRAILER_FORBIDDEN_FIELD_ELIDED`.
+    pub const TRAILER_FORBIDDEN_FIELD_ELIDED: &str = "h2.trailer.forbidden_field_elided";
+    pub const TRAILER_SPOOF_VECTOR_ELIDED: &str = "h2.trailer.spoof_vector_elided";
+    pub const WINDOW_UPDATE_DROPPED: &str = "h2.window_update_dropped";
+
+    // Flood-mitigation violation counters — one per flood class the H2
+    // mux's `H2FloodDetector` recognises. Surfaced in the TUI's H2 pane
+    // so operators can spot a flood-pattern before it pages.
+    pub const FLOOD_VIOLATION_GLITCH_WINDOW: &str = "h2.flood.violation.glitch_window";
+    pub const FLOOD_VIOLATION_RST_STREAM_WINDOW: &str = "h2.flood.violation.rst_stream_window";
+    pub const FLOOD_VIOLATION_RST_STREAM_LIFETIME: &str = "h2.flood.violation.rst_stream_lifetime";
+    pub const FLOOD_VIOLATION_RST_STREAM_PRE_RESPONSE_LIFETIME: &str =
+        "h2.flood.violation.rst_stream_pre_response_lifetime";
+    pub const FLOOD_VIOLATION_RST_STREAM_EMITTED_LIFETIME: &str =
+        "h2.flood.violation.rst_stream_emitted_lifetime";
+    pub const FLOOD_VIOLATION_PING_WINDOW: &str = "h2.flood.violation.ping_window";
+    pub const FLOOD_VIOLATION_PING_LIFETIME: &str = "h2.flood.violation.ping_lifetime";
+    pub const FLOOD_VIOLATION_SETTINGS_WINDOW: &str = "h2.flood.violation.settings_window";
+    pub const FLOOD_VIOLATION_SETTINGS_LIFETIME: &str = "h2.flood.violation.settings_lifetime";
+    pub const FLOOD_VIOLATION_EMPTY_DATA_WINDOW: &str = "h2.flood.violation.empty_data_window";
+    pub const FLOOD_VIOLATION_CONTINUATION_PER_BLOCK: &str =
+        "h2.flood.violation.continuation_per_block";
+    pub const FLOOD_VIOLATION_WINDOW_UPDATE_STREAM0_WINDOW: &str =
+        "h2.flood.violation.window_update_stream0_window";
+    pub const FLOOD_VIOLATION_HEADER_SIZE_PER_BLOCK: &str =
+        "h2.flood.violation.header_size_per_block";
+    /// Every `metric_key` an `H2FloodViolation` carries, one per flood class
+    /// (`lib/src/protocol/mux/h2_flood_detector.rs`). The detector's
+    /// `test_flood_violation_metric_keys_are_unique_and_namespaced` pins this
+    /// list to what it emits, and `sozu top` reads its H2 pane rows from it.
+    pub const FLOOD_VIOLATION_KEYS: [&str; 13] = [
+        FLOOD_VIOLATION_RST_STREAM_PRE_RESPONSE_LIFETIME,
+        FLOOD_VIOLATION_RST_STREAM_LIFETIME,
+        FLOOD_VIOLATION_RST_STREAM_EMITTED_LIFETIME,
+        FLOOD_VIOLATION_RST_STREAM_WINDOW,
+        FLOOD_VIOLATION_CONTINUATION_PER_BLOCK,
+        FLOOD_VIOLATION_HEADER_SIZE_PER_BLOCK,
+        FLOOD_VIOLATION_PING_WINDOW,
+        FLOOD_VIOLATION_PING_LIFETIME,
+        FLOOD_VIOLATION_SETTINGS_WINDOW,
+        FLOOD_VIOLATION_SETTINGS_LIFETIME,
+        FLOOD_VIOLATION_EMPTY_DATA_WINDOW,
+        FLOOD_VIOLATION_WINDOW_UPDATE_STREAM0_WINDOW,
+        FLOOD_VIOLATION_GLITCH_WINDOW,
+    ];
+    /// A new client stream refused with `REFUSED_STREAM` in the soft state
+    /// below the pre-response RST_STREAM cap (`h2_stream_refusal_percent`).
+    /// The connection stays open; a rising rate is the early warning before
+    /// `h2.flood.violation.rst_stream_pre_response_lifetime`.
+    pub const FLOOD_STREAM_REFUSED: &str = "h2.flood.stream_refused";
+}
+
+/// HTTP counters (H1 + H2 share these); see `https` for the HTTPS-specific
+/// variants and `h2` for H2-frame-level counters.
+pub mod http {
+    pub const ERR_400: &str = "http.400.errors";
+    pub const ERR_401: &str = "http.401.errors";
+    pub const ERR_404: &str = "http.404.errors";
+    pub const ERR_408: &str = "http.408.errors";
+    pub const ERR_413: &str = "http.413.errors";
+    pub const ERR_421: &str = "http.421.errors";
+    pub const ERR_502: &str = "http.502.errors";
+    pub const ERR_503: &str = "http.503.errors";
+    pub const ERR_504: &str = "http.504.errors";
+    pub const ERR_507: &str = "http.507.errors";
+    /// Catch-all for the default answers that have no dedicated `ERR_*`
+    /// bucket; incremented alongside the per-code counter where one exists.
+    pub const ERRORS: &str = "http.errors";
+    pub const REDIRECTION_301: &str = "http.301.redirection";
+    pub const REDIRECTION_302: &str = "http.302.redirection";
+    pub const REDIRECTION_308: &str = "http.308.redirection";
+    pub const ACTIVE_REQUESTS: &str = "http.active_requests";
+    pub const ALPN_H2: &str = "http.alpn.h2";
+    pub const ALPN_HTTP11: &str = "http.alpn.http11";
+    pub const BACKEND_PARSE_ERRORS: &str = "http.backend_parse_errors";
+    pub const E2E_H2: &str = "http.e2e.h2";
+    pub const E2E_HTTP11: &str = "http.e2e.http11";
+    pub const EARLY_RESPONSE_CLOSE: &str = "http.early_response_close";
+    /// H1 client connections closed because a response completed before its
+    /// request was received whole (a backend answering an upload early): the
+    /// rest of the body is never read as a request (sozu-proxy/sozu#1721).
+    pub const CLOSE_REQUEST_INCOMPLETE: &str = "http.close.request_incomplete";
+    pub const FAILED_BACKEND_MATCHING: &str = "http.failed_backend_matching";
+    /// Client `Forwarded` lines removed because their value is not a
+    /// well-formed RFC 7239 §4 list, counted once per removed line. Only the
+    /// `both` and `rfc7239` `forwarded_headers` modes, which extend the chain,
+    /// remove such a line; the request itself is still forwarded.
+    pub const FORWARDED_MALFORMED_ELIDED: &str = "http.forwarded_malformed_elided";
+    /// Requests rejected because a Transfer-Encoding header survived parsing without
+    /// kawa adopting chunked framing (CL.TE request-smuggling defense, CWE-444).
+    pub const FRONTEND_TE_SMUGGLING: &str = "http.frontend.transfer_encoding_smuggling";
+    /// Requests rejected (400) because a forwarded Content-Length value was not
+    /// `1*DIGIT`, e.g. `+5` (RFC 9110 §8.6; request-smuggling defense, CWE-444).
+    /// Defense in depth: kawa >= 0.7.2 refuses such a value first, counted in
+    /// `FRONTEND_PARSE_ERRORS`, so this stays at zero unless kawa regresses.
+    pub const FRONTEND_CONTENT_LENGTH_INVALID: &str = "http.frontend.content_length_invalid";
+    /// Backend responses rejected (502) because their Content-Length value was
+    /// not `1*DIGIT` (RFC 9110 §8.6, RFC 9112 §6.3). Defense in depth:
+    /// kawa >= 0.7.2 refuses such a response first, counted in
+    /// `BACKEND_PARSE_ERRORS`, so this stays at zero unless kawa regresses.
+    pub const BACKEND_CONTENT_LENGTH_INVALID: &str = "http.backend.content_length_invalid";
+    pub const FRONTEND_PARSE_ERRORS: &str = "http.frontend_parse_errors";
+    pub const HSTS_FRONTEND_ADDED: &str = "http.hsts.frontend_added";
+    pub const HSTS_FRONTEND_REFRESHED: &str = "http.hsts.frontend_refreshed";
+    pub const HSTS_LISTENER_DEFAULT_PATCHED: &str = "http.hsts.listener_default_patched";
+    pub const HSTS_SUPPRESSED_PLAINTEXT: &str = "http.hsts.suppressed_plaintext";
+    pub const HSTS_UNRENDERED: &str = "http.hsts.unrendered";
+    pub const INFINITE_LOOP_ERROR: &str = "http.infinite_loop.error";
+    pub const REDIRECT_TEMPLATE_COMPILE_ERROR: &str = "http.redirect_template.compile_error";
+    pub const REQUESTS: &str = "http.requests";
+    pub const SNI_AUTHORITY_MISMATCH: &str = "http.sni_authority_mismatch";
+    pub const STATUS_1XX: &str = "http.status.1xx";
+    pub const STATUS_2XX: &str = "http.status.2xx";
+    pub const STATUS_3XX: &str = "http.status.3xx";
+    pub const STATUS_4XX: &str = "http.status.4xx";
+    pub const STATUS_5XX: &str = "http.status.5xx";
+    pub const STATUS_OTHER: &str = "http.status.other";
+    /// H1 chunked requests rejected because their trailer section carried
+    /// more fields than the listener's `h2_max_header_fields`, the bound the
+    /// H2 frontend applies to a trailer block (sozu-proxy/sozu#1701). One
+    /// increment per request; the request is answered 400.
+    pub const TRAILER_FIELD_LIMIT_EXCEEDED: &str = "http.trailer.field_limit_exceeded";
+    /// Trailer fields elided from an H1 chunked request because their name is
+    /// one of `editor::TRAILER_FORBIDDEN_FIELDS` (framing, routing, request
+    /// modifiers, authentication, content processing or connection-specific
+    /// fields a trailer must not carry, RFC 9110 §6.5.1;
+    /// sozu-proxy/sozu#1701). One increment per field. The H2 frontend
+    /// counts the same drop in `h2::TRAILER_FORBIDDEN_FIELD_ELIDED`.
+    pub const TRAILER_FORBIDDEN_FIELD_ELIDED: &str = "http.trailer.forbidden_field_elided";
+    /// Trailer fields elided from an H1 chunked request because their name is
+    /// one of `editor::TRAILER_SPOOF_VECTOR_HEADERS` (client attribution a
+    /// trailer must not carry, RFC 9110 §6.5.1; sozu-proxy/sozu#1689). One
+    /// increment per field. The H2 frontend counts the same drop in
+    /// `h2::TRAILER_SPOOF_VECTOR_ELIDED`.
+    pub const TRAILER_SPOOF_VECTOR_ELIDED: &str = "http.trailer.spoof_vector_elided";
+    pub const TRUSTING_X_PORT: &str = "http.trusting.x_port";
+    pub const TRUSTING_X_PORT_DIFF: &str = "http.trusting.x_port.diff";
+    pub const TRUSTING_X_PROTO: &str = "http.trusting.x_proto";
+    pub const TRUSTING_X_PROTO_DIFF: &str = "http.trusting.x_proto.diff";
+    pub const UPGRADE_EXPECT_FAILED: &str = "http.upgrade.expect.failed";
+    pub const UPGRADE_MUX_FAILED: &str = "http.upgrade.mux.failed";
+    pub const UPGRADE_WS_FAILED: &str = "http.upgrade.ws.failed";
+    pub const X_REQUEST_ID_GENERATED: &str = "http.x_request_id.generated";
+    pub const X_REQUEST_ID_PROPAGATED: &str = "http.x_request_id.propagated";
+}
+
+/// Per-status-code HTTP counters. Only the codes Sōzu either generates as
+/// a default answer or that operators routinely chart get a dedicated bucket;
+/// the rest fold into the `http::STATUS_*XX` parent buckets.
+pub mod http_status {
+    pub const S200: &str = "http.status.200";
+    pub const S201: &str = "http.status.201";
+    pub const S204: &str = "http.status.204";
+    pub const S301: &str = "http.status.301";
+    pub const S302: &str = "http.status.302";
+    pub const S304: &str = "http.status.304";
+    pub const S400: &str = "http.status.400";
+    pub const S401: &str = "http.status.401";
+    pub const S403: &str = "http.status.403";
+    pub const S404: &str = "http.status.404";
+    pub const S408: &str = "http.status.408";
+    pub const S413: &str = "http.status.413";
+    pub const S429: &str = "http.status.429";
+    pub const S500: &str = "http.status.500";
+    pub const S502: &str = "http.status.502";
+    pub const S503: &str = "http.status.503";
+    pub const S504: &str = "http.status.504";
+    pub const S507: &str = "http.status.507";
+}
+
+/// HTTPS-specific counters; see `http` for the HTTP family these complement.
+pub mod https {
+    pub const ALPN_REJECTED_HTTP11_DISABLED: &str = "https.alpn.rejected.http11_disabled";
+    pub const ALPN_REJECTED_UNSUPPORTED: &str = "https.alpn.rejected.unsupported";
+    pub const UPGRADE_EXPECT_FAILED: &str = "https.upgrade.expect.failed";
+    pub const UPGRADE_HANDSHAKE_FAILED: &str = "https.upgrade.handshake.failed";
+    pub const UPGRADE_MUX_FAILED: &str = "https.upgrade.mux.failed";
+    pub const UPGRADE_WSS_FAILED: &str = "https.upgrade.wss.failed";
+}
+
+/// Per-listener counters.
+pub mod listener {
+    pub const ACCEPTED_TOTAL: &str = "listener.accepted.total";
+    pub const CONNECTION_CAPPED: &str = "listener.connection_capped";
+}
+
+/// Pipe-protocol counters.
+pub mod pipe {
+    pub const ERRORS: &str = "pipe.errors";
+}
+
+/// Worker-process runtime gauges.
+pub mod process {
+    pub const UPTIME_SECONDS: &str = "process.uptime_seconds";
+}
+
+/// Protocol-type counters that increment once per session and track which
+/// protocol carried it end-to-end.
+pub mod protocol {
+    pub const HTTP: &str = "protocol.http";
+    pub const HTTPS: &str = "protocol.https";
+    pub const PROXY_EXPECT: &str = "protocol.proxy.expect";
+    pub const PROXY_RELAY: &str = "protocol.proxy.relay";
+    pub const PROXY_SEND: &str = "protocol.proxy.send";
+    pub const TCP: &str = "protocol.tcp";
+    pub const TLS_HANDSHAKE: &str = "protocol.tls.handshake";
+    pub const WS: &str = "protocol.ws";
+    pub const WSS: &str = "protocol.wss";
+}
+
+/// PROXY-protocol counters.
+pub mod proxy_protocol {
+    pub const ERRORS: &str = "proxy_protocol.errors";
+}
+
+/// `rustls`-specific counters for read/write infinite-loop guards.
+pub mod rustls {
+    pub const READ_ERROR: &str = "rustls.read.error";
+    pub const READ_INFINITE_LOOP_ERROR: &str = "rustls.read.infinite_loop.error";
+    /// A TLS frontend's `recv(2)` answered `ECONNRESET`/`ECONNABORTED`: the
+    /// peer reset the connection (sozu-proxy/sozu#434). Counted once per
+    /// reset, during the handshake or after it.
+    pub const READ_RESET: &str = "rustls.read.reset";
+    pub const WRITE_ERROR: &str = "rustls.write.error";
+    /// A TLS frontend's `writev(2)` answered `ECONNRESET`/`ECONNABORTED`.
+    /// Still counted under [`WRITE_ERROR`] as well, as it was before this
+    /// counter existed.
+    pub const WRITE_RESET: &str = "rustls.write.reset";
+    pub const WRITE_INFINITE_LOOP_ERROR: &str = "rustls.write.infinite_loop.error";
+}
+
+/// Worker liveness gauge, emitted by the server tick.
+pub mod server {
+    pub const LIVE: &str = "server.live";
+}
+
+/// Generic session-level counters.
+pub mod sessions {
+    pub const EVICTED: &str = "sessions.evicted";
+}
+
+/// Slab-allocator gauges.
+pub mod slab {
+    pub const ACCEPT_THRESHOLD_PERCENT: &str = "slab.accept_threshold_percent";
+    pub const CAPACITY: &str = "slab.capacity";
+    pub const ENTRIES: &str = "slab.entries";
+    pub const USAGE_PERCENT: &str = "slab.usage_percent";
+}
+
+/// Raw-socket counters.
+pub mod socket {
+    pub const WRITE_INFINITE_LOOP_ERROR: &str = "socket.write.infinite_loop.error";
+}
+
+/// TCP protocol counters.
+pub mod tcp {
+    pub const INFINITE_LOOP_ERROR: &str = "tcp.infinite_loop.error";
+    pub const READ_ERROR: &str = "tcp.read.error";
+    /// A plain TCP socket's `recv(2)` or `splice(2)` answered
+    /// `ECONNRESET`/`ECONNABORTED`: the peer reset the connection
+    /// (sozu-proxy/sozu#434). Frontend and backend sockets alike.
+    pub const READ_RESET: &str = "tcp.read.reset";
+    pub const REQUESTS: &str = "tcp.requests";
+    pub const UPGRADE_EXPECT_FAILED: &str = "tcp.upgrade.expect.failed";
+    pub const UPGRADE_PIPE_FAILED: &str = "tcp.upgrade.pipe.failed";
+    pub const UPGRADE_RELAY_FAILED: &str = "tcp.upgrade.relay.failed";
+    pub const UPGRADE_SEND_FAILED: &str = "tcp.upgrade.send.failed";
+    pub const UPGRADE_SNI_PREREAD_FAILED: &str = "tcp.upgrade.sni_preread.failed";
+    pub const WRITE_ERROR: &str = "tcp.write.error";
+    /// A plain TCP socket's `send(2)`/`writev(2)` or `splice(2)` answered
+    /// `ECONNRESET`/`ECONNABORTED`. The `send` paths still count it under
+    /// [`WRITE_ERROR`] as well, as they did before this counter existed.
+    pub const WRITE_RESET: &str = "tcp.write.reset";
+
+    /// SNI-preread counters (TCP passthrough routing, sozu-proxy/sozu#1279),
+    /// fed by the shell in `lib/src/protocol/tcp_preread/shell.rs` (decision
+    /// metrics) and `lib/src/tcp.rs` (the `ACTIVE` gauge + `DURATION`
+    /// timing, both owned centrally by the session lifecycle so each is
+    /// touched exactly once per session regardless of which of the three
+    /// exits -- reject / upgrade / teardown -- it takes).
+    pub mod sni_preread {
+        use crate::protocol::tcp_preread::RejectReason;
+
+        /// A cluster was chosen from the ClientHello's SNI (+ optional ALPN).
+        pub const ROUTED: &str = "tcp.sni_preread.routed";
+        /// Gauge: sessions currently prereading. Incremented once at
+        /// `SniPreread` construction, decremented exactly once on every
+        /// exit (reject / upgrade / teardown); underflow is a bug.
+        pub const ACTIVE: &str = "tcp.sni_preread.active";
+        /// `time!` of the wall-clock spent prereading, recorded on every
+        /// exit alongside the `ACTIVE` decrement.
+        pub const DURATION: &str = "tcp.sni_preread.duration";
+
+        pub const REJECTED_NOT_TLS: &str = "tcp.sni_preread.rejected.not_tls";
+        pub const REJECTED_MALFORMED_RECORD: &str = "tcp.sni_preread.rejected.malformed_record";
+        pub const REJECTED_MALFORMED_HANDSHAKE: &str =
+            "tcp.sni_preread.rejected.malformed_handshake";
+        pub const REJECTED_FRAGMENTED: &str = "tcp.sni_preread.rejected.fragmented";
+        pub const REJECTED_TOO_LARGE: &str = "tcp.sni_preread.rejected.too_large";
+        pub const REJECTED_NO_SNI: &str = "tcp.sni_preread.rejected.no_sni";
+        pub const REJECTED_ECH_OUTER_ABSENT: &str = "tcp.sni_preread.rejected.ech_outer_absent";
+        pub const REJECTED_SNI_UNMATCHED: &str = "tcp.sni_preread.rejected.sni_unmatched";
+        pub const REJECTED_ALPN_UNMATCHED: &str = "tcp.sni_preread.rejected.alpn_unmatched";
+        pub const REJECTED_PROXY_HEADER_INVALID: &str =
+            "tcp.sni_preread.rejected.proxy_header_invalid";
+        pub const REJECTED_FRONT_CLOSED: &str = "tcp.sni_preread.rejected.front_closed";
+
+        /// Total function over every `RejectReason` variant: a new variant
+        /// added to the core without a matching arm here fails to compile,
+        /// so the metric surface can never silently drop a rejection reason.
+        pub fn rejected_name(reason: RejectReason) -> &'static str {
+            match reason {
+                RejectReason::NotTls => REJECTED_NOT_TLS,
+                RejectReason::MalformedRecord => REJECTED_MALFORMED_RECORD,
+                RejectReason::MalformedHandshake => REJECTED_MALFORMED_HANDSHAKE,
+                RejectReason::Fragmented => REJECTED_FRAGMENTED,
+                RejectReason::TooLarge => REJECTED_TOO_LARGE,
+                RejectReason::NoSni => REJECTED_NO_SNI,
+                RejectReason::EchOuterAbsent => REJECTED_ECH_OUTER_ABSENT,
+                RejectReason::SniUnmatched => REJECTED_SNI_UNMATCHED,
+                RejectReason::AlpnUnmatched => REJECTED_ALPN_UNMATCHED,
+                RejectReason::ProxyHeaderInvalid => REJECTED_PROXY_HEADER_INVALID,
+                RejectReason::FrontClosed => REJECTED_FRONT_CLOSED,
+            }
+        }
+    }
+}
+
+/// UDP datapath counters/gauges, fed by the UDP I/O shell in `lib/src/udp.rs`.
+///
+/// `IN`/`OUT` follow the client perspective: `IN` = client→backend
+/// (request), `OUT` = backend→client (reply). `ACTIVE_FLOWS` is a gauge that
+/// must never underflow — it is incremented exactly once per admitted flow
+/// (`FLOWS_CREATED`) and decremented exactly once per close.
+pub mod udp {
+    /// Client→backend datagrams forwarded.
+    pub const DATAGRAMS_IN: &str = "udp.datagrams.in";
+    /// Backend→client datagrams returned.
+    pub const DATAGRAMS_OUT: &str = "udp.datagrams.out";
+    /// Payload bytes forwarded client→backend (excludes PPv2 prefix).
+    pub const BYTES_IN: &str = "udp.bytes.in";
+    /// Payload bytes returned backend→client.
+    pub const BYTES_OUT: &str = "udp.bytes.out";
+    /// Gauge: currently admitted flows. Never underflows.
+    pub const ACTIVE_FLOWS: &str = "udp.active_flows";
+    /// Flows admitted since boot.
+    pub const FLOWS_CREATED: &str = "udp.flows.created";
+    /// Flows torn down (idle / teardown / drain).
+    pub const FLOWS_EVICTED: &str = "udp.flows.evicted";
+    /// New flows shed at the `max_flows` cap, at a per-source limit, or
+    /// under fd pressure.
+    pub const FLOWS_SHED: &str = "udp.flows.shed";
+    /// New flows shed because their source IP or subnet held the cluster's
+    /// `max_connections_per_ip` / `max_connections_per_subnet` flows. Also
+    /// counted in [`FLOWS_SHED`].
+    pub const FLOWS_SHED_SOURCE_LIMIT: &str = "udp.flows.shed.source_limit";
+    /// Datagrams dropped before allocation (aggregate). Reason-specific
+    /// counters below carry the dotted `.<reason>` suffix; both are emitted
+    /// so dashboards can chart the total or break it down. The `incr!` macro
+    /// needs `&'static str`, so the by-reason names are fixed constants
+    /// rather than a runtime-formatted suffix.
+    pub const DATAGRAMS_DROPPED: &str = "udp.datagrams.dropped";
+    /// Dropped: failed validation (empty / extractor rejected).
+    pub const DROPPED_INVALID: &str = "udp.datagrams.dropped.invalid";
+    /// Dropped: exceeded `max_rx_datagram_size` (truncation surrogate).
+    pub const DROPPED_TRUNCATED: &str = "udp.datagrams.dropped.truncated";
+    /// Dropped: no cluster/backend configured for the listener.
+    pub const DROPPED_NO_BACKEND: &str = "udp.datagrams.dropped.no_backend";
+    /// Dropped: flow-table cap reached (shed).
+    pub const DROPPED_SHED: &str = "udp.datagrams.dropped.shed";
+    /// Dropped: referenced an unknown / already-closed flow.
+    pub const DROPPED_UNKNOWN_FLOW: &str = "udp.datagrams.dropped.unknown_flow";
+    /// Dropped: the bounded per-flow / client-return write queue was at
+    /// capacity (genuine egress-queue overflow under sustained `WouldBlock`).
+    pub const DROPPED_WQ_FULL: &str = "udp.datagrams.dropped.wq_full";
+    /// Dropped: a hard `send`/`send_to` error (e.g. ECONNREFUSED) on the egress
+    /// path, distinct from a queue-full overflow. The egress "no resolved flow /
+    /// socket gone" case routes to [`DROPPED_UNKNOWN_FLOW`] instead, so
+    /// `wq_full` only counts genuine bounded-queue overflow.
+    pub const DROPPED_SEND_ERROR: &str = "udp.datagrams.dropped.send_error";
+    /// Backend health transitions observed by the UDP health prober.
+    pub const BACKEND_HEALTH: &str = "udp.backend.health";
+    /// `time!` of a flow's lifetime, recorded on close.
+    pub const FLOW_DURATION: &str = "udp.flow.duration";
+}
+
+/// TLS counters (certificate inventory, handshake timing).
+pub mod tls {
+    pub const CERT_MIN_EXPIRES_AT_SECONDS: &str = "tls.cert.min_expires_at_seconds";
+    pub const DEFAULT_CERT_USED: &str = "tls.default_cert_used";
+    pub const HANDSHAKE_MS: &str = "tls.handshake_ms";
+}
+
+/// WebSocket counters.
+pub mod websocket {
+    pub const ACTIVE_REQUESTS: &str = "websocket.active_requests";
+}
+
+/// Miscellaneous counters that don't fit a richer family.
+pub mod misc {
+    pub const PANIC: &str = "panic";
+    pub const ZOMBIES: &str = "zombies";
+}

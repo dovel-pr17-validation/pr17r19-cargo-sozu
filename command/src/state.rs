@@ -1,0 +1,12106 @@
+use std::{
+    borrow::Cow,
+    collections::{
+        BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry as BTreeMapEntry,
+        hash_map::DefaultHasher,
+    },
+    fmt,
+    fs::File,
+    hash::{Hash, Hasher},
+    io::Write,
+    net::SocketAddr,
+};
+
+use prost::{Message, UnknownEnumValue};
+
+use crate::{
+    ObjectKind,
+    certificate::{CertificateError, Fingerprint, calculate_fingerprint},
+    config::validate_sni_pattern,
+    listener_key::{InterfaceError, ListenerKey, validate_listener_interface},
+    proto::{
+        command::{
+            ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
+            ClusterInformation, CustomHttpAnswers, DeactivateListener, ForwardedHeaders,
+            FrontendFilters, HealthCheckConfig, HealthChecksList, HstsConfig, HttpListenerConfig,
+            HttpsListenerConfig, InitialState, ListedFrontends, ListenerType, ListenersList,
+            PathRule, QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
+            ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
+            RequestUdpFrontend, SetProtectedHealthCheck, SocketAddress, TcpListenerConfig,
+            UdpListenerConfig, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+            UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerRequest, request::RequestType,
+        },
+        display::format_request_type,
+    },
+    response::{Backend, HttpFrontend, TcpFrontend, UdpFrontend},
+};
+
+/// To use throughout Sōzu
+///
+/// `Arc`, not `Rc`, although each worker is single-threaded: embedders keep
+/// [`ConfigState`] and the `response` types behind locks shared across
+/// threads (a multi-threaded tokio runtime, axum extensions), so they must
+/// stay `Send + Sync`. The assertion below holds that contract.
+pub type ClusterId = std::sync::Arc<str>;
+
+// Public contract: every type carrying a `ClusterId` stays `Send + Sync`.
+// Switching the alias to `Rc<str>` fails to compile here rather than in an
+// embedder's build.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ClusterId>();
+    assert_send_sync::<ConfigState>();
+    assert_send_sync::<StateError>();
+    assert_send_sync::<crate::response::HttpFrontend>();
+    assert_send_sync::<crate::response::TcpFrontend>();
+    assert_send_sync::<crate::response::UdpFrontend>();
+    assert_send_sync::<crate::response::Backend>();
+};
+
+/// Build the unambiguous inverse of a mutating request.
+///
+/// The main process and each worker use the same inverse to restore their
+/// respective [`ConfigState`] when no runtime worker accepts a command. Only
+/// verbs whose prior value is fully determined by the request are covered.
+/// Upserts, listener updates, cluster removals, and certificate mutations need
+/// a snapshot of the displaced value and therefore return `None`.
+pub fn rollback_request(request: &RequestType) -> Option<Request> {
+    let inverse = match request {
+        RequestType::AddHttpListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
+            address: config.address,
+            proxy: ListenerType::Http.into(),
+        }),
+        RequestType::AddHttpsListener(config)
+        | RequestType::AddHttpsListenerWithClientAuth(config) => {
+            RequestType::RemoveListener(RemoveListener {
+                interface: config.interface.clone(),
+                address: config.address,
+                proxy: ListenerType::Https.into(),
+            })
+        }
+        RequestType::AddTcpListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
+            address: config.address,
+            proxy: ListenerType::Tcp.into(),
+        }),
+        RequestType::AddUdpListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
+            address: config.address,
+            proxy: ListenerType::Udp.into(),
+        }),
+        RequestType::AddHttpFrontend(front)
+        | RequestType::AddHttpFrontendWithSilentClose(front)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
+            RequestType::remove_http_frontend(front.clone())
+        }
+        RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpsFrontendWithSilentClose(front)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
+            RequestType::remove_https_frontend(front.clone())
+        }
+        RequestType::AddTcpFrontend(front) => RequestType::RemoveTcpFrontend(front.clone()),
+        RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone()),
+        _ => return None,
+    };
+    Some(inverse.into())
+}
+
+/// Why a UDP cluster and a backend with a `unix_path` never meet in the state.
+const UDP_UNIX_BACKEND_REFUSED: &str = "a UDP cluster cannot use unix_path backends";
+
+#[derive(thiserror::Error)]
+pub enum StateError {
+    #[error("Request came in empty")]
+    EmptyRequest,
+    #[error("dispatching this request did not bring any change to the state")]
+    NoChange,
+    #[error("State can not handle this request")]
+    UndispatchableRequest,
+    #[error("Did not find {kind:?} with address or id_bytes={}", .id.len())]
+    NotFound { kind: ObjectKind, id: String },
+    #[error(
+        "{kind:?} with id_bytes={} already exists; remove it first, or apply the corresponding update if the object supports one, instead of re-adding it",
+        .id.len()
+    )]
+    Exists { kind: ObjectKind, id: String },
+    /// The object belongs to a cluster the state does not hold, never added
+    /// or already removed. A backend belongs to its cluster
+    /// (`ConfigState::add_backend`), so it is refused rather than stored
+    /// without one. Per `doc/observability.md` a cluster identifier is
+    /// protected material in error text: `Display`/`Debug` render only its
+    /// length, and the raw field stays lossless for callers.
+    #[error(
+        "{kind:?} names a cluster that does not exist (cluster_id_bytes={}); add the cluster first",
+        .cluster_id.len()
+    )]
+    ClusterNotFound {
+        kind: ObjectKind,
+        cluster_id: String,
+    },
+    #[error("Wrong field value: {0}")]
+    WrongFieldValue(UnknownEnumValue),
+    #[error("Could not add certificate: error_kind={}", certificate_error_kind(.0))]
+    AddCertificate(CertificateError),
+    #[error("Could not remove certificate: fingerprint_bytes={}", .0.len())]
+    RemoveCertificate(String),
+    #[error("Could not replace certificate: error_bytes={}", .0.len())]
+    ReplaceCertificate(String),
+    #[error("Could not convert frontend: frontend_bytes={} error_bytes={}", .frontend.len(), .error.len())]
+    FrontendConversion { frontend: String, error: String },
+    #[error("Could not write state to file: io_kind={:?} os_code={:?}", .0.kind(), .0.raw_os_error())]
+    FileError(std::io::Error),
+    #[error("Invalid value for field '{field}': {reason}")]
+    InvalidValue {
+        field: &'static str,
+        reason: &'static str,
+    },
+    /// Mirrors the worker's `ProxyError::InvalidTcpFrontend`
+    /// (`lib/src/tcp.rs`): the master rejects an `AddTcpFrontend` for the
+    /// same reasons `validate_new_tcp_front` would, so a route never lands
+    /// in `ConfigState` only to be NACKed by every worker on the next
+    /// fan-out (sozu-proxy/sozu#1290).
+    #[error("invalid TCP frontend for address {address}: reason_bytes={}", .reason.len())]
+    InvalidTcpFrontend { address: SocketAddr, reason: String },
+    /// A UDP listener address is the WHOLE routing key. A datagram carries no
+    /// SNI, no `Host` header and no path, so no attribute of an incoming
+    /// datagram could pick between two frontends bound to one address --
+    /// which is why this is not an unimplemented feature but an unanswerable
+    /// question, and why TCP legitimately hosts several frontends per address
+    /// while UDP cannot. The worker agrees by construction:
+    /// `UdpProxy::add_udp_front` (`lib/src/udp.rs`) overwrites
+    /// `listener.cluster_id` and the listener's tags, and
+    /// `cluster_for_listener` maps one listener token to exactly one cluster.
+    ///
+    /// `current_cluster_id` and `current_tags` name the frontend already
+    /// holding `address`, so a caller matching this variant can tell the
+    /// operator which frontend to remove first. Per `doc/observability.md`'s
+    /// sensitive-value logging boundary a cluster identifier and a frontend's
+    /// tags are protected material in error text, so the `Display`/`Debug`
+    /// projection renders only the address and bounded metadata; the raw
+    /// fields stay lossless for callers, exactly as that boundary specifies.
+    #[error(
+        "UDP frontend address {address} is already claimed by another frontend: \
+         cluster_id_bytes={} current_cluster_id_bytes={} current_tag_count={}",
+        .cluster_id.len(),
+        .current_cluster_id.len(),
+        .current_tags.len()
+    )]
+    UdpFrontendAddressTaken {
+        address: SocketAddr,
+        cluster_id: ClusterId,
+        current_cluster_id: ClusterId,
+        current_tags: BTreeMap<String, String>,
+    },
+    /// The `interface` of an added listener is not a valid interface name, or
+    /// the platform cannot bind a socket to an interface.
+    #[error("invalid listener interface: {0}")]
+    ListenerInterface(InterfaceError),
+    /// An `Update*Listener` patch names its listener by address only, and
+    /// several listeners share that address on different interfaces.
+    #[error(
+        "{count} listeners share the address {address} on different interfaces; an update \
+         patch cannot tell them apart: remove and re-add the one to change"
+    )]
+    AmbiguousListenerAddress { address: SocketAddr, count: usize },
+}
+
+/// Refuse a listener whose interface is not a valid name on this platform, so
+/// its key always round-trips through its text form (`ListenerKey`).
+fn validated_listener_key(key: ListenerKey) -> Result<ListenerKey, StateError> {
+    if let Some(interface) = &key.interface {
+        validate_listener_interface(interface).map_err(StateError::ListenerInterface)?;
+    }
+    Ok(key)
+}
+
+/// The one listener an update patch names by `address`: the patch carries no
+/// interface, so it applies when exactly one listener sits on that address,
+/// whatever its interface, and is refused when several do.
+fn listener_key_for_update<V>(
+    listeners: &BTreeMap<ListenerKey, V>,
+    address: SocketAddr,
+    kind: ObjectKind,
+) -> Result<ListenerKey, StateError> {
+    let mut matching = listeners.keys().filter(|key| key.address == address);
+    let Some(first) = matching.next() else {
+        return Err(StateError::NotFound {
+            kind,
+            id: address.to_string(),
+        });
+    };
+    let others = matching.count();
+    if others > 0 {
+        return Err(StateError::AmbiguousListenerAddress {
+            address,
+            count: others + 1,
+        });
+    }
+    Ok(first.clone())
+}
+
+impl fmt::Debug for StateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StateError({self})")
+    }
+}
+
+fn certificate_error_kind(error: &CertificateError) -> &'static str {
+    match error {
+        CertificateError::ParsePEMCertificate(_) => "parse_pem_certificate",
+        CertificateError::ParseX509Certificate(_) => "parse_x509_certificate",
+        CertificateError::InvalidTlsVersion(_) => "invalid_tls_version",
+        CertificateError::InvalidFingerprint(_) => "invalid_fingerprint",
+        CertificateError::LoadFile { .. } => "load_file",
+        CertificateError::DecodeError(_) => "decode_error",
+    }
+}
+
+/// Why a cluster may not both name an affinity header or cookie and serve a
+/// TCP frontend.
+const TCP_CLUSTER_AFFINITY_KEY: &str = "a TCP frontend always keys on the client source IP: \
+    affinity_header and affinity_cookie apply to HTTP/HTTPS clusters only";
+
+/// Runtime selection metadata attached to one stored TLS certificate.
+///
+/// The certificate material remains in [`ConfigState::certificates`] so its
+/// public map type and every command protobuf stay unchanged. This sidecar is
+/// serialized with `ConfigState`: SaveState request generation, main-process
+/// upgrades and worker bootstrap can therefore retain an operator-provided
+/// expiration and the insertion order used to break equal-expiration ties.
+///
+/// Adding this public type and [`ConfigState::certificate_metadata`] is a Rust
+/// source compatibility change for downstream exhaustive `ConfigState`
+/// literals. Serialized states written before the field existed remain
+/// readable because the sidecar defaults to empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificateMetadata {
+    pub expired_at: Option<i64>,
+    pub insertion_order: u64,
+}
+
+/// Metadata for every certificate on one listener address.
+///
+/// The serialized representation is transparently the fingerprint map. The
+/// private `next_order` cache is never trusted across deserialization; the
+/// first state-changing certificate mutation normalizes a legacy/partial
+/// index, then ordinary replay appends subsequent certificates in O(1).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CertificateMetadataIndex {
+    entries: HashMap<Fingerprint, CertificateMetadata>,
+    #[serde(skip)]
+    next_order: Option<u64>,
+}
+
+impl PartialEq for CertificateMetadataIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for CertificateMetadataIndex {}
+
+/// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
+/// from frontends to backends. Hence, it contains all details about:
+///
+/// - listeners (socket addresses, for TCP and HTTP connections)
+/// - frontends (bind to a listener)
+/// - backends (to forward connections to)
+/// - clusters (routing rules from frontends to backends)
+/// - TLS certificates
+#[derive(Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigState {
+    pub clusters: BTreeMap<ClusterId, Cluster>,
+    pub backends: BTreeMap<ClusterId, Vec<Backend>>,
+    /// listener key (address, plus interface when bound) -> HTTP listener
+    pub http_listeners: BTreeMap<ListenerKey, HttpListenerConfig>,
+    /// listener key -> HTTPS listener
+    pub https_listeners: BTreeMap<ListenerKey, HttpsListenerConfig>,
+    /// listener key -> TCP listener
+    pub tcp_listeners: BTreeMap<ListenerKey, TcpListenerConfig>,
+    /// listener key -> UDP listener
+    pub udp_listeners: BTreeMap<ListenerKey, UdpListenerConfig>,
+    /// HTTP frontends, indexed by a summary of each front's address;hostname;path, for uniqueness.
+    /// For example: `"0.0.0.0:8080;lolcatho.st;P/api"`
+    pub http_fronts: BTreeMap<String, HttpFrontend>,
+    /// indexed by (address, hostname, path)
+    pub https_fronts: BTreeMap<String, HttpFrontend>,
+    pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
+    pub udp_fronts: HashMap<ClusterId, Vec<UdpFrontend>>,
+    /// TLS certificate material by listener address and leaf fingerprint.
+    ///
+    /// Mutations must go through [`Self::dispatch`] so
+    /// [`Self::certificate_metadata`] remains coherent. The map stays public
+    /// for compatibility, but replacing entries directly in memory can
+    /// invalidate the sidecar without changing either map's cardinality; that
+    /// shape cannot be detected by the O(1) mutation fast path. Deserialized
+    /// state is treated as untrusted and normalized on its first successful
+    /// certificate mutation.
+    pub certificates: HashMap<SocketAddr, HashMap<Fingerprint, CertificateAndKey>>,
+    /// Selection metadata for entries in `certificates`, keyed identically.
+    ///
+    /// A missing or partial sidecar is a valid legacy state. Read paths derive
+    /// a deterministic total order and certificate mutations normalize the
+    /// affected address only after all fallible validation has succeeded.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub certificate_metadata: HashMap<SocketAddr, CertificateMetadataIndex>,
+    /// A census of requests that were received. Name of the request -> number of occurences
+    pub request_counts: BTreeMap<String, i32>,
+}
+
+impl std::fmt::Debug for ConfigState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backends_count = self
+            .backends
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let tcp_frontends_count = self
+            .tcp_fronts
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let udp_frontends_count = self
+            .udp_fronts
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let certificates_count = self
+            .certificates
+            .values()
+            .map(HashMap::len)
+            .fold(0usize, usize::saturating_add);
+
+        f.debug_struct("ConfigState")
+            .field("clusters_count", &self.clusters.len())
+            .field("backend_clusters_count", &self.backends.len())
+            .field("backends_count", &backends_count)
+            .field("http_listeners_count", &self.http_listeners.len())
+            .field("https_listeners_count", &self.https_listeners.len())
+            .field("tcp_listeners_count", &self.tcp_listeners.len())
+            .field("udp_listeners_count", &self.udp_listeners.len())
+            .field("http_frontends_count", &self.http_fronts.len())
+            .field("https_frontends_count", &self.https_fronts.len())
+            .field("tcp_frontend_clusters_count", &self.tcp_fronts.len())
+            .field("tcp_frontends_count", &tcp_frontends_count)
+            .field("udp_frontend_clusters_count", &self.udp_fronts.len())
+            .field("udp_frontends_count", &udp_frontends_count)
+            .field("certificate_addresses_count", &self.certificates.len())
+            .field("certificates_count", &certificates_count)
+            .field(
+                "certificate_metadata_addresses_count",
+                &self.certificate_metadata.len(),
+            )
+            .field("request_counts_count", &self.request_counts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConfigState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Certificates at `address` in their effective runtime insertion order.
+    ///
+    /// Legacy or externally deserialized states may have missing, duplicate or
+    /// gapped ordinals. They remain readable: entries without metadata sort
+    /// first by fingerprint; metadata-bearing entries follow by ordinal and
+    /// then fingerprint. The returned ordinals are always normalized to the
+    /// contiguous range `0..len`, without mutating `self`.
+    pub fn ordered_certificate_entries(
+        &self,
+        address: SocketAddr,
+    ) -> Vec<(Fingerprint, &CertificateAndKey, CertificateMetadata)> {
+        let Some(certificates) = self.certificates.get(&address) else {
+            return Vec::new();
+        };
+        let metadata = self.certificate_metadata.get(&address);
+        let mut fingerprints: Vec<Fingerprint> =
+            certificates.keys().map(ToOwned::to_owned).collect();
+        fingerprints.sort_by(|left, right| {
+            match (
+                metadata.and_then(|index| index.entries.get(left)),
+                metadata.and_then(|index| index.entries.get(right)),
+            ) {
+                (None, None) => left.cmp(right),
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(left_metadata), Some(right_metadata)) => left_metadata
+                    .insertion_order
+                    .cmp(&right_metadata.insertion_order)
+                    .then_with(|| left.cmp(right)),
+            }
+        });
+
+        fingerprints
+            .into_iter()
+            .enumerate()
+            .filter_map(|(insertion_order, fingerprint)| {
+                let certificate = certificates.get(&fingerprint)?;
+                let expired_at = metadata
+                    .and_then(|index| index.entries.get(&fingerprint))
+                    .and_then(|entry| entry.expired_at);
+                Some((
+                    fingerprint,
+                    certificate,
+                    CertificateMetadata {
+                        expired_at,
+                        insertion_order: insertion_order as u64,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Replay requests for one listener, ordered exactly as its resolver was
+    /// populated and carrying every retained expiration override.
+    pub fn certificate_add_requests_for_address(&self, address: SocketAddr) -> Vec<AddCertificate> {
+        self.ordered_certificate_entries(address)
+            .into_iter()
+            .map(|(_, certificate, metadata)| AddCertificate {
+                address: SocketAddress::from(address),
+                certificate: certificate.to_owned(),
+                expired_at: metadata.expired_at,
+            })
+            .collect()
+    }
+
+    fn normalized_certificate_metadata_for_address(
+        &self,
+        address: SocketAddr,
+    ) -> CertificateMetadataIndex {
+        let entries: HashMap<Fingerprint, CertificateMetadata> = self
+            .ordered_certificate_entries(address)
+            .into_iter()
+            .map(|(fingerprint, _, metadata)| (fingerprint, metadata))
+            .collect();
+        CertificateMetadataIndex {
+            next_order: Some(entries.len() as u64),
+            entries,
+        }
+    }
+
+    fn certificate_metadata_is_trusted(&self, address: SocketAddr) -> bool {
+        let certificate_count = self.certificates.get(&address).map_or(0, HashMap::len);
+        self.certificate_metadata
+            .get(&address)
+            .is_some_and(|metadata| {
+                metadata.next_order == Some(certificate_count as u64)
+                    && metadata.entries.len() == certificate_count
+            })
+    }
+
+    /// Take the canonical metadata index for an already-validated mutation.
+    ///
+    /// State built by this process carries a trusted `next_order` cache and
+    /// can be reused directly. Deserialized or partial state has no trusted
+    /// cache and pays the sorting cost once before the mutation commits.
+    fn take_certificate_metadata_for_state_change(
+        &mut self,
+        address: SocketAddr,
+    ) -> CertificateMetadataIndex {
+        if self.certificate_metadata_is_trusted(address) {
+            self.certificate_metadata
+                .remove(&address)
+                .expect("trusted metadata index must remain present")
+        } else {
+            self.normalized_certificate_metadata_for_address(address)
+        }
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn normalized_certificate_metadata(&self) -> HashMap<SocketAddr, CertificateMetadataIndex> {
+        self.certificates
+            .keys()
+            .filter_map(|address| {
+                let metadata = self.normalized_certificate_metadata_for_address(*address);
+                (!metadata.entries.is_empty()).then_some((*address, metadata))
+            })
+            .collect()
+    }
+
+    fn remove_certificate_metadata(
+        metadata: &mut CertificateMetadataIndex,
+        fingerprint: &Fingerprint,
+    ) -> Option<CertificateMetadata> {
+        let removed = metadata.entries.remove(fingerprint)?;
+        for entry in metadata.entries.values_mut() {
+            if entry.insertion_order > removed.insertion_order {
+                entry.insertion_order -= 1;
+            }
+        }
+        metadata.next_order = Some(metadata.entries.len() as u64);
+        Some(removed)
+    }
+
+    fn certificate_add_requests(&self) -> Vec<AddCertificate> {
+        let mut addresses: Vec<SocketAddr> = self.certificates.keys().copied().collect();
+        addresses.sort_unstable();
+        addresses
+            .into_iter()
+            .flat_map(|address| self.certificate_add_requests_for_address(address))
+            .collect()
+    }
+
+    /// Capture the compensating request that restores this exact state if
+    /// `request` is accepted here but refused by the runtime afterwards.
+    ///
+    /// Additions whose inverse is independent of prior state use
+    /// [`rollback_request`]. Frontend removals instead snapshot the stored
+    /// frontend before dispatch: their wire request is only a selector and
+    /// can omit metadata that an `Add` must restore. Listener activation also
+    /// snapshots the stored active flag so a refused activation only undoes
+    /// the transition from inactive to active.
+    pub fn rollback_for(&self, request: &RequestType) -> Option<Request> {
+        if let Some(rollback) = rollback_request(request) {
+            return Some(rollback);
+        }
+
+        let inverse = match request {
+            RequestType::RemoveHttpFrontend(selector)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(selector) => self
+                .http_fronts
+                .get(&selector.to_string())
+                .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
+                .cloned()
+                .map(RequestHttpFrontend::from)
+                .map(RequestType::add_http_frontend),
+            RequestType::RemoveHttpsFrontend(selector)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(selector) => self
+                .https_fronts
+                .get(&selector.to_string())
+                .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
+                .cloned()
+                .map(RequestHttpFrontend::from)
+                .map(RequestType::add_https_frontend),
+            RequestType::RemoveTcpFrontend(selector) => {
+                let address: SocketAddr = selector.address.into();
+                let sni = selector.sni.as_deref().map(str::to_ascii_lowercase);
+                let alpn = canonical_tcp_alpn(&selector.alpn);
+                self.tcp_fronts
+                    .get(selector.cluster_id.as_str())
+                    .and_then(|frontends| {
+                        frontends
+                            .iter()
+                            .find(|stored| tcp_frontend_matches(stored, address, &sni, &alpn))
+                    })
+                    .cloned()
+                    .map(RequestTcpFrontend::from)
+                    .map(RequestType::AddTcpFrontend)
+            }
+            RequestType::RemoveUdpFrontend(selector) => {
+                let address: SocketAddr = selector.address.into();
+                self.udp_fronts
+                    .get(selector.cluster_id.as_str())
+                    .and_then(|frontends| {
+                        frontends.iter().find(|stored| {
+                            stored.address == address && stored.tags == selector.tags
+                        })
+                    })
+                    .cloned()
+                    .map(RequestUdpFrontend::from)
+                    .map(RequestType::AddUdpFrontend)
+            }
+            RequestType::ActivateListener(activate) => {
+                let key = activate.listener_key();
+                let was_inactive = match ListenerType::try_from(activate.proxy).ok()? {
+                    ListenerType::Http => self
+                        .http_listeners
+                        .get(&key)
+                        .map(|listener| !listener.active),
+                    ListenerType::Https => self
+                        .https_listeners
+                        .get(&key)
+                        .map(|listener| !listener.active),
+                    ListenerType::Tcp => self
+                        .tcp_listeners
+                        .get(&key)
+                        .map(|listener| !listener.active),
+                    ListenerType::Udp => self
+                        .udp_listeners
+                        .get(&key)
+                        .map(|listener| !listener.active),
+                }?;
+
+                was_inactive.then(|| {
+                    RequestType::DeactivateListener(DeactivateListener {
+                        address: activate.address,
+                        proxy: activate.proxy,
+                        to_scm: false,
+                        interface: activate.interface.to_owned(),
+                    })
+                })
+            }
+            _ => None,
+        };
+
+        inverse.map(Into::into)
+    }
+
+    pub fn dispatch(&mut self, request: &Request) -> Result<(), StateError> {
+        let request_type = match &request.request_type {
+            Some(t) => t,
+            None => return Err(StateError::EmptyRequest),
+        };
+
+        self.increment_request_count(request);
+
+        if let Some(reason) = self.health_check_port_unix_conflict(request_type) {
+            return Err(StateError::InvalidValue {
+                field: "health_check.port",
+                reason,
+            });
+        }
+
+        let result = match request_type {
+            RequestType::AddCluster(cluster) => self.add_cluster(cluster),
+            RequestType::RemoveCluster(cluster_id) => self.remove_cluster(cluster_id),
+            RequestType::AddHttpListener(listener) => self.add_http_listener(listener),
+            RequestType::AddHttpsListener(listener)
+            | RequestType::AddHttpsListenerWithClientAuth(listener) => {
+                self.add_https_listener(listener)
+            }
+            RequestType::AddTcpListener(listener) => self.add_tcp_listener(listener),
+            RequestType::AddUdpListener(listener) => self.add_udp_listener(listener),
+            RequestType::RemoveListener(remove) => self.remove_listener(remove),
+            RequestType::ActivateListener(activate) => self.activate_listener(activate),
+            RequestType::DeactivateListener(deactivate) => self.deactivate_listener(deactivate),
+            RequestType::AddHttpFrontend(front)
+            | RequestType::AddHttpFrontendWithSilentClose(front)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
+                self.add_http_frontend(front)
+            }
+            RequestType::RemoveHttpFrontend(front)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(front) => {
+                self.remove_http_frontend(front)
+            }
+            RequestType::AddCertificate(add) => self.add_certificate(add),
+            RequestType::RemoveCertificate(remove) => self.remove_certificate(remove),
+            RequestType::ReplaceCertificate(replace) => self.replace_certificate(replace),
+            RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithSilentClose(front)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
+                self.add_https_frontend(front)
+            }
+            RequestType::RemoveHttpsFrontend(front)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front) => {
+                self.remove_https_frontend(front)
+            }
+            RequestType::AddTcpFrontend(front) => self.add_tcp_frontend(front),
+            RequestType::RemoveTcpFrontend(front) => self.remove_tcp_frontend(front),
+            RequestType::AddUdpFrontend(front) => self.add_udp_frontend(front),
+            RequestType::RemoveUdpFrontend(front) => self.remove_udp_frontend(front),
+            RequestType::AddBackend(add_backend) | RequestType::AddUnixBackend(add_backend) => {
+                self.add_backend(add_backend)
+            }
+            RequestType::RemoveBackend(backend) => self.remove_backend(backend),
+            RequestType::UpdateHttpListener(patch) => self.update_http_listener(patch),
+            RequestType::UpdateHttpsListener(patch)
+            | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
+                self.update_https_listener(patch)
+            }
+            RequestType::UpdateTcpListener(patch) => self.update_tcp_listener(patch),
+            RequestType::UpdateUdpListener(patch) => self.update_udp_listener(patch),
+            RequestType::SetHealthCheck(set) => {
+                self.set_health_check(&set.cluster_id, &set.config)
+            }
+            RequestType::SetProtectedHealthCheck(set) => self.set_protected_health_check(set),
+            RequestType::RemoveHealthCheck(cluster_id) => self.remove_health_check(cluster_id),
+
+            // This is to avoid the error message. These request types are
+            // worker-only / runtime-only and do not affect the persisted
+            // ConfigState (e.g., a worker-side global limit set via
+            // SetMaxConnectionsPerIp does NOT survive a worker restart;
+            // operators must mirror the change in the TOML to make it
+            // sticky).
+            RequestType::Logging(_)
+            | RequestType::CountRequests(_)
+            | RequestType::Status(_)
+            | RequestType::SoftStop(_)
+            | RequestType::QueryCertificatesFromWorkers(_)
+            | RequestType::QueryClusterById(_)
+            | RequestType::QueryClustersByDomain(_)
+            | RequestType::QueryMetrics(_)
+            | RequestType::QueryClustersHashes(_)
+            | RequestType::ConfigureMetrics(_)
+            | RequestType::SetMetricDetail(_)
+            | RequestType::ReturnListenSockets(_)
+            | RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::QueryMaxConnectionsPerIp(_)
+            | RequestType::SetMaxConnectionsPerSubnet(_)
+            | RequestType::QueryMaxConnectionsPerSubnet(_)
+            | RequestType::SetMaxConnectionAttempts(_)
+            // an action on live sessions: never saved, never replayed
+            | RequestType::CloseSessions(_)
+            | RequestType::HardStop(_) => Ok(()),
+
+            _other_request => Err(StateError::UndispatchableRequest),
+        };
+
+        // Run-to-completion postcondition: whatever path `dispatch` took, the
+        // cross-map invariants of the model must hold once it returns. We run
+        // the full sweep on both success and error: a failed mutating handler
+        // (e.g. a duplicate `add_*` or an absent `remove_*`) is required to be
+        // a no-op, so the invariants must be intact regardless of the result.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+
+        result
+    }
+
+    /// Full cross-map invariant sweep for the control-plane state model.
+    ///
+    /// This is the run-to-completion postcondition called via a
+    /// `#[cfg(debug_assertions)]` guard at the end of [`Self::dispatch`]. It
+    /// encodes the coherence invariants the diff/replay machinery relies on:
+    /// every map entry is self-consistent (a value's stored key/cluster_id
+    /// matches the key it is filed under), and the public accounting helpers
+    /// (`count_frontends`/`count_backends`) agree with the raw map contents.
+    ///
+    /// Compiled out entirely in release builds (no body, no callers).
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        // Listener maps: the value's `address` and `interface` fields must
+        // match the `ListenerKey` it is filed under, or a hot-upgrade replay (which re-derives the
+        // key from the value) would land the entry under a different key.
+        for (addr, listener) in &self.http_listeners {
+            debug_assert_eq!(
+                listener.listener_key(),
+                *addr,
+                "http_listener value address must match its map key"
+            );
+        }
+        for (addr, listener) in &self.https_listeners {
+            debug_assert_eq!(
+                listener.listener_key(),
+                *addr,
+                "https_listener value address must match its map key"
+            );
+        }
+        for (addr, listener) in &self.tcp_listeners {
+            debug_assert_eq!(
+                listener.listener_key(),
+                *addr,
+                "tcp_listener value address must match its map key"
+            );
+        }
+
+        // Clusters: the value's `cluster_id` must match the key it is filed
+        // under (replay re-keys on `cluster.cluster_id`).
+        for (cluster_id, cluster) in &self.clusters {
+            debug_assert_eq!(
+                cluster.cluster_id.as_str(),
+                &**cluster_id,
+                "cluster value cluster_id must match its map key"
+            );
+        }
+
+        // Backends: grouped by cluster_id. Every backend in a bucket must carry
+        // that bucket's cluster_id (replay groups on `backend.cluster_id`), and
+        // the per-cluster Vec must stay deduplicated on (backend_id, address) —
+        // `add_backend` upserts, so duplicates would mean lost state.
+        for (cluster_id, backends) in &self.backends {
+            // A backend belongs to its cluster: `add_backend` refuses one of
+            // an unknown cluster and `remove_cluster` removes the bucket.
+            debug_assert!(
+                backends.is_empty() || self.clusters.contains_key(cluster_id),
+                "a backend bucket must belong to an existing cluster"
+            );
+            for backend in backends {
+                debug_assert_eq!(
+                    &backend.cluster_id, cluster_id,
+                    "backend cluster_id must match its bucket key"
+                );
+            }
+            let unique: HashSet<(&String, &SocketAddr)> = backends
+                .iter()
+                .map(|b| (&b.backend_id, &b.address))
+                .collect();
+            debug_assert_eq!(
+                unique.len(),
+                backends.len(),
+                "backends within a cluster must be unique on (backend_id, address)"
+            );
+        }
+
+        // TCP frontends: grouped by cluster_id. Every frontend in a bucket must
+        // carry that bucket's cluster_id, and `add_tcp_frontend` rejects exact
+        // duplicates so each bucket stays a set.
+        for (cluster_id, fronts) in &self.tcp_fronts {
+            for front in fronts {
+                debug_assert_eq!(
+                    &front.cluster_id, cluster_id,
+                    "tcp_frontend cluster_id must match its bucket key"
+                );
+            }
+            let unique: HashSet<&TcpFrontend> = fronts.iter().collect();
+            debug_assert_eq!(
+                unique.len(),
+                fronts.len(),
+                "tcp frontends within a cluster must be unique"
+            );
+        }
+
+        // Certificates: nested map keyed by (address, fingerprint). We do not
+        // recompute each inner fingerprint here (expensive -- it requires
+        // re-parsing the stored PEM), but the outer bucket itself must never
+        // be empty. `add_certificate` and `replace_certificate` only ever
+        // materialise a bucket together with a certificate, and
+        // `remove_certificate` evicts the address key once its last
+        // certificate is gone -- so an address key mapped to zero
+        // certificates is unreachable through the public API. It is exactly
+        // the corrupt state sozu-proxy/sozu#1404 produced, and the same
+        // shape two OTHER paths were independently found to reach while
+        // adding this coverage: `remove_certificate` leaving a dangling
+        // empty bucket after evicting an address's last certificate
+        // (`remove_certificate_evicts_the_address_when_its_last_certificate_is_removed`),
+        // and a rejected `add_certificate` leaving one behind for a
+        // previously-absent address
+        // (`add_certificate_with_valid_pem_armor_but_invalid_x509_leaves_no_bucket`).
+        // Both are fixed alongside this check. Left uncaught, this state is
+        // invisible to `hash_state` (which does not fold `self.certificates`
+        // at all) and silently dropped by `generate_requests` (which emits no
+        // `AddCertificate` for an empty bucket) -- `check_invariants` is the
+        // one place in this postcondition sweep that can catch it.
+        for (address, certs) in &self.certificates {
+            debug_assert!(
+                !certs.is_empty(),
+                "certificate bucket for address {address} must never be empty (sozu-proxy/sozu#1404)"
+            );
+        }
+        // A trusted sidecar is produced only by successful certificate
+        // mutations in this module. Deserialization clears `next_order`, so
+        // legacy, partial and externally authored sidecars stay readable and
+        // are deliberately excluded until the next successful mutation
+        // normalizes that address.
+        for (address, metadata) in &self.certificate_metadata {
+            let Some(next_order) = metadata.next_order else {
+                continue;
+            };
+            let certificates = self
+                .certificates
+                .get(address)
+                .expect("trusted certificate metadata must have a certificate bucket");
+            debug_assert_eq!(
+                metadata.entries.len(),
+                certificates.len(),
+                "trusted certificate metadata must cover every stored fingerprint"
+            );
+            debug_assert_eq!(
+                next_order,
+                metadata.entries.len() as u64,
+                "trusted certificate metadata next ordinal must equal its length"
+            );
+            let ordinals: BTreeSet<u64> = metadata
+                .entries
+                .iter()
+                .map(|(fingerprint, entry)| {
+                    debug_assert!(
+                        certificates.contains_key(fingerprint),
+                        "trusted certificate metadata cannot retain an orphan fingerprint"
+                    );
+                    entry.insertion_order
+                })
+                .collect();
+            debug_assert_eq!(
+                ordinals,
+                (0..next_order).collect(),
+                "trusted certificate ordinals must be unique and contiguous"
+            );
+        }
+
+        // Public accounting helpers must agree with the raw maps. These are the
+        // numbers the CLI and metrics surface; a drift here is a real bug.
+        let raw_frontends = self.http_fronts.len()
+            + self.https_fronts.len()
+            + self.count_tcp_frontends_raw()
+            + self.count_udp_frontends_raw();
+        debug_assert_eq!(
+            self.count_frontends(),
+            raw_frontends,
+            "count_frontends must equal the sum of all frontend map entries"
+        );
+        let raw_backends: usize = self.backends.values().map(|v| v.len()).sum();
+        debug_assert_eq!(
+            self.count_backends(),
+            raw_backends,
+            "count_backends must equal the sum of all backend Vec lengths"
+        );
+    }
+
+    /// Raw count of TCP frontends across all clusters. Used by the debug-only
+    /// [`Self::check_invariants`] to cross-check `count_frontends`, and by
+    /// `add_tcp_frontend`'s no-mutation-before-admission accounting.
+    /// Compiled unconditionally (unlike `check_invariants`): it is a trivial
+    /// sum of bucket lengths, and `debug_assert!` arguments still typecheck
+    /// in release builds even though they compile out — a debug-gated helper
+    /// referenced there breaks the release/bench build.
+    fn count_tcp_frontends_raw(&self) -> usize {
+        self.tcp_fronts.values().map(|v| v.len()).sum()
+    }
+
+    fn count_udp_frontends_raw(&self) -> usize {
+        self.udp_fronts.values().map(|v| v.len()).sum()
+    }
+
+    /// Frontends (every protocol) and backends whose owning cluster satisfies
+    /// `owned`. A frontend without a `cluster_id` is never counted. Used by
+    /// `remove_cluster`'s assertions, and compiled unconditionally for the
+    /// same reason as [`Self::count_tcp_frontends_raw`].
+    fn count_objects_where(&self, owned: impl Fn(&str) -> bool) -> usize {
+        let keyed = |cluster_id: &ClusterId, len: usize| if owned(cluster_id) { len } else { 0 };
+        let routed = |front: &HttpFrontend| front.cluster_id.as_deref().is_some_and(&owned);
+        self.backends
+            .iter()
+            .map(|(k, v)| keyed(k, v.len()))
+            .sum::<usize>()
+            + self
+                .tcp_fronts
+                .iter()
+                .map(|(k, v)| keyed(k, v.len()))
+                .sum::<usize>()
+            + self
+                .udp_fronts
+                .iter()
+                .map(|(k, v)| keyed(k, v.len()))
+                .sum::<usize>()
+            + self.http_fronts.values().filter(|f| routed(f)).count()
+            + self.https_fronts.values().filter(|f| routed(f)).count()
+    }
+
+    fn count_objects_owned_by(&self, cluster_id: &str) -> usize {
+        self.count_objects_where(|owner| owner == cluster_id)
+    }
+
+    /// Debug builds only: it walks every frontend and backend, which a
+    /// release `remove_cluster` must not pay for.
+    #[cfg(debug_assertions)]
+    fn count_objects_not_owned_by(&self, cluster_id: &str) -> usize {
+        self.count_objects_where(|owner| owner != cluster_id)
+    }
+
+    /// Increments the count for this request type
+    fn increment_request_count(&mut self, request: &Request) {
+        if let Some(request_type) = &request.request_type {
+            let count = self
+                .request_counts
+                .entry(format_request_type(request_type).to_owned())
+                .or_insert(1);
+            *count += 1;
+        }
+    }
+
+    pub fn get_request_counts(&self) -> RequestCounts {
+        RequestCounts {
+            map: self.request_counts.clone(),
+        }
+    }
+
+    fn add_cluster(&mut self, cluster: &Cluster) -> Result<(), StateError> {
+        // Validate any inline `cluster.health_check` before mutating state so
+        // an invalid config (zero thresholds, missing leading `/`, CR/LF/NUL/C0
+        // in URI) cannot ride in via the AddCluster path. Without this, TOML
+        // reload, SaveState/LoadState, and direct API AddCluster requests
+        // bypass the SetHealthCheck-side check and let an attacker-controlled
+        // health-check URI smuggle CRLF into outbound HTTP/1.1 probes.
+        if let Some(hc) = cluster.health_check.as_ref()
+            && let Err(reason) = crate::config::validate_health_check_config(hc)
+        {
+            return Err(StateError::InvalidValue {
+                field: "health_check",
+                reason,
+            });
+        }
+        // A cluster that turns UDP cannot keep a backend dialed over a UNIX
+        // stream socket (see `add_backend`).
+        if cluster.udp.is_some()
+            && self
+                .backends
+                .get(cluster.cluster_id.as_str())
+                .is_some_and(|backends| backends.iter().any(|b| b.unix_path.is_some()))
+        {
+            return Err(StateError::InvalidValue {
+                field: "unix_path",
+                reason: UDP_UNIX_BACKEND_REFUSED,
+            });
+        }
+        // Same gate for the client affinity key: a name no request can carry,
+        // or both a header and a cookie, would key selection on something
+        // other than what the cluster declares.
+        if let Err(reason) = crate::config::validate_affinity_key(
+            cluster.affinity_header.as_deref(),
+            cluster.affinity_cookie.as_deref(),
+        ) {
+            return Err(StateError::InvalidValue {
+                field: "affinity_key",
+                reason,
+            });
+        }
+        if let Err(reason) = crate::config::validate_shuffle_sharding(
+            cluster.shard_percent,
+            cluster.shard_min_backends,
+            cluster.shard_mode,
+        ) {
+            return Err(StateError::InvalidValue {
+                field: "shuffle_sharding",
+                reason,
+            });
+        }
+        if let Some(Err(reason)) = cluster
+            .max_connection_attempts
+            .map(crate::config::validate_max_connection_attempts)
+        {
+            return Err(StateError::InvalidValue {
+                field: "max_connection_attempts",
+                reason,
+            });
+        }
+        // A TCP session has no request to read a header or a cookie from and
+        // always keys on the source IP, so a cluster serving TCP frontends
+        // may not name one: the configuration would claim a key the proxy
+        // does not use. `add_tcp_frontend` holds the other order.
+        if (cluster.affinity_header.is_some() || cluster.affinity_cookie.is_some())
+            && self
+                .tcp_fronts
+                .get(cluster.cluster_id.as_str())
+                .is_some_and(|fronts| !fronts.is_empty())
+        {
+            return Err(StateError::InvalidValue {
+                field: "affinity_key",
+                reason: TCP_CLUSTER_AFFINITY_KEY,
+            });
+        }
+        let cluster = cluster.clone();
+        // AddCluster is an upsert (replacing an existing cluster_id keeps the
+        // entry count flat), so we assert on presence/key-coherence rather than
+        // a strict +1 on len.
+        let cluster_id = ClusterId::from(cluster.cluster_id.as_str());
+        self.clusters.insert(cluster_id.clone(), cluster);
+        debug_assert!(
+            self.clusters.contains_key(&cluster_id),
+            "add_cluster must leave the cluster present in the map"
+        );
+        debug_assert_eq!(
+            self.clusters
+                .get(&cluster_id)
+                .map(|c| c.cluster_id.as_str()),
+            Some(&*cluster_id),
+            "stored cluster must be keyed by its own cluster_id"
+        );
+        Ok(())
+    }
+
+    /// Remove a cluster together with every frontend and backend that names
+    /// it, for every protocol. A frontend without a `cluster_id` (a deny or
+    /// answer route) names no cluster and stays. A cluster the state does not
+    /// hold is `NotFound`, and then nothing is removed, not even a frontend
+    /// that names it.
+    fn remove_cluster(&mut self, cluster_id: &str) -> Result<(), StateError> {
+        let before = self.clusters.len();
+        match self.clusters.remove(cluster_id) {
+            Some(_) => {
+                #[cfg(debug_assertions)]
+                let owned_by_others = self.count_objects_not_owned_by(cluster_id);
+
+                self.backends.remove(cluster_id);
+                self.tcp_fronts.remove(cluster_id);
+                self.udp_fronts.remove(cluster_id);
+                self.http_fronts
+                    .retain(|_, front| front.cluster_id.as_deref() != Some(cluster_id));
+                self.https_fronts
+                    .retain(|_, front| front.cluster_id.as_deref() != Some(cluster_id));
+
+                debug_assert!(
+                    !self.clusters.contains_key(cluster_id),
+                    "remove_cluster must evict the cluster"
+                );
+                debug_assert_eq!(
+                    self.clusters.len(),
+                    before - 1,
+                    "remove_cluster must drop exactly one entry"
+                );
+                debug_assert_eq!(
+                    self.count_objects_owned_by(cluster_id),
+                    0,
+                    "remove_cluster must leave no frontend or backend naming the cluster"
+                );
+                #[cfg(debug_assertions)]
+                debug_assert_eq!(
+                    self.count_objects_not_owned_by(cluster_id),
+                    owned_by_others,
+                    "remove_cluster must not touch a frontend or backend of another cluster"
+                );
+                Ok(())
+            }
+            None => {
+                debug_assert_eq!(
+                    self.clusters.len(),
+                    before,
+                    "a failed remove_cluster must not mutate the map"
+                );
+                Err(StateError::NotFound {
+                    kind: ObjectKind::Cluster,
+                    id: cluster_id.to_owned(),
+                })
+            }
+        }
+    }
+
+    /// The removal orders for every frontend and backend
+    /// `ConfigState::remove_cluster` would remove with `cluster_id`, or none when
+    /// the state does not hold that cluster. A worker reads them from its own
+    /// state before applying a `RemoveCluster` to it, then applies them to
+    /// its proxies so they drop what the state drops.
+    pub fn cluster_removal_requests(&self, cluster_id: &str) -> Vec<Request> {
+        if !self.clusters.contains_key(cluster_id) {
+            return Vec::new();
+        }
+        let owned = |front: &&HttpFrontend| front.cluster_id.as_deref() == Some(cluster_id);
+        let mut requests: Vec<Request> = Vec::new();
+        requests.extend(
+            self.http_fronts
+                .values()
+                .filter(owned)
+                .map(|front| RequestType::remove_http_frontend(front.clone().into()).into()),
+        );
+        requests.extend(
+            self.https_fronts
+                .values()
+                .filter(owned)
+                .map(|front| RequestType::remove_https_frontend(front.clone().into()).into()),
+        );
+        requests.extend(
+            self.tcp_fronts
+                .get(cluster_id)
+                .into_iter()
+                .flatten()
+                .map(|front| RequestType::RemoveTcpFrontend(front.clone().into()).into()),
+        );
+        requests.extend(
+            self.udp_fronts
+                .get(cluster_id)
+                .into_iter()
+                .flatten()
+                .map(|front| RequestType::RemoveUdpFrontend(front.clone().into()).into()),
+        );
+        requests.extend(
+            self.backends
+                .get(cluster_id)
+                .into_iter()
+                .flatten()
+                .map(|backend| {
+                    RequestType::RemoveBackend(RemoveBackend {
+                        cluster_id: backend.cluster_id.to_string(),
+                        backend_id: backend.backend_id.clone(),
+                        address: SocketAddress::from(backend.address),
+                    })
+                    .into()
+                }),
+        );
+        debug_assert_eq!(
+            requests.len(),
+            self.count_objects_owned_by(cluster_id),
+            "one removal order per frontend or backend the cluster owns"
+        );
+        requests
+    }
+
+    /// Whether `error`, the answer [`Self::dispatch`] gave to `request`,
+    /// means the frontend or backend `request` removes already went away
+    /// with its cluster: the removal found nothing to remove (`NotFound`),
+    /// and the state does not hold the cluster it names either, so
+    /// `RemoveCluster` removed it. Such a removal has nothing left to do and
+    /// is answered ok, which keeps `sozu cluster remove` followed by the
+    /// removal of each of its frontends working. A frontend without a
+    /// `cluster_id` names no cluster and never matches.
+    ///
+    /// It never covers an object another cluster owns: a frontend removal
+    /// matches only a frontend of the cluster it names (see
+    /// `remove_frontend_from`), so its `NotFound` leaves such an object alone.
+    pub fn removed_with_its_cluster(&self, request: &Request, error: &StateError) -> bool {
+        if !matches!(error, StateError::NotFound { .. }) {
+            return false;
+        }
+        let cluster_id = match &request.request_type {
+            Some(
+                RequestType::RemoveHttpFrontend(front)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(front)
+                | RequestType::RemoveHttpsFrontend(front)
+                | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front),
+            ) => front.cluster_id.as_deref(),
+            Some(RequestType::RemoveTcpFrontend(front)) => Some(front.cluster_id.as_str()),
+            Some(RequestType::RemoveUdpFrontend(front)) => Some(front.cluster_id.as_str()),
+            Some(RequestType::RemoveBackend(backend)) => Some(backend.cluster_id.as_str()),
+            _ => None,
+        };
+        cluster_id.is_some_and(|cluster_id| !self.clusters.contains_key(cluster_id))
+    }
+
+    /// The answer to a removal [`Self::removed_with_its_cluster`] accepts.
+    /// The same answer covers a cluster that never existed, a typo for
+    /// instance, so it says the cluster does not exist and, when another
+    /// cluster (or a route with no cluster) now holds the same key or
+    /// address, which one: that object is not removed.
+    pub fn removed_with_its_cluster_message(&self, request: &Request) -> String {
+        let (cluster_id, owner) = match &request.request_type {
+            Some(
+                RequestType::RemoveHttpFrontend(front)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(front),
+            ) => (
+                front.cluster_id.clone(),
+                self.http_fronts
+                    .get(&front.to_string())
+                    .map(|stored| stored.cluster_id.as_deref().map(str::to_owned)),
+            ),
+            Some(
+                RequestType::RemoveHttpsFrontend(front)
+                | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front),
+            ) => (
+                front.cluster_id.clone(),
+                self.https_fronts
+                    .get(&front.to_string())
+                    .map(|stored| stored.cluster_id.as_deref().map(str::to_owned)),
+            ),
+            Some(RequestType::RemoveTcpFrontend(front)) => {
+                let address: SocketAddr = front.address.into();
+                let sni = front.sni.as_deref().map(str::to_ascii_lowercase);
+                let alpn = canonical_tcp_alpn(&front.alpn);
+                (
+                    Some(front.cluster_id.clone()),
+                    self.tcp_fronts
+                        .values()
+                        .flatten()
+                        .find(|stored| tcp_frontend_matches(stored, address, &sni, &alpn))
+                        .map(|stored| Some(stored.cluster_id.to_string())),
+                )
+            }
+            Some(RequestType::RemoveUdpFrontend(front)) => {
+                let address: SocketAddr = front.address.into();
+                (
+                    Some(front.cluster_id.clone()),
+                    self.udp_fronts
+                        .values()
+                        .flatten()
+                        .find(|stored| stored.address == address)
+                        .map(|stored| Some(stored.cluster_id.to_string())),
+                )
+            }
+            Some(RequestType::RemoveBackend(backend)) => (Some(backend.cluster_id.clone()), None),
+            _ => (None, None),
+        };
+        let mut message = format!(
+            "nothing to remove: cluster {} does not exist (removed, or never added), \
+             and none of its frontends or backends either",
+            cluster_id.as_deref().unwrap_or("<none>")
+        );
+        match owner {
+            Some(Some(owner)) => message.push_str(&format!(
+                "; this key belongs to cluster {owner}, left in place"
+            )),
+            Some(None) => {
+                message.push_str("; this key belongs to a route with no cluster, left in place")
+            }
+            None => {}
+        }
+        message
+    }
+
+    /// The metadata half of a protected order, whose values the state never
+    /// holds. The order must be the main process's own: every header carries a
+    /// fingerprint, and the carriers match the headers one for one. The state
+    /// keeps names and fingerprints only.
+    fn set_protected_health_check(
+        &mut self,
+        set: &SetProtectedHealthCheck,
+    ) -> Result<(), StateError> {
+        let invalid = |reason| StateError::InvalidValue {
+            field: "health_check",
+            reason,
+        };
+        if set.config.headers.iter().any(|h| h.fingerprint.is_empty()) {
+            return Err(invalid("health check header fingerprint is missing"));
+        }
+        crate::config::validate_health_check_header_values(&set.config, &set.values)
+            .map_err(invalid)?;
+        self.set_health_check(&set.cluster_id, &set.config)
+    }
+
+    fn set_health_check(
+        &mut self,
+        cluster_id: &str,
+        config: &HealthCheckConfig,
+    ) -> Result<(), StateError> {
+        // Validate before mutating state so an invalid config (zero
+        // thresholds, missing leading `/`, CR/LF/NUL/C0 in URI) cannot
+        // round-trip through SaveState/LoadState. The worker also
+        // validates at the SetHealthCheck handler — this is the
+        // master-side mirror so off-channel TOML reload paths don't
+        // bypass the policy.
+        if let Err(reason) = crate::config::validate_health_check_config(config) {
+            return Err(StateError::InvalidValue {
+                field: "health_check",
+                reason,
+            });
+        }
+        match self.clusters.get_mut(cluster_id) {
+            Some(cluster) => {
+                cluster.health_check = Some(config.to_owned());
+                Ok(())
+            }
+            None => Err(StateError::NotFound {
+                kind: ObjectKind::Cluster,
+                id: cluster_id.to_owned(),
+            }),
+        }
+    }
+
+    fn remove_health_check(&mut self, cluster_id: &str) -> Result<(), StateError> {
+        match self.clusters.get_mut(cluster_id) {
+            Some(cluster) => {
+                cluster.health_check = None;
+                Ok(())
+            }
+            None => Err(StateError::NotFound {
+                kind: ObjectKind::Cluster,
+                id: cluster_id.to_owned(),
+            }),
+        }
+    }
+
+    pub fn list_health_checks(&self, cluster_id: Option<&str>) -> HealthChecksList {
+        let map = self
+            .clusters
+            .iter()
+            .filter(|(id, _)| cluster_id.is_none_or(|filter| filter == &id[..]))
+            .filter_map(|(id, cluster)| {
+                cluster
+                    .health_check
+                    .as_ref()
+                    .map(|hc| (id.to_string(), hc.to_owned()))
+            })
+            .collect();
+        HealthChecksList { map }
+    }
+
+    fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> Result<(), StateError> {
+        // Refuse an unknown mode before storing anything: the worker would
+        // otherwise read it as the default while the state records it.
+        if let Some(v) = listener.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+        let address = validated_listener_key(listener.listener_key())?;
+        let before = self.http_listeners.len();
+        match self.http_listeners.entry(address.clone()) {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
+            BTreeMapEntry::Occupied(_) => {
+                debug_assert_eq!(
+                    self.http_listeners.len(),
+                    before,
+                    "a rejected duplicate add_http_listener must not mutate the map"
+                );
+                return Err(StateError::Exists {
+                    kind: ObjectKind::HttpListener,
+                    id: address.to_string(),
+                });
+            }
+        };
+        debug_assert!(
+            self.http_listeners.contains_key(&address),
+            "add_http_listener must insert the listener under its address"
+        );
+        debug_assert_eq!(
+            self.http_listeners.len(),
+            before + 1,
+            "add_http_listener inserts exactly one entry on the vacant path"
+        );
+        Ok(())
+    }
+
+    fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> Result<(), StateError> {
+        // Refuse an unknown mode before storing anything: the worker would
+        // otherwise read it as the default while the state records it.
+        if let Some(v) = listener.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+        let address = validated_listener_key(listener.listener_key())?;
+        let before = self.https_listeners.len();
+        match self.https_listeners.entry(address.clone()) {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
+            BTreeMapEntry::Occupied(_) => {
+                debug_assert_eq!(
+                    self.https_listeners.len(),
+                    before,
+                    "a rejected duplicate add_https_listener must not mutate the map"
+                );
+                return Err(StateError::Exists {
+                    kind: ObjectKind::HttpsListener,
+                    id: address.to_string(),
+                });
+            }
+        };
+        debug_assert!(
+            self.https_listeners.contains_key(&address),
+            "add_https_listener must insert the listener under its address"
+        );
+        debug_assert_eq!(
+            self.https_listeners.len(),
+            before + 1,
+            "add_https_listener inserts exactly one entry on the vacant path"
+        );
+        Ok(())
+    }
+
+    fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> Result<(), StateError> {
+        let address = validated_listener_key(listener.listener_key())?;
+        let before = self.tcp_listeners.len();
+        match self.tcp_listeners.entry(address.clone()) {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
+            BTreeMapEntry::Occupied(_) => {
+                debug_assert_eq!(
+                    self.tcp_listeners.len(),
+                    before,
+                    "a rejected duplicate add_tcp_listener must not mutate the map"
+                );
+                return Err(StateError::Exists {
+                    kind: ObjectKind::TcpListener,
+                    id: address.to_string(),
+                });
+            }
+        };
+        debug_assert!(
+            self.tcp_listeners.contains_key(&address),
+            "add_tcp_listener must insert the listener under its address"
+        );
+        debug_assert_eq!(
+            self.tcp_listeners.len(),
+            before + 1,
+            "add_tcp_listener inserts exactly one entry on the vacant path"
+        );
+        Ok(())
+    }
+
+    fn add_udp_listener(&mut self, listener: &UdpListenerConfig) -> Result<(), StateError> {
+        let address = validated_listener_key(listener.listener_key())?;
+        match self.udp_listeners.entry(address.clone()) {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
+            BTreeMapEntry::Occupied(_) => {
+                return Err(StateError::Exists {
+                    kind: ObjectKind::UdpListener,
+                    id: address.to_string(),
+                });
+            }
+        };
+        Ok(())
+    }
+
+    fn remove_listener(&mut self, remove: &RemoveListener) -> Result<(), StateError> {
+        match ListenerType::try_from(remove.proxy).map_err(StateError::WrongFieldValue)? {
+            ListenerType::Http => self.remove_http_listener(&remove.listener_key()),
+            ListenerType::Https => self.remove_https_listener(&remove.listener_key()),
+            ListenerType::Tcp => self.remove_tcp_listener(&remove.listener_key()),
+            ListenerType::Udp => self.remove_udp_listener(&remove.listener_key()),
+        }
+    }
+
+    fn remove_http_listener(&mut self, address: &ListenerKey) -> Result<(), StateError> {
+        let before = self.http_listeners.len();
+        if self.http_listeners.remove(address).is_none() {
+            debug_assert_eq!(
+                self.http_listeners.len(),
+                before,
+                "a failed remove_http_listener must not mutate the map"
+            );
+            return Err(StateError::NoChange);
+        }
+        debug_assert!(
+            !self.http_listeners.contains_key(address),
+            "remove_http_listener must evict the address"
+        );
+        debug_assert_eq!(
+            self.http_listeners.len(),
+            before - 1,
+            "remove_http_listener drops exactly one entry"
+        );
+        Ok(())
+    }
+
+    fn remove_https_listener(&mut self, address: &ListenerKey) -> Result<(), StateError> {
+        let before = self.https_listeners.len();
+        if self.https_listeners.remove(address).is_none() {
+            debug_assert_eq!(
+                self.https_listeners.len(),
+                before,
+                "a failed remove_https_listener must not mutate the map"
+            );
+            return Err(StateError::NoChange);
+        }
+        debug_assert!(
+            !self.https_listeners.contains_key(address),
+            "remove_https_listener must evict the address"
+        );
+        debug_assert_eq!(
+            self.https_listeners.len(),
+            before - 1,
+            "remove_https_listener drops exactly one entry"
+        );
+        Ok(())
+    }
+
+    fn remove_tcp_listener(&mut self, address: &ListenerKey) -> Result<(), StateError> {
+        let before = self.tcp_listeners.len();
+        if self.tcp_listeners.remove(address).is_none() {
+            debug_assert_eq!(
+                self.tcp_listeners.len(),
+                before,
+                "a failed remove_tcp_listener must not mutate the map"
+            );
+            return Err(StateError::NoChange);
+        }
+        debug_assert!(
+            !self.tcp_listeners.contains_key(address),
+            "remove_tcp_listener must evict the address"
+        );
+        debug_assert_eq!(
+            self.tcp_listeners.len(),
+            before - 1,
+            "remove_tcp_listener drops exactly one entry"
+        );
+        Ok(())
+    }
+
+    fn remove_udp_listener(&mut self, address: &ListenerKey) -> Result<(), StateError> {
+        if self.udp_listeners.remove(address).is_none() {
+            return Err(StateError::NoChange);
+        }
+        Ok(())
+    }
+
+    /// Validate and apply a partial patch to an existing HTTP listener.
+    ///
+    /// Only `Some` fields in the patch are written; `None` fields preserve the
+    /// current value. Returns `StateError::NotFound` if the address is unknown,
+    /// `StateError::InvalidValue` if a flood-knob value is below the required
+    /// minimum or another field is invalid.
+    ///
+    /// All-or-nothing (sozu-proxy/sozu#1703): every fallible check runs before
+    /// the first write, so a refused patch leaves the stored listener exactly
+    /// as it was. Every write below is infallible; keep it that way, or move
+    /// a new check up with the others.
+    fn update_http_listener(&mut self, patch: &UpdateHttpListenerConfig) -> Result<(), StateError> {
+        validate_h2_flood_knobs_http(patch)?;
+
+        let key = listener_key_for_update(
+            &self.http_listeners,
+            patch.address.into(),
+            ObjectKind::HttpListener,
+        )?;
+        if let Some(ref v) = patch.sozu_id_header {
+            validate_sozu_id_header(v)?;
+        }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+
+        let listener = self
+            .http_listeners
+            .get_mut(&key)
+            .expect("listener_key_for_update returns a key present in the map");
+
+        // Shared session-at-accept / per-connection knobs
+        if let Some(v) = patch.public_address {
+            listener.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            listener.expect_proxy = v;
+        }
+        if let Some(ref v) = patch.sticky_name {
+            listener.sticky_name = v.to_owned();
+        }
+        if let Some(v) = patch.front_timeout {
+            listener.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            listener.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            listener.connect_timeout = v;
+        }
+        if let Some(v) = patch.request_timeout {
+            listener.request_timeout = v;
+        }
+        if let Some(v) = patch.elide_x_real_ip {
+            listener.elide_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.send_x_real_ip {
+            listener.send_x_real_ip = Some(v);
+        }
+        if let Some(patch_answers) = patch.http_answers.as_ref() {
+            merge_custom_http_answers(&mut listener.http_answers, patch_answers);
+        }
+        merge_answers(&mut listener.answers, &patch.answers);
+        // H2 flood knobs
+        if let Some(v) = patch.h2_max_rst_stream_per_window {
+            listener.h2_max_rst_stream_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_ping_per_window {
+            listener.h2_max_ping_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_settings_per_window {
+            listener.h2_max_settings_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_empty_data_per_window {
+            listener.h2_max_empty_data_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_continuation_frames {
+            listener.h2_max_continuation_frames = Some(v);
+        }
+        if let Some(v) = patch.h2_max_glitch_count {
+            listener.h2_max_glitch_count = Some(v);
+        }
+        if let Some(v) = patch.h2_initial_connection_window {
+            listener.h2_initial_connection_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_concurrent_streams {
+            listener.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_shrink_ratio {
+            listener.h2_stream_shrink_ratio = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_lifetime {
+            listener.h2_max_rst_stream_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
+            listener.h2_max_rst_stream_abusive_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
+            listener.h2_max_rst_stream_emitted_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_list_size {
+            listener.h2_max_header_list_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_table_size {
+            listener.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_fields {
+            listener.h2_max_header_fields = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_refusal_percent {
+            listener.h2_stream_refusal_percent = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_idle_timeout_seconds {
+            listener.h2_stream_idle_timeout_seconds = Some(v);
+        }
+        // 0 is valid for graceful_shutdown_deadline (means "wait forever")
+        if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
+            listener.h2_graceful_shutdown_deadline_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_max_window_update_stream0_per_window {
+            listener.h2_max_window_update_stream0_per_window = Some(v);
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            listener.sozu_id_header = Some(v.to_owned());
+        }
+        if let Some(v) = patch.forwarded_headers {
+            listener.forwarded_headers = Some(v);
+        }
+        Ok(())
+    }
+
+    /// The patch a configuration reload sends for an HTTPS listener that is
+    /// already running with another client authentication policy.
+    ///
+    /// A reload replays `AddHttpsListener` for every listener of the file,
+    /// and the state refuses it for an address it already holds, so a CA or
+    /// CRL refreshed on disk would never reach the workers. With revocation
+    /// expiry enforced, a CRL that could not be refreshed would end up
+    /// rejecting every client. `None` when no listener is at that key, or
+    /// when its policy already matches.
+    pub fn client_auth_refresh(
+        &self,
+        listener: &HttpsListenerConfig,
+    ) -> Option<UpdateHttpsListenerConfig> {
+        let running = self.https_listeners.get(&listener.listener_key())?;
+        let policy = listener.client_auth_policy();
+        (running.client_auth_policy() != policy).then(|| UpdateHttpsListenerConfig {
+            address: listener.address,
+            client_auth_policy: Some(policy),
+            ..Default::default()
+        })
+    }
+
+    /// Validate and apply a partial patch to an existing HTTPS listener.
+    ///
+    /// Only `Some` fields in the patch are written; `None` fields preserve the
+    /// current value. Returns `StateError::NotFound` if the address is unknown,
+    /// `StateError::InvalidValue` if a flood-knob value is below the required
+    /// minimum, an ALPN value is unknown, an `hsts` block lacks `enabled`, or
+    /// another field is invalid.
+    ///
+    /// All-or-nothing (sozu-proxy/sozu#1703), as
+    /// [`Self::update_http_listener`]: every fallible check runs before the
+    /// first write.
+    ///
+    /// `hsts` is recorded as a full-object replacement, as the workers apply
+    /// it, so `SaveState`, `ListListeners` and the replay to a new worker
+    /// carry the patched listener default (sozu-proxy/sozu#1715). The
+    /// `enabled` check makes the main process refuse the same patch every
+    /// worker refuses (`ListenerError::HstsEnabledRequired` in
+    /// `HttpsListener::update_config`, `lib/src/https.rs`) instead of
+    /// recording its fields while no worker applies them.
+    fn update_https_listener(
+        &mut self,
+        patch: &UpdateHttpsListenerConfig,
+    ) -> Result<(), StateError> {
+        validate_h2_flood_knobs_https(patch)?;
+
+        let key = listener_key_for_update(
+            &self.https_listeners,
+            patch.address.into(),
+            ObjectKind::HttpsListener,
+        )?;
+        if let Some(ref alpn_wrapper) = patch.alpn_protocols {
+            validate_alpn_protocols(&alpn_wrapper.values)?;
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            validate_sozu_id_header(v)?;
+        }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+        if let Some(ref hsts) = patch.hsts {
+            validate_hsts_patch(hsts)?;
+        }
+
+        let listener = self
+            .https_listeners
+            .get_mut(&key)
+            .expect("listener_key_for_update returns a key present in the map");
+
+        // Shared session-at-accept / per-connection knobs
+        if let Some(v) = patch.public_address {
+            listener.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            listener.expect_proxy = v;
+        }
+        if let Some(ref v) = patch.sticky_name {
+            listener.sticky_name = v.to_owned();
+        }
+        if let Some(v) = patch.front_timeout {
+            listener.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            listener.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            listener.connect_timeout = v;
+        }
+        if let Some(v) = patch.request_timeout {
+            listener.request_timeout = v;
+        }
+        if let Some(v) = patch.elide_x_real_ip {
+            listener.elide_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.send_x_real_ip {
+            listener.send_x_real_ip = Some(v);
+        }
+        if let Some(patch_answers) = patch.http_answers.as_ref() {
+            merge_custom_http_answers(&mut listener.http_answers, patch_answers);
+        }
+        merge_answers(&mut listener.answers, &patch.answers);
+        // HTTPS-only knobs
+        // Full-object replacement, as the worker applies it.
+        if let Some(hsts) = patch.hsts {
+            listener.hsts = Some(hsts);
+        }
+        if let Some(ref alpn_wrapper) = patch.alpn_protocols {
+            // Empty values vec = reset to default (runtime treats empty as default)
+            listener.alpn_protocols = alpn_wrapper.values.clone();
+        }
+        if let Some(v) = patch.strict_sni_binding {
+            listener.strict_sni_binding = Some(v);
+        }
+        if let Some(v) = patch.disable_http11 {
+            listener.disable_http11 = Some(v);
+        }
+        if let Some(ref policy) = patch.client_auth_policy {
+            listener.apply_client_auth_policy(policy);
+        }
+        // H2 flood knobs
+        if let Some(v) = patch.h2_max_rst_stream_per_window {
+            listener.h2_max_rst_stream_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_ping_per_window {
+            listener.h2_max_ping_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_settings_per_window {
+            listener.h2_max_settings_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_empty_data_per_window {
+            listener.h2_max_empty_data_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_continuation_frames {
+            listener.h2_max_continuation_frames = Some(v);
+        }
+        if let Some(v) = patch.h2_max_glitch_count {
+            listener.h2_max_glitch_count = Some(v);
+        }
+        if let Some(v) = patch.h2_initial_connection_window {
+            listener.h2_initial_connection_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_concurrent_streams {
+            listener.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_shrink_ratio {
+            listener.h2_stream_shrink_ratio = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_lifetime {
+            listener.h2_max_rst_stream_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
+            listener.h2_max_rst_stream_abusive_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
+            listener.h2_max_rst_stream_emitted_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_list_size {
+            listener.h2_max_header_list_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_table_size {
+            listener.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_fields {
+            listener.h2_max_header_fields = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_refusal_percent {
+            listener.h2_stream_refusal_percent = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_idle_timeout_seconds {
+            listener.h2_stream_idle_timeout_seconds = Some(v);
+        }
+        // 0 is valid for graceful_shutdown_deadline (means "wait forever")
+        if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
+            listener.h2_graceful_shutdown_deadline_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_max_window_update_stream0_per_window {
+            listener.h2_max_window_update_stream0_per_window = Some(v);
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            listener.sozu_id_header = Some(v.to_owned());
+        }
+        if let Some(v) = patch.forwarded_headers {
+            listener.forwarded_headers = Some(v);
+        }
+        Ok(())
+    }
+
+    /// Validate and apply a partial patch to an existing TCP listener.
+    ///
+    /// Only `Some` fields in the patch are written; `None` fields preserve the
+    /// current value. Returns `StateError::NotFound` if the address is unknown.
+    fn update_tcp_listener(&mut self, patch: &UpdateTcpListenerConfig) -> Result<(), StateError> {
+        let key = listener_key_for_update(
+            &self.tcp_listeners,
+            patch.address.into(),
+            ObjectKind::TcpListener,
+        )?;
+        let listener = self
+            .tcp_listeners
+            .get_mut(&key)
+            .expect("listener_key_for_update returns a key present in the map");
+
+        if let Some(v) = patch.public_address {
+            listener.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            listener.expect_proxy = v;
+        }
+        if let Some(v) = patch.front_timeout {
+            listener.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            listener.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            listener.connect_timeout = v;
+        }
+        Ok(())
+    }
+
+    /// Validate and apply a partial patch to an existing UDP listener.
+    ///
+    /// Only `Some` fields in the patch are written; `None` fields preserve the
+    /// current value. Returns `StateError::NotFound` if the address is unknown.
+    fn update_udp_listener(&mut self, patch: &UpdateUdpListenerConfig) -> Result<(), StateError> {
+        let key = listener_key_for_update(
+            &self.udp_listeners,
+            patch.address.into(),
+            ObjectKind::UdpListener,
+        )?;
+        let listener = self
+            .udp_listeners
+            .get_mut(&key)
+            .expect("listener_key_for_update returns a key present in the map");
+
+        if let Some(v) = patch.public_address {
+            listener.public_address = Some(v);
+        }
+        if let Some(v) = patch.front_timeout {
+            listener.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            listener.back_timeout = v;
+        }
+        if let Some(v) = patch.max_rx_datagram_size {
+            listener.max_rx_datagram_size = v;
+        }
+        if let Some(v) = patch.max_flows {
+            listener.max_flows = v;
+        }
+        Ok(())
+    }
+
+    fn activate_listener(&mut self, activate: &ActivateListener) -> Result<(), StateError> {
+        match ListenerType::try_from(activate.proxy).map_err(StateError::WrongFieldValue)? {
+            ListenerType::Http => self
+                .http_listeners
+                .get_mut(&activate.listener_key())
+                .map(|listener| listener.active = true)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::HttpListener,
+                    id: activate.listener_key().to_string(),
+                }),
+            ListenerType::Https => self
+                .https_listeners
+                .get_mut(&activate.listener_key())
+                .map(|listener| listener.active = true)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::HttpsListener,
+                    id: activate.listener_key().to_string(),
+                }),
+            ListenerType::Tcp => self
+                .tcp_listeners
+                .get_mut(&activate.listener_key())
+                .map(|listener| listener.active = true)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::TcpListener,
+                    id: activate.listener_key().to_string(),
+                }),
+            ListenerType::Udp => self
+                .udp_listeners
+                .get_mut(&activate.listener_key())
+                .map(|listener| listener.active = true)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::UdpListener,
+                    id: activate.listener_key().to_string(),
+                }),
+        }
+    }
+
+    fn deactivate_listener(&mut self, deactivate: &DeactivateListener) -> Result<(), StateError> {
+        match ListenerType::try_from(deactivate.proxy).map_err(StateError::WrongFieldValue)? {
+            ListenerType::Http => self
+                .http_listeners
+                .get_mut(&deactivate.listener_key())
+                .map(|listener| listener.active = false)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::HttpListener,
+                    id: deactivate.listener_key().to_string(),
+                }),
+            ListenerType::Https => self
+                .https_listeners
+                .get_mut(&deactivate.listener_key())
+                .map(|listener| listener.active = false)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::HttpsListener,
+                    id: deactivate.listener_key().to_string(),
+                }),
+            ListenerType::Tcp => self
+                .tcp_listeners
+                .get_mut(&deactivate.listener_key())
+                .map(|listener| listener.active = false)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::TcpListener,
+                    id: deactivate.listener_key().to_string(),
+                }),
+            ListenerType::Udp => self
+                .udp_listeners
+                .get_mut(&deactivate.listener_key())
+                .map(|listener| listener.active = false)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::UdpListener,
+                    id: deactivate.listener_key().to_string(),
+                }),
+        }
+    }
+
+    /// Insert `front` under its route key in `fronts`, or refuse a duplicate.
+    ///
+    /// The HTTP and HTTPS frontend adds differ only by the map they index and
+    /// the [`ObjectKind`] they report, so they share this body: a second copy
+    /// of the admission logic is a second place for the route-key identity to
+    /// drift.
+    fn add_frontend_to(
+        fronts: &mut BTreeMap<String, HttpFrontend>,
+        front: &RequestHttpFrontend,
+        kind: ObjectKind,
+    ) -> Result<(), StateError> {
+        let front_as_key = front.to_string();
+        let before = fronts.len();
+
+        match fronts.entry(front.to_string()) {
+            BTreeMapEntry::Vacant(e) => {
+                e.insert(front.clone().to_frontend().map_err(|into_error| {
+                    StateError::FrontendConversion {
+                        frontend: front_as_key,
+                        error: into_error.to_string(),
+                    }
+                })?)
+            }
+            BTreeMapEntry::Occupied(_) => {
+                debug_assert_eq!(
+                    fronts.len(),
+                    before,
+                    "a rejected duplicate {kind:?} add must not mutate the map"
+                );
+                return Err(StateError::Exists {
+                    kind,
+                    id: front.to_string(),
+                });
+            }
+        };
+        // On the conversion-error path the `?` already returned, so reaching
+        // here means exactly one entry was inserted under the route key.
+        debug_assert!(
+            fronts.contains_key(&front.to_string()),
+            "adding a {kind:?} must insert the route key on success"
+        );
+        debug_assert_eq!(
+            fronts.len(),
+            before + 1,
+            "adding a {kind:?} inserts exactly one entry on success"
+        );
+        Ok(())
+    }
+
+    /// Evict `front`'s route key from `fronts`. Shared by the HTTP and HTTPS
+    /// frontend removals for the same reason [`Self::add_frontend_to`] is.
+    fn remove_frontend_from(
+        fronts: &mut BTreeMap<String, HttpFrontend>,
+        front: &RequestHttpFrontend,
+        kind: ObjectKind,
+    ) -> Result<(), StateError> {
+        let key = front.to_string();
+        let before = fronts.len();
+        // The route key names no cluster: a key freed by one cluster's
+        // removal can be taken by another. Match the stored frontend only if
+        // it belongs to the cluster the removal names, or a late removal for
+        // the first cluster would evict the second one's route.
+        match fronts.get(&key) {
+            Some(stored) if stored.cluster_id.as_deref() == front.cluster_id.as_deref() => {
+                fronts.remove(&key);
+            }
+            _ => {
+                debug_assert_eq!(fronts.len(), before, "a refused removal must not mutate");
+                return Err(StateError::NotFound {
+                    kind,
+                    id: front.to_string(),
+                });
+            }
+        }
+        debug_assert!(
+            !fronts.contains_key(&key),
+            "removing a frontend must evict the route key"
+        );
+        debug_assert_eq!(
+            fronts.len(),
+            before - 1,
+            "removing a frontend drops exactly one entry"
+        );
+        Ok(())
+    }
+
+    fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        Self::add_frontend_to(&mut self.http_fronts, front, ObjectKind::HttpFrontend)
+    }
+
+    fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        Self::add_frontend_to(&mut self.https_fronts, front, ObjectKind::HttpsFrontend)
+    }
+
+    fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        Self::remove_frontend_from(&mut self.http_fronts, front, ObjectKind::HttpFrontend)
+    }
+
+    fn remove_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        Self::remove_frontend_from(&mut self.https_fronts, front, ObjectKind::HttpsFrontend)
+    }
+
+    fn add_certificate(&mut self, add: &AddCertificate) -> Result<(), StateError> {
+        let fingerprint = add
+            .certificate
+            .fingerprint()
+            .map_err(StateError::AddCertificate)?;
+        let address: SocketAddr = add.address.into();
+
+        // Duplicate AddCertificate is historically a complete no-op keyed by
+        // leaf fingerprint. In particular it must not rewrite material,
+        // expiration metadata or selection order from a differing retry.
+        if self
+            .certificates
+            .get(&address)
+            .is_some_and(|entries| entries.contains_key(&fingerprint))
+        {
+            let names_bytes = add
+                .certificate
+                .names
+                .iter()
+                .fold(0usize, |total, name| total.saturating_add(name.len()));
+            info!(
+                "Skip loading certificate with fingerprint_bytes={} names_count={} names_bytes={} on listener '{}', the certificate is already present.",
+                fingerprint.0.len(),
+                add.certificate.names.len(),
+                names_bytes,
+                add.address
+            );
+            return Ok(());
+        }
+
+        // Both fallible steps (`fingerprint()` above, `apply_overriding_names`
+        // below -- the latter re-parses as X.509 when `names` is empty, so
+        // well-formed PEM armor around invalid DER content still fails here)
+        // run BEFORE `self.certificates` is touched. `entry(..).or_default()`
+        // unconditionally materialises a bucket for the address, including a
+        // brand-new one; ordering it after either fallible step used to leave
+        // a dangling empty bucket for a previously-absent address on a
+        // rejected add -- the same "mutate before the fallible step" defect
+        // class as sozu-proxy/sozu#1404's `replace_certificate`, found while
+        // adding certificate coverage to `check_invariants` for that issue.
+        let mut add = add.clone();
+        add.certificate
+            .apply_overriding_names()
+            .map_err(StateError::AddCertificate)?;
+        let trusted_next_order = self.certificate_metadata_is_trusted(address).then(|| {
+            self.certificate_metadata
+                .get(&address)
+                .and_then(|index| index.next_order)
+                .expect("trusted metadata index must carry its next ordinal")
+        });
+        let normalized_metadata = trusted_next_order
+            .is_none()
+            .then(|| self.normalized_certificate_metadata_for_address(address));
+        let entry = self.certificates.entry(address).or_default();
+        let before = entry.len();
+        entry.insert(fingerprint.clone(), add.certificate);
+        if let Some(insertion_order) = trusted_next_order {
+            let metadata = self
+                .certificate_metadata
+                .get_mut(&address)
+                .expect("trusted metadata index must remain present");
+            metadata.entries.insert(
+                fingerprint.clone(),
+                CertificateMetadata {
+                    expired_at: add.expired_at,
+                    insertion_order,
+                },
+            );
+            metadata.next_order = Some(insertion_order + 1);
+        } else {
+            // The existing index came from a legacy or externally
+            // deserialized state. Validation above has completed, so it is
+            // now safe to normalize once and commit the new entry.
+            let mut metadata =
+                normalized_metadata.expect("untrusted metadata must have a normalized candidate");
+            let insertion_order = metadata.entries.len() as u64;
+            metadata.entries.insert(
+                fingerprint.clone(),
+                CertificateMetadata {
+                    expired_at: add.expired_at,
+                    insertion_order,
+                },
+            );
+            metadata.next_order = Some(insertion_order + 1);
+            self.certificate_metadata.insert(address, metadata);
+        }
+        debug_assert!(
+            entry.contains_key(&fingerprint),
+            "add_certificate must insert the fingerprint under its address"
+        );
+        debug_assert_eq!(
+            entry.len(),
+            before + 1,
+            "add_certificate inserts exactly one fingerprint on the new path"
+        );
+        Ok(())
+    }
+
+    fn remove_certificate(&mut self, remove: &RemoveCertificate) -> Result<(), StateError> {
+        let fingerprint = Fingerprint(
+            hex::decode(&remove.fingerprint)
+                .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
+        );
+        let address = remove.address.into();
+
+        if self
+            .certificates
+            .get(&address)
+            .is_none_or(|entries| !entries.contains_key(&fingerprint))
+        {
+            return Ok(());
+        }
+
+        let mut metadata = self.take_certificate_metadata_for_state_change(address);
+        Self::remove_certificate_metadata(&mut metadata, &fingerprint);
+
+        let became_empty = if let Some(index) = self.certificates.get_mut(&address) {
+            index.remove(&fingerprint);
+            debug_assert!(
+                !index.contains_key(&fingerprint),
+                "remove_certificate must evict the fingerprint when the address is known"
+            );
+            index.is_empty()
+        } else {
+            false
+        };
+
+        // Mirror `CertificateResolver::remove_certificate`'s
+        // `name_fingerprint_idx` cleanup (`lib/src/tls.rs`, #1202): an
+        // address bucket emptied by removing its last certificate must not
+        // linger as a dangling `self.certificates[address] == {}` entry.
+        // That leftover was reachable through ordinary
+        // `AddCertificate`+`RemoveCertificate` and broke
+        // `generate_requests`'s own round-trip postcondition (an empty
+        // bucket contributes zero `AddCertificate` requests, so replaying
+        // them into a fresh `ConfigState` never recreates the entry).
+        // Found while adding certificate coverage to `check_invariants` for
+        // sozu-proxy/sozu#1404.
+        if became_empty {
+            self.certificates.remove(&address);
+            self.certificate_metadata.remove(&address);
+        } else {
+            self.certificate_metadata.insert(address, metadata);
+        }
+
+        Ok(())
+    }
+
+    /// - check that the address is known
+    /// - calculate the new fingerprint (fallible: parses the PEM)
+    /// - insert the new certificate with the new fingerprint as key
+    /// - check that the new entry is present in the certificates hashmap
+    /// - only then remove the old certificate, using the old fingerprint
+    ///
+    /// Add-before-remove ordering, mirroring the fix applied to
+    /// `CertificateResolver::replace_certificate` in `lib/src/tls.rs` for
+    /// the same defect (sozu-proxy/sozu#1202, closing #774): computing the
+    /// new fingerprint is fallible, so nothing is removed until the
+    /// replacement is safely stored. A malformed PEM therefore leaves the
+    /// address's certificate map untouched instead of emptied
+    /// (sozu-proxy/sozu#1404). This also makes the idempotent case (old
+    /// fingerprint == new fingerprint, e.g. an operator or ACME retry loop
+    /// resubmitting the same PEM) naturally safe: the entry is
+    /// (re-)inserted and then deliberately NOT removed, instead of being
+    /// removed right after being re-inserted under the same key.
+    fn replace_certificate(&mut self, replace: &ReplaceCertificate) -> Result<(), StateError> {
+        let replace_address = replace.address.into();
+        let old_fingerprint = Fingerprint(
+            hex::decode(&replace.old_fingerprint)
+                .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
+        );
+
+        if !self.certificates.contains_key(&replace_address) {
+            return Err(StateError::NotFound {
+                kind: ObjectKind::Certificate,
+                id: replace.address.to_string(),
+            });
+        }
+
+        let mut new_certificate = replace.new_certificate.to_owned();
+        new_certificate
+            .apply_overriding_names()
+            .map_err(|error| StateError::ReplaceCertificate(error.to_string()))?;
+        let new_fingerprint = Fingerprint(
+            calculate_fingerprint(new_certificate.certificate.as_bytes()).map_err(
+                |fingerprint_err| StateError::ReplaceCertificate(fingerprint_err.to_string()),
+            )?,
+        );
+        let stored_material_matches = self
+            .certificates
+            .get(&replace_address)
+            .and_then(|entries| entries.get(&new_fingerprint))
+            .is_some_and(|stored| stored == &new_certificate);
+        let stored_expiration_matches = self
+            .certificate_metadata
+            .get(&replace_address)
+            .and_then(|metadata| metadata.entries.get(&new_fingerprint))
+            .and_then(|metadata| metadata.expired_at)
+            == replace.new_expired_at;
+
+        // A byte-for-byte effective self-replace is a complete no-op. Return
+        // before normalizing legacy metadata so successful no-op commands keep
+        // their historical behavior and cost.
+        if old_fingerprint == new_fingerprint
+            && stored_material_matches
+            && stored_expiration_matches
+        {
+            return Ok(());
+        }
+
+        let mut metadata = self.take_certificate_metadata_for_state_change(replace_address);
+        let new_material_already_stored = stored_material_matches
+            && metadata
+                .entries
+                .get(&new_fingerprint)
+                .is_some_and(|stored| stored.expired_at == replace.new_expired_at);
+
+        let certificates =
+            self.certificates
+                .get_mut(&replace_address)
+                .ok_or(StateError::ReplaceCertificate(
+                    "Unlikely error. This entry in the certificate hashmap should be present"
+                        .to_owned(),
+                ))?;
+
+        if !new_material_already_stored {
+            certificates.remove(&new_fingerprint);
+            Self::remove_certificate_metadata(&mut metadata, &new_fingerprint);
+        }
+        if old_fingerprint != new_fingerprint {
+            certificates.remove(&old_fingerprint);
+            Self::remove_certificate_metadata(&mut metadata, &old_fingerprint);
+        }
+        if !new_material_already_stored {
+            let insertion_order = metadata.entries.len() as u64;
+            certificates.insert(new_fingerprint.clone(), new_certificate);
+            metadata.entries.insert(
+                new_fingerprint.clone(),
+                CertificateMetadata {
+                    expired_at: replace.new_expired_at,
+                    insertion_order,
+                },
+            );
+            metadata.next_order = Some(insertion_order + 1);
+        }
+        self.certificate_metadata.insert(replace_address, metadata);
+
+        // Postcondition: the new fingerprint is keyed under the address, and
+        // (unless old and new collide, e.g. a self-replace) the old one is gone.
+        debug_assert!(
+            self.certificates
+                .get(&replace_address)
+                .is_some_and(|certs| certs.contains_key(&new_fingerprint)),
+            "replace_certificate must leave the new fingerprint present"
+        );
+        debug_assert!(
+            new_fingerprint == old_fingerprint
+                || self
+                    .certificates
+                    .get(&replace_address)
+                    .is_none_or(|certs| !certs.contains_key(&old_fingerprint)),
+            "replace_certificate must evict the old fingerprint unless it equals the new one"
+        );
+        Ok(())
+    }
+
+    /// Admission control mirrors the worker's `validate_new_tcp_front`
+    /// (`lib/src/tcp.rs`) so the master never persists a route its own
+    /// workers reject on the next fan-out (sozu-proxy/sozu#1290): the
+    /// command server mutates master state before dispatching to workers,
+    /// and a worker NACK never rolls the master back. Every check below
+    /// runs, and every canonicalization is computed, BEFORE `self.tcp_fronts`
+    /// is touched -- an early `Err` return is a true no-op on `self`.
+    fn add_tcp_frontend(&mut self, front: &RequestTcpFrontend) -> Result<(), StateError> {
+        let address: SocketAddr = front.address.into();
+
+        // The other order of `add_cluster`'s check: a TCP frontend may not
+        // join a cluster that keys on a request header or cookie.
+        if self
+            .clusters
+            .get(front.cluster_id.as_str())
+            .is_some_and(|cluster| {
+                cluster.affinity_header.is_some() || cluster.affinity_cookie.is_some()
+            })
+        {
+            return Err(StateError::InvalidTcpFrontend {
+                address,
+                reason: TCP_CLUSTER_AFFINITY_KEY.to_owned(),
+            });
+        }
+
+        // Canonicalize first: shape-validate and lowercase `sni` through the
+        // SAME `validate_sni_pattern` config-load and the worker use, and
+        // reduce `alpn` to its canonical sorted+deduped set. Both canonical
+        // forms are what gets stored (so the state's own hashing/diffing/
+        // `generate_requests` replay sees one identity per route,
+        // independent of how the caller cased/ordered its request) AND what
+        // every admission check below compares against.
+        let normalized_sni = match &front.sni {
+            Some(sni) => Some(validate_sni_pattern(sni).map_err(|config_error| {
+                StateError::InvalidTcpFrontend {
+                    address,
+                    reason: format!("sni {sni:?} failed SNI shape validation: {config_error}"),
+                }
+            })?),
+            None => None,
+        };
+        let alpn = canonical_tcp_alpn(&front.alpn);
+
+        // Worker parity (`validate_new_tcp_front`'s first no-SNI check):
+        // alpn only matches within an SNI-scoped preread, so a frontend
+        // without sni would silently ignore its alpn list. Config-load's
+        // `to_tcp_front` already rejects this shape; a raw `AddTcpFrontend`
+        // over the command socket must not slip past the master either.
+        if normalized_sni.is_none() && !alpn.is_empty() {
+            return Err(StateError::InvalidTcpFrontend {
+                address,
+                reason: format!(
+                    "alpn = {alpn:?} set without sni: alpn only matches within an SNI-scoped \
+                     preread, so a frontend without sni would silently ignore its alpn list"
+                ),
+            });
+        }
+
+        let total_before = self.count_tcp_frontends_raw();
+
+        // Listener-wide scan across ALL clusters' buckets at this address --
+        // the previous check only walked `front.cluster_id`'s own bucket, so
+        // a duplicate identity, a no-SNI/SNI mix, a second catch-all, or an
+        // overlapping ALPN set under a DIFFERENT cluster_id all used to pass
+        // here and then fail on every worker.
+        let mut listener_has_no_sni_front = false;
+        let mut listener_has_sni_front = false;
+        for existing in self
+            .tcp_fronts
+            .values()
+            .flatten()
+            .filter(|existing| existing.address == address)
+        {
+            if tcp_frontend_matches(existing, address, &normalized_sni, &alpn) {
+                return Err(StateError::Exists {
+                    kind: ObjectKind::TcpFrontend,
+                    id: format!(
+                        "TcpFrontend {{ address: {address}, sni: {normalized_sni:?}, \
+                         alpn: {alpn:?} }}"
+                    ),
+                });
+            }
+            match &existing.sni {
+                None => listener_has_no_sni_front = true,
+                Some(existing_sni) => {
+                    listener_has_sni_front = true;
+                    // Catch-all / ALPN-overlap only matter between two
+                    // SNI-scoped fronts sharing the exact same normalized
+                    // sni -- exact and wildcard patterns are DISTINCT keys
+                    // here, never matched against each other (no trie
+                    // matching in `ConfigState`), mirroring the worker's own
+                    // `accept_wildcard: false` self-lookup.
+                    if normalized_sni.as_deref() != Some(existing_sni.as_str()) {
+                        continue;
+                    }
+                    let existing_is_catch_all = existing.alpn.is_empty();
+                    let new_is_catch_all = alpn.is_empty();
+                    if existing_is_catch_all && new_is_catch_all {
+                        return Err(StateError::InvalidTcpFrontend {
+                            address,
+                            reason: format!(
+                                "sni {existing_sni:?} already has a catch-all (empty alpn) \
+                                 frontend: at most one frontend per (address, sni) may omit \
+                                 alpn"
+                            ),
+                        });
+                    }
+                    // A catch-all coexisting with an ALPN-scoped sibling on
+                    // the same sni is legal (worker parity: `AlpnMatcher::Any`
+                    // only conflicts with another `Any`, never with a
+                    // `OneOf`) -- only two ALPN-scoped fronts can overlap.
+                    if !existing_is_catch_all
+                        && !new_is_catch_all
+                        && let Some(overlap) = alpn
+                            .iter()
+                            .find(|protocol| existing.alpn.contains(protocol))
+                    {
+                        return Err(StateError::InvalidTcpFrontend {
+                            address,
+                            reason: format!(
+                                "sni {existing_sni:?} already has a frontend matching ALPN \
+                                 protocol {overlap:?}: ALPN matchers for the same (address, \
+                                 sni) must not overlap"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        match &normalized_sni {
+            None if listener_has_sni_front => {
+                return Err(StateError::InvalidTcpFrontend {
+                    address,
+                    reason: "a no-SNI frontend cannot be added to a listener that already has \
+                             SNI-scoped routes"
+                        .to_string(),
+                });
+            }
+            Some(_) if listener_has_no_sni_front => {
+                return Err(StateError::InvalidTcpFrontend {
+                    address,
+                    reason: "an SNI-scoped frontend cannot be added to a listener that already \
+                             has a no-SNI catch-all cluster"
+                        .to_string(),
+                });
+            }
+            _ => {}
+        }
+        // POST: every admission check above either returned `Err` or fell
+        // through -- none of them may mutate `self`, so the total frontend
+        // count observed before the scan must still hold at this point.
+        debug_assert_eq!(
+            self.count_tcp_frontends_raw(),
+            total_before,
+            "add_tcp_frontend must not mutate tcp_fronts before every admission check has \
+             passed"
+        );
+
+        let tcp_frontend = TcpFrontend {
+            cluster_id: front.cluster_id.as_str().into(),
+            address,
+            tags: front.tags.clone(),
+            sni: normalized_sni,
+            alpn,
+        };
+        let tcp_frontends = self
+            .tcp_fronts
+            .entry(tcp_frontend.cluster_id.clone())
+            .or_default();
+        let before = tcp_frontends.len();
+        debug_assert_eq!(
+            *tcp_frontend.cluster_id, *front.cluster_id,
+            "the built frontend must carry its bucket's cluster_id"
+        );
+        tcp_frontends.push(tcp_frontend);
+        debug_assert_eq!(
+            tcp_frontends.len(),
+            before + 1,
+            "add_tcp_frontend appends exactly one entry"
+        );
+        Ok(())
+    }
+
+    fn remove_tcp_frontend(
+        &mut self,
+        front_to_remove: &RequestTcpFrontend,
+    ) -> Result<(), StateError> {
+        let tcp_frontends =
+            self.tcp_fronts
+                .get_mut(front_to_remove.cluster_id.as_str())
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::TcpFrontend,
+                    id: format!(
+                        "RequestTcpFrontend {{ cluster_id: {:?}, address: {:?}, tags: {:?}, sni: {:?}, alpn: {:?} }}",
+                        front_to_remove.cluster_id,
+                        front_to_remove.address,
+                        front_to_remove.tags,
+                        front_to_remove.sni,
+                        front_to_remove.alpn,
+                    ),
+                })?;
+
+        let len = tcp_frontends.len();
+        let remove_address: SocketAddr = front_to_remove.address.into();
+        // Canonicalize for matching, mirroring add_tcp_frontend and the
+        // worker: lowercase `sni` (the SNI-preread core normalizes to
+        // lowercase before ever looking a route up, and `TcpFrontend.sni` is
+        // stored in that same normalized form) and reduce `alpn` to its
+        // canonical sorted+deduped set, so a request differing only in sni
+        // case or alpn order still matches the stored frontend instead of
+        // falling through to `NoChange`. Shape is intentionally NOT
+        // re-validated here: a malformed pattern could never have been
+        // stored post-fix, so it simply matches nothing below.
+        let remove_sni = front_to_remove.sni.as_deref().map(str::to_ascii_lowercase);
+        let remove_alpn = canonical_tcp_alpn(&front_to_remove.alpn);
+        // INV: removal identity mirrors add_tcp_frontend's (address, sni,
+        // alpn) key — removing one SNI-scoped frontend on a listener must
+        // not also evict a sibling frontend at the same address with a
+        // different sni/alpn.
+        tcp_frontends.retain(|front| {
+            !tcp_frontend_matches(front, remove_address, &remove_sni, &remove_alpn)
+        });
+        let after = tcp_frontends.len();
+        if after == len {
+            return Err(StateError::NoChange);
+        }
+        // `retain` may drop more than one entry only if duplicates on the same
+        // (address, sni, alpn) ever existed; `add_tcp_frontend` forbids that,
+        // so a successful removal must drop exactly one and leave none
+        // matching.
+        debug_assert_eq!(
+            after,
+            len - 1,
+            "remove_tcp_frontend drops exactly one entry"
+        );
+        debug_assert!(
+            !tcp_frontends.iter().any(|f| tcp_frontend_matches(
+                f,
+                remove_address,
+                &remove_sni,
+                &remove_alpn
+            )),
+            "remove_tcp_frontend must leave no frontend matching the removed (address, sni, alpn)"
+        );
+        Ok(())
+    }
+
+    /// Admits at most ONE UDP frontend per address, across every cluster.
+    ///
+    /// UDP has no routing discriminator: a datagram carries no SNI, no `Host`
+    /// header and no path, so the listener address IS the entire routing key
+    /// and no attribute of an incoming datagram could pick between two
+    /// frontends bound to it. TCP legitimately hosts several frontends per
+    /// address because `(address, sni, alpn)` discriminates; UDP has no
+    /// equivalent.
+    ///
+    /// The worker cannot represent a second claim either:
+    /// `UdpProxy::add_udp_front` (`lib/src/udp.rs`) overwrites
+    /// `listener.cluster_id` and `listener.set_tags(address, ...)`, and
+    /// `cluster_for_listener: HashMap<Token, ClusterId>` holds strictly one
+    /// cluster per listener token, one listener per address. So the state used
+    /// to admit two shapes the datapath silently collapsed to whichever
+    /// frontend was applied LAST: two frontends at one (cluster, address)
+    /// differing only in their tags, and -- with no check at all, because the
+    /// scan never left `front.cluster_id`'s own bucket -- two DIFFERENT
+    /// clusters claiming one address.
+    ///
+    /// Both are refused here instead, which is the same listener-wide
+    /// admission [`Self::add_tcp_frontend`] performs for its own key. Every
+    /// check runs BEFORE `self.udp_fronts` is touched, so an early `Err`
+    /// return is a true no-op on `self` -- the `entry(...).or_default()` that
+    /// used to open the bucket first now runs only once admission has passed.
+    fn add_udp_frontend(&mut self, front: &RequestUdpFrontend) -> Result<(), StateError> {
+        let address: SocketAddr = front.address.into();
+        let udp_frontend = UdpFrontend {
+            cluster_id: front.cluster_id.as_str().into(),
+            address,
+            tags: front.tags.clone(),
+        };
+
+        if self
+            .backends
+            .get(front.cluster_id.as_str())
+            .is_some_and(|backends| backends.iter().any(|b| b.unix_path.is_some()))
+        {
+            return Err(StateError::InvalidValue {
+                field: "unix_path",
+                reason: UDP_UNIX_BACKEND_REFUSED,
+            });
+        }
+
+        let total_before = self.count_udp_frontends_raw();
+
+        // Listener-wide scan across ALL clusters' buckets at this address, as
+        // `add_tcp_frontend` does: the previous check only walked
+        // `front.cluster_id`'s own bucket, so a second cluster claiming the
+        // same address never met a check at all.
+        if let Some(current) = self
+            .udp_fronts
+            .values()
+            .flatten()
+            .find(|existing| existing.address == address)
+        {
+            // An exact re-add of the identity `add_udp_frontend` already
+            // admitted stays `Exists`, the answer every other add gives for
+            // its own key and the one whose message tells the operator to
+            // remove it first or send the corresponding update.
+            if *current == udp_frontend {
+                return Err(StateError::Exists {
+                    kind: ObjectKind::UdpFrontend,
+                    id: format!("{udp_frontend:?}"),
+                });
+            }
+            return Err(StateError::UdpFrontendAddressTaken {
+                address,
+                cluster_id: udp_frontend.cluster_id.clone(),
+                current_cluster_id: current.cluster_id.clone(),
+                current_tags: current.tags.clone(),
+            });
+        }
+
+        // POST: every admission check above either returned `Err` or fell
+        // through -- none of them may mutate `self`, so the total frontend
+        // count observed before the scan must still hold at this point.
+        debug_assert_eq!(
+            self.count_udp_frontends_raw(),
+            total_before,
+            "add_udp_frontend must not mutate udp_fronts before every admission check has passed"
+        );
+
+        let udp_frontends = self
+            .udp_fronts
+            .entry(udp_frontend.cluster_id.clone())
+            .or_default();
+        let before = udp_frontends.len();
+        udp_frontends.push(udp_frontend);
+        debug_assert_eq!(
+            udp_frontends.len(),
+            before + 1,
+            "add_udp_frontend appends exactly one entry"
+        );
+        // INV: a UDP listener address is the ENTIRE routing key, so exactly
+        // one frontend may hold it across every cluster -- the model the
+        // worker's one-cluster-per-listener-token datapath can represent.
+        debug_assert_eq!(
+            self.udp_fronts
+                .values()
+                .flatten()
+                .filter(|existing| existing.address == address)
+                .count(),
+            1,
+            "add_udp_frontend must leave exactly one frontend on an address, across all clusters"
+        );
+        Ok(())
+    }
+
+    fn remove_udp_frontend(
+        &mut self,
+        front_to_remove: &RequestUdpFrontend,
+    ) -> Result<(), StateError> {
+        let udp_frontends = self
+            .udp_fronts
+            .get_mut(front_to_remove.cluster_id.as_str())
+            .ok_or(StateError::NotFound {
+                kind: ObjectKind::UdpFrontend,
+                id: format!("{front_to_remove:?}"),
+            })?;
+
+        let len = udp_frontends.len();
+        let remove_address: SocketAddr = front_to_remove.address.into();
+        // INV: removal identity mirrors add_udp_frontend's
+        // (cluster_id, address, tags) key -- the bucket this `get_mut`
+        // returned already scopes `cluster_id`, exactly as
+        // `tcp_frontend_matches` leaves it to `remove_tcp_frontend`'s own
+        // bucket lookup. The tags stay load-bearing now that
+        // `add_udp_frontend` admits one frontend per address across every
+        // cluster: a remove that omits them matches only a frontend stored
+        // with no tags, so against a TAGGED frontend on that address it must
+        // answer `NoChange` rather than clear it.
+        let matches_removal = |front: &UdpFrontend| {
+            front.address == remove_address && front.tags == front_to_remove.tags
+        };
+        udp_frontends.retain(|front| !matches_removal(front));
+        let after = udp_frontends.len();
+        if after == len {
+            return Err(StateError::NoChange);
+        }
+        // `retain` may drop more than one entry only if duplicates on the same
+        // (cluster_id, address, tags) ever existed; `add_udp_frontend` forbids
+        // that, so a successful removal must drop exactly one and leave none
+        // matching.
+        debug_assert_eq!(
+            after,
+            len - 1,
+            "remove_udp_frontend drops exactly one entry"
+        );
+        debug_assert!(
+            !udp_frontends.iter().any(matches_removal),
+            "remove_udp_frontend must leave no frontend matching the removed (address, tags)"
+        );
+        Ok(())
+    }
+
+    /// Why `request` would put a health check `port` next to a backend with a
+    /// `unix_path` in one cluster, which
+    /// `sozu_command::config::HEALTH_CHECK_PORT_UNIX_REFUSED` forbids, in either order of arrival: the port set on a cluster that
+    /// holds a unix backend (`AddCluster`, `SetHealthCheck`), or a unix backend
+    /// added to a cluster whose health check sets a port.
+    ///
+    /// `None` for every other request, and for one a more specific refusal
+    /// already covers (an unknown cluster, an invalid health check, a UDP
+    /// cluster, a `unix_path` that does not parse), so those diagnostics keep
+    /// their precedence. The worker asks this before dispatching, because it
+    /// must not touch its proxies for a request the state refuses.
+    pub fn health_check_port_unix_conflict(&self, request: &RequestType) -> Option<&'static str> {
+        let holds_unix_backend = |cluster_id: &str| {
+            self.backends
+                .get(cluster_id)
+                .is_some_and(|backends| backends.iter().any(|b| b.unix_path.is_some()))
+        };
+        let port_conflicts = |config: &crate::proto::command::HealthCheckConfig,
+                              cluster_id: &str| {
+            config.port.is_some()
+                && crate::config::validate_health_check_config(config).is_ok()
+                && holds_unix_backend(cluster_id)
+        };
+        let conflict = match request {
+            RequestType::AddCluster(cluster) => {
+                cluster.udp.is_none()
+                    && cluster
+                        .health_check
+                        .as_ref()
+                        .is_some_and(|config| port_conflicts(config, &cluster.cluster_id))
+            }
+            RequestType::SetHealthCheck(set) => {
+                self.clusters.contains_key(set.cluster_id.as_str())
+                    && port_conflicts(&set.config, &set.cluster_id)
+            }
+            RequestType::SetProtectedHealthCheck(set) => {
+                self.clusters.contains_key(set.cluster_id.as_str())
+                    && port_conflicts(&set.config, &set.cluster_id)
+            }
+            RequestType::AddBackend(add) | RequestType::AddUnixBackend(add) => {
+                add.unix_path.as_deref().is_some_and(|unix_path| {
+                    crate::config::parse_backend_unix_path(unix_path).is_ok()
+                        && !self.is_udp_cluster(&add.cluster_id)
+                        && self
+                            .clusters
+                            .get(add.cluster_id.as_str())
+                            .and_then(|cluster| cluster.health_check.as_ref())
+                            .is_some_and(|config| config.port.is_some())
+                })
+            }
+            _ => false,
+        };
+        conflict.then_some(crate::config::HEALTH_CHECK_PORT_UNIX_REFUSED)
+    }
+
+    /// Whether datagrams, not streams, reach this cluster: it has a UDP
+    /// frontend or carries UDP-specific settings.
+    fn is_udp_cluster(&self, cluster_id: &str) -> bool {
+        self.udp_fronts
+            .get(cluster_id)
+            .is_some_and(|fronts| !fronts.is_empty())
+            || self
+                .clusters
+                .get(cluster_id)
+                .is_some_and(|cluster| cluster.udp.is_some())
+    }
+
+    /// Add or update a backend of an existing cluster. A backend belongs to
+    /// its cluster: one naming a cluster the state does not hold, never added
+    /// or already removed (`Self::remove_cluster` removes its backends), is
+    /// refused with `ClusterNotFound` and the state is left untouched, before
+    /// any `unix_path` or UDP validation.
+    /// Frontends stay independent of their cluster's presence.
+    fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
+        if !self.clusters.contains_key(add_backend.cluster_id.as_str()) {
+            debug_assert!(
+                self.backends
+                    .get(add_backend.cluster_id.as_str())
+                    .is_none_or(Vec::is_empty),
+                "no backend may outlive its cluster"
+            );
+            return Err(StateError::ClusterNotFound {
+                kind: ObjectKind::Backend,
+                cluster_id: add_backend.cluster_id.to_owned(),
+            });
+        }
+        if let Some(unix_path) = add_backend.unix_path.as_deref() {
+            crate::config::parse_backend_unix_path(unix_path).map_err(|reason| {
+                StateError::InvalidValue {
+                    field: "unix_path",
+                    reason,
+                }
+            })?;
+            // A UDP cluster relays datagrams over UDP sockets: a UNIX stream
+            // endpoint cannot carry them, and the datapath would relay to the
+            // identity `address` instead. The frontend that makes the cluster
+            // UDP may land after the backend; `add_udp_frontend` refuses that
+            // order.
+            if self.is_udp_cluster(&add_backend.cluster_id) {
+                return Err(StateError::InvalidValue {
+                    field: "unix_path",
+                    reason: UDP_UNIX_BACKEND_REFUSED,
+                });
+            }
+        }
+        let backend = Backend {
+            address: add_backend.address.into(),
+            cluster_id: add_backend.cluster_id.as_str().into(),
+            backend_id: add_backend.backend_id.clone(),
+            sticky_id: add_backend.sticky_id.clone(),
+            load_balancing_parameters: add_backend.load_balancing_parameters,
+            backup: add_backend.backup,
+            unix_path: add_backend.unix_path.clone(),
+        };
+        let backends = self.backends.entry(backend.cluster_id.clone()).or_default();
+        let backend_id = backend.backend_id.clone();
+        let backend_address = backend.address;
+        let before = backends.len();
+
+        // we might be modifying the sticky id or load balancing parameters:
+        // the retain drops at most one prior copy (the map stays deduplicated
+        // on (backend_id, address)), then we re-push the new version. So the
+        // net length grows by exactly one iff this was a brand-new backend.
+        let was_present = backends
+            .iter()
+            .any(|b| b.backend_id == backend_id && b.address == backend_address);
+        backends.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
+        debug_assert_eq!(
+            backends.len(),
+            before - was_present as usize,
+            "the upsert retain must drop exactly the prior copy iff it existed"
+        );
+        backends.push(backend);
+        backends.sort();
+
+        debug_assert_eq!(
+            backends.len(),
+            before + (!was_present) as usize,
+            "add_backend grows the bucket by one iff the backend was new"
+        );
+        debug_assert_eq!(
+            backends
+                .iter()
+                .filter(|b| b.backend_id == backend_id && b.address == backend_address)
+                .count(),
+            1,
+            "exactly one copy of the upserted backend must remain"
+        );
+        Ok(())
+    }
+
+    fn remove_backend(&mut self, backend: &RemoveBackend) -> Result<(), StateError> {
+        let backend_list =
+            self.backends
+                .get_mut(backend.cluster_id.as_str())
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::Backend,
+                    id: backend.backend_id.to_owned(),
+                })?;
+
+        let len = backend_list.len();
+        let remove_address: SocketAddr = backend.address.into();
+        backend_list.retain(|b| b.backend_id != backend.backend_id || b.address != remove_address);
+        backend_list.sort();
+        let after = backend_list.len();
+        if after == len {
+            return Err(StateError::NoChange);
+        }
+        // The list is deduplicated on (backend_id, address), so a matching
+        // removal drops exactly one entry and leaves nothing matching.
+        debug_assert_eq!(after, len - 1, "remove_backend drops exactly one entry");
+        debug_assert!(
+            !backend_list
+                .iter()
+                .any(|b| b.backend_id == backend.backend_id && b.address == remove_address),
+            "remove_backend must leave no backend matching (backend_id, address)"
+        );
+        Ok(())
+    }
+
+    /// creates all requests needed to bootstrap the state
+    fn generate_requests(&self) -> Vec<Request> {
+        let mut v: Vec<Request> = Vec::new();
+
+        for listener in self.http_listeners.values() {
+            v.push(RequestType::AddHttpListener(listener.clone()).into());
+            if listener.active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Http.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for listener in self.https_listeners.values() {
+            v.push(RequestType::add_https_listener(listener.clone()).into());
+            if listener.active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Https.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for listener in self.tcp_listeners.values() {
+            v.push(RequestType::AddTcpListener(listener.clone()).into());
+            if listener.active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for listener in self.udp_listeners.values() {
+            v.push(RequestType::AddUdpListener(listener.clone()).into());
+            if listener.active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Udp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for cluster in self.clusters.values() {
+            v.push(RequestType::AddCluster(cluster.clone()).into());
+        }
+
+        for front in self.http_fronts.values() {
+            v.push(RequestType::add_http_frontend(front.clone().into()).into());
+        }
+
+        for add in self.certificate_add_requests() {
+            v.push(RequestType::AddCertificate(add).into());
+        }
+
+        for front in self.https_fronts.values() {
+            v.push(RequestType::add_https_frontend(front.clone().into()).into());
+        }
+
+        for front_list in self.tcp_fronts.values() {
+            for front in front_list {
+                v.push(RequestType::AddTcpFrontend(front.clone().into()).into());
+            }
+        }
+
+        for front_list in self.udp_fronts.values() {
+            for front in front_list {
+                v.push(RequestType::AddUdpFrontend(front.clone().into()).into());
+            }
+        }
+
+        for backend_list in self.backends.values() {
+            for backend in backend_list {
+                v.push(RequestType::add_backend(backend.clone().to_add_backend()).into());
+            }
+        }
+
+        // Bootstrap round-trip: replaying `generate_requests` into a fresh,
+        // empty `ConfigState` must reconstruct `self`'s maps exactly. This is
+        // the property SaveState/LoadState and worker bootstrap depend on. We
+        // compare the business maps only (not `request_counts`, which is
+        // bookkeeping mutated by `dispatch`).
+        #[cfg(debug_assertions)]
+        {
+            let mut replayed = ConfigState::new();
+            for request in &v {
+                debug_assert!(
+                    replayed.dispatch(request).is_ok(),
+                    "every request from generate_requests must replay cleanly"
+                );
+            }
+            debug_assert!(
+                replayed.clusters == self.clusters
+                    && replayed.backends == self.backends
+                    && replayed.http_listeners == self.http_listeners
+                    && replayed.https_listeners == self.https_listeners
+                    && replayed.tcp_listeners == self.tcp_listeners
+                    && replayed.http_fronts == self.http_fronts
+                    && replayed.https_fronts == self.https_fronts
+                    && replayed.tcp_fronts == self.tcp_fronts
+                    && replayed.certificates == self.certificates
+                    && replayed.certificate_metadata == self.normalized_certificate_metadata(),
+                "replaying generate_requests into a fresh state must reproduce self"
+            );
+        }
+
+        v
+    }
+
+    pub fn generate_activate_requests(&self) -> Vec<Request> {
+        let mut v: Vec<Request> = Vec::new();
+        for front in self
+            .http_listeners
+            .iter()
+            .filter(|(_, listener)| listener.active)
+            .map(|(k, _)| k)
+        {
+            v.push(
+                RequestType::ActivateListener(ActivateListener {
+                    interface: front.interface.clone(),
+                    address: SocketAddress::from(front.address),
+                    proxy: ListenerType::Http.into(),
+                    from_scm: false,
+                })
+                .into(),
+            );
+        }
+
+        for front in self
+            .https_listeners
+            .iter()
+            .filter(|(_, listener)| listener.active)
+            .map(|(k, _)| k)
+        {
+            v.push(
+                RequestType::ActivateListener(ActivateListener {
+                    interface: front.interface.clone(),
+                    address: SocketAddress::from(front.address),
+                    proxy: ListenerType::Https.into(),
+                    from_scm: false,
+                })
+                .into(),
+            );
+        }
+        for front in self
+            .tcp_listeners
+            .iter()
+            .filter(|(_, listener)| listener.active)
+            .map(|(k, _)| k)
+        {
+            v.push(
+                RequestType::ActivateListener(ActivateListener {
+                    interface: front.interface.clone(),
+                    address: SocketAddress::from(front.address),
+                    proxy: ListenerType::Tcp.into(),
+                    from_scm: false,
+                })
+                .into(),
+            );
+        }
+        for front in self
+            .udp_listeners
+            .iter()
+            .filter(|(_, listener)| listener.active)
+            .map(|(k, _)| k)
+        {
+            v.push(
+                RequestType::ActivateListener(ActivateListener {
+                    interface: front.interface.clone(),
+                    address: SocketAddress::from(front.address),
+                    proxy: ListenerType::Udp.into(),
+                    from_scm: false,
+                })
+                .into(),
+            );
+        }
+
+        // Symmetry with the active-listener census: exactly one ActivateListener
+        // is emitted per active listener across the four maps, no more, no less.
+        #[cfg(debug_assertions)]
+        {
+            let active_listeners = self.http_listeners.values().filter(|l| l.active).count()
+                + self.https_listeners.values().filter(|l| l.active).count()
+                + self.tcp_listeners.values().filter(|l| l.active).count()
+                + self.udp_listeners.values().filter(|l| l.active).count();
+            debug_assert_eq!(
+                v.len(),
+                active_listeners,
+                "generate_activate_requests emits one request per active listener"
+            );
+            debug_assert!(
+                v.iter()
+                    .all(|r| matches!(r.request_type, Some(RequestType::ActivateListener(_)))),
+                "generate_activate_requests must emit only ActivateListener requests"
+            );
+        }
+
+        v
+    }
+
+    pub fn diff(&self, other: &ConfigState) -> Vec<Request> {
+        let my_tcp_listeners: HashSet<&ListenerKey> = self.tcp_listeners.keys().collect();
+        let their_tcp_listeners: HashSet<&ListenerKey> = other.tcp_listeners.keys().collect();
+        let removed_tcp_listeners = my_tcp_listeners.difference(&their_tcp_listeners);
+        let added_tcp_listeners = their_tcp_listeners.difference(&my_tcp_listeners);
+
+        let my_udp_listeners: HashSet<&ListenerKey> = self.udp_listeners.keys().collect();
+        let their_udp_listeners: HashSet<&ListenerKey> = other.udp_listeners.keys().collect();
+        let removed_udp_listeners = my_udp_listeners.difference(&their_udp_listeners);
+        let added_udp_listeners = their_udp_listeners.difference(&my_udp_listeners);
+
+        let my_http_listeners: HashSet<&ListenerKey> = self.http_listeners.keys().collect();
+        let their_http_listeners: HashSet<&ListenerKey> = other.http_listeners.keys().collect();
+        let removed_http_listeners = my_http_listeners.difference(&their_http_listeners);
+        let added_http_listeners = their_http_listeners.difference(&my_http_listeners);
+
+        let my_https_listeners: HashSet<&ListenerKey> = self.https_listeners.keys().collect();
+        let their_https_listeners: HashSet<&ListenerKey> = other.https_listeners.keys().collect();
+        let removed_https_listeners = my_https_listeners.difference(&their_https_listeners);
+        let added_https_listeners = their_https_listeners.difference(&my_https_listeners);
+
+        let mut v: Vec<Request> = vec![];
+
+        for address in removed_tcp_listeners {
+            if self.tcp_listeners[*address].active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
+                        proxy: ListenerType::Tcp.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+
+            v.push(
+                RequestType::RemoveListener(RemoveListener {
+                    interface: address.interface.clone(),
+                    address: SocketAddress::from(address.address),
+                    proxy: ListenerType::Tcp.into(),
+                })
+                .into(),
+            );
+        }
+
+        for address in added_tcp_listeners.clone() {
+            v.push(RequestType::AddTcpListener(other.tcp_listeners[*address].clone()).into());
+
+            if other.tcp_listeners[*address].active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
+                        proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for address in removed_udp_listeners {
+            if self.udp_listeners[*address].active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
+                        proxy: ListenerType::Udp.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+
+            v.push(
+                RequestType::RemoveListener(RemoveListener {
+                    interface: address.interface.clone(),
+                    address: SocketAddress::from(address.address),
+                    proxy: ListenerType::Udp.into(),
+                })
+                .into(),
+            );
+        }
+
+        for address in added_udp_listeners.clone() {
+            v.push(RequestType::AddUdpListener(other.udp_listeners[*address].clone()).into());
+
+            if other.udp_listeners[*address].active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
+                        proxy: ListenerType::Udp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for address in removed_http_listeners {
+            if self.http_listeners[*address].active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
+                        proxy: ListenerType::Http.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+
+            v.push(
+                RequestType::RemoveListener(RemoveListener {
+                    interface: address.interface.clone(),
+                    address: SocketAddress::from(address.address),
+                    proxy: ListenerType::Http.into(),
+                })
+                .into(),
+            );
+        }
+
+        for address in added_http_listeners.clone() {
+            v.push(RequestType::AddHttpListener(other.http_listeners[*address].clone()).into());
+
+            if other.http_listeners[*address].active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
+                        proxy: ListenerType::Http.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for address in removed_https_listeners {
+            if self.https_listeners[*address].active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
+                        proxy: ListenerType::Https.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+
+            v.push(
+                RequestType::RemoveListener(RemoveListener {
+                    interface: address.interface.clone(),
+                    address: SocketAddress::from(address.address),
+                    proxy: ListenerType::Https.into(),
+                })
+                .into(),
+            );
+        }
+
+        for address in added_https_listeners.clone() {
+            v.push(RequestType::add_https_listener(other.https_listeners[*address].clone()).into());
+
+            if other.https_listeners[*address].active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
+                        proxy: ListenerType::Https.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for addr in my_tcp_listeners.intersection(&their_tcp_listeners) {
+            let my_listener = &self.tcp_listeners[*addr];
+            let their_listener = &other.tcp_listeners[*addr];
+
+            if my_listener != their_listener {
+                v.push(
+                    RequestType::RemoveListener(RemoveListener {
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
+                        proxy: ListenerType::Tcp.into(),
+                    })
+                    .into(),
+                );
+                // any added listener should be unactive
+                let mut listener_to_add = their_listener.clone();
+                listener_to_add.active = false;
+                v.push(RequestType::AddTcpListener(listener_to_add).into());
+
+                // The Remove + Add(active=false) above wipes the listener's
+                // active state. Re-emit an ActivateListener whenever the target
+                // state keeps it active, otherwise a config change on a still
+                // active listener would silently deactivate it on replay. This
+                // subsumes the newly-active (`!my.active && their.active`) case:
+                // a differing `active` flag always makes the listeners unequal.
+                if their_listener.active {
+                    v.push(
+                        RequestType::ActivateListener(ActivateListener {
+                            interface: addr.interface.clone(),
+                            address: SocketAddress::from(addr.address),
+                            proxy: ListenerType::Tcp.into(),
+                            from_scm: false,
+                        })
+                        .into(),
+                    );
+                }
+            }
+
+            if my_listener.active && !their_listener.active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
+                        proxy: ListenerType::Tcp.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for addr in my_udp_listeners.intersection(&their_udp_listeners) {
+            let my_listener = &self.udp_listeners[*addr];
+            let their_listener = &other.udp_listeners[*addr];
+
+            if my_listener != their_listener {
+                v.push(
+                    RequestType::RemoveListener(RemoveListener {
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
+                        proxy: ListenerType::Udp.into(),
+                    })
+                    .into(),
+                );
+                // any added listener should be unactive
+                let mut listener_to_add = their_listener.clone();
+                listener_to_add.active = false;
+                v.push(RequestType::AddUdpListener(listener_to_add).into());
+
+                // The Remove + Add(active=false) above wipes the listener's
+                // active state. Re-emit an ActivateListener whenever the target
+                // state keeps it active, otherwise a config change on a still
+                // active listener would silently deactivate it on replay. This
+                // subsumes the newly-active (`!my.active && their.active`) case:
+                // a differing `active` flag always makes the listeners unequal.
+                if their_listener.active {
+                    v.push(
+                        RequestType::ActivateListener(ActivateListener {
+                            interface: addr.interface.clone(),
+                            address: SocketAddress::from(addr.address),
+                            proxy: ListenerType::Udp.into(),
+                            from_scm: false,
+                        })
+                        .into(),
+                    );
+                }
+            }
+
+            if my_listener.active && !their_listener.active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
+                        proxy: ListenerType::Udp.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for addr in my_http_listeners.intersection(&their_http_listeners) {
+            let my_listener = &self.http_listeners[*addr];
+            let their_listener = &other.http_listeners[*addr];
+
+            if my_listener != their_listener {
+                v.push(
+                    RequestType::RemoveListener(RemoveListener {
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
+                        proxy: ListenerType::Http.into(),
+                    })
+                    .into(),
+                );
+                // any added listener should be unactive
+                let mut listener_to_add = their_listener.clone();
+                listener_to_add.active = false;
+                v.push(RequestType::AddHttpListener(listener_to_add).into());
+
+                // The Remove + Add(active=false) above wipes the listener's
+                // active state. Re-emit an ActivateListener whenever the target
+                // state keeps it active, otherwise a config change on a still
+                // active listener would silently deactivate it on replay. This
+                // subsumes the newly-active (`!my.active && their.active`) case:
+                // a differing `active` flag always makes the listeners unequal.
+                if their_listener.active {
+                    v.push(
+                        RequestType::ActivateListener(ActivateListener {
+                            interface: addr.interface.clone(),
+                            address: SocketAddress::from(addr.address),
+                            proxy: ListenerType::Http.into(),
+                            from_scm: false,
+                        })
+                        .into(),
+                    );
+                }
+            }
+
+            if my_listener.active && !their_listener.active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
+                        proxy: ListenerType::Http.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for addr in my_https_listeners.intersection(&their_https_listeners) {
+            let my_listener = &self.https_listeners[*addr];
+            let their_listener = &other.https_listeners[*addr];
+
+            if my_listener != their_listener {
+                v.push(
+                    RequestType::RemoveListener(RemoveListener {
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
+                        proxy: ListenerType::Https.into(),
+                    })
+                    .into(),
+                );
+                // any added listener should be unactive
+                let mut listener_to_add = their_listener.clone();
+                listener_to_add.active = false;
+                v.push(RequestType::add_https_listener(listener_to_add).into());
+
+                // The Remove + Add(active=false) above wipes the listener's
+                // active state. Re-emit an ActivateListener whenever the target
+                // state keeps it active, otherwise a config change on a still
+                // active listener would silently deactivate it on replay. This
+                // subsumes the newly-active (`!my.active && their.active`) case:
+                // a differing `active` flag always makes the listeners unequal.
+                if their_listener.active {
+                    v.push(
+                        RequestType::ActivateListener(ActivateListener {
+                            interface: addr.interface.clone(),
+                            address: SocketAddress::from(addr.address),
+                            proxy: ListenerType::Https.into(),
+                            from_scm: false,
+                        })
+                        .into(),
+                    );
+                }
+            }
+
+            if my_listener.active && !their_listener.active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
+                        proxy: ListenerType::Https.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        let mut removed_clusters: Vec<&ClusterId> = Vec::new();
+        // A cluster that gains a health check port while `self` still holds a
+        // unix backend for it is refused until that backend is replaced
+        // (`Self::health_check_port_unix_conflict`): its `AddCluster` follows
+        // the backend orders below.
+        let mut deferred_clusters: Vec<Request> = Vec::new();
+        for (cluster_id, res) in diff_map(self.clusters.iter(), other.clusters.iter()) {
+            match res {
+                DiffResult::Added | DiffResult::Changed => {
+                    let add: Request =
+                        RequestType::AddCluster(other.clusters.get(cluster_id).unwrap().clone())
+                            .into();
+                    if add.request_type.as_ref().is_some_and(|request| {
+                        self.health_check_port_unix_conflict(request).is_some()
+                    }) {
+                        deferred_clusters.push(add);
+                    } else {
+                        v.push(add);
+                    }
+                }
+                DiffResult::Removed => {
+                    removed_clusters.push(cluster_id);
+                    v.push(RequestType::RemoveCluster(cluster_id.to_string()).into())
+                }
+            }
+        }
+
+        // `base` is `self` once every `RemoveCluster` above has cascaded
+        // (`Self::remove_cluster`). The frontend and backend diffs start from
+        // it, not from `self`: they emit no removal the cascade already
+        // performs, which would otherwise find nothing left to remove, and
+        // they add back an object `other` still holds for a removed cluster.
+        // Without a removed cluster, `base` is `self` itself, not a copy.
+        let base: Cow<'_, ConfigState> = if removed_clusters.is_empty() {
+            Cow::Borrowed(self)
+        } else {
+            let mut cascaded = self.clone();
+            for cluster_id in &removed_clusters {
+                let removed = cascaded.remove_cluster(cluster_id);
+                debug_assert!(
+                    removed.is_ok(),
+                    "a cluster diff_map reports removed must exist in self"
+                );
+            }
+            Cow::Owned(cascaded)
+        };
+
+        for ((cluster_id, backend_id), res) in diff_map(
+            base.backends.iter().flat_map(|(cluster_id, v)| {
+                v.iter()
+                    .map(move |backend| ((cluster_id, &backend.backend_id), backend))
+            }),
+            other.backends.iter().flat_map(|(cluster_id, v)| {
+                v.iter()
+                    .map(move |backend| ((cluster_id, &backend.backend_id), backend))
+            }),
+        ) {
+            match res {
+                DiffResult::Added => {
+                    let backend = other
+                        .backends
+                        .get(cluster_id)
+                        .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                        .unwrap();
+                    v.push(RequestType::add_backend(backend.clone().to_add_backend()).into());
+                }
+                DiffResult::Removed => {
+                    let backend = base
+                        .backends
+                        .get(cluster_id)
+                        .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                        .unwrap();
+
+                    v.push(
+                        RequestType::RemoveBackend(RemoveBackend {
+                            cluster_id: backend.cluster_id.to_string(),
+                            backend_id: backend.backend_id.clone(),
+                            address: SocketAddress::from(backend.address),
+                        })
+                        .into(),
+                    );
+                }
+                DiffResult::Changed => {
+                    let backend = base
+                        .backends
+                        .get(cluster_id)
+                        .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                        .unwrap();
+
+                    v.push(
+                        RequestType::RemoveBackend(RemoveBackend {
+                            cluster_id: backend.cluster_id.to_string(),
+                            backend_id: backend.backend_id.clone(),
+                            address: SocketAddress::from(backend.address),
+                        })
+                        .into(),
+                    );
+
+                    let backend = other
+                        .backends
+                        .get(cluster_id)
+                        .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                        .unwrap();
+                    v.push(RequestType::add_backend(backend.clone().to_add_backend()).into());
+                }
+            }
+        }
+
+        v.append(&mut deferred_clusters);
+
+        let mut my_http_fronts: HashSet<(&str, &HttpFrontend)> = HashSet::new();
+        for (route, front) in base.http_fronts.iter() {
+            my_http_fronts.insert((route, front));
+        }
+        let mut their_http_fronts: HashSet<(&str, &HttpFrontend)> = HashSet::new();
+        for (route, front) in other.http_fronts.iter() {
+            their_http_fronts.insert((route, front));
+        }
+
+        let removed_http_fronts = my_http_fronts.difference(&their_http_fronts);
+        let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
+
+        for &(_, front) in removed_http_fronts {
+            v.push(RequestType::remove_http_frontend(front.clone().into()).into());
+        }
+
+        for &(_, front) in added_http_fronts {
+            v.push(RequestType::add_http_frontend(front.clone().into()).into());
+        }
+
+        let mut my_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
+        for (route, front) in base.https_fronts.iter() {
+            my_https_fronts.insert((route, front));
+        }
+        let mut their_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
+        for (route, front) in other.https_fronts.iter() {
+            their_https_fronts.insert((route, front));
+        }
+        let removed_https_fronts = my_https_fronts.difference(&their_https_fronts);
+        let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
+
+        for &(_, front) in removed_https_fronts {
+            v.push(RequestType::remove_https_frontend(front.clone().into()).into());
+        }
+
+        for &(_, front) in added_https_fronts {
+            v.push(RequestType::add_https_frontend(front.clone().into()).into());
+        }
+
+        let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
+        for (cluster_id, front_list) in base.tcp_fronts.iter() {
+            for front in front_list.iter() {
+                my_tcp_fronts.insert((cluster_id, front));
+            }
+        }
+        let mut their_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
+        for (cluster_id, front_list) in other.tcp_fronts.iter() {
+            for front in front_list.iter() {
+                their_tcp_fronts.insert((cluster_id, front));
+            }
+        }
+
+        let removed_tcp_fronts = my_tcp_fronts.difference(&their_tcp_fronts);
+        let added_tcp_fronts = their_tcp_fronts.difference(&my_tcp_fronts);
+
+        for &(_, front) in removed_tcp_fronts {
+            v.push(RequestType::RemoveTcpFrontend(front.clone().into()).into());
+        }
+
+        for &(_, front) in added_tcp_fronts {
+            v.push(RequestType::AddTcpFrontend(front.clone().into()).into());
+        }
+
+        let mut my_udp_fronts: HashSet<(&ClusterId, &UdpFrontend)> = HashSet::new();
+        for (cluster_id, front_list) in base.udp_fronts.iter() {
+            for front in front_list.iter() {
+                my_udp_fronts.insert((cluster_id, front));
+            }
+        }
+        let mut their_udp_fronts: HashSet<(&ClusterId, &UdpFrontend)> = HashSet::new();
+        for (cluster_id, front_list) in other.udp_fronts.iter() {
+            for front in front_list.iter() {
+                their_udp_fronts.insert((cluster_id, front));
+            }
+        }
+
+        let removed_udp_fronts = my_udp_fronts.difference(&their_udp_fronts);
+        let added_udp_fronts = their_udp_fronts.difference(&my_udp_fronts);
+
+        for &(_, front) in removed_udp_fronts {
+            v.push(RequestType::RemoveUdpFrontend(front.clone().into()).into());
+        }
+
+        for &(_, front) in added_udp_fronts {
+            v.push(RequestType::AddUdpFrontend(front.clone().into()).into());
+        }
+
+        // Certificates have two observable dimensions beyond their map key:
+        // the payload/expiration stored under a common fingerprint, and the
+        // insertion order used to break equal-expiration name collisions.
+        // Build this part of the diff against a certificate-only shadow and
+        // apply every emitted request to it. That makes combined payload,
+        // expiry and order changes converge by construction.
+        let mut certificate_shadow = ConfigState {
+            certificates: self.certificates.to_owned(),
+            certificate_metadata: self.certificate_metadata.to_owned(),
+            ..Default::default()
+        };
+        let certificate_addresses: BTreeSet<SocketAddr> = self
+            .certificates
+            .keys()
+            .chain(other.certificates.keys())
+            .copied()
+            .collect();
+
+        for address in certificate_addresses {
+            // `certificate_shadow` may originate from a legacy or externally
+            // deserialized state. Normalize this address once before the
+            // loop: every dispatch below then maintains the canonical index
+            // in O(1) for Add rather than sorting the full address once per
+            // target certificate.
+            let normalized_metadata =
+                certificate_shadow.normalized_certificate_metadata_for_address(address);
+            if normalized_metadata.entries.is_empty() {
+                certificate_shadow.certificate_metadata.remove(&address);
+            } else {
+                certificate_shadow
+                    .certificate_metadata
+                    .insert(address, normalized_metadata);
+            }
+            let target: Vec<(Fingerprint, AddCertificate)> = other
+                .ordered_certificate_entries(address)
+                .into_iter()
+                .map(|(fingerprint, certificate, metadata)| {
+                    (
+                        fingerprint,
+                        AddCertificate {
+                            address: SocketAddress::from(address),
+                            certificate: certificate.to_owned(),
+                            expired_at: metadata.expired_at,
+                        },
+                    )
+                })
+                .collect();
+            let target_fingerprints: BTreeSet<Fingerprint> = target
+                .iter()
+                .map(|(fingerprint, _)| fingerprint.to_owned())
+                .collect();
+            let current_fingerprints: BTreeSet<Fingerprint> = certificate_shadow
+                .certificates
+                .get(&address)
+                .into_iter()
+                .flat_map(HashMap::keys)
+                .map(ToOwned::to_owned)
+                .collect();
+
+            for fingerprint in current_fingerprints.difference(&target_fingerprints) {
+                let request: Request = RequestType::RemoveCertificate(RemoveCertificate {
+                    address: SocketAddress::from(address),
+                    fingerprint: fingerprint.to_string(),
+                })
+                .into();
+                let result = certificate_shadow.dispatch(&request);
+                debug_assert!(
+                    result.is_ok(),
+                    "certificate removal diff must replay: {result:?}"
+                );
+                v.push(request);
+            }
+
+            for (fingerprint, add) in &target {
+                let current_certificate = certificate_shadow
+                    .certificates
+                    .get(&address)
+                    .and_then(|entries| entries.get(fingerprint));
+                let current_expired_at = certificate_shadow
+                    .certificate_metadata
+                    .get(&address)
+                    .and_then(|index| index.entries.get(fingerprint))
+                    .and_then(|metadata| metadata.expired_at);
+
+                let request_type = match current_certificate {
+                    // Missing target certificates are inserted by the order
+                    // convergence pass below. Adding them here can put them
+                    // ahead of retained entries and then needlessly remove
+                    // and re-add the same fresh certificate.
+                    None => None,
+                    Some(current)
+                        if current != &add.certificate || current_expired_at != add.expired_at =>
+                    {
+                        Some(RequestType::ReplaceCertificate(ReplaceCertificate {
+                            address: SocketAddress::from(address),
+                            new_certificate: add.certificate.to_owned(),
+                            old_fingerprint: fingerprint.to_string(),
+                            new_expired_at: add.expired_at,
+                        }))
+                    }
+                    Some(_) => None,
+                };
+
+                if let Some(request_type) = request_type {
+                    let request: Request = request_type.into();
+                    let result = certificate_shadow.dispatch(&request);
+                    debug_assert!(
+                        result.is_ok(),
+                        "certificate update diff must replay: {result:?}"
+                    );
+                    v.push(request);
+                }
+            }
+
+            let target_order: Vec<Fingerprint> = target
+                .iter()
+                .map(|(fingerprint, _)| fingerprint.to_owned())
+                .collect();
+            let shadow_order: Vec<Fingerprint> = certificate_shadow
+                .ordered_certificate_entries(address)
+                .into_iter()
+                .map(|(fingerprint, _, _)| fingerprint)
+                .collect();
+            if shadow_order != target_order {
+                // Keep the longest prefix of the target that already appears
+                // as a subsequence of the current order. Moving only the
+                // remaining suffix to the end, in target order, converges
+                // this order-only pass without moving the retained prefix.
+                // For A,B,C -> B,C,A this retains B,C and moves only A. When
+                // source and target have the same set and at least two
+                // certificates, one remains globally throughout this pass;
+                // set changes handled above can still pass through zero. A
+                // domain carried only by a certificate being moved can also
+                // briefly fall back or become unavailable. This sequence is
+                // convergent, not atomic or interruption-free.
+                let mut shadow_cursor = 0usize;
+                let mut retained_prefix_len = 0usize;
+                for fingerprint in &target_order {
+                    let Some(offset) = shadow_order[shadow_cursor..]
+                        .iter()
+                        .position(|candidate| candidate == fingerprint)
+                    else {
+                        break;
+                    };
+                    shadow_cursor += offset + 1;
+                    retained_prefix_len += 1;
+                }
+
+                for (fingerprint, add) in target.iter().skip(retained_prefix_len) {
+                    let already_present = certificate_shadow
+                        .certificates
+                        .get(&address)
+                        .is_some_and(|certificates| certificates.contains_key(fingerprint));
+                    let mut request_types = Vec::with_capacity(usize::from(already_present) + 1);
+                    if already_present {
+                        request_types.push(RequestType::RemoveCertificate(RemoveCertificate {
+                            address: SocketAddress::from(address),
+                            fingerprint: fingerprint.to_string(),
+                        }));
+                    }
+                    request_types.push(RequestType::AddCertificate(add.to_owned()));
+                    for request_type in request_types {
+                        let request: Request = request_type.into();
+                        let result = certificate_shadow.dispatch(&request);
+                        debug_assert!(
+                            result.is_ok(),
+                            "certificate order diff must replay: {result:?}"
+                        );
+                        v.push(request);
+                    }
+                }
+            }
+
+            debug_assert_eq!(
+                certificate_shadow.certificate_add_requests_for_address(address),
+                other.certificate_add_requests_for_address(address),
+                "certificate diff must converge payload, expiration and insertion order"
+            );
+        }
+
+        for address in added_tcp_listeners {
+            let listener = &other.tcp_listeners[*address];
+            if listener.active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for address in added_udp_listeners {
+            let listener = &other.udp_listeners[*address];
+            if listener.active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Udp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        // Replay symmetry: the request set `diff` emits, when replayed onto a
+        // clone of `self`, must reproduce `other`'s routing-relevant maps —
+        // listeners included, with their `active` flag. This is the property the
+        // hot-reconfig fan-out relies on — a worker applies these requests and
+        // must converge on `other`. We verify it in debug by actually replaying;
+        // `dispatch`'s own invariant sweep runs on every step.
+        //
+        // Deliberate normalizations. Empty buckets: `backends`/`tcp_fronts` are
+        // compared after dropping them. `remove_backend`/`remove_tcp_frontend`
+        // leave an empty `Vec` under a cluster key, whereas `other` may have no
+        // key at all. An empty bucket emits no requests and is semantically
+        // equivalent to an absent one, so we normalize it away before comparing.
+        #[cfg(debug_assertions)]
+        {
+            let mut replayed = self.clone();
+            for request in &v {
+                // A diff request must always be dispatchable onto `self`.
+                debug_assert!(
+                    replayed.dispatch(request).is_ok(),
+                    "every request emitted by diff must replay cleanly onto self"
+                );
+            }
+            let nonempty = |m: &BTreeMap<ClusterId, Vec<Backend>>| {
+                m.iter()
+                    .filter(|(_, v)| !v.is_empty())
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            // TCP diff equality is set equality of complete `TcpFrontend` records, so a
+            // pure permutation of one bucket emits no orders. Project each non-empty
+            // bucket to a set of full records for this postcondition only; storage and
+            // request emission are not reordered.
+            let nonempty_tcp = |m: &HashMap<ClusterId, Vec<TcpFrontend>>| {
+                m.iter()
+                    .filter(|(_, v)| !v.is_empty())
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            v.iter().cloned().collect::<BTreeSet<TcpFrontend>>(),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+            debug_assert!(
+                replayed.clusters == other.clusters
+                    && nonempty(&replayed.backends) == nonempty(&other.backends)
+                    && replayed.http_fronts == other.http_fronts
+                    && replayed.https_fronts == other.https_fronts
+                    && nonempty_tcp(&replayed.tcp_fronts) == nonempty_tcp(&other.tcp_fronts)
+                    && replayed.certificates == other.certificates
+                    // A legacy `self` has no sidecar and replaying leaves the
+                    // retained certificates' metadata empty: compare both sides
+                    // after the same legacy normalization.
+                    && replayed.normalized_certificate_metadata()
+                        == other.normalized_certificate_metadata()
+                    && replayed.http_listeners == other.http_listeners
+                    && replayed.https_listeners == other.https_listeners
+                    && replayed.tcp_listeners == other.tcp_listeners
+                    && replayed.udp_listeners == other.udp_listeners,
+                "replaying diff(self, other) onto self must reproduce other's clusters/backends/frontends/certificates/listeners"
+            );
+        }
+
+        v
+    }
+
+    // FIXME: what about deny rules?
+    pub fn hash_state(&self) -> BTreeMap<ClusterId, u64> {
+        let mut hm: HashMap<ClusterId, DefaultHasher> = self
+            .clusters
+            .keys()
+            .map(|cluster_id| {
+                let mut hasher = DefaultHasher::new();
+                self.clusters.get(cluster_id).hash(&mut hasher);
+                if let Some(backends) = self.backends.get(cluster_id) {
+                    backends.iter().collect::<BTreeSet<_>>().hash(&mut hasher)
+                }
+                if let Some(tcp_fronts) = self.tcp_fronts.get(cluster_id) {
+                    tcp_fronts.iter().collect::<BTreeSet<_>>().hash(&mut hasher)
+                }
+                (cluster_id.to_owned(), hasher)
+            })
+            .collect();
+
+        for front in self.http_fronts.values() {
+            if let Some(cluster_id) = &front.cluster_id
+                && let Some(hasher) = hm.get_mut(cluster_id)
+            {
+                front.hash(hasher);
+            }
+        }
+
+        for front in self.https_fronts.values() {
+            if let Some(cluster_id) = &front.cluster_id
+                && let Some(hasher) = hm.get_mut(cluster_id)
+            {
+                front.hash(hasher);
+            }
+        }
+
+        hm.drain()
+            .map(|(cluster_id, hasher)| (cluster_id, hasher.finish()))
+            .collect()
+    }
+
+    /// Gives details about a given cluster.
+    /// Types like `HttpFrontend` are converted into protobuf ones, like `RequestHttpFrontend`
+    pub fn cluster_state(&self, cluster_id: &str) -> Option<ClusterInformation> {
+        let configuration = self.clusters.get(cluster_id).cloned()?;
+        info!("{:?}", configuration);
+
+        let http_frontends: Vec<RequestHttpFrontend> = self
+            .http_fronts
+            .values()
+            .filter(|front| front.cluster_id.as_deref() == Some(cluster_id))
+            .map(|front| front.clone().into())
+            .collect();
+
+        let https_frontends: Vec<RequestHttpFrontend> = self
+            .https_fronts
+            .values()
+            .filter(|front| front.cluster_id.as_deref() == Some(cluster_id))
+            .map(|front| front.clone().into())
+            .collect();
+
+        let tcp_frontends: Vec<RequestTcpFrontend> = self
+            .tcp_fronts
+            .get(cluster_id)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|front| front.clone().into())
+            .collect();
+
+        let udp_frontends: Vec<RequestUdpFrontend> = self
+            .udp_fronts
+            .get(cluster_id)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|front| front.clone().into())
+            .collect();
+
+        let backends: Vec<AddBackend> = self
+            .backends
+            .get(cluster_id)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|backend| backend.clone().into())
+            .collect();
+
+        Some(ClusterInformation {
+            configuration: Some(configuration),
+            http_frontends,
+            https_frontends,
+            tcp_frontends,
+            backends,
+            udp_frontends,
+        })
+    }
+
+    pub fn count_backends(&self) -> usize {
+        self.backends.values().fold(0, |acc, v| acc + v.len())
+    }
+
+    pub fn count_frontends(&self) -> usize {
+        self.http_fronts.values().count()
+            + self.https_fronts.values().count()
+            + self.tcp_fronts.values().fold(0, |acc, v| acc + v.len())
+            + self.udp_fronts.values().fold(0, |acc, v| acc + v.len())
+    }
+
+    pub fn get_cluster_ids_by_domain(
+        &self,
+        hostname: String,
+        path: Option<String>,
+    ) -> HashSet<ClusterId> {
+        let mut cluster_ids: HashSet<ClusterId> = HashSet::new();
+
+        self.http_fronts.values().for_each(|front| {
+            if domain_check(&front.hostname, &front.path, &hostname, &path)
+                && let Some(id) = &front.cluster_id
+            {
+                cluster_ids.insert(id.clone());
+            }
+        });
+
+        self.https_fronts.values().for_each(|front| {
+            if domain_check(&front.hostname, &front.path, &hostname, &path)
+                && let Some(id) = &front.cluster_id
+            {
+                cluster_ids.insert(id.clone());
+            }
+        });
+
+        cluster_ids
+    }
+
+    /// Filter the control plane's certificate record.
+    ///
+    /// `filters.domain` is matched by **exact SAN equality** and is tested
+    /// before `filters.fingerprint`, so a request carrying both answers the
+    /// domain only. That is deliberately NOT the question
+    /// `sozu certificate list --domain <host>` asks: the certificate that
+    /// serves a handshake is chosen by `CertificateResolver::domain_lookup`,
+    /// a `TrieNode` lookup resolving `*.` wildcard and regex labels, so a
+    /// `*.example.com` certificate is invisible to an exact-equality query
+    /// for `foo.example.com` (sozu#1383).
+    ///
+    /// The trie lives in `sozu-lib`, which depends on this crate — the
+    /// reverse edge is a cargo cycle — so the operator-facing `--domain`
+    /// query is resolved one layer up, in `bin`'s
+    /// `certificates_serving_domain` (`bin/src/command/requests.rs`). Do not
+    /// reimplement hostname matching here: a second implementation is what
+    /// drifts from the resolver and reopens sozu#1383.
+    pub fn get_certificates(
+        &self,
+        filters: QueryCertificatesFilters,
+    ) -> BTreeMap<String, CertificateAndKey> {
+        self.certificates
+            .values()
+            .flat_map(|hash_map| hash_map.iter())
+            .filter(|(fingerprint, cert)| {
+                if let Some(domain) = &filters.domain {
+                    cert.names.contains(domain)
+                } else if let Some(f) = &filters.fingerprint {
+                    fingerprint.to_string() == *f
+                } else {
+                    true
+                }
+            })
+            .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.to_owned()))
+            .collect()
+    }
+
+    pub fn list_frontends(&self, filters: FrontendFilters) -> ListedFrontends {
+        // if no http / https / tcp filter is provided, list all of them
+        let list_all = !filters.http && !filters.https && !filters.tcp;
+
+        // an HTTP/HTTPS frontend with no cluster is a `Deny` rule: it routes
+        // to no cluster at all, so a cluster filter never matches it.
+        let matches_cluster = |cluster_id: Option<&str>| match &filters.cluster_id {
+            Some(wanted) => cluster_id == Some(wanted.as_str()),
+            None => true,
+        };
+        let matches_domain = |hostname: &str| match &filters.domain {
+            Some(domain) => hostname.contains(domain),
+            None => true,
+        };
+
+        let mut listed_frontends = ListedFrontends::default();
+
+        if filters.http || list_all {
+            for http_frontend in self.http_fronts.iter().filter(|f| {
+                matches_domain(&f.1.hostname) && matches_cluster(f.1.cluster_id.as_deref())
+            }) {
+                listed_frontends
+                    .http_frontends
+                    .push(http_frontend.1.to_owned().into());
+            }
+        }
+
+        if filters.https || list_all {
+            for https_frontend in self.https_fronts.iter().filter(|f| {
+                matches_domain(&f.1.hostname) && matches_cluster(f.1.cluster_id.as_deref())
+            }) {
+                listed_frontends
+                    .https_frontends
+                    .push(https_frontend.1.to_owned().into());
+            }
+        }
+
+        if (filters.tcp || list_all) && filters.domain.is_none() {
+            for tcp_frontend in fronts_of_cluster(&self.tcp_fronts, filters.cluster_id.as_deref()) {
+                listed_frontends
+                    .tcp_frontends
+                    .push(tcp_frontend.to_owned().into())
+            }
+        }
+
+        // `FrontendFilters` has no dedicated `udp` flag, so UDP frontends ride
+        // the same default/all-pass path as TCP: surfaced when no protocol
+        // filter is set (`list_all`) or when the `tcp` filter is requested.
+        // Datagram frontends carry no hostname, so a `domain` filter excludes
+        // them (matching the TCP branch).
+        if (filters.tcp || list_all) && filters.domain.is_none() {
+            for udp_frontend in fronts_of_cluster(&self.udp_fronts, filters.cluster_id.as_deref()) {
+                listed_frontends
+                    .udp_frontends
+                    .push(udp_frontend.to_owned().into())
+            }
+        }
+
+        listed_frontends
+    }
+
+    pub fn list_listeners(&self) -> ListenersList {
+        ListenersList {
+            http_listeners: self
+                .http_listeners
+                .iter()
+                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
+                .collect(),
+            https_listeners: self
+                .https_listeners
+                .iter()
+                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
+                .collect(),
+            tcp_listeners: self
+                .tcp_listeners
+                .iter()
+                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
+                .collect(),
+            udp_listeners: self
+                .udp_listeners
+                .iter()
+                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
+                .collect(),
+        }
+    }
+
+    // create requests needed for a worker to recreate the state
+    pub fn produce_initial_state(&self) -> InitialState {
+        let mut worker_requests = Vec::new();
+        for (counter, request) in self.generate_requests().into_iter().enumerate() {
+            worker_requests.push(WorkerRequest::new(format!("SAVE-{counter}"), request));
+        }
+        InitialState {
+            requests: worker_requests,
+        }
+    }
+
+    /// generate requests necessary to recreate the state,
+    /// in protobuf, to a temp file
+    pub fn write_initial_state_to_file(&self, file: &mut File) -> Result<usize, StateError> {
+        let initial_state = self.produce_initial_state();
+        let count = initial_state.requests.len();
+
+        let bytes_to_write = initial_state.encode_to_vec();
+        println!("writing {} in the temp file", bytes_to_write.len());
+        file.write_all(&bytes_to_write)
+            .map_err(StateError::FileError)?;
+
+        file.sync_all().map_err(StateError::FileError)?;
+
+        Ok(count)
+    }
+
+    /// generate requests necessary to recreate the state,
+    /// write them in a JSON form in a file, separated by \n\0,
+    /// returns the number of written requests
+    pub fn write_requests_to_file(&self, file: &mut File) -> Result<usize, StateError> {
+        let mut counter = 0usize;
+        let requests = self.generate_requests();
+
+        for request in requests {
+            let message = WorkerRequest::new(format!("SAVE-{counter}"), request);
+
+            file.write_all(
+                &serde_json::to_string(&message)
+                    .map(|s| s.into_bytes())
+                    .unwrap_or_default(),
+            )
+            .map_err(StateError::FileError)?;
+
+            file.write_all(&b"\n\0"[..])
+                .map_err(StateError::FileError)?;
+
+            if counter.is_multiple_of(1000) {
+                info!("writing {} commands to file", counter);
+                file.sync_all().map_err(StateError::FileError)?;
+            }
+            counter += 1;
+        }
+        file.sync_all().map_err(StateError::FileError)?;
+
+        Ok(counter)
+    }
+}
+
+/// One knob's floor, in the shape [`crate::for_each_h2_knob_floor`] expands
+/// (sozu-proxy/sozu#1418). The list itself lives there, shared with
+/// `ListenerBuilder::validate_h2_thresholds` in `crate::config`, so this file
+/// carries the `StateError` wording and not a second copy of the knobs.
+///
+/// `u64::from` covers both the `u32` and the `u64` knobs; every field is
+/// unsigned, so `< 1` is exactly `== 0`.
+macro_rules! require_h2_knob_floor {
+    ($config:ident, $field:ident, $minimum:literal) => {
+        if let Some(value) = $config.$field
+            && u64::from(value) < $minimum
+        {
+            return Err(StateError::InvalidValue {
+                field: stringify!($field),
+                reason: concat!("must be >= ", stringify!($minimum)),
+            });
+        }
+    };
+}
+
+/// Validate all H2 flood knobs in an HTTP listener patch.
+///
+/// Every flood-detector knob (including stream-0 WINDOW_UPDATE) requires a
+/// value `>= 1`. `0` does not disable the detector — `check_flood` compares
+/// `count > threshold`, so it makes the first event that counter sees a
+/// violation, which is every request for `h2_max_header_list_size` and
+/// `h2_max_header_fields` (also the HPACK decode budget) and the first
+/// matching frame for the per-window and lifetime counters. The runtime
+/// constructor `H2FloodConfig::new()` clamps with `.max(1)` instead, but a
+/// clamp rewrites the operator's stated value, so the control plane refuses
+/// it here.
+///
+/// `h2_max_concurrent_streams` is a connection-config knob that also requires
+/// `>= 1`; `h2_stream_shrink_ratio` requires `>= 2`.
+///
+/// `h2_graceful_shutdown_deadline_seconds = 0` is intentionally **allowed** —
+/// it means "wait forever (no forced close after GOAWAY)".
+pub fn validate_h2_flood_knobs_http(patch: &UpdateHttpListenerConfig) -> Result<(), StateError> {
+    crate::for_each_h2_knob_floor!(require_h2_knob_floor, patch);
+    Ok(())
+}
+
+/// Validate all H2 flood knobs in an HTTPS listener patch (same rules as HTTP).
+pub fn validate_h2_flood_knobs_https(patch: &UpdateHttpsListenerConfig) -> Result<(), StateError> {
+    crate::for_each_h2_knob_floor!(require_h2_knob_floor, patch);
+    Ok(())
+}
+
+/// Validate the H2 knobs of a complete HTTP listener configuration, on the
+/// `AddHttpListener` path (sozu-proxy/sozu#1418).
+///
+/// `UpdateHttpListener` has refused these values since the knobs existed
+/// ([`validate_h2_flood_knobs_http`]) and `ListenerBuilder::to_http`
+/// (`command/src/config.rs`) now refuses them at config load — but a raw
+/// protobuf `AddHttpListener` straight to the command socket went through
+/// neither. `ConfigState::add_http_listener` clones the config in with no
+/// validation, `SaveState` re-serialises it, every replay re-injects it, and
+/// each worker then rewrites the operator's `0` to `1` with the runtime clamp.
+/// The main process's pre-dispatch validation
+/// (`bin/src/command/requests.rs::validate_h2_knob_floors`) closes that door.
+///
+/// It closes it for what an operator is STATING, not for replay.
+/// `bin/src/command/requests.rs` runs this only for
+/// `RequestOrigin::Authored`; on `LoadState` it calls it to `warn!` and count,
+/// then keeps the listener. An entry the replay gate rejects is skipped, and a
+/// skipped listener never binds — dropping every frontend behind it to prevent
+/// one clamped threshold is the worse outcome. The clamp does not tighten the
+/// knob, it loosens it by one event (`count > threshold` trips on the first
+/// counted event at `0`, on the second at `1`), but `0` is not "no limit" and
+/// not a protection level anyone tuned. The worker-side clamp is what serves
+/// that case.
+pub fn validate_h2_flood_knobs_http_listener(
+    config: &HttpListenerConfig,
+) -> Result<(), StateError> {
+    crate::for_each_h2_knob_floor!(require_h2_knob_floor, config);
+    Ok(())
+}
+
+/// Validate the H2 knobs of a complete HTTPS listener configuration, on the
+/// `AddHttpsListener` path (same rules as
+/// [`validate_h2_flood_knobs_http_listener`]).
+pub fn validate_h2_flood_knobs_https_listener(
+    config: &HttpsListenerConfig,
+) -> Result<(), StateError> {
+    crate::for_each_h2_knob_floor!(require_h2_knob_floor, config);
+    Ok(())
+}
+
+/// Validate a `sozu_id_header` value against RFC 9110 §5.1 header-name grammar.
+///
+/// Rejects empty strings and strings containing CR, LF, colon, space, or tab —
+/// a conservative approximation of the token grammar that covers all practical
+/// injection vectors without a full RFC 9110 tokenizer.
+/// Merge the `answers` map of a listener patch into the listener's stored
+/// map, as `HttpListener::update_config` and `HttpsListener::update_config`
+/// (`lib/src/http.rs`, `lib/src/https.rs`) do on the workers: a non-empty
+/// body replaces the template of its status, an empty body preserves it.
+fn merge_answers(stored: &mut BTreeMap<String, String>, patch: &BTreeMap<String, String>) {
+    for (code, body) in patch {
+        if !body.is_empty() {
+            stored.insert(code.to_owned(), body.to_owned());
+        }
+    }
+}
+
+/// Merge a `CustomHttpAnswers` patch into the listener's stored answers,
+/// preserving any field not present in the patch.
+///
+/// Field-mask semantic: `None` in `patch` means "preserve", `Some` means
+/// "replace". A no-op patch (all-None) leaves `target` untouched. If `target`
+/// is currently `None`, initialize it from the patch (any `None` field stays
+/// `None` so hot-upgrade replay sees the same partial state).
+pub fn merge_custom_http_answers(
+    target: &mut Option<CustomHttpAnswers>,
+    patch: &CustomHttpAnswers,
+) {
+    let current = target.get_or_insert_with(CustomHttpAnswers::default);
+    macro_rules! merge_field {
+        ($field:ident) => {
+            if let Some(ref v) = patch.$field {
+                current.$field = Some(v.clone());
+            }
+        };
+    }
+    merge_field!(answer_301);
+    merge_field!(answer_400);
+    merge_field!(answer_401);
+    merge_field!(answer_404);
+    merge_field!(answer_408);
+    merge_field!(answer_413);
+    merge_field!(answer_421);
+    merge_field!(answer_502);
+    merge_field!(answer_503);
+    merge_field!(answer_504);
+    merge_field!(answer_507);
+}
+
+/// Validate an `AlpnProtocols` patch: each value must be "h2" or "http/1.1".
+/// Empty values vec is allowed (reset-to-default).
+pub fn validate_alpn_protocols(values: &[String]) -> Result<(), StateError> {
+    for value in values {
+        if value != "h2" && value != "http/1.1" {
+            return Err(StateError::InvalidValue {
+                field: "alpn_protocols",
+                reason: "each value must be \"h2\" or \"http/1.1\"",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate a `sozu_id_header` value against the RFC 9110 §5.1 `token` grammar:
+///
+/// ```text
+/// token  = 1*tchar
+/// tchar  = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+///          "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+/// ```
+///
+/// Rejects empty strings, non-ASCII bytes, controls (including CR/LF/tab),
+/// separators (including colon and space), and any other non-`tchar` byte.
+pub fn validate_sozu_id_header(value: &str) -> Result<(), StateError> {
+    if value.is_empty() {
+        return Err(StateError::InvalidValue {
+            field: "sozu_id_header",
+            reason: "must not be empty",
+        });
+    }
+    for b in value.bytes() {
+        let is_tchar = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            );
+        if !is_tchar {
+            return Err(StateError::InvalidValue {
+                field: "sozu_id_header",
+                reason: "must be a valid HTTP header name (RFC 9110 §5.1 token: alphanumeric or one of !#$%&'*+-.^_`|~)",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate the `hsts` block of an `UpdateHttpsListenerConfig` patch: it
+/// replaces the listener default whole, and `enabled` is what tells "disable"
+/// from "enable", so a block without it is refused — on the main process
+/// here, on the worker with `ListenerError::HstsEnabledRequired`.
+pub fn validate_hsts_patch(hsts: &HstsConfig) -> Result<(), StateError> {
+    if hsts.enabled.is_none() {
+        return Err(StateError::InvalidValue {
+            field: "hsts",
+            reason: "`enabled` is required whenever the hsts block is present",
+        });
+    }
+    Ok(())
+}
+
+/// Validate a `forwarded_headers` wire value: it must name a
+/// [`ForwardedHeaders`] variant. prost decodes an unknown enum number into the
+/// raw `i32`, and the listener getter would silently read it as the default;
+/// a patch carrying one is refused instead.
+pub fn validate_forwarded_headers(value: i32) -> Result<(), StateError> {
+    ForwardedHeaders::try_from(value)
+        .map(|_| ())
+        .map_err(|_| StateError::InvalidValue {
+            field: "forwarded_headers",
+            reason: "must be one of both, x_forwarded, rfc7239, none",
+        })
+}
+
+/// TCP and UDP frontends are keyed by cluster id: with a cluster filter, look
+/// the single entry up instead of scanning every cluster; without one, yield
+/// every frontend.
+fn fronts_of_cluster<'a, F>(
+    fronts: &'a HashMap<ClusterId, Vec<F>>,
+    cluster_id: Option<&str>,
+) -> impl Iterator<Item = &'a F> {
+    let (one, all) = match cluster_id {
+        Some(cluster_id) => (fronts.get(cluster_id), None),
+        None => (None, Some(fronts.values())),
+    };
+    one.into_iter().chain(all.into_iter().flatten()).flatten()
+}
+
+fn domain_check(
+    front_hostname: &str,
+    front_path_rule: &PathRule,
+    hostname: &str,
+    path_prefix: &Option<String>,
+) -> bool {
+    if hostname != front_hostname {
+        return false;
+    }
+
+    if let Some(path) = &path_prefix {
+        return path == &front_path_rule.value;
+    }
+
+    true
+}
+
+/// Canonicalize a TCP frontend's ALPN list into its sorted, deduplicated set
+/// representation. ALPN matching (the worker's `AlpnMatcher::OneOf` in
+/// `lib/src/tcp.rs`) is semantically a *set* of protocol names, not an
+/// ordered list: comparing `Vec`s directly treats `["h2", "http/1.1"]` and
+/// `["http/1.1", "h2"]` as distinct identities, silently admitting a
+/// duplicate/overlapping frontend the worker rejects on the next fan-out
+/// (sozu-proxy/sozu#1290). Used both to canonicalize a frontend for storage
+/// and to canonicalize a candidate for comparison, so `TcpFrontend.alpn` is
+/// always already in this form.
+fn canonical_tcp_alpn(alpn: &[String]) -> Vec<String> {
+    let mut alpn = alpn.to_vec();
+    alpn.sort();
+    alpn.dedup();
+    // POST: strictly increasing (sorted, no adjacent duplicates) — the
+    // single property every caller relies on to treat two canonical lists
+    // as set-equal via plain `==`.
+    debug_assert!(
+        alpn.windows(2).all(|pair| pair[0] < pair[1]),
+        "canonical_tcp_alpn must return a strictly sorted, duplicate-free list"
+    );
+    alpn
+}
+
+/// Identity predicate for a TCP frontend: `(address, sni, alpn)`, not the
+/// whole struct -- two frontends differing only in `tags` still collide
+/// here even though they compare unequal as full structs, since they'd
+/// still match the exact same wire traffic. `sni` and `alpn` are expected
+/// to already be in canonical form (normalized-lowercase sni, sorted+deduped
+/// alpn via [`canonical_tcp_alpn`]) on both sides -- this is a plain
+/// equality check, not itself a canonicalizer. Shared by
+/// `add_tcp_frontend`'s duplicate check and `remove_tcp_frontend`'s
+/// retain/postcondition so the three call sites can never drift apart
+/// (sozu-proxy/sozu#1290).
+fn tcp_frontend_matches(
+    front: &TcpFrontend,
+    address: SocketAddr,
+    sni: &Option<String>,
+    alpn: &[String],
+) -> bool {
+    front.address == address && front.sni == *sni && front.alpn.as_slice() == alpn
+}
+
+struct DiffMap<'a, K: Ord, V, I1, I2> {
+    my_it: I1,
+    other_it: I2,
+    my: Option<(K, &'a V)>,
+    other: Option<(K, &'a V)>,
+}
+
+//fn diff_map<'a, K:Ord, V: PartialEq>(my: &'a BTreeMap<K,V>, other: &'a BTreeMap<K,V>) -> DiffMap<'a,K,V> {
+fn diff_map<
+    'a,
+    K: Ord,
+    V: PartialEq,
+    I1: Iterator<Item = (K, &'a V)>,
+    I2: Iterator<Item = (K, &'a V)>,
+>(
+    my: I1,
+    other: I2,
+) -> DiffMap<'a, K, V, I1, I2> {
+    DiffMap {
+        my_it: my,
+        other_it: other,
+        my: None,
+        other: None,
+    }
+}
+
+enum DiffResult {
+    Added,
+    Removed,
+    Changed,
+}
+
+// this will iterate over the keys of both iterators
+// since keys are sorted, it should be easy to see which ones are in common or not
+impl<'a, K: Ord, V: PartialEq, I1: Iterator<Item = (K, &'a V)>, I2: Iterator<Item = (K, &'a V)>>
+    std::iter::Iterator for DiffMap<'a, K, V, I1, I2>
+{
+    type Item = (K, DiffResult);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.my.is_none() {
+                self.my = self.my_it.next();
+            }
+            if self.other.is_none() {
+                self.other = self.other_it.next();
+            }
+
+            match (self.my.take(), self.other.take()) {
+                // there are no more elements in my_it, all the next elements in other
+                // should be added
+                // if other was none, we will stop the iterator there
+                (None, other) => return other.map(|(k, _)| (k, DiffResult::Added)),
+                // there are no more elements in other_it, all the next elements in my
+                // should be removed
+                (Some((k, _)), None) => return Some((k, DiffResult::Removed)),
+                // element is present in my but not other
+                (Some((k1, _v1)), Some((k2, v2))) if k1 < k2 => {
+                    self.other = Some((k2, v2));
+                    return Some((k1, DiffResult::Removed));
+                }
+                // element is present in other byt not in my
+                (Some((k1, v1)), Some((k2, _v2))) if k1 > k2 => {
+                    self.my = Some((k1, v1));
+                    return Some((k2, DiffResult::Added));
+                }
+                (Some((k1, v1)), Some((_k2, v2))) if v1 != v2 => {
+                    // key is present in both, if elements have changed
+                    // return a value, otherwise go to the next key for both maps
+                    return Some((k1, DiffResult::Changed));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::{RngExt, rng, seq::SliceRandom};
+
+    use super::*;
+    use crate::proto::command::{
+        ClientAuthMode, CloseSessions, CustomHttpAnswers, Header, HeaderPosition, HstsConfig,
+        LoadBalancingParams, PathRuleKind, RedirectPolicy, RedirectScheme, RequestHttpFrontend,
+        RequestTcpFrontend, RequestUdpFrontend, RulePosition, UdpListenerConfig,
+        UpdateUdpListenerConfig,
+    };
+
+    fn capture_test_logs(run: impl FnOnce() + Send + 'static) -> String {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("test log receiver must bind to a loopback port");
+        let target = format!(
+            "udp://{}",
+            receiver
+                .local_addr()
+                .expect("test log receiver must have a local address")
+        );
+
+        std::thread::spawn(move || {
+            crate::logging::Logger::init(
+                "state-log-redaction-test".to_owned(),
+                "info",
+                &target,
+                false,
+                None,
+                None,
+                None,
+            )
+            .expect("test logger must initialize");
+            run();
+        })
+        .join()
+        .expect("log-producing test thread must not panic");
+
+        receiver
+            .set_nonblocking(true)
+            .expect("test log receiver must become nonblocking");
+        let mut output = String::new();
+        let mut datagram = vec![0; 65_507];
+        loop {
+            match receiver.recv(&mut datagram) {
+                Ok(length) => output.push_str(&String::from_utf8_lossy(&datagram[..length])),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("test log receiver failed: {error}"),
+            }
+        }
+        assert!(!output.is_empty(), "test log capture received no datagrams");
+        output
+    }
+
+    #[test]
+    fn duplicate_certificate_log_redacts_names() {
+        const NAME_SECRET: &str = "DUPLICATE_CERTIFICATE_NAME_SECRET_SENTINEL";
+
+        let name = format!("{NAME_SECRET}{}", "x".repeat(4096));
+        let name_len = name.len();
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: vec![name],
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable")
+            .to_string();
+        let output = capture_test_logs(move || {
+            let mut state = ConfigState::default();
+            let add = AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate,
+                expired_at: None,
+            };
+
+            state
+                .add_certificate(&add)
+                .expect("first certificate insertion must succeed");
+            state
+                .add_certificate(&add)
+                .expect("duplicate certificate insertion must be skipped");
+        });
+
+        assert!(
+            !output.contains(NAME_SECRET),
+            "duplicate certificate log leaked certificate name {NAME_SECRET}"
+        );
+        assert!(
+            !output.contains(&fingerprint),
+            "duplicate certificate log leaked certificate fingerprint {fingerprint}"
+        );
+        for metadata in [
+            "fingerprint_bytes=32".to_owned(),
+            "names_count=1".to_owned(),
+            format!("names_bytes={name_len}"),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "duplicate certificate log omitted bounded metadata {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 512,
+            "duplicate certificate log is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    /// Regression for sozu-proxy/sozu#1404 (#774 surviving in a second
+    /// implementation of the same verb): `replace_certificate` used to
+    /// remove the old fingerprint from the address's certificate map
+    /// BEFORE computing the new fingerprint, and computing it is fallible
+    /// (`calculate_fingerprint` parses the PEM). A malformed
+    /// `new_certificate.certificate` therefore made the `?` propagate
+    /// after the old certificate was already gone, leaving the address
+    /// with zero certificates. The fix must compute/insert the new
+    /// certificate before removing the old one, so a failed replace is a
+    /// true no-op on `self`.
+    #[test]
+    fn replace_certificate_with_malformed_pem_keeps_old_certificate() {
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let old_fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        let mut state = ConfigState::default();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate,
+                expired_at: None,
+            })
+            .expect("initial certificate insertion must succeed");
+
+        let malformed = CertificateAndKey {
+            certificate: "not a valid pem certificate".to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let error = state
+            .replace_certificate(&ReplaceCertificate {
+                address,
+                new_certificate: malformed,
+                old_fingerprint: old_fingerprint.to_string(),
+                new_expired_at: None,
+            })
+            .expect_err("replacing with a malformed PEM must fail");
+        assert!(
+            matches!(error, StateError::ReplaceCertificate(_)),
+            "expected StateError::ReplaceCertificate, got {error:?}"
+        );
+
+        let certificates_for_address = state
+            .certificates
+            .get(&SocketAddr::from(address))
+            .expect("the address must still be present in the certificate map");
+        assert!(
+            certificates_for_address.contains_key(&old_fingerprint),
+            "a failed replace must leave the original certificate in place, found {:?}",
+            certificates_for_address.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            certificates_for_address.len(),
+            1,
+            "a failed replace must not leave the address with zero (or extra) certificates"
+        );
+    }
+
+    /// When `ReplaceCertificate` resubmits the SAME PEM (an operator or
+    /// ACME retry loop), the old and new fingerprints are equal.
+    /// Mirrors `lib/src/tls.rs`'s
+    /// `replace_certificate_with_same_fingerprint_is_noop`: an
+    /// unconditional "insert new, then remove old" must not delete the
+    /// entry the caller meant to retain merely because old == new.
+    #[test]
+    fn replace_certificate_with_same_fingerprint_keeps_certificate() {
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        let mut state = ConfigState::default();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate.clone(),
+                expired_at: None,
+            })
+            .expect("initial certificate insertion must succeed");
+
+        state
+            .replace_certificate(&ReplaceCertificate {
+                address,
+                new_certificate: certificate,
+                old_fingerprint: fingerprint.to_string(),
+                new_expired_at: None,
+            })
+            .expect("idempotent replace with the identical certificate must succeed");
+
+        let certificates_for_address = state
+            .certificates
+            .get(&SocketAddr::from(address))
+            .expect("the address must still be present in the certificate map");
+        assert!(
+            certificates_for_address.contains_key(&fingerprint),
+            "an idempotent replace (old fingerprint == new fingerprint) must not delete \
+             the entry the caller meant to retain, found {:?}",
+            certificates_for_address.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            certificates_for_address.len(),
+            1,
+            "an idempotent replace must not change the number of stored certificates"
+        );
+    }
+
+    /// `AddCertificate` resolves empty name overrides from the certificate's
+    /// SAN/CN before storing the payload. `ReplaceCertificate` must preserve
+    /// the same canonical form so SaveState and worker-upgrade replay rebuild
+    /// exactly the state main accepted.
+    #[test]
+    fn replace_certificate_with_empty_names_round_trips_through_saved_state() {
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let mut state = ConfigState::default();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate.to_owned(),
+                expired_at: None,
+            })
+            .expect("initial certificate insertion must succeed");
+        assert!(
+            !state.certificates[&SocketAddr::from(address)][&fingerprint]
+                .names
+                .is_empty(),
+            "the fixture must expose at least one SAN or CN"
+        );
+
+        state
+            .replace_certificate(&ReplaceCertificate {
+                address,
+                new_certificate: certificate,
+                old_fingerprint: fingerprint.to_string(),
+                new_expired_at: None,
+            })
+            .expect("same-fingerprint replacement must succeed");
+
+        let requests = state.generate_requests();
+        let mut replayed = ConfigState::default();
+        for request in &requests {
+            replayed
+                .dispatch(request)
+                .unwrap_or_else(|error| panic!("could not replay {request:?}: {error}"));
+        }
+        assert_eq!(
+            replayed.certificates, state.certificates,
+            "saved-state replay must preserve canonical certificate names"
+        );
+    }
+
+    fn ordered_saved_certificates(state: &ConfigState) -> Vec<(Fingerprint, Option<i64>)> {
+        state
+            .generate_requests()
+            .into_iter()
+            .filter_map(|request| match request.request_type {
+                Some(RequestType::AddCertificate(add)) => Some((
+                    add.certificate
+                        .fingerprint()
+                        .expect("saved certificate fingerprint"),
+                    add.expired_at,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn distinct_test_certificates() -> (CertificateAndKey, CertificateAndKey) {
+        (
+            CertificateAndKey {
+                certificate: include_str!("../../lib/assets/tests/certificate-1y.pem").to_owned(),
+                key: include_str!("../../lib/assets/tests/key-1y.pem").to_owned(),
+                names: vec!["shared.example.test".to_owned()],
+                ..Default::default()
+            },
+            CertificateAndKey {
+                certificate: include_str!("../../lib/assets/tests/certificate-2y.pem").to_owned(),
+                key: include_str!("../../lib/assets/tests/key-2y.pem").to_owned(),
+                names: vec!["shared.example.test".to_owned()],
+                ..Default::default()
+            },
+        )
+    }
+
+    fn third_test_certificate() -> CertificateAndKey {
+        CertificateAndKey {
+            certificate: include_str!("../../lib/assets/tests/certificate-3.pem").to_owned(),
+            key: include_str!("../../lib/assets/tests/key.pem").to_owned(),
+            names: vec!["shared.example.test".to_owned()],
+            ..Default::default()
+        }
+    }
+
+    fn ordered_fingerprints(state: &ConfigState, address: SocketAddress) -> Vec<Fingerprint> {
+        state
+            .ordered_certificate_entries(address.into())
+            .into_iter()
+            .map(|(fingerprint, _, _)| fingerprint)
+            .collect()
+    }
+
+    /// SaveState, worker bootstrap and worker upgrade all consume
+    /// `generate_requests`. The request stream must retain both the explicit
+    /// expiration override and the insertion order that breaks ties between
+    /// certificates serving the same name.
+    #[test]
+    fn saved_certificate_requests_preserve_expiration_and_insertion_order() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let mut state = ConfigState::new();
+        for (certificate, expired_at) in [
+            (certificate_a, Some(2_100_000_000)),
+            (certificate_b, Some(2_200_000_000)),
+        ] {
+            state
+                .dispatch(
+                    &RequestType::AddCertificate(AddCertificate {
+                        address,
+                        certificate,
+                        expired_at,
+                    })
+                    .into(),
+                )
+                .expect("add certificate with expiration override");
+        }
+
+        assert_eq!(
+            ordered_saved_certificates(&state),
+            vec![
+                (fingerprint_a, Some(2_100_000_000)),
+                (fingerprint_b, Some(2_200_000_000)),
+            ],
+            "saved-state requests must preserve certificate order and expiration overrides"
+        );
+
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = tempfile::tempfile().expect("create SaveState file");
+        state
+            .write_requests_to_file(&mut file)
+            .expect("serialize SaveState request stream");
+        file.seek(SeekFrom::Start(0))
+            .expect("rewind SaveState file");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).expect("read SaveState file");
+        let (remaining, requests) = crate::parser::parse_several_requests::<WorkerRequest>(&bytes)
+            .expect("parse LoadState request stream");
+        assert!(remaining.is_empty(), "LoadState parser left trailing bytes");
+        let mut replayed = ConfigState::new();
+        for request in requests {
+            replayed
+                .dispatch(&request.content)
+                .expect("LoadState request dispatch");
+        }
+        assert_eq!(
+            replayed, state,
+            "SaveState file parsing and LoadState dispatch must preserve all certificate metadata"
+        );
+    }
+
+    /// A same-fingerprint replacement can change names, key material or the
+    /// explicit expiration without changing the leaf certificate fingerprint.
+    /// `diff` must emit the replacement instead of treating the common map key
+    /// as unchanged.
+    #[test]
+    fn certificate_diff_replays_same_fingerprint_payload_and_expiration_changes() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (mut certificate, _) = distinct_test_certificates();
+        certificate.names = vec!["before.example.test".to_owned()];
+        let fingerprint = certificate.fingerprint().expect("fingerprint certificate");
+        let mut before = ConfigState::new();
+        before
+            .dispatch(
+                &RequestType::AddCertificate(AddCertificate {
+                    address,
+                    certificate: certificate.to_owned(),
+                    expired_at: Some(2_100_000_000),
+                })
+                .into(),
+            )
+            .expect("add original certificate");
+        let mut after = before.to_owned();
+        certificate.names = vec!["after.example.test".to_owned()];
+        after
+            .dispatch(
+                &RequestType::ReplaceCertificate(ReplaceCertificate {
+                    address,
+                    new_certificate: certificate,
+                    old_fingerprint: fingerprint.to_string(),
+                    new_expired_at: Some(2_200_000_000),
+                })
+                .into(),
+            )
+            .expect("replace same-fingerprint certificate payload");
+
+        let diff = before.diff(&after);
+        assert!(
+            diff.iter().any(|request| matches!(
+                request.request_type,
+                Some(RequestType::ReplaceCertificate(_))
+            )),
+            "same-fingerprint payload/expiration changes must emit ReplaceCertificate: {diff:?}"
+        );
+    }
+
+    /// Equal-expiration certificate selection uses insertion order. Two states
+    /// with identical payload maps but opposite insertion order therefore need
+    /// a non-empty diff that replays the target order.
+    #[test]
+    fn certificate_diff_replays_order_only_changes() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let mut before = ConfigState::new();
+        let mut after = ConfigState::new();
+        for certificate in [certificate_a.to_owned(), certificate_b.to_owned()] {
+            before
+                .dispatch(
+                    &RequestType::AddCertificate(AddCertificate {
+                        address,
+                        certificate,
+                        expired_at: Some(2_100_000_000),
+                    })
+                    .into(),
+                )
+                .expect("add before certificate");
+        }
+        for certificate in [certificate_b, certificate_a] {
+            after
+                .dispatch(
+                    &RequestType::AddCertificate(AddCertificate {
+                        address,
+                        certificate,
+                        expired_at: Some(2_100_000_000),
+                    })
+                    .into(),
+                )
+                .expect("add after certificate");
+        }
+
+        let diff = before.diff(&after);
+        assert_eq!(
+            diff.len(),
+            2,
+            "A,B -> B,A needs only Remove(A), Add(A), not churn for B: {diff:?}"
+        );
+        assert!(
+            matches!(
+                &diff[0].request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_a.to_string()
+            ) && matches!(
+                &diff[1].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_a)
+            ),
+            "the minimal order-only sequence must move only certificate A to the end: {diff:?}"
+        );
+    }
+
+    #[test]
+    fn certificate_diff_rotates_three_entries_by_moving_only_the_suffix() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let certificate_c = third_test_certificate();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let fingerprint_c = certificate_c.fingerprint().expect("fingerprint C");
+        let build = |certificates: Vec<CertificateAndKey>| {
+            let mut state = ConfigState::new();
+            for certificate in certificates {
+                state
+                    .dispatch(
+                        &RequestType::AddCertificate(AddCertificate {
+                            address,
+                            certificate,
+                            expired_at: Some(2_100_000_000),
+                        })
+                        .into(),
+                    )
+                    .expect("add certificate");
+            }
+            state
+        };
+        let before = build(vec![
+            certificate_a.to_owned(),
+            certificate_b.to_owned(),
+            certificate_c.to_owned(),
+        ]);
+        let after = build(vec![certificate_b, certificate_c, certificate_a]);
+
+        let diff = before.diff(&after);
+        assert_eq!(
+            diff.len(),
+            2,
+            "A,B,C -> B,C,A needs only Remove(A), Add(A): {diff:?}"
+        );
+        assert!(
+            matches!(
+                &diff[0].request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_a.to_string()
+            ) && matches!(
+                &diff[1].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_a)
+            ),
+            "the rotation must leave B and C in place: {diff:?}"
+        );
+        assert!(
+            diff.iter().all(|request| !matches!(
+                &request.request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_b.to_string()
+                        || remove.fingerprint == fingerprint_c.to_string()
+            )),
+            "B and C are the retained target prefix and must not be removed: {diff:?}"
+        );
+
+        let mut interrupted = before.to_owned();
+        interrupted
+            .dispatch(&diff[0])
+            .expect("apply the minimal sequence's remove boundary");
+        assert_ne!(
+            ordered_fingerprints(&interrupted, address),
+            ordered_fingerprints(&after, address),
+            "the interruption point must expose a real partial state"
+        );
+        for request in interrupted.diff(&after) {
+            interrupted
+                .dispatch(&request)
+                .expect("fresh diff recovers the interrupted rotation");
+        }
+        assert_eq!(
+            ordered_fingerprints(&interrupted, address),
+            vec![fingerprint_b, fingerprint_c, fingerprint_a],
+            "recovery must converge on the target order and its final winner"
+        );
+    }
+
+    #[test]
+    fn certificate_diff_inserts_around_a_retained_entry_without_readding_new_suffix() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let certificate_c = third_test_certificate();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let fingerprint_c = certificate_c.fingerprint().expect("fingerprint C");
+        let build = |certificates: Vec<CertificateAndKey>| {
+            let mut state = ConfigState::new();
+            for certificate in certificates {
+                state
+                    .dispatch(
+                        &RequestType::AddCertificate(AddCertificate {
+                            address,
+                            certificate,
+                            expired_at: Some(2_100_000_000),
+                        })
+                        .into(),
+                    )
+                    .expect("add certificate");
+            }
+            state
+        };
+        let before = build(vec![certificate_b.to_owned()]);
+        let after = build(vec![certificate_a, certificate_b, certificate_c]);
+
+        let diff = before.diff(&after);
+        assert_eq!(
+            diff.len(),
+            4,
+            "B -> A,B,C needs Add(A), Remove(B), Add(B), Add(C): {diff:?}"
+        );
+        assert!(
+            matches!(
+                &diff[0].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_a)
+            ) && matches!(
+                &diff[1].request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_b.to_string()
+            ) && matches!(
+                &diff[2].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_b)
+            ) && matches!(
+                &diff[3].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_c)
+            ),
+            "new certificate C must never be removed after insertion: {diff:?}"
+        );
+        assert!(
+            diff.iter().all(|request| !matches!(
+                &request.request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_c.to_string()
+            )),
+            "the missing target suffix C is added once and never churned: {diff:?}"
+        );
+
+        let mut interrupted = before.to_owned();
+        interrupted
+            .dispatch(&diff[0])
+            .expect("apply the inserted target prefix before interruption");
+        assert_ne!(
+            ordered_fingerprints(&interrupted, address),
+            ordered_fingerprints(&after, address),
+            "the prefix interruption must expose a real partial state"
+        );
+        for request in interrupted.diff(&after) {
+            interrupted
+                .dispatch(&request)
+                .expect("fresh diff recovers the interrupted insertion sequence");
+        }
+        assert_eq!(
+            ordered_fingerprints(&interrupted, address),
+            vec![fingerprint_a, fingerprint_b, fingerprint_c],
+            "recovery must converge on the target order and final winner"
+        );
+    }
+
+    #[test]
+    fn duplicate_certificate_add_keeps_payload_expiration_and_order() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate, _) = distinct_test_certificates();
+        let mut state = ConfigState::new();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate.to_owned(),
+                expired_at: Some(2_100_000_000),
+            })
+            .expect("initial certificate");
+        let before = state.to_owned();
+        let mut differing_retry = certificate;
+        differing_retry.names = vec!["different.example.test".to_owned()];
+
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: differing_retry,
+                expired_at: Some(2_200_000_000),
+            })
+            .expect("duplicate fingerprint stays an accepted no-op");
+
+        assert_eq!(
+            state, before,
+            "duplicate AddCertificate must be a total no-op"
+        );
+    }
+
+    #[test]
+    fn replacing_with_an_existing_identical_target_preserves_its_ordinal() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let certificate_c = third_test_certificate();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let fingerprint_c = certificate_c.fingerprint().expect("fingerprint C");
+        let mut state = ConfigState::new();
+        for certificate in [certificate_a, certificate_b.to_owned(), certificate_c] {
+            state
+                .add_certificate(&AddCertificate {
+                    address,
+                    certificate,
+                    expired_at: Some(2_100_000_000),
+                })
+                .expect("initial certificate");
+        }
+
+        state
+            .replace_certificate(&ReplaceCertificate {
+                address,
+                new_certificate: certificate_b,
+                old_fingerprint: fingerprint_a.to_string(),
+                new_expired_at: Some(2_100_000_000),
+            })
+            .expect("replace A with already-stored B");
+
+        assert_eq!(
+            ordered_fingerprints(&state, address),
+            vec![fingerprint_b, fingerprint_c],
+            "an already-stored replacement keeps B in place while removing A"
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_normalizes_once_and_the_second_replay_is_stable() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let mut current = ConfigState::new();
+        for (certificate, expired_at) in [
+            (certificate_a, Some(2_100_000_000)),
+            (certificate_b, Some(2_200_000_000)),
+        ] {
+            current
+                .add_certificate(&AddCertificate {
+                    address,
+                    certificate,
+                    expired_at,
+                })
+                .expect("current certificate");
+        }
+        let mut legacy_json = serde_json::to_value(&current).expect("serialize current state");
+        legacy_json
+            .as_object_mut()
+            .expect("ConfigState JSON object")
+            .remove("certificate_metadata")
+            .expect("current state writes certificate metadata");
+        let legacy: ConfigState =
+            serde_json::from_value(legacy_json).expect("legacy state without sidecar");
+        assert!(legacy.certificate_metadata.is_empty());
+
+        let mut first_replay = ConfigState::new();
+        for request in legacy.generate_requests() {
+            first_replay
+                .dispatch(&request)
+                .expect("legacy request stream replays");
+        }
+        assert_eq!(
+            first_replay.certificate_metadata,
+            legacy.normalized_certificate_metadata(),
+            "the first replay records deterministic fallback ordinals"
+        );
+        assert_ne!(
+            first_replay, legacy,
+            "normalization is semantic state and must not be hidden from PartialEq"
+        );
+
+        let mut second_replay = ConfigState::new();
+        for request in first_replay.generate_requests() {
+            second_replay
+                .dispatch(&request)
+                .expect("normalized request stream replays");
+        }
+        assert_eq!(
+            second_replay, first_replay,
+            "a second replay of normalized metadata must be byte/PartialEq stable"
+        );
+        assert_eq!(
+            serde_json::to_value(&second_replay).expect("serialize second replay"),
+            serde_json::to_value(&first_replay).expect("serialize first replay"),
+            "the derived next-order cache must not affect serialized state"
+        );
+    }
+
+    /// A 2.3.1 state: HTTPS listener, two clusters with frontends and backends,
+    /// two certificates with explicit expirations, and no serialized
+    /// `certificate_metadata` sidecar.
+    fn legacy_state_with_certificates() -> (ConfigState, SocketAddress) {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let mut current = ConfigState::new();
+        current
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(address)).into())
+            .expect("https listener");
+        for cluster_id in ["cluster_1", "cluster_2"] {
+            current
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: cluster_id.to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("cluster");
+            current
+                .dispatch(
+                    &RequestType::AddBackend(AddBackend {
+                        cluster_id: cluster_id.to_owned(),
+                        backend_id: format!("{cluster_id}-0"),
+                        address: SocketAddress::new_v4(127, 0, 0, 1, 9000),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("backend");
+            current
+                .dispatch(
+                    &RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                        cluster_id: Some(cluster_id.to_owned()),
+                        hostname: format!("{cluster_id}.example.test"),
+                        path: PathRule::prefix(String::from("/")),
+                        address,
+                        position: RulePosition::Tree.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("frontend");
+        }
+        for (certificate, expired_at) in [
+            (certificate_a, Some(2_100_000_000)),
+            (certificate_b, Some(2_200_000_000)),
+        ] {
+            current
+                .add_certificate(&AddCertificate {
+                    address,
+                    certificate,
+                    expired_at,
+                })
+                .expect("certificate");
+        }
+        let mut json = serde_json::to_value(&current).expect("serialize current state");
+        json.as_object_mut()
+            .expect("ConfigState JSON object")
+            .remove("certificate_metadata")
+            .expect("current state writes certificate metadata");
+        let legacy: ConfigState = serde_json::from_value(json).expect("legacy state");
+        assert!(legacy.certificate_metadata.is_empty());
+        (legacy, address)
+    }
+
+    fn replay_diff(from: &ConfigState, requests: &[Request]) -> ConfigState {
+        let mut replayed = from.clone();
+        for request in requests {
+            replayed.dispatch(request).expect("diff request replays");
+        }
+        replayed
+    }
+
+    #[test]
+    fn diff_of_legacy_state_without_metadata_tolerates_a_listener_change() {
+        let (legacy, address) = legacy_state_with_certificates();
+        let mut desired = legacy.clone();
+        desired
+            .https_listeners
+            .get_mut(&ListenerKey::from(address))
+            .expect("listener")
+            .front_timeout = 61;
+
+        let requests = legacy.diff(&desired);
+
+        assert!(!requests.is_empty(), "a listener change emits requests");
+        assert!(
+            requests.iter().all(|request| !matches!(
+                request.request_type,
+                Some(
+                    RequestType::AddCertificate(_)
+                        | RequestType::RemoveCertificate(_)
+                        | RequestType::ReplaceCertificate(_)
+                )
+            )),
+            "retained certificates are not re-sent"
+        );
+        let replayed = replay_diff(&legacy, &requests);
+        assert_eq!(replayed.https_listeners, desired.https_listeners);
+        assert_eq!(replayed.certificates, desired.certificates);
+        assert_eq!(replayed.https_fronts, legacy.https_fronts);
+        assert_eq!(replayed.backends, legacy.backends);
+        assert_eq!(
+            replayed.normalized_certificate_metadata(),
+            desired.normalized_certificate_metadata()
+        );
+    }
+
+    #[test]
+    fn diff_of_legacy_state_without_metadata_tolerates_unrelated_removals() {
+        let (legacy, address) = legacy_state_with_certificates();
+        let mut desired = legacy.clone();
+        desired
+            .dispatch(
+                &RequestType::RemoveBackend(RemoveBackend {
+                    cluster_id: "cluster_2".to_owned(),
+                    backend_id: "cluster_2-0".to_owned(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 9000),
+                })
+                .into(),
+            )
+            .expect("remove backend");
+        desired
+            .dispatch(
+                &RequestType::RemoveHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: Some("cluster_2".to_owned()),
+                    hostname: "cluster_2.example.test".to_owned(),
+                    path: PathRule::prefix(String::from("/")),
+                    address,
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("remove frontend");
+
+        let requests = legacy.diff(&desired);
+
+        assert_eq!(requests.len(), 2, "exactly the two removals: {requests:?}");
+        let replayed = replay_diff(&legacy, &requests);
+        assert_eq!(replayed.certificates, legacy.certificates);
+        assert_eq!(replayed.https_fronts, desired.https_fronts);
+        assert_eq!(
+            replayed.backends.get("cluster_1"),
+            legacy.backends.get("cluster_1"),
+            "the unaffected cluster keeps its backend"
+        );
+        assert!(
+            replayed
+                .backends
+                .get("cluster_2")
+                .is_none_or(|backends| backends.is_empty())
+        );
+        assert_eq!(
+            replayed.normalized_certificate_metadata(),
+            desired.normalized_certificate_metadata()
+        );
+    }
+
+    /// Normalizing a legacy sidecar must not hide explicit differences: a
+    /// different `expired_at` or insertion order is still a certificate
+    /// operation.
+    #[test]
+    fn diff_still_reports_explicit_metadata_differences() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let build = |first: (&CertificateAndKey, u64), second: (&CertificateAndKey, u64)| {
+            let mut state = ConfigState::new();
+            for (certificate, expired_at) in [first, second] {
+                state
+                    .add_certificate(&AddCertificate {
+                        address,
+                        certificate: certificate.clone(),
+                        expired_at: Some(expired_at as i64),
+                    })
+                    .expect("certificate");
+            }
+            state
+        };
+        let base = build(
+            (&certificate_a, 2_100_000_000),
+            (&certificate_b, 2_200_000_000),
+        );
+        let other_expiry = build(
+            (&certificate_a, 2_100_000_000),
+            (&certificate_b, 2_300_000_000),
+        );
+        let other_order = build(
+            (&certificate_b, 2_200_000_000),
+            (&certificate_a, 2_100_000_000),
+        );
+
+        assert_ne!(
+            base.normalized_certificate_metadata(),
+            other_expiry.normalized_certificate_metadata(),
+            "expired_at survives normalization"
+        );
+        assert_ne!(
+            base.normalized_certificate_metadata(),
+            other_order.normalized_certificate_metadata(),
+            "insertion order survives normalization"
+        );
+        for other in [&other_expiry, &other_order] {
+            let requests = base.diff(other);
+            assert!(
+                requests.iter().any(|request| matches!(
+                    request.request_type,
+                    Some(
+                        RequestType::AddCertificate(_)
+                            | RequestType::RemoveCertificate(_)
+                            | RequestType::ReplaceCertificate(_)
+                    )
+                )),
+                "an explicit metadata difference yields certificate operations"
+            );
+            let replayed = replay_diff(&base, &requests);
+            assert_eq!(
+                replayed.normalized_certificate_metadata(),
+                other.normalized_certificate_metadata()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_reader_ignores_current_certificate_metadata_but_keeps_material() {
+        #[derive(serde::Deserialize)]
+        struct LegacyConfigStateMirror {
+            certificates: HashMap<SocketAddr, HashMap<Fingerprint, CertificateAndKey>>,
+        }
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let socket_address: SocketAddr = address.into();
+        let (certificate, _) = distinct_test_certificates();
+        let fingerprint = certificate.fingerprint().expect("fingerprint");
+        let mut current = ConfigState::new();
+        current
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate.to_owned(),
+                expired_at: Some(2_100_000_000),
+            })
+            .expect("current certificate");
+
+        let legacy: LegacyConfigStateMirror = serde_json::from_value(
+            serde_json::to_value(&current).expect("serialize current ConfigState"),
+        )
+        .expect("an old serde reader must ignore the unknown metadata field");
+
+        assert_eq!(
+            legacy.certificates[&socket_address][&fingerprint], certificate,
+            "new-to-old JSON remains syntactically readable, with metadata intentionally lost"
+        );
+    }
+
+    #[test]
+    fn malformed_legacy_metadata_is_unchanged_on_refusal_then_normalized_on_success() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let socket_address: SocketAddr = address.into();
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let mut state = ConfigState::new();
+        state.certificates.insert(
+            socket_address,
+            HashMap::from([(fingerprint_a.to_owned(), certificate_a)]),
+        );
+        state.certificate_metadata.insert(
+            socket_address,
+            CertificateMetadataIndex {
+                entries: HashMap::from([
+                    (
+                        fingerprint_a,
+                        CertificateMetadata {
+                            expired_at: Some(2_100_000_000),
+                            insertion_order: 7,
+                        },
+                    ),
+                    (
+                        Fingerprint(vec![0xff]),
+                        CertificateMetadata {
+                            expired_at: Some(9),
+                            insertion_order: 7,
+                        },
+                    ),
+                ]),
+                next_order: None,
+            },
+        );
+        let before = state.to_owned();
+
+        let error = state.add_certificate(&AddCertificate {
+            address,
+            certificate: CertificateAndKey {
+                certificate: "not PEM".to_owned(),
+                ..Default::default()
+            },
+            expired_at: None,
+        });
+        assert!(error.is_err(), "malformed certificate must be refused");
+        assert_eq!(
+            state, before,
+            "a refusal must not normalize or mutate legacy state"
+        );
+
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate_b,
+                expired_at: Some(2_200_000_000),
+            })
+            .expect("valid mutation normalizes legacy metadata");
+        let metadata = &state.certificate_metadata[&socket_address].entries;
+        assert_eq!(metadata.len(), 2, "orphan metadata must be pruned");
+        assert_eq!(metadata[&fingerprint_b].insertion_order, 1);
+        assert_eq!(
+            metadata
+                .values()
+                .map(|entry| entry.insertion_order)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1]),
+            "normalized ordinals must be unique and contiguous"
+        );
+    }
+
+    /// Found while adding certificate coverage to `check_invariants` for
+    /// sozu-proxy/sozu#1404: `remove_certificate` removed the fingerprint
+    /// from the address's inner map but never evicted the address key
+    /// itself, so removing an address's LAST certificate through the
+    /// ordinary, successful `AddCertificate` + `RemoveCertificate` sequence
+    /// left a dangling `self.certificates[address] == {}` entry. That
+    /// leftover is not merely untidy: `generate_requests` (`produce_initial_state`
+    /// / `SaveState` / worker bootstrap / hot upgrade) skips an empty bucket
+    /// when emitting `AddCertificate` requests, so replaying those requests
+    /// into a fresh `ConfigState` never recreates the entry -- it already
+    /// broke `generate_requests`'s own round-trip debug_assert before this
+    /// fix. Mirrors the `name_fingerprint_idx` empty-entry leak
+    /// `CertificateResolver::remove_certificate` (`lib/src/tls.rs`) was
+    /// fixed for in #1202.
+    #[test]
+    fn remove_certificate_evicts_the_address_when_its_last_certificate_is_removed() {
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        let mut state = ConfigState::default();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate,
+                expired_at: None,
+            })
+            .expect("initial certificate insertion must succeed");
+
+        state
+            .remove_certificate(&RemoveCertificate {
+                address,
+                fingerprint: fingerprint.to_string(),
+            })
+            .expect("removing the only certificate must succeed");
+
+        assert!(
+            !state.certificates.contains_key(&SocketAddr::from(address)),
+            "removing an address's last certificate must evict the address key too, \
+             found {:?}",
+            state.certificates.get(&SocketAddr::from(address))
+        );
+
+        // Regression proof for the round-trip this leak broke: this is the
+        // live path SaveState / worker bootstrap / hot upgrade use, and it
+        // carries its own debug_assert that a fresh replay reproduces `self`.
+        let _ = state.produce_initial_state();
+    }
+
+    /// Found alongside the `remove_certificate` leak above, same
+    /// investigation (sozu-proxy/sozu#1404): `add_certificate` computed
+    /// `add.certificate.fingerprint()` (parses PEM only) and THEN called
+    /// `self.certificates.entry(address).or_default()` -- unconditionally
+    /// materialising a bucket for the address, including a brand-new one --
+    /// BEFORE the second fallible step, `apply_overriding_names`, which
+    /// additionally parses full X.509 when `names` is empty. Valid PEM
+    /// armor wrapping invalid X.509 DER content therefore left a dangling
+    /// empty bucket for a previously-absent address on a REJECTED add,
+    /// violating the same "a rejected dispatch must be a true no-op"
+    /// contract `replace_certificate`'s ordering bug violated.
+    #[test]
+    fn add_certificate_with_valid_pem_armor_but_invalid_x509_leaves_no_bucket() {
+        // Valid PEM framing (base64 of arbitrary bytes), but the decoded
+        // bytes are not a valid X.509 DER structure.
+        let junk_pem = "-----BEGIN CERTIFICATE-----\n\
+             dGhpcyBpcyBub3QgYSB2YWxpZCB4NTA5IGRlciBzdHJ1Y3R1cmUgYXQgYWxsLCBq\n\
+             dXN0IGZpbGxlciBieXRlcyBwYWRkZWQgb3V0\n\
+             -----END CERTIFICATE-----\n";
+        let certificate = CertificateAndKey {
+            certificate: junk_pem.to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        let mut state = ConfigState::default();
+        assert!(
+            !state.certificates.contains_key(&SocketAddr::from(address)),
+            "the address must be absent before the add attempt"
+        );
+
+        let error = state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate,
+                expired_at: None,
+            })
+            .expect_err("valid PEM armor around invalid X.509 content must be rejected");
+        assert!(
+            matches!(error, StateError::AddCertificate(_)),
+            "expected StateError::AddCertificate, got {error:?}"
+        );
+
+        assert!(
+            !state.certificates.contains_key(&SocketAddr::from(address)),
+            "a rejected add_certificate must leave no bucket for a previously-absent address, \
+             found {:?}",
+            state.certificates.get(&SocketAddr::from(address))
+        );
+    }
+
+    #[test]
+    fn frontend_state_error_redacts_display_key() {
+        const HOSTNAME_SECRET: &str = "STATE_ERROR_HOSTNAME_SECRET_SENTINEL";
+        const PATH_SECRET: &str = "STATE_ERROR_PATH_SECRET_SENTINEL";
+        const METHOD_SECRET: &str = "STATE_ERROR_METHOD_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let front = RequestHttpFrontend {
+            cluster_id: Some("cluster".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            hostname: long_value(HOSTNAME_SECRET),
+            path: PathRule {
+                kind: PathRuleKind::Prefix as i32,
+                value: long_value(PATH_SECRET),
+            },
+            method: Some(long_value(METHOD_SECRET)),
+            position: RulePosition::Tree as i32,
+            tags: BTreeMap::new(),
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: Vec::new(),
+            hsts: None,
+            header_predicates: Vec::new(),
+        };
+        let mut state = ConfigState::default();
+        state
+            .add_http_frontend(&front)
+            .expect("first frontend insertion must succeed");
+        assert!(
+            state
+                .http_fronts
+                .keys()
+                .next()
+                .expect("raw state key must be retained")
+                .contains(HOSTNAME_SECRET),
+            "state storage must retain the raw operator-facing frontend key"
+        );
+
+        let error = state
+            .add_http_frontend(&front)
+            .expect_err("duplicate frontend insertion must return StateError::Exists");
+        let raw_frontend_key = front.to_string();
+        match &error {
+            StateError::Exists { id, .. } => assert_eq!(
+                id, &raw_frontend_key,
+                "StateError must preserve the public raw frontend identifier"
+            ),
+            other => panic!("expected StateError::Exists, got {other:?}"),
+        }
+        for (label, output) in [
+            ("Display", error.to_string()),
+            ("Debug", format!("{error:?}")),
+        ] {
+            for secret in [HOSTNAME_SECRET, PATH_SECRET, METHOD_SECRET] {
+                assert!(
+                    !output.contains(secret),
+                    "StateError {label} leaked frontend marker {secret}"
+                );
+            }
+            let metadata = format!("id_bytes={}", raw_frontend_key.len());
+            assert!(
+                output.contains(&metadata),
+                "StateError {label} omitted bounded metadata {metadata}: {output}"
+            );
+            assert!(
+                output.len() <= 512,
+                "StateError {label} output is not bounded: {} bytes",
+                output.len()
+            );
+        }
+    }
+
+    #[test]
+    fn state_error_formatting_bounds_every_string_bearing_variant() {
+        const SECRET: &str = "STATE_ERROR_VARIANT_SECRET_SENTINEL";
+
+        let long_value = || format!("{SECRET}{}", "x".repeat(4096));
+        let errors = [
+            StateError::NotFound {
+                kind: ObjectKind::Backend,
+                id: long_value(),
+            },
+            StateError::Exists {
+                kind: ObjectKind::Cluster,
+                id: long_value(),
+            },
+            StateError::ClusterNotFound {
+                kind: ObjectKind::Backend,
+                cluster_id: long_value(),
+            },
+            StateError::AddCertificate(CertificateError::ParsePEMCertificate(long_value())),
+            StateError::RemoveCertificate(long_value()),
+            StateError::ReplaceCertificate(long_value()),
+            StateError::FrontendConversion {
+                frontend: long_value(),
+                error: long_value(),
+            },
+            StateError::FileError(std::io::Error::other(long_value())),
+            StateError::InvalidTcpFrontend {
+                address: "127.0.0.1:443"
+                    .parse()
+                    .expect("test TCP frontend address must parse"),
+                reason: long_value(),
+            },
+            StateError::UdpFrontendAddressTaken {
+                address: "127.0.0.1:5353"
+                    .parse()
+                    .expect("test UDP frontend address must parse"),
+                cluster_id: long_value().into(),
+                current_cluster_id: long_value().into(),
+                current_tags: BTreeMap::from([(long_value(), long_value())]),
+            },
+        ];
+
+        for error in errors {
+            for (label, output) in [
+                ("Display", error.to_string()),
+                ("Debug", format!("{error:?}")),
+            ] {
+                assert!(
+                    !output.contains(SECRET),
+                    "StateError {label} leaked a string-bearing variant: {output}"
+                );
+                assert!(
+                    output.len() <= 512,
+                    "StateError {label} is not bounded: {} bytes",
+                    output.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_frontend_not_found_error_retains_the_raw_identity() {
+        const TCP_SECRET: &str = "STATE_ERROR_TCP_IDENTITY_SECRET_SENTINEL";
+
+        let long_value = |suffix: &str| format!("{TCP_SECRET}_{suffix}{}", "x".repeat(1024));
+        let frontend = RequestTcpFrontend {
+            cluster_id: long_value("cluster"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 443),
+            tags: BTreeMap::from([(long_value("tag-key"), long_value("tag-value"))]),
+            sni: Some(long_value("sni")),
+            alpn: vec![long_value("alpn")],
+        };
+        let error = ConfigState::default()
+            .remove_tcp_frontend(&frontend)
+            .expect_err("removing from a missing cluster must return StateError::NotFound");
+
+        match &error {
+            StateError::NotFound { id, .. } => assert!(
+                id.contains(TCP_SECRET),
+                "StateError must retain the raw TCP frontend identity: {id}"
+            ),
+            other => panic!("expected StateError::NotFound, got {other:?}"),
+        }
+        for output in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !output.contains(TCP_SECRET),
+                "StateError formatting leaked the retained TCP identity: {output}"
+            );
+            assert!(
+                output.len() <= 512,
+                "StateError formatting is not bounded: {} bytes",
+                output.len()
+            );
+        }
+    }
+
+    #[test]
+    fn retained_state_debug_redacts_http_frontend_and_collection_data() {
+        const CLUSTER_SECRET: &str = "RETAINED_CLUSTER_SECRET_SENTINEL";
+        const HOSTNAME_SECRET: &str = "RETAINED_HOSTNAME_SECRET_SENTINEL";
+        const PATH_SECRET: &str = "RETAINED_PATH_SECRET_SENTINEL";
+        const METHOD_SECRET: &str = "RETAINED_METHOD_SECRET_SENTINEL";
+        const TAG_KEY_SECRET: &str = "RETAINED_TAG_KEY_SECRET_SENTINEL";
+        const TAG_VALUE_SECRET: &str = "RETAINED_TAG_VALUE_SECRET_SENTINEL";
+        const REDIRECT_TEMPLATE_SECRET: &str = "RETAINED_REDIRECT_TEMPLATE_SECRET_SENTINEL";
+        const REWRITE_HOST_SECRET: &str = "RETAINED_REWRITE_HOST_SECRET_SENTINEL";
+        const REWRITE_PATH_SECRET: &str = "RETAINED_REWRITE_PATH_SECRET_SENTINEL";
+        const HEADER_KEY_SECRET: &str = "RETAINED_HEADER_KEY_SECRET_SENTINEL";
+        const HEADER_VALUE_SECRET: &str = "RETAINED_HEADER_VALUE_SECRET_SENTINEL";
+        const REQUEST_COUNT_SECRET: &str = "RETAINED_REQUEST_COUNT_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let request = RequestHttpFrontend {
+            cluster_id: Some(long_value(CLUSTER_SECRET)),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            hostname: long_value(HOSTNAME_SECRET),
+            path: PathRule {
+                kind: PathRuleKind::Regex as i32,
+                value: long_value(PATH_SECRET),
+            },
+            method: Some(long_value(METHOD_SECRET)),
+            position: RulePosition::Tree as i32,
+            tags: BTreeMap::from([(long_value(TAG_KEY_SECRET), long_value(TAG_VALUE_SECRET))]),
+            redirect: Some(RedirectPolicy::PermanentRedirect as i32),
+            redirect_scheme: Some(RedirectScheme::UseHttps as i32),
+            redirect_template: Some(long_value(REDIRECT_TEMPLATE_SECRET)),
+            rewrite_host: Some(long_value(REWRITE_HOST_SECRET)),
+            rewrite_path: Some(long_value(REWRITE_PATH_SECRET)),
+            rewrite_port: Some(9443),
+            required_auth: Some(true),
+            headers: vec![Header {
+                position: HeaderPosition::Both as i32,
+                key: long_value(HEADER_KEY_SECRET),
+                val: long_value(HEADER_VALUE_SECRET),
+            }],
+            hsts: Some(HstsConfig {
+                enabled: Some(true),
+                max_age: Some(31_536_000),
+                include_subdomains: Some(true),
+                preload: Some(false),
+                force_replace_backend: Some(true),
+            }),
+            header_predicates: Vec::new(),
+        };
+        let retained = request
+            .clone()
+            .to_frontend()
+            .expect("adversarial frontend must convert");
+        let retained_debug = format!("{retained:?}");
+
+        let mut state = ConfigState::default();
+        state
+            .dispatch(&RequestType::AddHttpFrontend(request).into())
+            .expect("adversarial frontend must be retained");
+        state
+            .request_counts
+            .insert(long_value(REQUEST_COUNT_SECRET), 7);
+        let retained_key = state
+            .http_fronts
+            .keys()
+            .next()
+            .expect("dispatch must retain the frontend's Display key");
+        assert!(retained_key.contains(HOSTNAME_SECRET));
+        assert!(retained_key.contains(PATH_SECRET));
+        assert!(retained_key.contains(METHOD_SECRET));
+        let state_debug = format!("{state:?}");
+
+        let secrets = [
+            CLUSTER_SECRET,
+            HOSTNAME_SECRET,
+            PATH_SECRET,
+            METHOD_SECRET,
+            TAG_KEY_SECRET,
+            TAG_VALUE_SECRET,
+            REDIRECT_TEMPLATE_SECRET,
+            REWRITE_HOST_SECRET,
+            REWRITE_PATH_SECRET,
+            HEADER_KEY_SECRET,
+            HEADER_VALUE_SECRET,
+            REQUEST_COUNT_SECRET,
+        ];
+        for (label, output) in [
+            ("HttpFrontend", &retained_debug),
+            ("ConfigState", &state_debug),
+        ] {
+            for secret in secrets {
+                assert!(
+                    !output.contains(secret),
+                    "{label} Debug leaked retained marker {secret}"
+                );
+            }
+            assert!(
+                output.len() <= 2048,
+                "{label} Debug output is not bounded: {} bytes",
+                output.len()
+            );
+        }
+
+        for metadata in [
+            format!("cluster_id_len: Some({})", long_value(CLUSTER_SECRET).len()),
+            "address: 127.0.0.1:8443".to_owned(),
+            format!("hostname_len: {}", long_value(HOSTNAME_SECRET).len()),
+            "path_kind: 1".to_owned(),
+            format!("path_len: {}", long_value(PATH_SECRET).len()),
+            format!("method_len: Some({})", long_value(METHOD_SECRET).len()),
+            "position: Tree".to_owned(),
+            "tags_count: Some(1)".to_owned(),
+            format!(
+                "tags_len: Some({})",
+                long_value(TAG_KEY_SECRET).len() + long_value(TAG_VALUE_SECRET).len()
+            ),
+            "redirect: Some(4)".to_owned(),
+            "redirect_scheme: Some(2)".to_owned(),
+            format!(
+                "redirect_template_len: Some({})",
+                long_value(REDIRECT_TEMPLATE_SECRET).len()
+            ),
+            format!(
+                "rewrite_host_len: Some({})",
+                long_value(REWRITE_HOST_SECRET).len()
+            ),
+            format!(
+                "rewrite_path_len: Some({})",
+                long_value(REWRITE_PATH_SECRET).len()
+            ),
+            "rewrite_port: Some(9443)".to_owned(),
+            "required_auth: Some(true)".to_owned(),
+            "headers_count: 1".to_owned(),
+            format!(
+                "headers_len: {}",
+                long_value(HEADER_KEY_SECRET).len() + long_value(HEADER_VALUE_SECRET).len()
+            ),
+            "hsts: Some(HstsConfig".to_owned(),
+        ] {
+            assert!(
+                retained_debug.contains(&metadata),
+                "HttpFrontend Debug omitted safe metadata {metadata}: {retained_debug}"
+            );
+        }
+        for metadata in [
+            "http_frontends_count: 1",
+            "backends_count: 0",
+            "tcp_frontends_count: 0",
+            "udp_frontends_count: 0",
+            "certificates_count: 0",
+            "request_counts_count: 2",
+        ] {
+            assert!(
+                state_debug.contains(metadata),
+                "ConfigState Debug omitted count metadata {metadata}: {state_debug}"
+            );
+        }
+    }
+
+    /// A backend belongs to its cluster (`ConfigState::add_backend`): add
+    /// the clusters a test's backends name before them.
+    fn add_clusters(state: &mut ConfigState, cluster_ids: &[&str]) {
+        for cluster_id in cluster_ids {
+            state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: cluster_id.to_string(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("Could not add the test cluster");
+        }
+    }
+
+    #[test]
+    fn serialize() {
+        let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1", "cluster_2"]);
+        state
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("lolcatho.st:8080"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_2")),
+                    hostname: String::from("test.local"),
+                    path: PathRule::prefix(String::from("/abc")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Pre.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-1"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1027),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_2"),
+                    backend_id: String::from("cluster_2-0"),
+                    address: SocketAddress::new_v4(192, 167, 1, 2, 1026),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-3"),
+                    address: SocketAddress::new_v4(192, 168, 1, 3, 1027),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::RemoveBackend(RemoveBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-3"),
+                    address: SocketAddress::new_v4(192, 168, 1, 3, 1027),
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        /*
+        let encoded = state.encode();
+        println!("serialized:\n{}", encoded);
+
+        let new_state: Option<HttpProxy> = decode_str(&encoded);
+        println!("deserialized:\n{:?}", new_state);
+        assert_eq!(new_state, Some(state));
+        */
+        //assert!(false);
+    }
+
+    #[test]
+    fn diff() {
+        let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1", "cluster_2"]);
+        state
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("lolcatho.st:8080"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Post.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_2")),
+                    hostname: String::from("test.local"),
+                    path: PathRule::prefix(String::from("/abc")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-1"),
+                    address: SocketAddress::new_v4(127, 0, 0, 2, 1027),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_2"),
+                    backend_id: String::from("cluster_2-0"),
+                    address: SocketAddress::new_v4(192, 167, 1, 2, 1026),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_2"),
+                    sticky_session: true,
+                    https_redirect: true,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        let mut state2: ConfigState = Default::default();
+        add_clusters(&mut state2, &["cluster_1"]);
+        state2
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("lolcatho.st:8080"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Post.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state2
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state2
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-1"),
+                    address: SocketAddress::new_v4(127, 0, 0, 2, 1027),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state2
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-2"),
+                    address: SocketAddress::new_v4(127, 0, 0, 2, 1028),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state2
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_3"),
+                    sticky_session: false,
+                    https_redirect: false,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        // `cluster_2` is gone from `state2`: its `RemoveCluster` also removes
+        // its frontend and its backend, so the diff emits no separate
+        // `RemoveHttpFrontend`/`RemoveBackend` for them.
+        let e: Vec<Request> = vec![
+            RequestType::AddBackend(AddBackend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-2"),
+                address: SocketAddress::new_v4(127, 0, 0, 2, 1028),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                ..Default::default()
+            })
+            .into(),
+            RequestType::RemoveCluster(String::from("cluster_2")).into(),
+            RequestType::AddCluster(Cluster {
+                cluster_id: String::from("cluster_3"),
+                sticky_session: false,
+                https_redirect: false,
+                ..Default::default()
+            })
+            .into(),
+        ];
+        let expected_diff: HashSet<&Request> = HashSet::from_iter(e.iter());
+
+        let d = state.diff(&state2);
+        let diff = HashSet::from_iter(d.iter());
+        println!("diff requests:\n{diff:#?}\n");
+        println!("expected diff requests:\n{expected_diff:#?}\n");
+
+        let hash1 = state.hash_state();
+        let hash2 = state2.hash_state();
+        let mut state3 = state.clone();
+        state3
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-2"),
+                    address: SocketAddress::new_v4(127, 0, 0, 2, 1028),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        let hash3 = state3.hash_state();
+        println!("state 1 hashes: {hash1:#?}");
+        println!("state 2 hashes: {hash2:#?}");
+        println!("state 3 hashes: {hash3:#?}");
+
+        assert_eq!(diff, expected_diff);
+    }
+
+    /// One cluster per id in `cluster_ids`, each owning one object of every
+    /// kind a cluster can own: an HTTP, an HTTPS, a TCP and a UDP frontend,
+    /// and a backend. Every state also carries a deny route
+    /// (`cluster_id: None`) on `cascade_a`'s hostname, which belongs to no
+    /// cluster and must outlive the removal of `cascade_a`.
+    fn state_with_clusters_owning_every_object_kind(cluster_ids: &[&str]) -> ConfigState {
+        let mut state = ConfigState::new();
+        for cluster_id in cluster_ids {
+            let port = match *cluster_id {
+                "cascade_a" => 9200,
+                "cascade_b" => 9300,
+                other => panic!("no test ports reserved for {other}"),
+            };
+            let requests: Vec<Request> = vec![
+                RequestType::AddCluster(Cluster {
+                    cluster_id: cluster_id.to_string(),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(cluster_id.to_string()),
+                    hostname: format!("{cluster_id}.test"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: Some(cluster_id.to_string()),
+                    hostname: format!("{cluster_id}.test"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: cluster_id.to_string(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, port),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddUdpFrontend(RequestUdpFrontend {
+                    cluster_id: cluster_id.to_string(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, port + 1),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddBackend(AddBackend {
+                    cluster_id: cluster_id.to_string(),
+                    backend_id: format!("{cluster_id}-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, port + 2),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            ];
+            for request in &requests {
+                state
+                    .dispatch(request)
+                    .unwrap_or_else(|e| panic!("could not apply {request:?}: {e}"));
+            }
+        }
+        state
+            .dispatch(&RequestType::AddHttpFrontend(cascade_deny_route()).into())
+            .expect("could not add the deny route");
+        state
+    }
+
+    /// A route that belongs to no cluster, on the hostname `cascade_a` serves.
+    fn cascade_deny_route() -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: None,
+            hostname: String::from("cascade_a.test"),
+            path: PathRule::prefix(String::from("/deny")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        }
+    }
+
+    /// The cluster a routing request names, if any.
+    fn cluster_named_by(request: &Request) -> Option<&str> {
+        match request.request_type.as_ref()? {
+            RequestType::AddCluster(cluster) => Some(&cluster.cluster_id),
+            RequestType::RemoveCluster(cluster_id) => Some(cluster_id),
+            RequestType::AddHttpFrontend(front)
+            | RequestType::RemoveHttpFrontend(front)
+            | RequestType::AddHttpsFrontend(front)
+            | RequestType::RemoveHttpsFrontend(front) => front.cluster_id.as_deref(),
+            RequestType::AddTcpFrontend(front) | RequestType::RemoveTcpFrontend(front) => {
+                Some(&front.cluster_id)
+            }
+            RequestType::AddUdpFrontend(front) | RequestType::RemoveUdpFrontend(front) => {
+                Some(&front.cluster_id)
+            }
+            RequestType::AddBackend(backend) | RequestType::AddUnixBackend(backend) => {
+                Some(&backend.cluster_id)
+            }
+            RequestType::RemoveBackend(backend) => Some(&backend.cluster_id),
+            _ => None,
+        }
+    }
+
+    /// Every routing map two states must agree on.
+    fn assert_same_routing(actual: &ConfigState, expected: &ConfigState, context: &str) {
+        assert_eq!(actual.clusters, expected.clusters, "{context}: clusters");
+        assert_eq!(actual.backends, expected.backends, "{context}: backends");
+        assert_eq!(
+            actual.http_fronts, expected.http_fronts,
+            "{context}: http_fronts"
+        );
+        assert_eq!(
+            actual.https_fronts, expected.https_fronts,
+            "{context}: https_fronts"
+        );
+        assert_eq!(
+            actual.tcp_fronts, expected.tcp_fronts,
+            "{context}: tcp_fronts"
+        );
+        assert_eq!(
+            actual.udp_fronts, expected.udp_fronts,
+            "{context}: udp_fronts"
+        );
+    }
+
+    /// Removing a cluster removes, for every protocol, the frontends and the
+    /// backends that name it, and nothing else: another cluster's objects and
+    /// a deny route on the removed cluster's own hostname stay.
+    #[test]
+    fn remove_cluster_removes_its_frontends_and_backends_for_every_protocol() {
+        let mut state = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        let expected = state_with_clusters_owning_every_object_kind(&["cascade_b"]);
+
+        state
+            .dispatch(&RequestType::RemoveCluster(String::from("cascade_a")).into())
+            .expect("removing an existing cluster must succeed");
+
+        assert_same_routing(&state, &expected, "after RemoveCluster(cascade_a)");
+        assert!(
+            state
+                .http_fronts
+                .values()
+                .any(|front| front.cluster_id.is_none() && front.hostname == "cascade_a.test"),
+            "a route that names no cluster must survive the removal of a cluster on its hostname"
+        );
+
+        // The cascade already removed the frontend: an explicit removal sent
+        // afterwards has nothing left to remove, and is recognised as such
+        // (the main process and the workers answer it ok).
+        let late: Request = RequestType::RemoveHttpFrontend(RequestHttpFrontend {
+            cluster_id: Some(String::from("cascade_a")),
+            hostname: String::from("cascade_a.test"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        })
+        .into();
+        let err = state
+            .dispatch(&late)
+            .expect_err("the cascade must already have removed the frontend");
+        assert!(
+            matches!(err, StateError::NotFound { .. }),
+            "expected NotFound, got: {err}"
+        );
+        assert!(
+            state.removed_with_its_cluster(&late, &err),
+            "a removal of an object that went with its cluster must be recognised"
+        );
+
+        // A removal naming a cluster that never existed (a typo) is answered
+        // the same way, and the answer says which route holds the key: here
+        // the deny route, which the removal leaves in place.
+        let mut typo = cascade_deny_route();
+        typo.cluster_id = Some(String::from("cascade_typo"));
+        let typo: Request = RequestType::RemoveHttpFrontend(typo).into();
+        let err = state
+            .dispatch(&typo)
+            .expect_err("a removal naming another cluster must not match the deny route");
+        assert!(state.removed_with_its_cluster(&typo, &err));
+        let answer = state.removed_with_its_cluster_message(&typo);
+        assert!(
+            answer.contains("this key belongs to a route with no cluster, left in place"),
+            "the ok answer must say the deny route holds the key: {answer}"
+        );
+        assert!(
+            state
+                .http_fronts
+                .values()
+                .any(|front| front.cluster_id.is_none() && front.hostname == "cascade_a.test"),
+            "the deny route must survive a removal naming a cluster that never existed"
+        );
+    }
+
+    /// The HTTP/HTTPS route key (`address;hostname;path;method`) names no
+    /// cluster, so a route key freed by a cluster removal can be taken by
+    /// another cluster. A removal still in flight for the first cluster must
+    /// then leave the second cluster's route alone, whether the first
+    /// cluster is gone or still there.
+    #[test]
+    fn a_stale_frontend_removal_never_removes_another_clusters_route() {
+        let route = |cluster_id: &str| RequestHttpFrontend {
+            cluster_id: Some(cluster_id.to_owned()),
+            hostname: String::from("reused.test"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        };
+        let cluster = |cluster_id: &str| {
+            RequestType::AddCluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                ..Default::default()
+            })
+        };
+        let owner =
+            |state: &ConfigState, fronts: fn(&ConfigState) -> &BTreeMap<String, HttpFrontend>| {
+                fronts(state)
+                    .get(&route("stale_b").to_string())
+                    .and_then(|front| front.cluster_id.as_deref().map(str::to_owned))
+            };
+
+        for (add, remove, fronts) in [
+            (
+                RequestType::AddHttpFrontend as fn(RequestHttpFrontend) -> RequestType,
+                RequestType::RemoveHttpFrontend as fn(RequestHttpFrontend) -> RequestType,
+                (|state: &ConfigState| &state.http_fronts)
+                    as fn(&ConfigState) -> &BTreeMap<String, HttpFrontend>,
+            ),
+            (
+                RequestType::AddHttpsFrontend,
+                RequestType::RemoveHttpsFrontend,
+                |state: &ConfigState| &state.https_fronts,
+            ),
+        ] {
+            // RemoveCluster(A), then B takes the route key A used, then a
+            // stale removal of A's frontend arrives.
+            let mut state = ConfigState::new();
+            for request in [
+                cluster("stale_a"),
+                add(route("stale_a")),
+                RequestType::RemoveCluster(String::from("stale_a")),
+                cluster("stale_b"),
+                add(route("stale_b")),
+            ] {
+                state
+                    .dispatch(&request.clone().into())
+                    .unwrap_or_else(|e| panic!("could not apply {request:?}: {e}"));
+            }
+            let stale: Request = remove(route("stale_a")).into();
+            let err = state
+                .dispatch(&stale)
+                .expect_err("a removal naming cluster A must not match cluster B's route");
+            assert!(
+                state.removed_with_its_cluster(&stale, &err),
+                "A is gone, so its frontend went with it: {err}"
+            );
+            let answer = state.removed_with_its_cluster_message(&stale);
+            assert!(
+                answer.contains("cluster stale_a does not exist")
+                    && answer.contains("this key belongs to cluster stale_b, left in place"),
+                "the ok answer must name the key's current owner: {answer}"
+            );
+            assert_eq!(
+                owner(&state, fronts).as_deref(),
+                Some("stale_b"),
+                "cluster B's route must survive a stale removal naming cluster A"
+            );
+
+            // Same stale removal while A still exists: refused, and not
+            // mistaken for an object removed with its cluster.
+            let mut state = ConfigState::new();
+            for request in [
+                cluster("stale_a"),
+                cluster("stale_b"),
+                add(route("stale_b")),
+            ] {
+                state
+                    .dispatch(&request.clone().into())
+                    .unwrap_or_else(|e| panic!("could not apply {request:?}: {e}"));
+            }
+            let err = state
+                .dispatch(&stale)
+                .expect_err("a removal naming cluster A must not match cluster B's route");
+            assert!(
+                !state.removed_with_its_cluster(&stale, &err),
+                "A still exists: the removal is refused, not already done"
+            );
+            assert_eq!(
+                owner(&state, fronts).as_deref(),
+                Some("stale_b"),
+                "cluster B's route must survive a removal naming cluster A"
+            );
+        }
+    }
+
+    /// `diff` towards a state without a cluster emits the `RemoveCluster`
+    /// alone: the cascade covers the cluster's frontends and backends, and a
+    /// separate removal of one of them would find nothing left to remove.
+    #[test]
+    fn diff_removing_a_cluster_relies_on_the_cascade() {
+        let before = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        let after = state_with_clusters_owning_every_object_kind(&["cascade_b"]);
+
+        let diff = before.diff(&after);
+        assert_eq!(
+            diff,
+            vec![Request::from(RequestType::RemoveCluster(String::from(
+                "cascade_a"
+            )))],
+            "the cascade must be the only removal the diff emits"
+        );
+
+        let mut replayed = before.clone();
+        for request in &diff {
+            replayed
+                .dispatch(request)
+                .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
+        }
+        assert_same_routing(&replayed, &after, "replaying diff(before, after)");
+    }
+
+    /// A target state may keep a frontend whose cluster it no longer holds.
+    /// The cascade removes that frontend with its cluster, so `diff` must add
+    /// it back after the `RemoveCluster`.
+    #[test]
+    fn diff_re_adds_a_frontend_the_target_keeps_for_a_removed_cluster() {
+        let before = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        let kept = RequestHttpFrontend {
+            cluster_id: Some(String::from("cascade_a")),
+            hostname: String::from("cascade_a.test"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        };
+        let mut after = state_with_clusters_owning_every_object_kind(&["cascade_b"]);
+        after
+            .dispatch(&RequestType::AddHttpFrontend(kept.clone()).into())
+            .expect("a frontend may name a cluster the state does not hold");
+
+        let diff = before.diff(&after);
+        let removal = diff
+            .iter()
+            .position(|r| r.request_type == Some(RequestType::RemoveCluster("cascade_a".into())))
+            .expect("the diff must remove cascade_a");
+        let re_add = diff
+            .iter()
+            .position(|r| r.request_type == Some(RequestType::AddHttpFrontend(kept.clone())))
+            .expect("the diff must add back the frontend the cascade removes");
+        assert!(
+            removal < re_add,
+            "the frontend must be added back after its cluster is removed: {diff:?}"
+        );
+
+        let mut replayed = before.clone();
+        for request in &diff {
+            replayed
+                .dispatch(request)
+                .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
+        }
+        assert_same_routing(&replayed, &after, "replaying diff(before, after)");
+    }
+
+    /// SaveState/LoadState and a worker upgrade replay `generate_requests`:
+    /// once a cluster is removed, none of its frontends or backends may come
+    /// back through that replay.
+    #[test]
+    fn a_removed_cluster_leaves_nothing_for_load_state_to_replay() {
+        let mut state = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        state
+            .dispatch(&RequestType::RemoveCluster(String::from("cascade_a")).into())
+            .expect("removing an existing cluster must succeed");
+
+        let requests = state.generate_requests();
+        let leaked: Vec<&Request> = requests
+            .iter()
+            .filter(|request| cluster_named_by(request) == Some("cascade_a"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "LoadState would replay objects of the removed cluster: {leaked:?}"
+        );
+
+        let mut replayed = ConfigState::new();
+        for request in &requests {
+            replayed
+                .dispatch(request)
+                .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
+        }
+        assert_same_routing(&replayed, &state, "replaying generate_requests");
+    }
+
+    fn add_backend_to(cluster_id: &str, port: u16) -> Request {
+        RequestType::AddBackend(AddBackend {
+            cluster_id: cluster_id.to_owned(),
+            backend_id: format!("{cluster_id}-{port}"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    /// A backend belongs to its cluster: an `AddBackend` naming a cluster the
+    /// state does not hold, never added or already removed, is refused and
+    /// leaves the state untouched, not even an empty bucket for that cluster.
+    #[test]
+    fn add_backend_for_an_unknown_cluster_is_refused() {
+        let mut state = ConfigState::new();
+
+        let refused = state.dispatch(&add_backend_to("orphan", 1026));
+        assert!(
+            matches!(refused, Err(StateError::ClusterNotFound { .. })),
+            "a backend of a cluster never added must be refused, got {refused:?}"
+        );
+        assert!(
+            state.backends.is_empty(),
+            "a refused AddBackend must not leave a bucket behind: {:?}",
+            state.backends
+        );
+
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("orphan"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("adding the cluster must succeed");
+        state
+            .dispatch(&add_backend_to("orphan", 1026))
+            .expect("a backend of an existing cluster must be added");
+        assert_eq!(state.count_backends(), 1);
+
+        state
+            .dispatch(&RequestType::RemoveCluster(String::from("orphan")).into())
+            .expect("removing an existing cluster must succeed");
+        assert!(
+            state.backends.is_empty(),
+            "RemoveCluster must remove the cluster's backends"
+        );
+        let refused = state.dispatch(&add_backend_to("orphan", 1027));
+        assert!(
+            matches!(refused, Err(StateError::ClusterNotFound { .. })),
+            "a backend of a removed cluster must be refused, got {refused:?}"
+        );
+        assert!(
+            state.backends.is_empty(),
+            "a backend must never outlive its cluster: {:?}",
+            state.backends
+        );
+    }
+
+    /// `AddUnixBackend` obeys the same ownership contract as `AddBackend`, and
+    /// the guard runs before `unix_path` validation: an unknown cluster is
+    /// `ClusterNotFound` even for an invalid path, and nothing is stored.
+    #[test]
+    fn add_unix_backend_for_an_unknown_cluster_is_refused() {
+        let mut state = ConfigState::new();
+        for unix_path in ["/run/app.sock", "relative.sock"] {
+            let refused = state.dispatch(
+                &RequestType::AddUnixBackend(AddBackend {
+                    cluster_id: String::from("orphan"),
+                    backend_id: String::from("orphan-unix"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+                    unix_path: Some(unix_path.to_owned()),
+                    ..Default::default()
+                })
+                .into(),
+            );
+            assert!(
+                matches!(refused, Err(StateError::ClusterNotFound { .. })),
+                "{unix_path:?}: an unknown cluster must be refused first, got {refused:?}"
+            );
+            assert!(
+                state.backends.is_empty(),
+                "a refused AddUnixBackend must not leave a bucket behind: {:?}",
+                state.backends
+            );
+        }
+        assert!(state.clusters.is_empty());
+    }
+
+    /// The refusal leaves the error text bounded: a cluster id is protected
+    /// material (`doc/observability.md`), so `Display` names only its length.
+    #[test]
+    fn unknown_cluster_error_names_the_object_without_the_cluster_id() {
+        let mut state = ConfigState::new();
+        let error = state
+            .dispatch(&add_backend_to("secret-cluster-id", 1026))
+            .expect_err("a backend of an unknown cluster must be refused");
+        let message = error.to_string();
+        assert!(
+            !message.contains("secret-cluster-id"),
+            "the error must not echo the cluster id: {message}"
+        );
+        assert!(
+            message.contains("Backend") && message.contains("add the cluster first"),
+            "the error must say what to do: {message}"
+        );
+    }
+
+    /// The configuration file emits each cluster's `AddCluster` before its
+    /// backends, so a TOML load still adds every backend.
+    #[test]
+    fn a_configuration_file_adds_each_cluster_before_its_backends() {
+        let config = crate::config::Config::load_from_path("assets/config.toml")
+            .expect("the test configuration must load");
+        let mut state = ConfigState::new();
+        for message in config
+            .generate_config_messages()
+            .expect("the test configuration must generate its orders")
+        {
+            let result = state.dispatch(&message.content);
+            if let Some(RequestType::AddBackend(_) | RequestType::AddCluster(_)) =
+                &message.content.request_type
+            {
+                result.unwrap_or_else(|e| panic!("could not apply {message:?}: {e}"));
+            }
+        }
+        assert_eq!(state.clusters.len(), 3);
+        assert_eq!(state.count_backends(), 5);
+    }
+
+    /// `diff` towards a state with a new cluster emits its `AddCluster`
+    /// before its `AddBackend`s, so the orders replay onto `self`.
+    #[test]
+    fn diff_adds_a_cluster_before_its_backends() {
+        let target = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        let mut state = ConfigState::new();
+        for request in state.diff(&target) {
+            state
+                .dispatch(&request)
+                .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
+        }
+        assert_same_routing(&state, &target, "replaying diff(empty, target)");
+    }
+
+    /// A cluster `app` with one backend of fixed identity, either a UNIX
+    /// backend probed through its socket, or an IP backend probed on `port`.
+    fn app_cluster_probing(port: Option<u32>, unix_path: Option<&str>) -> ConfigState {
+        let mut state = ConfigState::new();
+        let health_check = crate::proto::command::HealthCheckConfig {
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: crate::proto::command::HealthCheckMode::Tcp as i32,
+            port,
+            ..Default::default()
+        };
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    health_check: Some(health_check),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster must be accepted");
+        state
+            .dispatch(
+                &RequestType::add_backend(AddBackend {
+                    cluster_id: String::from("app"),
+                    backend_id: String::from("app-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 9000),
+                    unix_path: unix_path.map(ToOwned::to_owned),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the backend must be accepted");
+        state
+    }
+
+    /// `diff` between a cluster without a probe port owning a UNIX backend and
+    /// the same cluster with a probe port owning the same backend identity as
+    /// an IP backend (and the reverse) must converge: the port is only
+    /// accepted once the UNIX backend is gone, and a UNIX backend only once
+    /// the port is gone.
+    #[test]
+    fn diff_converges_when_a_probe_port_and_a_unix_backend_swap() {
+        let unix = app_cluster_probing(None, Some("/run/app.sock"));
+        let ip = app_cluster_probing(Some(8081), None);
+        for (from, to, direction) in [
+            (&unix, &ip, "unix -> ip+port"),
+            (&ip, &unix, "ip+port -> unix"),
+        ] {
+            let mut state = from.clone();
+            for request in from.diff(to) {
+                state
+                    .dispatch(&request)
+                    .unwrap_or_else(|e| panic!("{direction}: could not apply {request:?}: {e}"));
+            }
+            assert_same_routing(&state, to, direction);
+        }
+    }
+
+    #[test]
+    fn cluster_ids_by_domain() {
+        let mut config = ConfigState::new();
+        let http_front_cluster1 = RequestHttpFrontend {
+            cluster_id: Some(String::from("MyCluster_1")),
+            hostname: String::from("lolcatho.st"),
+            path: PathRule::prefix(String::from("")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        };
+
+        let https_front_cluster1 = RequestHttpFrontend {
+            cluster_id: Some(String::from("MyCluster_1")),
+            hostname: String::from("lolcatho.st"),
+            path: PathRule::prefix(String::from("")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+            ..Default::default()
+        };
+
+        let http_front_cluster2 = RequestHttpFrontend {
+            cluster_id: Some(String::from("MyCluster_2")),
+            hostname: String::from("lolcatho.st"),
+            path: PathRule::prefix(String::from("/api")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        };
+
+        let https_front_cluster2 = RequestHttpFrontend {
+            cluster_id: Some(String::from("MyCluster_2")),
+            hostname: String::from("lolcatho.st"),
+            path: PathRule::prefix(String::from("/api")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+            ..Default::default()
+        };
+
+        config
+            .dispatch(&RequestType::AddHttpFrontend(http_front_cluster1).into())
+            .expect("Could not execute request");
+        config
+            .dispatch(&RequestType::AddHttpFrontend(http_front_cluster2).into())
+            .expect("Could not execute request");
+        config
+            .dispatch(&RequestType::AddHttpsFrontend(https_front_cluster1).into())
+            .expect("Could not execute request");
+        config
+            .dispatch(&RequestType::AddHttpsFrontend(https_front_cluster2).into())
+            .expect("Could not execute request");
+
+        let mut cluster1_cluster2: HashSet<ClusterId> = HashSet::new();
+        cluster1_cluster2.insert(ClusterId::from("MyCluster_1"));
+        cluster1_cluster2.insert(ClusterId::from("MyCluster_2"));
+
+        let mut cluster2: HashSet<ClusterId> = HashSet::new();
+        cluster2.insert(ClusterId::from("MyCluster_2"));
+
+        let empty: HashSet<ClusterId> = HashSet::new();
+        assert_eq!(
+            config.get_cluster_ids_by_domain(String::from("lolcatho.st"), None),
+            cluster1_cluster2
+        );
+        assert_eq!(
+            config
+                .get_cluster_ids_by_domain(String::from("lolcatho.st"), Some(String::from("/api"))),
+            cluster2
+        );
+        assert_eq!(
+            config.get_cluster_ids_by_domain(String::from("lolcathost"), None),
+            empty
+        );
+        assert_eq!(
+            config
+                .get_cluster_ids_by_domain(String::from("lolcathost"), Some(String::from("/sozu"))),
+            empty
+        );
+    }
+
+    #[test]
+    fn duplicate_backends() {
+        let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1"]);
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        let b = Backend {
+            cluster_id: ClusterId::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
+            address: "127.0.0.1:1026".parse().unwrap(),
+            load_balancing_parameters: Some(LoadBalancingParams::default()),
+            sticky_id: Some("sticky".to_string()),
+            backup: None,
+            unix_path: None,
+        };
+
+        state
+            .dispatch(&RequestType::AddBackend(b.clone().to_add_backend()).into())
+            .expect("Could not execute order");
+
+        assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
+    }
+
+    /// #152: a backend's `unix_path` survives into the state and back out of
+    /// the orders it replays to a new worker, so a restart or an upgrade does
+    /// not turn a unix backend into a TCP one.
+    #[test]
+    fn a_unix_path_backend_round_trips_through_the_state() {
+        let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1"]);
+        let add = AddBackend {
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-unix"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+            unix_path: Some(String::from("/run/app.sock")),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::AddBackend(add.clone()).into())
+            .expect("a valid unix_path is accepted");
+        assert_eq!(
+            state.backends["cluster_1"][0].unix_path.as_deref(),
+            Some("/run/app.sock")
+        );
+        let replayed: Vec<AddBackend> = state
+            .generate_requests()
+            .into_iter()
+            .filter_map(|request| match request.request_type {
+                Some(RequestType::AddUnixBackend(backend)) => Some(backend),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replayed, vec![add]);
+    }
+
+    /// #152: the main process refuses a `unix_path` no worker could dial,
+    /// before it reaches the state.
+    #[test]
+    fn an_invalid_unix_path_is_refused() {
+        let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1"]);
+        for refused in ["", "relative.sock", "@"] {
+            let result = state.dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-unix"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+                    unix_path: Some(refused.to_owned()),
+                    ..Default::default()
+                })
+                .into(),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(StateError::InvalidValue {
+                        field: "unix_path",
+                        ..
+                    })
+                ),
+                "{refused:?} must be refused"
+            );
+        }
+        assert!(state.backends.is_empty());
+    }
+
+    #[test]
+    fn remove_backend() {
+        let mut state: ConfigState = Default::default();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        for i in 0..10 {
+            state
+                .dispatch(
+                    &RequestType::AddBackend(AddBackend {
+                        cluster_id: String::from("cluster_1"),
+                        backend_id: format!("cluster_1-{i}"),
+                        address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("Could not execute request");
+        }
+
+        assert_eq!(state.backends.get("cluster_1").unwrap().len(), 10);
+
+        let remove_backend_2 = RequestType::RemoveBackend(RemoveBackend {
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+        })
+        .into();
+
+        let remove_backend_result = state.dispatch(&remove_backend_2);
+
+        assert!(remove_backend_result.is_ok());
+        assert_eq!(state.backends.get("cluster_1").unwrap().len(), 9);
+
+        let redundant_remove = state.dispatch(&remove_backend_2);
+        assert!(matches!(redundant_remove, Err(StateError::NoChange)));
+        assert_eq!(state.backends.get("cluster_1").unwrap().len(), 9);
+    }
+
+    #[test]
+    fn remove_backends_randomly() {
+        let mut state: ConfigState = Default::default();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        for _ in 0..1000 {
+            for i in 0..10 {
+                state
+                    .dispatch(
+                        &RequestType::AddBackend(AddBackend {
+                            cluster_id: String::from("cluster_1"),
+                            backend_id: format!("cluster_1-{i}"),
+                            address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                            ..Default::default()
+                        })
+                        .into(),
+                    )
+                    .expect("Could not execute request");
+            }
+
+            let mut rng = rng();
+            let mut indexes = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+            indexes.shuffle(&mut rng);
+            let random_count = rng.random_range(1..indexes.len());
+            let random_indexes: Vec<i32> = indexes.into_iter().take(random_count).collect();
+
+            for j in random_indexes {
+                let remove_backend_result = state.dispatch(
+                    &RequestType::RemoveBackend(RemoveBackend {
+                        cluster_id: String::from("cluster_1"),
+                        backend_id: format!("cluster_1-{j}"),
+                        address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    })
+                    .into(),
+                );
+                assert!(remove_backend_result.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn listener_diff() {
+        let mut state: ConfigState = Default::default();
+        let custom_http_answers = Some(CustomHttpAnswers {
+            answer_404: Some("test".to_string()),
+            ..Default::default()
+        });
+        state
+            .dispatch(
+                &RequestType::AddTcpListener(TcpListenerConfig {
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
+                    proxy: ListenerType::Tcp.into(),
+                    from_scm: false,
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddHttpListener(HttpListenerConfig {
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddHttpsListener(HttpsListenerConfig {
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    proxy: ListenerType::Https.into(),
+                    from_scm: false,
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        let mut state2: ConfigState = Default::default();
+        state2
+            .dispatch(
+                &RequestType::AddTcpListener(TcpListenerConfig {
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
+                    expect_proxy: true,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state2
+            .dispatch(
+                &RequestType::AddHttpListener(HttpListenerConfig {
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    http_answers: custom_http_answers.clone(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state2
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    proxy: ListenerType::Http.into(),
+                    from_scm: false,
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state2
+            .dispatch(
+                &RequestType::AddHttpsListener(HttpsListenerConfig {
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    http_answers: custom_http_answers.clone(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state2
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    proxy: ListenerType::Https.into(),
+                    from_scm: false,
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        let e: Vec<Request> = vec![
+            RequestType::RemoveListener(RemoveListener {
+                interface: None,
+                address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
+                proxy: ListenerType::Tcp.into(),
+            })
+            .into(),
+            RequestType::AddTcpListener(TcpListenerConfig {
+                address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
+                expect_proxy: true,
+                ..Default::default()
+            })
+            .into(),
+            RequestType::DeactivateListener(DeactivateListener {
+                interface: None,
+                address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
+                proxy: ListenerType::Tcp.into(),
+                to_scm: false,
+            })
+            .into(),
+            RequestType::RemoveListener(RemoveListener {
+                interface: None,
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                proxy: ListenerType::Http.into(),
+            })
+            .into(),
+            RequestType::AddHttpListener(HttpListenerConfig {
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                http_answers: custom_http_answers.clone(),
+                ..Default::default()
+            })
+            .into(),
+            RequestType::ActivateListener(ActivateListener {
+                interface: None,
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                proxy: ListenerType::Http.into(),
+                from_scm: false,
+            })
+            .into(),
+            RequestType::RemoveListener(RemoveListener {
+                interface: None,
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                proxy: ListenerType::Https.into(),
+            })
+            .into(),
+            RequestType::AddHttpsListener(HttpsListenerConfig {
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                http_answers: custom_http_answers.clone(),
+                ..Default::default()
+            })
+            .into(),
+            // The 8443 HTTPS listener is active in both states but its content
+            // changed (custom answers). The Remove + Add(active=false) above
+            // wipes the active flag, so diff must re-emit an ActivateListener to
+            // keep the listener live across the hot reconfig. Without it the
+            // worker would silently deactivate the listener on replay.
+            RequestType::ActivateListener(ActivateListener {
+                interface: None,
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                proxy: ListenerType::Https.into(),
+                from_scm: false,
+            })
+            .into(),
+        ];
+
+        let diff = state.diff(&state2);
+        //let diff: HashSet<&RequestContent> = HashSet::from_iter(d.iter());
+        println!("expected diff requests:\n{e:#?}\n");
+        println!("diff requests:\n{diff:#?}\n");
+
+        let _hash1 = state.hash_state();
+        let _hash2 = state2.hash_state();
+
+        assert_eq!(diff, e);
+
+        // Round-trip: replaying diff(state -> state2) onto a clone of `state`
+        // must reproduce `state2`'s listener maps EXACTLY, active flag included.
+        // This is the hot-reconfig correctness property — a worker applies these
+        // requests and must converge on the target state. In particular the 8443
+        // HTTPS listener (active in both states, content changed) must come back
+        // ACTIVE, which is the bug the ActivateListener re-emission above fixes.
+        let mut replayed = state.clone();
+        for request in &diff {
+            replayed
+                .dispatch(request)
+                .expect("every diff request must replay cleanly onto the source state");
+        }
+        assert_eq!(
+            replayed.tcp_listeners, state2.tcp_listeners,
+            "replayed tcp_listeners must match the target state"
+        );
+        assert_eq!(
+            replayed.http_listeners, state2.http_listeners,
+            "replayed http_listeners must match the target state"
+        );
+        assert_eq!(
+            replayed.https_listeners, state2.https_listeners,
+            "replayed https_listeners must match the target state"
+        );
+        // Explicitly assert the still-active listener stays active across the
+        // config change (the core of the fixed bug).
+        let replayed_8443 = replayed
+            .https_listeners
+            .get(&ListenerKey::from(SocketAddress::new_v4(0, 0, 0, 0, 8443)))
+            .expect("8443 HTTPS listener must exist after replay");
+        assert!(
+            replayed_8443.active,
+            "the 8443 HTTPS listener must stay ACTIVE across a config change"
+        );
+    }
+
+    #[test]
+    fn certificate_retrieval() {
+        let mut state: ConfigState = Default::default();
+        let certificate_and_key = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/certificate.pem")),
+            key: String::from(include_str!("../assets/key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec!["lolcatho.st".to_string()],
+        };
+        let add_certificate = AddCertificate {
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            certificate: certificate_and_key,
+            expired_at: None,
+        };
+        state
+            .dispatch(&RequestType::AddCertificate(add_certificate).into())
+            .expect("Could not add certificate");
+
+        println!("state: {state:#?}");
+
+        // let fingerprint: Fingerprint = serde_json::from_str(
+        //     "\"ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5\"",
+        // )
+        // .expect("Could not deserialize the fingerprint");
+
+        let certificates_found_by_fingerprint = state.get_certificates(QueryCertificatesFilters {
+            domain: None,
+            fingerprint: Some(
+                "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5".to_string(),
+            ),
+        });
+
+        println!("found certificate: {certificates_found_by_fingerprint:#?}");
+
+        assert!(!certificates_found_by_fingerprint.is_empty());
+
+        let certificate_found_by_domain_name = state.get_certificates(QueryCertificatesFilters {
+            domain: Some("lolcatho.st".to_string()),
+            fingerprint: None,
+        });
+
+        assert!(!certificate_found_by_domain_name.is_empty());
+    }
+
+    #[test]
+    fn count_backends_across_clusters() {
+        let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1", "cluster_2"]);
+
+        assert_eq!(state.count_backends(), 0);
+
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 1);
+
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-1"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1027),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 2);
+
+        // add backend to a second cluster
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_2"),
+                    backend_id: String::from("cluster_2-0"),
+                    address: SocketAddress::new_v4(192, 168, 1, 1, 8080),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 3);
+
+        // remove a backend and verify count decreases
+        state
+            .dispatch(
+                &RequestType::RemoveBackend(RemoveBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 2);
+    }
+
+    /// The order a worker replays frontends in is the `http_fronts`
+    /// `BTreeMap` key order, and that key begins with the address and the
+    /// hostname (`RequestHttpFrontend`'s `Display`, `command/src/request.rs`).
+    /// `/test[0-9]/.example.com` therefore sorts BEFORE `test4.example.com`
+    /// — `/` is 0x2F, `t` is 0x74 — whatever order the operator added the
+    /// two frontends in. `produce_initial_state` and the protobuf
+    /// `InitialState.requests` it fills both preserve that order, and the
+    /// worker side walks it in sequence, so the regex segment reaches
+    /// `add_tree_rule` first on every launch of every worker.
+    ///
+    /// This is what sozu#1351's no-migration claim rests on. Two
+    /// consequences, and the test pins the fact both follow from:
+    ///
+    /// - On a build before the fix the divergence was PERMANENT, not
+    ///   transient: the leaking order is the only order a forked worker
+    ///   ever sees, so a restart reproduced it instead of healing it. A
+    ///   correct table built live by an exact-first sequence of API calls
+    ///   is therefore re-corrupted at the next worker fork or upgrade — the
+    ///   live order is never the durable one.
+    /// - On the fixed build the same replay yields the corrected routing
+    ///   with no state rewrite, because both orders now build the same
+    ///   table (`lib/src/router/mod.rs`'s
+    ///   `hostname_routing_does_not_depend_on_declaration_order`).
+    ///
+    /// To SEE THIS RED: in `ConfigState::generate_requests`, collect the
+    /// `http_fronts` values into a `Vec`, reverse it, and push from that —
+    /// or declare `http_fronts` as a `HashMap`. The asserted order stops
+    /// holding. Adding the two frontends in the other order below does NOT
+    /// redden it, which is the point.
+    #[test]
+    fn a_regex_hostname_is_always_replayed_before_the_exact_name_it_matches() {
+        let mut state: ConfigState = Default::default();
+
+        // Added exact-first: the order that routed correctly in-process on
+        // an affected build, and the one the replay does not preserve.
+        for hostname in ["test4.example.com", "/test[0-9]/.example.com"] {
+            state
+                .dispatch(
+                    &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                        cluster_id: Some(String::from("cluster_1")),
+                        hostname: String::from(hostname),
+                        path: PathRule::prefix(String::from("/")),
+                        address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                        position: RulePosition::Tree.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("Could not execute request");
+        }
+
+        // Asserted through `produce_initial_state`, not `generate_requests`
+        // alone, so the envelope the worker actually reads is covered too.
+        let replayed: Vec<String> = state
+            .produce_initial_state()
+            .requests
+            .into_iter()
+            .filter_map(|worker_request| match worker_request.content.request_type {
+                Some(RequestType::AddHttpFrontend(front)) => Some(front.hostname),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            replayed,
+            vec![
+                String::from("/test[0-9]/.example.com"),
+                String::from("test4.example.com"),
+            ],
+            "a worker replays the regex segment before the exact name it \
+             matches, whatever order the operator added them in",
+        );
+    }
+
+    #[test]
+    fn count_frontends_across_types() {
+        let mut state: ConfigState = Default::default();
+
+        assert_eq!(state.count_frontends(), 0);
+
+        // add an HTTP frontend
+        state
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 1);
+
+        // add an HTTPS frontend
+        state
+            .dispatch(
+                &RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("secure.example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 2);
+
+        // add a TCP frontend
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: String::from("cluster_2"),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 5432),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 3);
+
+        // add a second TCP frontend on the same cluster
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: String::from("cluster_2"),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 5433),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 4);
+
+        // remove the HTTP frontend
+        state
+            .dispatch(
+                &RequestType::RemoveHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 3);
+    }
+
+    /// A state that holds an HTTPS listener requiring a client certificate
+    /// must rebuild it on `AddHttpsListenerWithClientAuth`: those requests
+    /// are the initial state of every new worker, the saved state file and
+    /// the reload diff, and a peer that predates mutual TLS would build the
+    /// listener without client auth from `AddHttpsListener`.
+    #[test]
+    fn https_listener_requests_carry_client_auth_on_their_own_verb() {
+        let mtls_address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let plain_address = SocketAddress::new_v4(127, 0, 0, 1, 8444);
+        let mtls = HttpsListenerConfig {
+            client_auth: Some(ClientAuthMode::ClientAuthRequired as i32),
+            client_ca_certificates: vec!["CLIENT CA PEM".to_owned()],
+            ..make_https_listener(mtls_address)
+        };
+
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListenerWithClientAuth(mtls.clone()).into())
+            .expect("the mTLS verb must add the listener to the state");
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(plain_address)).into())
+            .expect("the historical verb must keep adding listeners without client auth");
+        assert_eq!(
+            state.https_listeners.len(),
+            2,
+            "both verbs add a listener to the same state"
+        );
+
+        let https_adds = |requests: Vec<Request>| -> Vec<(SocketAddress, bool)> {
+            requests
+                .into_iter()
+                .filter_map(|request| match request.request_type {
+                    Some(RequestType::AddHttpsListener(listener)) => {
+                        Some((listener.address, false))
+                    }
+                    Some(RequestType::AddHttpsListenerWithClientAuth(listener)) => {
+                        Some((listener.address, true))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut generated = https_adds(state.generate_requests());
+        generated.sort_by_key(|(address, _)| address.port);
+        assert_eq!(
+            generated,
+            vec![(mtls_address, true), (plain_address, false)],
+            "generate_requests must put only the listener asking for a client certificate on the mTLS verb"
+        );
+
+        let diff = https_adds(ConfigState::new().diff(&state));
+        assert!(
+            diff.contains(&(mtls_address, true)) && !diff.contains(&(mtls_address, false)),
+            "the reload diff must add the mTLS listener on the mTLS verb: {diff:?}"
+        );
+    }
+
+    /// A configuration reload must be able to refresh the CA bundle or the
+    /// CRLs of a running listener: replaying `AddHttpsListener` is refused
+    /// for an address the state holds, so the reload sends the patch
+    /// `client_auth_refresh` builds, and the state applies it.
+    #[test]
+    fn a_reload_refreshes_the_client_auth_policy_of_a_running_listener() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let with_crl = |crl: &str| HttpsListenerConfig {
+            client_auth: Some(ClientAuthMode::ClientAuthRequired as i32),
+            client_ca_certificates: vec!["CLIENT CA PEM".to_owned()],
+            client_ca_crls: vec![crl.to_owned()],
+            ..make_https_listener(address)
+        };
+
+        let mut state = ConfigState::new();
+        assert_eq!(
+            state.client_auth_refresh(&with_crl("CRL 1")),
+            None,
+            "a listener the state does not hold is added, not patched"
+        );
+        state
+            .dispatch(&RequestType::add_https_listener(with_crl("CRL 1")).into())
+            .expect("add the listener");
+        assert_eq!(
+            state.client_auth_refresh(&with_crl("CRL 1")),
+            None,
+            "an unchanged policy needs no patch"
+        );
+        assert!(
+            matches!(
+                state.dispatch(&RequestType::add_https_listener(with_crl("CRL 2")).into()),
+                Err(StateError::Exists { .. })
+            ),
+            "precondition: replaying the add for a held address is refused"
+        );
+
+        let patch = state
+            .client_auth_refresh(&with_crl("CRL 2"))
+            .expect("a refreshed CRL must produce a patch");
+        assert_eq!(patch.address, address);
+        assert_eq!(
+            patch.client_auth_policy,
+            Some(with_crl("CRL 2").client_auth_policy())
+        );
+        assert_eq!(
+            UpdateHttpsListenerConfig {
+                client_auth_policy: None,
+                ..patch.clone()
+            },
+            UpdateHttpsListenerConfig {
+                address,
+                ..Default::default()
+            },
+            "the patch carries the policy and nothing else"
+        );
+
+        state
+            .dispatch(&RequestType::update_https_listener(patch).into())
+            .expect("the state must apply the policy patch");
+        let running = state
+            .https_listeners
+            .values()
+            .next()
+            .expect("the listener is still there");
+        assert_eq!(running.client_ca_crls, vec!["CRL 2".to_owned()]);
+        assert_eq!(
+            state.client_auth_refresh(&with_crl("CRL 2")),
+            None,
+            "once applied, the same reload has nothing left to refresh"
+        );
+    }
+
+    // ── helpers ────────────────────────────────────────────────────────────────
+
+    fn make_https_listener(address: SocketAddress) -> HttpsListenerConfig {
+        HttpsListenerConfig {
+            address,
+            sticky_name: "SOZUBALANCEID".to_owned(),
+            front_timeout: 60,
+            back_timeout: 30,
+            connect_timeout: 3,
+            request_timeout: 10,
+            ..Default::default()
+        }
+    }
+
+    fn make_http_listener(address: SocketAddress) -> HttpListenerConfig {
+        HttpListenerConfig {
+            address,
+            sticky_name: "SOZUBALANCEID".to_owned(),
+            front_timeout: 60,
+            back_timeout: 30,
+            connect_timeout: 3,
+            request_timeout: 10,
+            ..Default::default()
+        }
+    }
+
+    fn make_tcp_listener(address: SocketAddress) -> TcpListenerConfig {
+        TcpListenerConfig {
+            address,
+            front_timeout: 60,
+            back_timeout: 30,
+            connect_timeout: 3,
+            ..Default::default()
+        }
+    }
+
+    fn make_udp_listener(address: SocketAddress, active: bool) -> UdpListenerConfig {
+        UdpListenerConfig {
+            interface: None,
+            address,
+            public_address: None,
+            front_timeout: 30,
+            back_timeout: 30,
+            max_rx_datagram_size: 1500,
+            max_flows: 0,
+            active,
+        }
+    }
+
+    /// Runtime refusal must restore an activation only when the request would
+    /// have changed the stored flag. This keeps the inverse scoped to the
+    /// exact `(protocol, address, interface)` listener and prevents a repeated
+    /// activation failure from deactivating an already-live listener.
+    #[test]
+    fn activation_rollback_restores_the_prior_flag_for_every_listener_type() {
+        let mut state = ConfigState::new();
+        let cases = [
+            (ListenerType::Http, 8200),
+            (ListenerType::Https, 8201),
+            (ListenerType::Tcp, 8202),
+            (ListenerType::Udp, 8203),
+        ];
+
+        for (listener_type, port) in cases {
+            let address = SocketAddress::new_v4(127, 0, 0, 1, port);
+            let interface = Some(format!("test-{port}"));
+            let proxy: i32 = listener_type.into();
+            let add = match listener_type {
+                ListenerType::Http => RequestType::AddHttpListener(with_interface(
+                    make_http_listener(address),
+                    |listener| listener.interface = interface.to_owned(),
+                )),
+                ListenerType::Https => RequestType::AddHttpsListener(with_interface(
+                    make_https_listener(address),
+                    |listener| listener.interface = interface.to_owned(),
+                )),
+                ListenerType::Tcp => RequestType::AddTcpListener(with_interface(
+                    make_tcp_listener(address),
+                    |listener| listener.interface = interface.to_owned(),
+                )),
+                ListenerType::Udp => RequestType::AddUdpListener(with_interface(
+                    make_udp_listener(address, false),
+                    |listener| listener.interface = interface.to_owned(),
+                )),
+            };
+            state
+                .dispatch(&add.into())
+                .expect("the inactive listener must be recorded");
+
+            let activate = ActivateListener {
+                address,
+                proxy,
+                from_scm: false,
+                interface: interface.to_owned(),
+            };
+            let rollback = state
+                .rollback_for(&RequestType::ActivateListener(activate.to_owned()))
+                .expect("an inactive listener must receive an activation rollback");
+            assert!(matches!(
+                rollback.request_type,
+                Some(RequestType::DeactivateListener(DeactivateListener {
+                    address: rollback_address,
+                    proxy,
+                    to_scm: false,
+                    interface: rollback_interface,
+                })) if rollback_address == address
+                    && proxy == activate.proxy
+                    && rollback_interface == interface
+            ));
+
+            state
+                .dispatch(&RequestType::ActivateListener(activate.to_owned()).into())
+                .expect("the listener must become active in the stored state");
+            assert!(
+                state
+                    .rollback_for(&RequestType::ActivateListener(activate))
+                    .is_none(),
+                "repeating activation for an already-active {listener_type:?} listener must not create a deactivation rollback"
+            );
+        }
+    }
+
+    /// Mandatory roundtrip guard for the UDP control-plane data model.
+    ///
+    /// 1. Build a state holding an active UDP listener + UDP frontend, run
+    ///    `generate_requests()`, replay every emitted request into a fresh
+    ///    `ConfigState`, and assert the two states are byte-for-byte equal.
+    /// 2. Prove a `diff()` between an empty state and the UDP-bearing state
+    ///    produces requests that, replayed, reconstruct the UDP listener and
+    ///    frontend (a hot-add path), and that the reverse diff tears them
+    ///    down again.
+    #[test]
+    fn test_udp_state_roundtrip() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 5353);
+
+        let mut state = ConfigState::default();
+        state
+            .dispatch(&RequestType::AddUdpListener(make_udp_listener(address, true)).into())
+            .expect("could not add udp listener");
+        state
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
+                    address,
+                    proxy: ListenerType::Udp.into(),
+                    from_scm: false,
+                })
+                .into(),
+            )
+            .expect("could not activate udp listener");
+        state
+            .dispatch(
+                &RequestType::AddUdpFrontend(RequestUdpFrontend {
+                    cluster_id: "udp_cluster".to_string(),
+                    address,
+                    tags: BTreeMap::from([("owner".to_string(), "team".to_string())]),
+                })
+                .into(),
+            )
+            .expect("could not add udp frontend");
+
+        assert_eq!(state.udp_listeners.len(), 1);
+        assert!(state.udp_listeners[&address.into()].active);
+        assert_eq!(
+            state.udp_fronts.get("udp_cluster").map(Vec::len),
+            Some(1usize)
+        );
+
+        // `request_counts` is a runtime census side-effect of `dispatch`; it
+        // diverges by construction whenever the number/shape of replayed
+        // requests differs from the originals, so compare the logical config
+        // with the census cleared on both sides.
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+
+        // 1. generate_requests → replay → equal
+        let mut replayed = ConfigState::default();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("could not replay generated request");
+        }
+        assert_eq!(
+            logical(&state),
+            logical(&replayed),
+            "UDP listener + frontend must survive generate_requests → replay"
+        );
+
+        // 2. diff from empty reconstructs the UDP objects
+        let empty = ConfigState::default();
+        let mut from_diff = ConfigState::default();
+        for request in empty.diff(&state) {
+            from_diff
+                .dispatch(&request)
+                .expect("could not replay diff request");
+        }
+        assert_eq!(
+            logical(&state),
+            logical(&from_diff),
+            "diff(empty -> state) must reconstruct the UDP listener + frontend"
+        );
+
+        // reverse diff tears them back down to empty
+        let mut torn_down = state.clone();
+        for request in state.diff(&empty) {
+            torn_down
+                .dispatch(&request)
+                .expect("could not replay teardown diff request");
+        }
+        assert!(
+            torn_down.udp_listeners.is_empty(),
+            "diff(state -> empty) must remove the UDP listener"
+        );
+        assert!(
+            torn_down
+                .udp_fronts
+                .get("udp_cluster")
+                .map(Vec::is_empty)
+                .unwrap_or(true),
+            "diff(state -> empty) must remove the UDP frontend"
+        );
+
+        // update path: a partial patch mutates the stored listener in place
+        state
+            .dispatch(
+                &RequestType::UpdateUdpListener(UpdateUdpListenerConfig {
+                    address,
+                    max_flows: Some(4096),
+                    front_timeout: Some(15),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not update udp listener");
+        let updated = &state.udp_listeners[&address.into()];
+        assert_eq!(updated.max_flows, 4096);
+        assert_eq!(updated.front_timeout, 15);
+        assert_eq!(
+            updated.back_timeout, 30,
+            "unpatched field must be preserved"
+        );
+    }
+
+    /// Mandatory roundtrip + identity guard for SNI/ALPN-scoped TCP
+    /// frontends (sozu-proxy/sozu#1279).
+    ///
+    /// 1. Build a state holding a TCP listener with non-default SNI-preread
+    ///    knobs plus two SNI-scoped frontends on the same address, run
+    ///    `generate_requests()`, replay every emitted request into a fresh
+    ///    `ConfigState`, and assert the two states are byte-for-byte equal.
+    /// 2. Prove `diff()` between an empty state and this state reconstructs
+    ///    the listener + both frontends (hot-add), and the reverse diff
+    ///    tears them back down.
+    /// 3. Prove add/remove identity is `(address, sni, alpn)`: removing one
+    ///    SNI-scoped sibling leaves the other untouched, and a
+    ///    address-only removal (mismatched sni/alpn) is rejected rather
+    ///    than silently nuking every frontend at that address.
+    #[test]
+    fn test_tcp_sni_alpn_state_roundtrip() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 6443);
+
+        let mut state = ConfigState::default();
+        state
+            .dispatch(
+                &RequestType::AddTcpListener(TcpListenerConfig {
+                    address,
+                    front_timeout: 60,
+                    back_timeout: 30,
+                    connect_timeout: 3,
+                    active: true,
+                    sni_preread_timeout: Some(2),
+                    sni_preread_max_bytes: Some(8192),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not add tcp listener");
+        state
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
+                    address,
+                    proxy: ListenerType::Tcp.into(),
+                    from_scm: false,
+                })
+                .into(),
+            )
+            .expect("could not activate tcp listener");
+
+        let frontend_a = RequestTcpFrontend {
+            cluster_id: "cluster_sni_a".to_string(),
+            address,
+            tags: BTreeMap::new(),
+            sni: Some("example.com".to_string()),
+            alpn: vec!["h2".to_string()],
+        };
+        let frontend_b = RequestTcpFrontend {
+            cluster_id: "cluster_sni_b".to_string(),
+            address,
+            tags: BTreeMap::new(),
+            sni: Some("other.example.com".to_string()),
+            alpn: vec![],
+        };
+        state
+            .dispatch(&RequestType::AddTcpFrontend(frontend_a.clone()).into())
+            .expect("could not add sni-a tcp frontend");
+        state
+            .dispatch(&RequestType::AddTcpFrontend(frontend_b.clone()).into())
+            .expect("could not add sni-b tcp frontend");
+
+        assert_eq!(state.tcp_listeners.len(), 1);
+        assert!(state.tcp_listeners[&address.into()].active);
+        assert_eq!(
+            state.tcp_listeners[&address.into()].sni_preread_timeout,
+            Some(2)
+        );
+        assert_eq!(
+            state.tcp_listeners[&address.into()].sni_preread_max_bytes,
+            Some(8192)
+        );
+        assert_eq!(state.count_tcp_frontends_raw(), 2);
+
+        // `request_counts` is a runtime census side-effect of `dispatch`; it
+        // diverges by construction whenever the number/shape of replayed
+        // requests differs from the originals, so compare the logical config
+        // with the census cleared on both sides.
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+
+        // 1. generate_requests → replay → equal
+        let mut replayed = ConfigState::default();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("could not replay generated request");
+        }
+        assert_eq!(
+            logical(&state),
+            logical(&replayed),
+            "SNI/ALPN TCP listener + frontends must survive generate_requests → replay"
+        );
+
+        // 2. diff from empty reconstructs the TCP objects
+        let empty = ConfigState::default();
+        let mut from_diff = ConfigState::default();
+        for request in empty.diff(&state) {
+            from_diff
+                .dispatch(&request)
+                .expect("could not replay diff request");
+        }
+        assert_eq!(
+            logical(&state),
+            logical(&from_diff),
+            "diff(empty -> state) must reconstruct the tcp listener + both sni frontends"
+        );
+
+        // reverse diff tears them back down to empty
+        let mut torn_down = state.clone();
+        for request in state.diff(&empty) {
+            torn_down
+                .dispatch(&request)
+                .expect("could not replay teardown diff request");
+        }
+        assert!(
+            torn_down.tcp_listeners.is_empty(),
+            "diff(state -> empty) must remove the tcp listener"
+        );
+        assert_eq!(
+            torn_down.count_tcp_frontends_raw(),
+            0,
+            "diff(state -> empty) must remove both sni frontends"
+        );
+
+        // 3a. an address-only removal (mismatched sni/alpn) must not match
+        // either sibling — identity is (address, sni, alpn), not address
+        // alone.
+        let mismatched_removal = state.dispatch(
+            &RequestType::RemoveTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_sni_a".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: None,
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            mismatched_removal.is_err(),
+            "removing by address alone (no matching sni/alpn) must be rejected"
+        );
+        assert_eq!(
+            state.count_tcp_frontends_raw(),
+            2,
+            "a rejected mismatched removal must not change either sibling"
+        );
+
+        // 3b. removing the exact (address, sni, alpn) identity of frontend_a
+        // must drop only that entry and leave frontend_b untouched.
+        state
+            .dispatch(&RequestType::RemoveTcpFrontend(frontend_a).into())
+            .expect("could not remove sni-a tcp frontend");
+        assert_eq!(state.count_tcp_frontends_raw(), 1);
+        let remaining = state
+            .tcp_fronts
+            .get("cluster_sni_b")
+            .expect("cluster_sni_b bucket must survive");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sni, Some("other.example.com".to_string()));
+    }
+
+    const TCP_PERM_CLUSTER: &str = "tcp_perm";
+
+    /// A TCP frontend request whose `route` tag identifies it in order checks.
+    fn tcp_frontend_request(
+        cluster_id: &str,
+        address: SocketAddress,
+        sni: Option<&str>,
+        alpn: &[&str],
+        route: &str,
+    ) -> RequestTcpFrontend {
+        RequestTcpFrontend {
+            cluster_id: cluster_id.to_string(),
+            address,
+            tags: BTreeMap::from([("route".to_string(), route.to_string())]),
+            sni: sni.map(str::to_string),
+            alpn: alpn.iter().map(|protocol| protocol.to_string()).collect(),
+        }
+    }
+
+    /// Four admissible frontends of ONE cluster, already in canonical form
+    /// (lowercase sni, sorted alpn), tagged `A`..`D`.
+    fn tcp_permutation_fixture() -> [RequestTcpFrontend; 4] {
+        [
+            tcp_frontend_request(
+                TCP_PERM_CLUSTER,
+                SocketAddress::new_v4(127, 0, 0, 1, 7001),
+                None,
+                &[],
+                "A",
+            ),
+            tcp_frontend_request(
+                TCP_PERM_CLUSTER,
+                SocketAddress::new_v4(127, 0, 0, 1, 7002),
+                Some("b.example.com"),
+                &["h2"],
+                "B",
+            ),
+            tcp_frontend_request(
+                TCP_PERM_CLUSTER,
+                SocketAddress::new_v4(127, 0, 0, 1, 7002),
+                Some("b.example.com"),
+                &["http/1.1"],
+                "C",
+            ),
+            tcp_frontend_request(
+                TCP_PERM_CLUSTER,
+                SocketAddress::new_v4(127, 0, 0, 1, 7003),
+                Some("d.example.com"),
+                &[],
+                "D",
+            ),
+        ]
+    }
+
+    /// A state built by dispatching `AddTcpFrontend` in the given order, so the
+    /// stored per-cluster `Vec` order is exactly the dispatch order.
+    fn tcp_state(requests: &[RequestTcpFrontend]) -> ConfigState {
+        let mut state = ConfigState::default();
+        for request in requests {
+            state
+                .dispatch(&RequestType::AddTcpFrontend(request.clone()).into())
+                .expect("could not add the test tcp frontend");
+        }
+        state
+    }
+
+    /// The `route` tags of one cluster's stored TCP bucket, in stored order.
+    fn tcp_route_order(state: &ConfigState, cluster_id: &str) -> Vec<String> {
+        state
+            .tcp_fronts
+            .get(cluster_id)
+            .map(|bucket| {
+                bucket
+                    .iter()
+                    .map(|front| front.tags["route"].clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Per-cluster sets of complete TCP frontend records, empty buckets dropped.
+    fn tcp_semantic(state: &ConfigState) -> BTreeMap<String, BTreeSet<TcpFrontend>> {
+        state
+            .tcp_fronts
+            .iter()
+            .filter(|(_, bucket)| !bucket.is_empty())
+            .map(|(cluster_id, bucket)| (cluster_id.to_string(), bucket.iter().cloned().collect()))
+            .collect()
+    }
+
+    /// `from.diff(to)`, asserting neither input state was modified.
+    fn diff_leaving_inputs_unchanged(from: &ConfigState, to: &ConfigState) -> Vec<Request> {
+        let from_before = from.clone();
+        let to_before = to.clone();
+        let requests = from.diff(to);
+        assert!(
+            *from == from_before,
+            "diff must leave the source state unchanged"
+        );
+        assert!(
+            *to == to_before,
+            "diff must leave the target state unchanged"
+        );
+        assert_eq!(
+            from.tcp_fronts, from_before.tcp_fronts,
+            "diff must preserve the source stored tcp order"
+        );
+        assert_eq!(
+            to.tcp_fronts, to_before.tcp_fronts,
+            "diff must preserve the target stored tcp order"
+        );
+        requests
+    }
+
+    /// A pure permutation of complete TCP frontends within one cluster is not
+    /// a semantic change: no orders, and the debug replay postcondition holds.
+    #[test]
+    fn diff_tcp_pure_permutation_of_complete_frontends_emits_no_orders() {
+        let [a, b, c, d] = tcp_permutation_fixture();
+        let original = tcp_state(&[a.clone(), b.clone(), c.clone(), d.clone()]);
+        let permuted = tcp_state(&[d, c, a, b]);
+
+        assert_eq!(
+            tcp_route_order(&original, TCP_PERM_CLUSTER),
+            ["A", "B", "C", "D"]
+        );
+        assert_eq!(
+            tcp_route_order(&permuted, TCP_PERM_CLUSTER),
+            ["D", "C", "A", "B"]
+        );
+        assert_ne!(
+            original.tcp_fronts, permuted.tcp_fronts,
+            "the stored vectors must differ in order for this test to be meaningful"
+        );
+        assert_eq!(tcp_semantic(&original), tcp_semantic(&permuted));
+
+        assert!(
+            diff_leaving_inputs_unchanged(&original, &permuted).is_empty(),
+            "a pure permutation must emit no orders"
+        );
+        assert!(
+            diff_leaving_inputs_unchanged(&permuted, &original).is_empty(),
+            "the reverse permutation must emit no orders"
+        );
+    }
+
+    /// `[A] -> [C, A]` is exactly the semantic addition of `C`.
+    #[test]
+    fn diff_tcp_prepended_frontend_emits_only_the_semantic_addition() {
+        let [a, _, c, _] = tcp_permutation_fixture();
+        let from = tcp_state(std::slice::from_ref(&a));
+        let to = tcp_state(&[c.clone(), a.clone()]);
+        assert_eq!(tcp_route_order(&to, TCP_PERM_CLUSTER), ["C", "A"]);
+
+        let requests = diff_leaving_inputs_unchanged(&from, &to);
+        let expected: Request = RequestType::AddTcpFrontend(c.clone()).into();
+        assert_eq!(requests, vec![expected]);
+
+        let replayed = replay_diff(&from, &requests);
+        assert_eq!(
+            tcp_route_order(&replayed, TCP_PERM_CLUSTER),
+            ["A", "C"],
+            "replay appends the added frontend to the stored bucket"
+        );
+        assert_eq!(tcp_semantic(&replayed), tcp_semantic(&to));
+
+        let reverse = diff_leaving_inputs_unchanged(&to, &from);
+        let expected_removal: Request = RequestType::RemoveTcpFrontend(c).into();
+        assert_eq!(reverse, vec![expected_removal]);
+        let reverted = replay_diff(&to, &reverse);
+        assert_eq!(tcp_route_order(&reverted, TCP_PERM_CLUSTER), ["A"]);
+        assert_eq!(tcp_semantic(&reverted), tcp_semantic(&from));
+    }
+
+    /// Rebuilding several clusters' TCP frontends from an empty state replays
+    /// to the same per-cluster sets of complete records, with no empty bucket
+    /// introduced; tearing them down normalizes away the emptied buckets.
+    #[test]
+    fn diff_tcp_reconstruction_from_empty_replays_to_same_semantic_sets() {
+        let [a, b, c, _] = tcp_permutation_fixture();
+        let cluster_x = "tcp_x";
+        let cluster_y = "tcp_y";
+        let mut x_a = a;
+        let mut x_b = b;
+        let mut x_c = c;
+        x_a.cluster_id = cluster_x.to_string();
+        x_b.cluster_id = cluster_x.to_string();
+        x_c.cluster_id = cluster_x.to_string();
+        let y_d = tcp_frontend_request(
+            cluster_y,
+            SocketAddress::new_v4(127, 0, 0, 1, 7003),
+            Some("d.example.com"),
+            &[],
+            "D",
+        );
+        let y_e = tcp_frontend_request(
+            cluster_y,
+            SocketAddress::new_v4(127, 0, 0, 1, 7004),
+            None,
+            &[],
+            "E",
+        );
+
+        let empty = ConfigState::default();
+        let target = tcp_state(&[x_c, y_e, x_a, y_d, x_b]);
+        assert_eq!(tcp_route_order(&target, cluster_x), ["C", "A", "B"]);
+        assert_eq!(tcp_route_order(&target, cluster_y), ["E", "D"]);
+
+        let requests = diff_leaving_inputs_unchanged(&empty, &target);
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests.iter().all(|request| matches!(
+                request.request_type,
+                Some(RequestType::AddTcpFrontend(_))
+            )),
+            "reconstruction from empty must only add tcp frontends"
+        );
+
+        let replayed = replay_diff(&empty, &requests);
+        assert_eq!(tcp_semantic(&replayed), tcp_semantic(&target));
+        assert_eq!(replayed.tcp_fronts.len(), 2);
+        assert!(
+            replayed
+                .tcp_fronts
+                .values()
+                .all(|bucket| !bucket.is_empty()),
+            "replay must not introduce empty buckets"
+        );
+
+        let teardown = diff_leaving_inputs_unchanged(&target, &empty);
+        assert_eq!(teardown.len(), 5);
+        let torn_down = replay_diff(&target, &teardown);
+        assert!(tcp_semantic(&torn_down).is_empty());
+        assert_eq!(tcp_semantic(&torn_down), tcp_semantic(&empty));
+    }
+
+    /// `state.diff(&state)` is empty and, like every diff call, leaves the
+    /// exact stored per-cluster order untouched.
+    #[test]
+    fn diff_tcp_self_is_empty_and_preserves_stored_order() {
+        let [a, b, c, d] = tcp_permutation_fixture();
+        let state = tcp_state(&[d, a, c, b]);
+
+        let bucket = state
+            .tcp_fronts
+            .get(TCP_PERM_CLUSTER)
+            .expect("the test cluster bucket must exist");
+        assert!(
+            !bucket.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the fixture bucket must be deliberately non-sorted"
+        );
+        assert_eq!(
+            tcp_route_order(&state, TCP_PERM_CLUSTER),
+            ["D", "A", "C", "B"]
+        );
+
+        let before = state.clone();
+        let stored_before = state.tcp_fronts.clone();
+        assert!(
+            diff_leaving_inputs_unchanged(&state, &state).is_empty(),
+            "a state diffed against itself must emit no orders"
+        );
+        assert!(state == before, "self-diff must not modify the state");
+        assert_eq!(state.tcp_fronts, stored_before);
+        assert_eq!(
+            tcp_route_order(&state, TCP_PERM_CLUSTER),
+            ["D", "A", "C", "B"]
+        );
+    }
+
+    /// Saved/self-generated request order stays faithful: replaying
+    /// `generate_requests` into an empty state reproduces a deliberately
+    /// non-sorted single-cluster TCP bucket exactly (full `Vec` equality).
+    #[test]
+    fn generate_requests_replay_preserves_non_sorted_tcp_bucket_order() {
+        let [a, b, c, d] = tcp_permutation_fixture();
+        let state = tcp_state(&[d, a, c, b]);
+
+        let bucket = state
+            .tcp_fronts
+            .get(TCP_PERM_CLUSTER)
+            .expect("the test cluster bucket must exist");
+        assert!(
+            !bucket.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the fixture bucket must be deliberately non-sorted"
+        );
+
+        let mut replayed = ConfigState::default();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("could not replay generated request");
+        }
+
+        // `request_counts` is a runtime census side-effect of `dispatch`;
+        // clear only it, as the other strict roundtrip helpers do.
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+        assert!(
+            logical(&state) == logical(&replayed),
+            "generate_requests -> replay must reproduce the state"
+        );
+        assert_eq!(
+            replayed.tcp_fronts.get(TCP_PERM_CLUSTER),
+            state.tcp_fronts.get(TCP_PERM_CLUSTER),
+            "the replayed bucket must equal the original Vec, order included"
+        );
+        assert_eq!(
+            tcp_route_order(&replayed, TCP_PERM_CLUSTER),
+            ["D", "A", "C", "B"]
+        );
+    }
+
+    // ── master-side TCP frontend admission parity (sozu-proxy/sozu#1290) ──────
+    //
+    // The command server mutates master `ConfigState` before fanning a
+    // request out to workers, and a worker NACK never rolls the master back.
+    // These tests prove the master rejects everything the worker's
+    // `validate_new_tcp_front` (`lib/src/tcp.rs`) would reject, BEFORE any
+    // mutation -- every rejection case asserts `hash_state()` and
+    // `count_tcp_frontends_raw()` (plus the relevant bucket lengths) are
+    // byte-for-byte unchanged, not just that the call returned `Err`.
+
+    fn add_tcp_test_cluster(state: &mut ConfigState, cluster_id: &str) {
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: cluster_id.to_string(),
+                    sticky_session: false,
+                    https_redirect: false,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not add cluster");
+    }
+
+    /// The (address, sni, alpn) identity check must span ALL clusters at a
+    /// listener address, not just the candidate's own `cluster_id` bucket --
+    /// otherwise the same identity under a different cluster_id is silently
+    /// accepted by the master and then rejected by every worker.
+    #[test]
+    fn add_tcp_frontend_rejects_cross_cluster_duplicate_identity() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9001);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_x");
+        add_tcp_test_cluster(&mut state, "cluster_y");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_x".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec!["h2".to_string()],
+                })
+                .into(),
+            )
+            .expect("could not add cluster_x tcp frontend");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_y".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec!["h2".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "the same (address, sni, alpn) under a different cluster_id must be rejected, \
+             got: {result:?}"
+        );
+        assert_eq!(
+            state.hash_state(),
+            hash_before,
+            "a rejected cross-cluster duplicate must not change the state hash"
+        );
+        assert_eq!(
+            state.count_tcp_frontends_raw(),
+            count_before,
+            "a rejected cross-cluster duplicate must not change the frontend count"
+        );
+        assert_eq!(state.tcp_fronts.get("cluster_x").map(Vec::len), Some(1));
+        assert_eq!(
+            state.tcp_fronts.get("cluster_y").map(Vec::len).unwrap_or(0),
+            0
+        );
+    }
+
+    /// ALPN identity is a *set*: the same protocols in a different order
+    /// must still collide as a duplicate, even within one cluster's bucket.
+    #[test]
+    fn add_tcp_frontend_rejects_reordered_alpn_duplicate() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9002);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_reorder");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_reorder".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+                })
+                .into(),
+            )
+            .expect("could not add first tcp frontend");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_reorder".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec!["http/1.1".to_string(), "h2".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "the same ALPN set in a different order must be rejected as a duplicate \
+             identity, got: {result:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before);
+        assert_eq!(
+            state.tcp_fronts.get("cluster_reorder").map(Vec::len),
+            Some(1)
+        );
+    }
+
+    /// Symmetric counterpart: removal must also treat ALPN as a set, so a
+    /// request differing only in protocol order still matches the stored
+    /// (canonical) frontend instead of falling through to `NoChange`.
+    #[test]
+    fn remove_tcp_frontend_matches_reordered_alpn() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9003);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_remove_reorder");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_remove_reorder".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+                })
+                .into(),
+            )
+            .expect("could not add tcp frontend");
+
+        let result = state.dispatch(
+            &RequestType::RemoveTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_remove_reorder".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec!["http/1.1".to_string(), "h2".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_ok(),
+            "removing with the same ALPN set in a different order must succeed, got: {result:?}"
+        );
+        assert_eq!(state.count_tcp_frontends_raw(), 0);
+    }
+
+    /// ALPN-set overlap on the same (address, normalized sni) must be
+    /// rejected even across different clusters -- the previous check never
+    /// looked outside the candidate's own cluster bucket at all.
+    #[test]
+    fn add_tcp_frontend_rejects_alpn_overlap_across_clusters_same_sni() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9004);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_overlap_a");
+        add_tcp_test_cluster(&mut state, "cluster_overlap_b");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_overlap_a".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec!["h2".to_string()],
+                })
+                .into(),
+            )
+            .expect("could not add cluster_overlap_a tcp frontend");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_overlap_b".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "an overlapping ALPN set on the same (address, sni) under a different cluster_id \
+             must be rejected, got: {result:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before);
+        assert_eq!(
+            state
+                .tcp_fronts
+                .get("cluster_overlap_b")
+                .map(Vec::len)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    /// Listener-wide no-SNI/SNI mixing must be enforced in both directions,
+    /// across cluster buckets.
+    #[test]
+    fn add_tcp_frontend_rejects_no_sni_sni_mixing_both_directions() {
+        let address_a = SocketAddress::new_v4(127, 0, 0, 1, 9005);
+        let address_b = SocketAddress::new_v4(127, 0, 0, 1, 9006);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_mix_1");
+        add_tcp_test_cluster(&mut state, "cluster_mix_2");
+        add_tcp_test_cluster(&mut state, "cluster_mix_3");
+        add_tcp_test_cluster(&mut state, "cluster_mix_4");
+
+        // Direction 1: a no-SNI frontend exists; adding an SNI-scoped
+        // frontend at the SAME address must be rejected.
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_mix_1".to_string(),
+                    address: address_a,
+                    tags: BTreeMap::new(),
+                    sni: None,
+                    alpn: vec![],
+                })
+                .into(),
+            )
+            .expect("could not add no-sni tcp frontend");
+        let hash_before_a = state.hash_state();
+        let count_before_a = state.count_tcp_frontends_raw();
+        let result_a = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_mix_2".to_string(),
+                address: address_a,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            result_a.is_err(),
+            "an SNI-scoped frontend must not be added to a listener with an existing no-SNI \
+             front, got: {result_a:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before_a);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before_a);
+
+        // Direction 2: an SNI-scoped frontend exists; adding a no-SNI
+        // frontend at the SAME address must be rejected.
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_mix_3".to_string(),
+                    address: address_b,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec![],
+                })
+                .into(),
+            )
+            .expect("could not add sni-scoped tcp frontend");
+        let hash_before_b = state.hash_state();
+        let count_before_b = state.count_tcp_frontends_raw();
+        let result_b = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_mix_4".to_string(),
+                address: address_b,
+                tags: BTreeMap::new(),
+                sni: None,
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            result_b.is_err(),
+            "a no-SNI frontend must not be added to a listener with existing SNI-scoped \
+             fronts, got: {result_b:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before_b);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before_b);
+    }
+
+    /// A malformed SNI pattern must be rejected by the master itself, not
+    /// merely by config-load's `to_tcp_front` -- a raw `AddTcpFrontend` over
+    /// the command socket, or a `LoadState` replay, bypasses `config.rs`
+    /// entirely.
+    #[test]
+    fn add_tcp_frontend_rejects_malformed_sni_shape() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9007);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_malformed");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_malformed".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                // Leading empty label -- rejected by `validate_sni_pattern`.
+                sni: Some(".example.com".to_string()),
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "a malformed SNI pattern must be rejected by the master, not merely by \
+             config-load, got: {result:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before);
+        assert_eq!(
+            state
+                .tcp_fronts
+                .get("cluster_malformed")
+                .map(Vec::len)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    /// A non-empty `alpn` without `sni` must be rejected by the master:
+    /// alpn only matches within an SNI-scoped preread, so a no-SNI frontend
+    /// would silently ignore its alpn list. Config-load (`to_tcp_front`) and
+    /// the worker both reject this shape; a raw `AddTcpFrontend` over the
+    /// command socket must not slip past the master.
+    #[test]
+    fn add_tcp_frontend_rejects_alpn_without_sni() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9009);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_alpn_no_sni");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_alpn_no_sni".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: None,
+                alpn: vec!["h2".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "a non-empty alpn without sni must be rejected by the master, got: {result:?}"
+        );
+        assert_eq!(
+            state.hash_state(),
+            hash_before,
+            "a rejected alpn-without-sni add must not change the state hash"
+        );
+        assert_eq!(
+            state.count_tcp_frontends_raw(),
+            count_before,
+            "a rejected alpn-without-sni add must not change the frontend count"
+        );
+        assert_eq!(
+            state
+                .tcp_fronts
+                .get("cluster_alpn_no_sni")
+                .map(Vec::len)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    /// Worker-parity guard: an exact catch-all and a wildcard catch-all on
+    /// the SAME address are DISTINCT (address, sni) keys and must both be
+    /// accepted -- the listener-wide admission checks above must not
+    /// over-forbid this legal combination by conflating exact and wildcard
+    /// SNI as the same key.
+    #[test]
+    fn add_tcp_frontend_accepts_exact_and_wildcard_catch_all_siblings() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9008);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_exact_catchall");
+        add_tcp_test_cluster(&mut state, "cluster_wildcard_catchall");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_exact_catchall".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec![],
+                })
+                .into(),
+            )
+            .expect("could not add exact catch-all tcp frontend");
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_wildcard_catchall".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("*.example.com".to_string()),
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_ok(),
+            "an exact catch-all and a wildcard catch-all on the same address must both be \
+             accepted, got: {result:?}"
+        );
+        assert_eq!(state.count_tcp_frontends_raw(), 2);
+    }
+
+    /// `list_frontends` must surface UDP frontends alongside TCP ones. The
+    /// proto `FrontendFilters` has no `udp` flag, so UDP rides the default
+    /// (all-pass) and `tcp` filters; a `domain` filter excludes both.
+    #[test]
+    fn list_frontends_includes_udp() {
+        let tcp_addr = SocketAddress::new_v4(0, 0, 0, 0, 6379);
+        let udp_addr = SocketAddress::new_v4(0, 0, 0, 0, 5353);
+
+        let mut state = ConfigState::default();
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "tcp_cluster".to_string(),
+                    address: tcp_addr,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not add tcp frontend");
+        state
+            .dispatch(
+                &RequestType::AddUdpFrontend(RequestUdpFrontend {
+                    cluster_id: "udp_cluster".to_string(),
+                    address: udp_addr,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not add udp frontend");
+
+        // default filters (all false, no domain) → list everything, incl. UDP
+        let all = state.list_frontends(FrontendFilters::default());
+        assert_eq!(all.tcp_frontends.len(), 1, "tcp frontend must be listed");
+        assert_eq!(
+            all.udp_frontends.len(),
+            1,
+            "udp frontend must be listed under the default all-pass path"
+        );
+        assert_eq!(all.udp_frontends[0].cluster_id, "udp_cluster");
+        assert_eq!(all.udp_frontends[0].address, udp_addr);
+
+        // explicit `tcp` filter surfaces both TCP and UDP (no `udp` flag exists)
+        let tcp_only = state.list_frontends(FrontendFilters {
+            tcp: true,
+            ..Default::default()
+        });
+        assert_eq!(tcp_only.tcp_frontends.len(), 1);
+        assert_eq!(
+            tcp_only.udp_frontends.len(),
+            1,
+            "udp frontends ride the tcp filter"
+        );
+
+        // an `http` filter excludes both TCP and UDP
+        let http_only = state.list_frontends(FrontendFilters {
+            http: true,
+            ..Default::default()
+        });
+        assert!(http_only.tcp_frontends.is_empty());
+        assert!(http_only.udp_frontends.is_empty());
+
+        // a `domain` filter excludes UDP (no hostname), matching TCP behaviour
+        let domain_filtered = state.list_frontends(FrontendFilters {
+            domain: Some("example.com".to_string()),
+            ..Default::default()
+        });
+        assert!(domain_filtered.tcp_frontends.is_empty());
+        assert!(domain_filtered.udp_frontends.is_empty());
+    }
+
+    /// `list_frontends` must honour the `cluster_id` filter on every protocol,
+    /// combine it with the `domain` filter, and never match a `Deny` frontend
+    /// (one with no cluster id at all).
+    #[test]
+    fn list_frontends_filters_by_cluster_id() {
+        let http_addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let https_addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::default();
+        for (cluster_id, hostname) in [
+            (Some(String::from("wanted")), "wanted.example.com"),
+            (Some(String::from("other")), "other.example.com"),
+            // a `Deny` frontend: routes to no cluster
+            (None, "denied.example.com"),
+        ] {
+            state
+                .dispatch(
+                    &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                        cluster_id: cluster_id.clone(),
+                        hostname: hostname.to_string(),
+                        path: PathRule::prefix(String::from("/")),
+                        address: http_addr,
+                        position: RulePosition::Tree.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("could not add http frontend");
+            state
+                .dispatch(
+                    &RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                        cluster_id,
+                        hostname: hostname.to_string(),
+                        path: PathRule::prefix(String::from("/")),
+                        address: https_addr,
+                        position: RulePosition::Tree.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("could not add https frontend");
+        }
+        // TCP/UDP frontends are keyed by address, so each cluster gets its own
+        for (cluster_id, port) in [("wanted", 6379u16), ("other", 6380)] {
+            state
+                .dispatch(
+                    &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                        cluster_id: cluster_id.to_string(),
+                        address: SocketAddress::new_v4(0, 0, 0, 0, port),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("could not add tcp frontend");
+            state
+                .dispatch(
+                    &RequestType::AddUdpFrontend(RequestUdpFrontend {
+                        cluster_id: cluster_id.to_string(),
+                        address: SocketAddress::new_v4(0, 0, 0, 0, port + 1000),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("could not add udp frontend");
+        }
+
+        // no filter → everything, including the `Deny` frontends
+        let all = state.list_frontends(FrontendFilters::default());
+        assert_eq!(all.http_frontends.len(), 3);
+        assert_eq!(all.https_frontends.len(), 3);
+        assert_eq!(all.tcp_frontends.len(), 2);
+        assert_eq!(all.udp_frontends.len(), 2);
+
+        // cluster filter alone → one frontend of each protocol, and only the
+        // wanted one (positive AND negative space)
+        let wanted = state.list_frontends(FrontendFilters {
+            cluster_id: Some("wanted".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(wanted.http_frontends.len(), 1);
+        assert_eq!(wanted.https_frontends.len(), 1);
+        assert_eq!(wanted.tcp_frontends.len(), 1);
+        assert_eq!(wanted.udp_frontends.len(), 1);
+        assert_eq!(
+            wanted.http_frontends[0].cluster_id.as_deref(),
+            Some("wanted")
+        );
+        assert_eq!(wanted.tcp_frontends[0].cluster_id, "wanted");
+        assert_eq!(wanted.udp_frontends[0].cluster_id, "wanted");
+        assert!(
+            wanted
+                .http_frontends
+                .iter()
+                .chain(wanted.https_frontends.iter())
+                .all(|f| f.hostname == "wanted.example.com"),
+            "no frontend of another cluster may leak through the filter"
+        );
+
+        // an unknown cluster id matches nothing at all
+        let unknown = state.list_frontends(FrontendFilters {
+            cluster_id: Some("nope".to_string()),
+            ..Default::default()
+        });
+        assert!(unknown.http_frontends.is_empty());
+        assert!(unknown.https_frontends.is_empty());
+        assert!(unknown.tcp_frontends.is_empty());
+        assert!(unknown.udp_frontends.is_empty());
+
+        // `cluster_id` and `domain` are ANDed, not ORed
+        let conflicting = state.list_frontends(FrontendFilters {
+            cluster_id: Some("wanted".to_string()),
+            domain: Some("other.example.com".to_string()),
+            ..Default::default()
+        });
+        assert!(conflicting.http_frontends.is_empty());
+        assert!(conflicting.https_frontends.is_empty());
+
+        // the cluster filter composes with a protocol filter
+        let https_only = state.list_frontends(FrontendFilters {
+            https: true,
+            cluster_id: Some("wanted".to_string()),
+            ..Default::default()
+        });
+        assert!(https_only.http_frontends.is_empty());
+        assert_eq!(https_only.https_frontends.len(), 1);
+        assert!(https_only.tcp_frontends.is_empty());
+        assert!(https_only.udp_frontends.is_empty());
+    }
+
+    // ── update_https_listener ──────────────────────────────────────────────────
+
+    /// Happy path: patching two H2 flood knobs updates the map entry; all other
+    /// fields are left untouched.
+    #[test]
+    fn update_https_listener_happy_path_h2_knobs() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            h2_max_rst_stream_per_window: Some(50),
+            h2_max_ping_per_window: Some(20),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("update must succeed");
+
+        let listener = state
+            .https_listeners
+            .get(&ListenerKey::from(addr))
+            .expect("listener must be present");
+        assert_eq!(listener.h2_max_rst_stream_per_window, Some(50));
+        assert_eq!(listener.h2_max_ping_per_window, Some(20));
+        // Untouched fields must be unchanged
+        assert_eq!(listener.front_timeout, 60);
+        assert_eq!(listener.h2_max_settings_per_window, None);
+    }
+
+    /// NotFound: patching a listener address that was never registered returns
+    /// `StateError::NotFound`.
+    #[test]
+    fn update_https_listener_not_found() {
+        let mut state = ConfigState::new();
+        let patch = UpdateHttpsListenerConfig {
+            address: SocketAddress::new_v4(1, 2, 3, 4, 9999),
+            h2_max_rst_stream_per_window: Some(50),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::NotFound {
+                    kind: ObjectKind::HttpsListener,
+                    ..
+                }
+            ),
+            "expected NotFound, got: {err}"
+        );
+    }
+
+    /// No-op: a patch with only `address` set (all options None) is Ok and does
+    /// not change any field.
+    #[test]
+    fn update_https_listener_noop_patch() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let original = make_https_listener(addr);
+        state
+            .dispatch(&RequestType::AddHttpsListener(original.clone()).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("no-op patch must succeed");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, original.front_timeout);
+        assert_eq!(
+            listener.h2_max_rst_stream_per_window,
+            original.h2_max_rst_stream_per_window
+        );
+    }
+
+    /// InvalidValue: setting a flood knob to 0 must be rejected.
+    #[test]
+    fn update_https_listener_invalid_value_flood_knob_zero() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            h2_max_rst_stream_per_window: Some(0),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "h2_max_rst_stream_per_window",
+                    ..
+                }
+            ),
+            "expected InvalidValue for flood knob 0, got: {err}"
+        );
+    }
+
+    /// AddCluster: an inline `cluster.health_check` with a CRLF-bearing URI
+    /// must be rejected before the cluster lands in `ConfigState`. Without
+    /// this guard, TOML reload / SaveState / direct API AddCluster requests
+    /// bypass the SetHealthCheck-side check and let an attacker-controlled
+    /// health-check URI smuggle CR/LF into outbound HTTP/1.1 probes.
+    #[test]
+    fn a_tcp_frontend_and_an_affinity_key_never_share_a_cluster() {
+        use crate::proto::command::RequestTcpFrontend;
+
+        let keyed = |cluster_id: &str| -> Request {
+            RequestType::AddCluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                affinity_header: Some(String::from("X-Tenant")),
+                ..Default::default()
+            })
+            .into()
+        };
+        let tcp_front = |cluster_id: &str, port: u16| -> Request {
+            RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: cluster_id.to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, port),
+                ..Default::default()
+            })
+            .into()
+        };
+
+        // A keyed cluster refuses a TCP frontend.
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&keyed("keyed"))
+            .expect("a keyed cluster is valid");
+        let err = state
+            .dispatch(&tcp_front("keyed", 4000))
+            .expect_err("a TCP frontend may not join a keyed cluster");
+        assert!(
+            matches!(err, StateError::InvalidTcpFrontend { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(state.tcp_fronts.get("keyed").is_none_or(Vec::is_empty));
+
+        // A cluster serving a TCP frontend refuses a key.
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("tcp"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a plain cluster is valid");
+        state
+            .dispatch(&tcp_front("tcp", 4001))
+            .expect("a TCP frontend may join a plain cluster");
+        let err = state
+            .dispatch(&keyed("tcp"))
+            .expect_err("a cluster serving TCP may not name a key");
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "affinity_key",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(state.clusters["tcp"].affinity_header, None);
+    }
+
+    /// A cluster budget allowing no attempt, or more than the attempt
+    /// counters hold, is refused; an accepted one is stored with the cluster,
+    /// so it is saved and replayed with it (sozu-proxy/sozu#1800).
+    #[test]
+    fn add_cluster_with_out_of_range_max_connection_attempts_rejected() {
+        for attempts in [0, 256] {
+            let mut state = ConfigState::new();
+            let err = state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: String::from("budget"),
+                        max_connection_attempts: Some(attempts),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect_err("an out-of-range budget must be refused");
+            assert!(
+                matches!(
+                    err,
+                    StateError::InvalidValue {
+                        field: "max_connection_attempts",
+                        ..
+                    }
+                ),
+                "{attempts}: unexpected error {err:?}"
+            );
+            assert!(state.clusters.is_empty());
+        }
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("budget"),
+                    max_connection_attempts: Some(7),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a budget in range is accepted");
+        assert_eq!(state.clusters["budget"].max_connection_attempts, Some(7));
+    }
+
+    #[test]
+    fn add_cluster_with_invalid_shuffle_sharding_rejected() {
+        for (percent, minimum, mode) in [
+            (Some(0), None, None),
+            (Some(101), None, None),
+            (Some(50), Some(1), None),
+            (None, Some(8), None),
+            (None, None, Some(1)),
+            (Some(50), None, Some(7)),
+        ] {
+            let mut state = ConfigState::new();
+            let err = state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: String::from("sharded"),
+                        shard_percent: percent,
+                        shard_min_backends: minimum,
+                        shard_mode: mode,
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect_err("invalid shuffle sharding must be refused");
+            assert!(
+                matches!(
+                    err,
+                    StateError::InvalidValue {
+                        field: "shuffle_sharding",
+                        ..
+                    }
+                ),
+                "({percent:?}, {minimum:?}, {mode:?}): unexpected error {err:?}"
+            );
+            assert!(state.clusters.is_empty());
+        }
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("sharded"),
+                    shard_percent: Some(25),
+                    shard_min_backends: Some(4),
+                    shard_mode: Some(1),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a valid sharded cluster is accepted");
+    }
+
+    #[test]
+    fn add_cluster_with_two_affinity_key_sources_rejected() {
+        let mut state = ConfigState::new();
+        let err = state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("keyed"),
+                    affinity_header: Some(String::from("X-Tenant")),
+                    affinity_cookie: Some(String::from("tenant")),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect_err("a cluster keyed on both a header and a cookie must be refused");
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "affinity_key",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            state.clusters.is_empty(),
+            "a refused cluster must not be stored"
+        );
+    }
+
+    #[test]
+    fn add_cluster_invalid_health_check_uri_rejected() {
+        use crate::proto::command::HealthCheckConfig;
+
+        let mut state = ConfigState::new();
+        let err = state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("evil_cluster"),
+                    health_check: Some(HealthCheckConfig {
+                        uri: String::from("/foo\r\nGET /admin"),
+                        interval: 5_000,
+                        timeout: 1_000,
+                        healthy_threshold: 2,
+                        unhealthy_threshold: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "health_check",
+                    ..
+                }
+            ),
+            "expected InvalidValue for CRLF-bearing health-check URI, got: {err}"
+        );
+        assert!(
+            !state.clusters.contains_key("evil_cluster"),
+            "cluster must not be inserted when health_check fails validation",
+        );
+    }
+
+    /// #1801: `SetHealthCheck` refuses a TCP-mode probe carrying a status
+    /// field, and keeps the previous config; the same probe without one is
+    /// stored.
+    #[test]
+    fn set_health_check_tcp_mode_with_status_field_rejected() {
+        use crate::proto::command::{HealthCheckConfig, HealthCheckMode, SetHealthCheck};
+
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster is added");
+        let tcp = HealthCheckConfig {
+            uri: String::new(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Tcp as i32,
+            ..Default::default()
+        };
+        let set = |config: HealthCheckConfig| {
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: String::from("app"),
+                config,
+            })
+            .into()
+        };
+
+        let err = state
+            .dispatch(&set(HealthCheckConfig {
+                expected_status: 200,
+                ..tcp.clone()
+            }))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "health_check",
+                    ..
+                }
+            ),
+            "expected InvalidValue for a TCP probe with expected_status, got: {err}"
+        );
+        assert_eq!(state.clusters["app"].health_check, None);
+
+        state
+            .dispatch(&set(tcp.clone()))
+            .expect("a bare TCP probe is accepted");
+        assert_eq!(state.clusters["app"].health_check, Some(tcp));
+    }
+
+    /// `SetHealthCheck` refuses a probe port outside `1..=65535` and keeps
+    /// the previous config; a valid port is stored as sent.
+    #[test]
+    fn set_health_check_out_of_range_port_rejected() {
+        use crate::proto::command::{HealthCheckConfig, HealthCheckMode, SetHealthCheck};
+
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster is added");
+        let probe = HealthCheckConfig {
+            uri: String::new(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Tcp as i32,
+            port: Some(8081),
+            ..Default::default()
+        };
+        let set = |config: HealthCheckConfig| {
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: String::from("app"),
+                config,
+            })
+            .into()
+        };
+
+        for port in [0, 65536] {
+            let err = state
+                .dispatch(&set(HealthCheckConfig {
+                    port: Some(port),
+                    ..probe.clone()
+                }))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StateError::InvalidValue {
+                        field: "health_check",
+                        ..
+                    }
+                ),
+                "expected InvalidValue for probe port {port}, got: {err}"
+            );
+            assert_eq!(state.clusters["app"].health_check, None);
+        }
+
+        state
+            .dispatch(&set(probe.clone()))
+            .expect("a probe port within 1..=65535 is accepted");
+        assert_eq!(state.clusters["app"].health_check, Some(probe));
+    }
+
+    /// Custom health-check headers: validation runs before any mutation, and
+    /// the exact ordered values survive query, diff, the saved-state file and
+    /// a generated replay.
+    #[test]
+    fn health_check_headers_validate_before_mutation_and_survive_replay() {
+        use std::io::Read;
+
+        use crate::{
+            parser::parse_several_requests,
+            proto::command::{
+                HealthCheckConfig, HealthCheckHeader, HealthCheckMode, SetHealthCheck,
+            },
+        };
+
+        // Metadata only: the fingerprint stands for a value the state never holds.
+        let header = |name: &str, tag: &str| HealthCheckHeader {
+            name: name.to_owned(),
+            fingerprint: format!("sozu-hc-hmac-sha256:v1:{:032x}:{:064x}", 7, tag.len()),
+        };
+        let probe = |headers: Vec<HealthCheckHeader>| HealthCheckConfig {
+            uri: "/health".to_owned(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Http as i32,
+            headers,
+            ..Default::default()
+        };
+        let ordered = vec![
+            header("Z-Last", "1"),
+            header("Authorization", "Bearer"),
+            header("A-First", ""),
+        ];
+        let set = |config: HealthCheckConfig| -> Request {
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: String::from("app"),
+                config,
+            })
+            .into()
+        };
+        // A reserved name: refused by validation, not by the type.
+        let invalid = probe(vec![header("Host", "1")]);
+
+        // AddCluster with an invalid inline health check leaves no cluster.
+        let mut state = ConfigState::new();
+        let err = state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    health_check: Some(invalid.clone()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "health_check",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        assert!(state.clusters.is_empty(), "no cluster may be inserted");
+
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster is added");
+        state
+            .dispatch(&set(probe(ordered.clone())))
+            .expect("a valid header list is accepted");
+
+        // A refused SetHealthCheck keeps the previous list, byte for byte.
+        let before = state.clone();
+        let err = state.dispatch(&set(invalid)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "health_check",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        // `request_counts` is a census of dispatched orders, not configuration.
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+        assert_eq!(
+            logical(&state),
+            logical(&before),
+            "a refused order must not mutate the state"
+        );
+        assert_eq!(
+            state.clusters["app"].health_check.as_ref().unwrap().headers,
+            ordered
+        );
+
+        // Query: cluster state and the health-check listing.
+        let queried = state.cluster_state("app").expect("cluster exists");
+        assert_eq!(
+            queried.configuration.unwrap().health_check.unwrap().headers,
+            ordered
+        );
+        assert_eq!(
+            state.list_health_checks(Some("app")).map["app"].headers,
+            ordered
+        );
+
+        // Diff from an empty state, and from a state with other headers.
+        let adds = ConfigState::new().diff(&state);
+        let carried = adds.iter().any(|request| {
+            matches!(
+                &request.request_type,
+                Some(RequestType::AddCluster(cluster))
+                    if cluster.health_check.as_ref().is_some_and(|hc| hc.headers == ordered)
+            )
+        });
+        assert!(carried, "the diff must carry the ordered headers: {adds:?}");
+        let mut reordered = state.clone();
+        reordered
+            .dispatch(&set(probe(ordered.iter().rev().cloned().collect())))
+            .expect("a reordered list is valid");
+        assert!(
+            !state.diff(&reordered).is_empty(),
+            "a header reorder is a cluster change"
+        );
+        assert!(state.diff(&state.clone()).is_empty());
+
+        // Saved-state file: write, parse back, replay.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("headers.state");
+        let mut file = File::create(&path).expect("creatable");
+        let written = state.write_requests_to_file(&mut file).expect("saves");
+        drop(file);
+        let mut saved = Vec::new();
+        File::open(&path)
+            .expect("readable")
+            .read_to_end(&mut saved)
+            .expect("readable");
+        let (remainder, requests) =
+            parse_several_requests::<WorkerRequest>(&saved).expect("the file parses");
+        assert!(remainder.is_empty());
+        assert_eq!(requests.len(), written);
+        let mut loaded = ConfigState::new();
+        for request in &requests {
+            loaded.dispatch(&request.content).expect("replays");
+        }
+
+        // Generated replay.
+        let mut replayed = ConfigState::new();
+        for request in state.generate_requests() {
+            replayed.dispatch(&request).expect("replays");
+        }
+
+        for (name, other) in [("loaded", &loaded), ("replayed", &replayed)] {
+            assert_eq!(
+                other.clusters["app"].health_check.as_ref().unwrap().headers,
+                ordered,
+                "{name} state must keep the exact ordered headers"
+            );
+        }
+    }
+
+    /// A protected order reaches the state as metadata: names and the main
+    /// process's fingerprints only, validated before any mutation. An order
+    /// with a header lacking its fingerprint, or whose carriers do not follow
+    /// its headers, is refused and the previous configuration stays.
+    #[test]
+    fn protected_health_check_order_stores_metadata_only_and_refuses_before_mutation() {
+        use crate::proto::command::{
+            HealthCheckConfig, HealthCheckHeader, HealthCheckHeaderValue, HealthCheckMode,
+            SetProtectedHealthCheck,
+        };
+
+        const SECRET: &str = "SYNTHETIC-STATE-SECRET-77c1";
+        let fingerprint = format!("sozu-hc-hmac-sha256:v1:{:032x}:{:064x}", 1, 2);
+        let order = |fingerprint: &str, carrier_name: &str| {
+            RequestType::SetProtectedHealthCheck(SetProtectedHealthCheck {
+                cluster_id: String::from("app"),
+                config: HealthCheckConfig {
+                    uri: "/health".to_owned(),
+                    interval: 10,
+                    timeout: 5,
+                    healthy_threshold: 3,
+                    unhealthy_threshold: 3,
+                    mode: HealthCheckMode::Http as i32,
+                    headers: vec![HealthCheckHeader {
+                        name: "Authorization".to_owned(),
+                        fingerprint: fingerprint.to_owned(),
+                    }],
+                    ..Default::default()
+                },
+                values: vec![HealthCheckHeaderValue {
+                    name: carrier_name.to_owned(),
+                    value: SECRET.as_bytes().to_vec(),
+                }],
+            })
+            .into()
+        };
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster is added");
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+
+        let before = logical(&state);
+        for (what, refused) in [
+            ("no fingerprint", order("", "Authorization")),
+            ("another carrier", order(&fingerprint, "X-Other")),
+        ] {
+            assert!(state.dispatch(&refused).is_err(), "{what}");
+            assert_eq!(logical(&state), before, "{what}: no mutation");
+        }
+
+        state
+            .dispatch(&order(&fingerprint, "Authorization"))
+            .expect("a fingerprinted order with its carrier is accepted");
+        let stored = state.clusters["app"].health_check.as_ref().expect("set");
+        assert_eq!(stored.headers[0].fingerprint, fingerprint);
+        let rendered = format!("{state:?}{:?}", state.generate_requests());
+        assert!(!rendered.contains(SECRET), "the state holds no value");
+        let json = serde_json::to_string(&state.generate_requests()).expect("serializes");
+        assert!(!json.contains(SECRET), "a replay holds no value");
+    }
+
+    /// A probe `port` targets a backend IP, a `unix_path` backend has none:
+    /// whichever arrives second is refused, and the cluster, its health check
+    /// and its backends stay as they were.
+    #[test]
+    fn a_health_check_port_and_a_unix_backend_never_share_a_cluster() {
+        use crate::proto::command::{HealthCheckConfig, HealthCheckMode, SetHealthCheck};
+
+        let probe = |port| HealthCheckConfig {
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Tcp as i32,
+            port,
+            ..Default::default()
+        };
+        let cluster = |health_check| -> Request {
+            RequestType::AddCluster(Cluster {
+                cluster_id: String::from("app"),
+                health_check,
+                ..Default::default()
+            })
+            .into()
+        };
+        let backend = |unix_path: Option<&str>| AddBackend {
+            cluster_id: String::from("app"),
+            backend_id: String::from("app-0"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+            unix_path: unix_path.map(ToOwned::to_owned),
+            ..Default::default()
+        };
+        let add_unix: Request = RequestType::AddUnixBackend(backend(Some("/run/app.sock"))).into();
+        let set = |port| -> Request {
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: String::from("app"),
+                config: probe(port),
+            })
+            .into()
+        };
+        let refused = |state: &mut ConfigState, request: &Request| {
+            let before = (state.clusters.clone(), state.backends.clone());
+            let error = state.dispatch(request).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    StateError::InvalidValue {
+                        field: "health_check.port",
+                        reason: crate::config::HEALTH_CHECK_PORT_UNIX_REFUSED,
+                    }
+                ),
+                "expected the probe port / unix_path refusal, got: {error}"
+            );
+            assert_eq!(before, (state.clusters.clone(), state.backends.clone()));
+        };
+
+        // The probe port is there first.
+        let mut state = ConfigState::new();
+        state.dispatch(&cluster(Some(probe(Some(8081))))).unwrap();
+        refused(&mut state, &add_unix);
+        assert!(state.backends.get("app").is_none_or(Vec::is_empty));
+        state
+            .dispatch(&RequestType::AddBackend(backend(None)).into())
+            .expect("an IP backend takes the probe port");
+
+        // The unix backend is there first, through `SetHealthCheck`, then an
+        // `AddCluster` upsert.
+        let mut state = ConfigState::new();
+        state.dispatch(&cluster(Some(probe(None)))).unwrap();
+        state.dispatch(&add_unix).unwrap();
+        refused(&mut state, &set(Some(8081)));
+        refused(&mut state, &cluster(Some(probe(Some(8081)))));
+        assert_eq!(state.clusters["app"].health_check, Some(probe(None)));
+        state
+            .dispatch(&set(None))
+            .expect("a unix backend is probed through its socket");
+        state
+            .dispatch(&cluster(None))
+            .expect("an upsert without a health check keeps the unix backend");
+
+        // An unknown cluster keeps its own diagnostic.
+        let mut state = ConfigState::new();
+        assert!(matches!(
+            state.dispatch(&set(Some(8081))).unwrap_err(),
+            StateError::NotFound { .. }
+        ));
+        assert!(matches!(
+            state.dispatch(&add_unix).unwrap_err(),
+            StateError::ClusterNotFound { .. }
+        ));
+    }
+
+    /// ALPN validation: reject unknown ALPN values.
+    #[test]
+    fn update_https_listener_alpn_unknown_value_rejected() {
+        use crate::proto::command::AlpnProtocols;
+
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            alpn_protocols: Some(AlpnProtocols {
+                values: vec!["h3".to_owned()],
+            }),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "alpn_protocols",
+                    ..
+                }
+            ),
+            "expected InvalidValue for unknown ALPN, got: {err}"
+        );
+    }
+
+    /// ALPN validation: empty values vec = reset to default, must be accepted.
+    #[test]
+    fn update_https_listener_alpn_empty_reset_accepted() {
+        use crate::proto::command::AlpnProtocols;
+
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let mut listener = make_https_listener(addr);
+        listener.alpn_protocols = vec!["h2".to_owned()];
+        state
+            .dispatch(&RequestType::AddHttpsListener(listener).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            alpn_protocols: Some(AlpnProtocols { values: vec![] }),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("empty ALPN reset must succeed");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert!(
+            listener.alpn_protocols.is_empty(),
+            "ALPN must have been reset to empty"
+        );
+    }
+
+    /// ALPN validation: valid values ["h2", "http/1.1"] must be accepted.
+    #[test]
+    fn update_https_listener_alpn_valid_values_accepted() {
+        use crate::proto::command::AlpnProtocols;
+
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            alpn_protocols: Some(AlpnProtocols {
+                values: vec!["h2".to_owned(), "http/1.1".to_owned()],
+            }),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("valid ALPN must be accepted");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    /// ALPN absent wrapper: when `alpn_protocols` is None in the patch, the
+    /// listener's ALPN field must not be touched.
+    #[test]
+    fn update_https_listener_alpn_absent_preserves_existing() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let mut listener = make_https_listener(addr);
+        listener.alpn_protocols = vec!["h2".to_owned()];
+        state
+            .dispatch(&RequestType::AddHttpsListener(listener).into())
+            .unwrap();
+
+        // patch with no alpn_protocols field
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            front_timeout: Some(10),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap();
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(
+            listener.alpn_protocols,
+            vec!["h2"],
+            "ALPN must be preserved when not patched"
+        );
+    }
+
+    /// sozu_id_header validation: empty string must be rejected.
+    #[test]
+    fn update_https_listener_sozu_id_header_empty_rejected() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            sozu_id_header: Some(String::new()),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "sozu_id_header",
+                    ..
+                }
+            ),
+            "expected InvalidValue for empty header name, got: {err}"
+        );
+    }
+
+    /// sozu_id_header validation: value containing colon must be rejected.
+    #[test]
+    fn update_https_listener_sozu_id_header_colon_rejected() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            sozu_id_header: Some("bad: value".to_owned()),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "sozu_id_header",
+                    ..
+                }
+            ),
+            "expected InvalidValue for header name with colon, got: {err}"
+        );
+    }
+
+    /// sozu_id_header validation: well-formed token must be accepted.
+    #[test]
+    fn update_https_listener_sozu_id_header_valid_accepted() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            sozu_id_header: Some("X-Edge-Id".to_owned()),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("valid header name must be accepted");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.sozu_id_header.as_deref(), Some("X-Edge-Id"));
+    }
+
+    /// sozu#322: an `AddHttpListener` / `AddHttpsListener` carrying a
+    /// `forwarded_headers` wire value that names no `ForwardedHeaders`
+    /// variant is refused and stores nothing, as an update carrying one is.
+    /// Without this the state would record the raw number while the worker
+    /// reads it as the default. A known value is accepted.
+    #[test]
+    fn add_listener_rejects_an_unknown_forwarded_headers_value() {
+        let http = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let https = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+
+        let http_error = state
+            .dispatch(
+                &RequestType::AddHttpListener(HttpListenerConfig {
+                    forwarded_headers: Some(42),
+                    ..make_http_listener(http)
+                })
+                .into(),
+            )
+            .unwrap_err();
+        let https_error = state
+            .dispatch(
+                &RequestType::AddHttpsListener(HttpsListenerConfig {
+                    forwarded_headers: Some(-1),
+                    ..make_https_listener(https)
+                })
+                .into(),
+            )
+            .unwrap_err();
+        for error in [http_error, https_error] {
+            assert!(
+                matches!(
+                    error,
+                    StateError::InvalidValue {
+                        field: "forwarded_headers",
+                        ..
+                    }
+                ),
+                "expected InvalidValue for an unknown mode, got: {error}"
+            );
+        }
+        assert!(state.http_listeners.is_empty() && state.https_listeners.is_empty());
+
+        state
+            .dispatch(
+                &RequestType::AddHttpListener(HttpListenerConfig {
+                    forwarded_headers: Some(ForwardedHeaders::Rfc7239 as i32),
+                    ..make_http_listener(http)
+                })
+                .into(),
+            )
+            .expect("a known mode must be accepted on an HTTP listener");
+        state
+            .dispatch(
+                &RequestType::AddHttpsListener(HttpsListenerConfig {
+                    forwarded_headers: Some(ForwardedHeaders::None as i32),
+                    ..make_https_listener(https)
+                })
+                .into(),
+            )
+            .expect("a known mode must be accepted on an HTTPS listener");
+    }
+
+    /// sozu#322: `forwarded_headers` is hot-updatable on HTTP and HTTPS
+    /// listeners — the main-process state records the patched mode, so a
+    /// `ListListeners`, a `SaveState` and an upgrade replay all carry it —
+    /// and a wire value naming no `ForwardedHeaders` variant is refused.
+    #[test]
+    fn update_listener_forwarded_headers_applies_and_rejects_unknown_values() {
+        let http = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let https = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(http)).into())
+            .unwrap();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(https)).into())
+            .unwrap();
+
+        state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: http,
+                    forwarded_headers: Some(ForwardedHeaders::Rfc7239 as i32),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a known mode must be accepted on an HTTP listener");
+        state
+            .dispatch(
+                &RequestType::UpdateHttpsListener(UpdateHttpsListenerConfig {
+                    address: https,
+                    forwarded_headers: Some(ForwardedHeaders::None as i32),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a known mode must be accepted on an HTTPS listener");
+        assert_eq!(
+            state.http_listeners[&http.into()].forwarded_headers(),
+            ForwardedHeaders::Rfc7239
+        );
+        assert_eq!(
+            state.https_listeners[&https.into()].forwarded_headers(),
+            ForwardedHeaders::None
+        );
+
+        let http_error = state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: http,
+                    forwarded_headers: Some(42),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+        let https_error = state
+            .dispatch(
+                &RequestType::UpdateHttpsListener(UpdateHttpsListenerConfig {
+                    address: https,
+                    forwarded_headers: Some(-1),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+        for error in [http_error, https_error] {
+            assert!(
+                matches!(
+                    error,
+                    StateError::InvalidValue {
+                        field: "forwarded_headers",
+                        ..
+                    }
+                ),
+                "expected InvalidValue for an unknown mode, got: {error}"
+            );
+        }
+        // A refused patch leaves the recorded mode as it was.
+        assert_eq!(
+            state.http_listeners[&http.into()].forwarded_headers(),
+            ForwardedHeaders::Rfc7239
+        );
+        assert_eq!(
+            state.https_listeners[&https.into()].forwarded_headers(),
+            ForwardedHeaders::None
+        );
+    }
+
+    /// h2_graceful_shutdown_deadline_seconds = 0 must be allowed (means "wait forever").
+    #[test]
+    fn update_https_listener_graceful_shutdown_zero_allowed() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            h2_graceful_shutdown_deadline_seconds: Some(0),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("graceful_shutdown_deadline=0 must be allowed");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.h2_graceful_shutdown_deadline_seconds, Some(0));
+    }
+
+    // ── update_http_listener ───────────────────────────────────────────────────
+
+    /// Happy path for HTTP listener patch.
+    #[test]
+    fn update_http_listener_happy_path() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            front_timeout: Some(15),
+            h2_max_rst_stream_per_window: Some(25),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, 15);
+        assert_eq!(listener.h2_max_rst_stream_per_window, Some(25));
+        // untouched
+        assert_eq!(listener.back_timeout, 30);
+    }
+
+    /// sozu-proxy/sozu#1715: the `answers` map of an HTTP listener patch is
+    /// recorded in the main state as the workers apply it
+    /// (`HttpListener::update_config`, `lib/src/http.rs`): a non-empty body
+    /// replaces the stored template for its status, an empty body preserves
+    /// it, and the other statuses are untouched. Without it `SaveState`,
+    /// `ListListeners` and the replay to an upgraded worker lose the patch.
+    #[test]
+    fn update_http_listener_records_the_answers_map() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        let mut listener = make_http_listener(addr);
+        listener.answers = [
+            ("404".to_owned(), "stored 404".to_owned()),
+            ("503".to_owned(), "stored 503".to_owned()),
+        ]
+        .into();
+        state
+            .dispatch(&RequestType::AddHttpListener(listener).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            answers: [
+                ("404".to_owned(), String::new()),
+                ("503".to_owned(), "patched 503".to_owned()),
+                ("429".to_owned(), "patched 429".to_owned()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(
+            listener.answers.get("404").map(String::as_str),
+            Some("stored 404"),
+            "an empty body preserves the stored template"
+        );
+        assert_eq!(
+            listener.answers.get("503").map(String::as_str),
+            Some("patched 503")
+        );
+        assert_eq!(
+            listener.answers.get("429").map(String::as_str),
+            Some("patched 429")
+        );
+        assert_eq!(listener.answers.len(), 3);
+    }
+
+    /// sozu-proxy/sozu#1715: an HTTPS listener patch records its `answers`
+    /// map and its `hsts` block in the main state as the workers apply them
+    /// (`HttpsListener::update_config`, `lib/src/https.rs`). `hsts` is a
+    /// full-object replacement, and a patch without it keeps the recorded
+    /// policy.
+    #[test]
+    fn update_https_listener_records_the_answers_map_and_hsts() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let mut listener = make_https_listener(addr);
+        listener.answers = [("404".to_owned(), "stored 404".to_owned())].into();
+        listener.hsts = Some(HstsConfig {
+            enabled: Some(true),
+            max_age: Some(300),
+            include_subdomains: Some(true),
+            ..Default::default()
+        });
+        state
+            .dispatch(&RequestType::AddHttpsListener(listener).into())
+            .unwrap();
+
+        let disabled = HstsConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            answers: [
+                ("404".to_owned(), String::new()),
+                ("503".to_owned(), "patched 503".to_owned()),
+            ]
+            .into(),
+            hsts: Some(disabled),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("HTTPS update must succeed");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(
+            listener.answers.get("404").map(String::as_str),
+            Some("stored 404"),
+            "an empty body preserves the stored template"
+        );
+        assert_eq!(
+            listener.answers.get("503").map(String::as_str),
+            Some("patched 503")
+        );
+        assert_eq!(listener.answers.len(), 2);
+        assert_eq!(
+            listener.hsts,
+            Some(disabled),
+            "the patched hsts block replaces the stored one whole"
+        );
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            front_timeout: Some(15),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("HTTPS update must succeed");
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(
+            listener.hsts,
+            Some(disabled),
+            "a patch without hsts keeps the recorded policy"
+        );
+    }
+
+    /// HTTP listener: flood knob 0 is rejected.
+    #[test]
+    fn update_http_listener_flood_knob_zero_rejected() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            h2_max_window_update_stream0_per_window: Some(0),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "h2_max_window_update_stream0_per_window",
+                    ..
+                }
+            ),
+            "expected InvalidValue, got: {err}"
+        );
+    }
+
+    // ── X-Real-IP knobs (sozu#1688) ─────────────────────────────────────────────
+
+    /// A hot patch of `elide_x_real_ip` / `send_x_real_ip` on an HTTP listener
+    /// is recorded in the main state, which `listener list` and `SaveState`
+    /// read.
+    #[test]
+    fn update_http_listener_x_real_ip_patch_applied() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            elide_x_real_ip: Some(true),
+            send_x_real_ip: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.elide_x_real_ip, Some(true));
+        assert_eq!(listener.send_x_real_ip, Some(true));
+        // untouched
+        assert_eq!(listener.front_timeout, 60);
+    }
+
+    /// An absent X-Real-IP field preserves the recorded value, and patching one
+    /// knob never writes the other.
+    #[test]
+    fn update_http_listener_x_real_ip_absent_preserves_existing() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        let listener = HttpListenerConfig {
+            elide_x_real_ip: Some(true),
+            send_x_real_ip: Some(false),
+            ..make_http_listener(addr)
+        };
+        state
+            .dispatch(&RequestType::AddHttpListener(listener).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            send_x_real_ip: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.elide_x_real_ip, Some(true));
+        assert_eq!(listener.send_x_real_ip, Some(true));
+    }
+
+    /// A hot patch of the X-Real-IP knobs on an HTTPS listener is recorded in
+    /// the main state.
+    #[test]
+    fn update_https_listener_x_real_ip_patch_applied() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            elide_x_real_ip: Some(true),
+            send_x_real_ip: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("HTTPS update must succeed");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.elide_x_real_ip, Some(true));
+        assert_eq!(listener.send_x_real_ip, Some(true));
+        // untouched
+        assert_eq!(listener.front_timeout, 60);
+    }
+
+    /// An absent X-Real-IP field preserves the recorded HTTPS value, and
+    /// patching one knob never writes the other.
+    #[test]
+    fn update_https_listener_x_real_ip_absent_preserves_existing() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let listener = HttpsListenerConfig {
+            elide_x_real_ip: Some(false),
+            send_x_real_ip: Some(true),
+            ..make_https_listener(addr)
+        };
+        state
+            .dispatch(&RequestType::AddHttpsListener(listener).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            elide_x_real_ip: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("HTTPS update must succeed");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.elide_x_real_ip, Some(true));
+        assert_eq!(listener.send_x_real_ip, Some(true));
+    }
+
+    /// The hot X-Real-IP values survive `generate_requests`, the replay a new
+    /// worker receives on upgrade or restart: replaying it must not revert them.
+    #[test]
+    fn update_listener_x_real_ip_survives_generate_requests_replay() {
+        let http_addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let https_addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(http_addr)).into())
+            .unwrap();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(https_addr)).into())
+            .unwrap();
+        state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: http_addr,
+                    elide_x_real_ip: Some(true),
+                    send_x_real_ip: Some(true),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap();
+        state
+            .dispatch(
+                &RequestType::UpdateHttpsListener(UpdateHttpsListenerConfig {
+                    address: https_addr,
+                    elide_x_real_ip: Some(true),
+                    send_x_real_ip: Some(true),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap();
+
+        let mut replayed = ConfigState::new();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("could not replay generated request");
+        }
+
+        let http = replayed
+            .http_listeners
+            .get(&ListenerKey::from(http_addr))
+            .expect("replayed HTTP listener");
+        assert_eq!(http.elide_x_real_ip, Some(true));
+        assert_eq!(http.send_x_real_ip, Some(true));
+        let https = replayed
+            .https_listeners
+            .get(&ListenerKey::from(https_addr))
+            .expect("replayed HTTPS listener");
+        assert_eq!(https.elide_x_real_ip, Some(true));
+        assert_eq!(https.send_x_real_ip, Some(true));
+    }
+
+    // ── update_tcp_listener ────────────────────────────────────────────────────
+
+    /// Happy path for TCP listener patch.
+    #[test]
+    fn update_tcp_listener_happy_path() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 9000);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddTcpListener(make_tcp_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateTcpListenerConfig {
+            address: addr,
+            front_timeout: Some(5),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateTcpListener(patch).into())
+            .expect("TCP update must succeed");
+
+        let listener = state.tcp_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, 5);
+        assert_eq!(listener.back_timeout, 30); // untouched
+    }
+
+    /// TCP listener: NotFound when address is unknown.
+    #[test]
+    fn update_tcp_listener_not_found() {
+        let mut state = ConfigState::new();
+        let patch = UpdateTcpListenerConfig {
+            address: SocketAddress::new_v4(9, 9, 9, 9, 9999),
+            front_timeout: Some(5),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateTcpListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::NotFound {
+                    kind: ObjectKind::TcpListener,
+                    ..
+                }
+            ),
+            "expected NotFound, got: {err}"
+        );
+    }
+
+    // ── rejected listener patches are all-or-nothing (sozu#1703) ───────────────
+
+    /// The state a rejected request must leave intact: everything but
+    /// `request_counts`, which `ConfigState::dispatch` bumps before it runs
+    /// the verb, accepted or not.
+    fn without_request_counts(state: &ConfigState) -> ConfigState {
+        ConfigState {
+            request_counts: BTreeMap::new(),
+            ..state.clone()
+        }
+    }
+
+    /// A rejected `UpdateHttpListener` leaves the main state exactly as it was.
+    /// Each patch carries fields that validate and are applied early, then one
+    /// invalid field: the old code wrote the early fields, validated the late
+    /// one, and returned the error with the early writes kept, so
+    /// `listener list`, `SaveState` and upgrade replay showed a patch that was
+    /// refused.
+    ///
+    /// To SEE THIS RED: in `ConfigState::update_http_listener`, move the
+    /// `validate_sozu_id_header` / `validate_forwarded_headers` calls back
+    /// into the field writes they guard.
+    #[test]
+    fn update_http_listener_rejected_patch_leaves_the_state_unchanged() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+
+        let valid_prefix = UpdateHttpListenerConfig {
+            address: addr,
+            front_timeout: Some(99),
+            sticky_name: Some("PATCHED".to_owned()),
+            elide_x_real_ip: Some(true),
+            http_answers: Some(CustomHttpAnswers {
+                answer_404: Some("HTTP/1.1 404 Not Found\r\n\r\n".to_owned()),
+                ..Default::default()
+            }),
+            h2_max_rst_stream_per_window: Some(7),
+            ..Default::default()
+        };
+        let rejected = [
+            (
+                "sozu_id_header",
+                UpdateHttpListenerConfig {
+                    sozu_id_header: Some("bad header".to_owned()),
+                    ..valid_prefix.clone()
+                },
+            ),
+            (
+                "forwarded_headers",
+                UpdateHttpListenerConfig {
+                    forwarded_headers: Some(i32::MAX),
+                    ..valid_prefix.clone()
+                },
+            ),
+        ];
+        for (field, patch) in rejected {
+            let before = without_request_counts(&state);
+            let err = state
+                .dispatch(&RequestType::UpdateHttpListener(patch).into())
+                .unwrap_err();
+            assert!(
+                matches!(err, StateError::InvalidValue { field: f, .. } if f == field),
+                "expected InvalidValue on {field}, got: {err}"
+            );
+            assert!(
+                without_request_counts(&state) == before,
+                "a patch rejected on {field} must leave the main state unchanged"
+            );
+        }
+
+        // The same prefix alone is accepted: the rejections above come from
+        // the invalid field, not from the prefix.
+        state
+            .dispatch(&RequestType::UpdateHttpListener(valid_prefix).into())
+            .expect("the valid prefix alone must apply");
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, 99);
+        assert_eq!(listener.sticky_name, "PATCHED");
+    }
+
+    /// The HTTPS counterpart, with the two HTTPS-only late failures: an unknown
+    /// ALPN value (validated mid-way through the old write sequence) and an
+    /// `hsts` block without `enabled`, which every worker refuses
+    /// (`ListenerError::HstsEnabledRequired`) but the main state used to
+    /// accept, so the main process and its workers disagreed on the verdict.
+    ///
+    /// To SEE THIS RED: in `ConfigState::update_https_listener`, move the
+    /// field validators back into the field writes they guard, or drop the
+    /// `hsts` check.
+    #[test]
+    fn update_https_listener_rejected_patch_leaves_the_state_unchanged() {
+        use crate::proto::command::AlpnProtocols;
+
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let valid_prefix = UpdateHttpsListenerConfig {
+            address: addr,
+            front_timeout: Some(99),
+            sticky_name: Some("PATCHED".to_owned()),
+            send_x_real_ip: Some(true),
+            http_answers: Some(CustomHttpAnswers {
+                answer_404: Some("HTTP/1.1 404 Not Found\r\n\r\n".to_owned()),
+                ..Default::default()
+            }),
+            strict_sni_binding: Some(false),
+            h2_max_rst_stream_per_window: Some(7),
+            ..Default::default()
+        };
+        let rejected = [
+            (
+                "alpn_protocols",
+                UpdateHttpsListenerConfig {
+                    alpn_protocols: Some(AlpnProtocols {
+                        values: vec!["h3".to_owned()],
+                    }),
+                    ..valid_prefix.clone()
+                },
+            ),
+            (
+                "sozu_id_header",
+                UpdateHttpsListenerConfig {
+                    sozu_id_header: Some(String::new()),
+                    ..valid_prefix.clone()
+                },
+            ),
+            (
+                "forwarded_headers",
+                UpdateHttpsListenerConfig {
+                    forwarded_headers: Some(-1),
+                    ..valid_prefix.clone()
+                },
+            ),
+            (
+                "hsts",
+                UpdateHttpsListenerConfig {
+                    hsts: Some(HstsConfig {
+                        enabled: None,
+                        max_age: Some(60),
+                        ..Default::default()
+                    }),
+                    ..valid_prefix.clone()
+                },
+            ),
+        ];
+        for (field, patch) in rejected {
+            let before = without_request_counts(&state);
+            let err = state
+                .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+                .unwrap_err();
+            assert!(
+                matches!(err, StateError::InvalidValue { field: f, .. } if f == field),
+                "expected InvalidValue on {field}, got: {err}"
+            );
+            assert!(
+                without_request_counts(&state) == before,
+                "a patch rejected on {field} must leave the main state unchanged"
+            );
+        }
+
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(valid_prefix).into())
+            .expect("the valid prefix alone must apply");
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, 99);
+        assert_eq!(listener.strict_sni_binding, Some(false));
+    }
+
+    /// `update_tcp_listener` validates nothing past the listener lookup, so a
+    /// TCP patch can only be refused before its first write. This pins that:
+    /// a refused TCP patch leaves the main state unchanged.
+    #[test]
+    fn update_tcp_listener_rejected_patch_leaves_the_state_unchanged() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 9000);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddTcpListener(make_tcp_listener(addr)).into())
+            .unwrap();
+
+        let before = without_request_counts(&state);
+        let err = state
+            .dispatch(
+                &RequestType::UpdateTcpListener(UpdateTcpListenerConfig {
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 9001),
+                    front_timeout: Some(5),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StateError::NotFound { .. }), "got: {err}");
+        assert!(
+            without_request_counts(&state) == before,
+            "a refused TCP patch must change nothing"
+        );
+    }
+
+    /// `ConfigState::dispatch` MUST treat `SetMetricDetail` as a
+    /// runtime-only verb (no persisted state mutation). A future
+    /// refactor that drops the variant from the no-op match arm and
+    /// falls through to the catch-all would silently re-break the
+    /// SetMetricDetail dispatch path with `UndispatchableRequest`.
+    #[test]
+    fn dispatch_passes_through_set_metric_detail() {
+        use crate::proto::command::{MetricDetail, SetMetricDetail};
+        let mut state = ConfigState::new();
+        let req: Request = RequestType::SetMetricDetail(SetMetricDetail {
+            client_id: "test:1".to_owned(),
+            detail: Some(MetricDetail::DetailBackend as i32),
+            ttl_seconds: Some(60),
+            clear: Some(false),
+            reason: Some("regression-guard".to_owned()),
+            peer_pid: None,
+            peer_session_ulid: None,
+        })
+        .into();
+        state
+            .dispatch(&req)
+            .expect("SetMetricDetail must traverse dispatch without UndispatchableRequest");
+    }
+
+    /// `remove_udp_frontend` removes ONLY the frontend the caller named: its
+    /// key mirrors `add_udp_frontend`'s, exactly as the TCP pair does.
+    ///
+    /// [`ConfigState::add_udp_frontend`] stores a full
+    /// `UdpFrontend { cluster_id, address, tags }` and admits one frontend per
+    /// address across every cluster, so the entries a bucket holds sit at
+    /// DIFFERENT addresses — this test asserts that premise first so it cannot
+    /// rot. [`ConfigState::remove_udp_frontend`] retains on that same
+    /// (cluster, address, tags) identity — the bucket already scopes
+    /// `cluster_id` — so a removal drops exactly one entry and leaves every
+    /// other frontend in the bucket alone. This is the mirror
+    /// `remove_tcp_frontend` has always had for its own (address, sni, alpn)
+    /// key, and it is what makes `RemoveUdpFrontend` a true inverse of
+    /// `AddUdpFrontend` for `compute_rollback` (`bin/src/command/requests.rs`,
+    /// `a_udp_frontend_add_inverts_to_its_exact_removal`).
+    ///
+    /// The tags are part of the key in BOTH directions, so a remove carrying
+    /// no tags does not clear a tagged frontend — the observable semantics
+    /// this test also pins. `sozu frontend udp remove --tags` carries them,
+    /// mirroring `--sni` / `--alpn` on the TCP remove.
+    ///
+    /// To SEE THIS RED, one mutation per half:
+    ///
+    /// - The SIBLING half: widen `matches_removal` in
+    ///   [`ConfigState::remove_udp_frontend`] to the whole bucket,
+    ///   `|_front: &UdpFrontend| true`. In a build with `debug_assertions` the
+    ///   production guard fires first — `remove_udp_frontend drops exactly one
+    ///   entry, left: 0, right: 1` — which is the TCP-twin assertion doing its
+    ///   job. Strip that `debug_assert_eq!` and its companion too and the
+    ///   failure lands on the `surviving == ["team-b"]` assertion instead.
+    /// - The TAGLESS half, which the mutation above never reaches: restore the
+    ///   pre-fix address-only retain by reducing `matches_removal` to
+    ///   `|front: &UdpFrontend| front.address == remove_address`. The tagged
+    ///   removal still drops exactly one entry, so the sibling half and both
+    ///   production assertions pass; the ONLY failure is the
+    ///   `expect_err("a tagless remove must not match a tagged UDP frontend")`
+    ///   below. That half is what existing operator scripts hit, so it is
+    ///   pinned on its own rather than shadowed by the sibling assertion.
+    #[test]
+    fn remove_udp_frontend_drops_exactly_the_frontend_its_tags_name() {
+        let team_a_address = SocketAddress::new_v4(127, 0, 0, 1, 9100);
+        let team_b_address = SocketAddress::new_v4(127, 0, 0, 1, 9101);
+        let front = |owner: &str, address| RequestUdpFrontend {
+            cluster_id: "udp_cluster".to_string(),
+            address,
+            tags: BTreeMap::from([("owner".to_string(), owner.to_string())]),
+        };
+        let mut state = ConfigState::new();
+
+        // The premise: one cluster, two addresses — one frontend per address
+        // is what `add_udp_frontend` admits and what the worker's
+        // one-cluster-per-listener datapath can represent.
+        for (owner, address) in [("team-a", team_a_address), ("team-b", team_b_address)] {
+            state
+                .dispatch(&RequestType::AddUdpFrontend(front(owner, address)).into())
+                .expect("one UDP frontend per address must be admitted");
+        }
+        assert_eq!(
+            state.udp_fronts.get("udp_cluster").map(Vec::len),
+            Some(2usize),
+            "both tagged UDP frontends must be in the state before the removal"
+        );
+
+        state
+            .dispatch(&RequestType::RemoveUdpFrontend(front("team-a", team_a_address)).into())
+            .expect("removing one of the two must succeed");
+
+        let surviving: Vec<&str> = state
+            .udp_fronts
+            .get("udp_cluster")
+            .map(|fronts| {
+                fronts
+                    .iter()
+                    .filter_map(|f| f.tags.get("owner").map(String::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            surviving,
+            vec!["team-b"],
+            "removing one UDP frontend must not evict the rest of its cluster's bucket"
+        );
+
+        // The other half of the narrowed key: tags belong to the removal
+        // identity in BOTH directions, so a remove carrying none matches
+        // nothing at that address instead of clearing the frontend on it.
+        let tagless = RequestUdpFrontend {
+            cluster_id: "udp_cluster".to_string(),
+            address: team_b_address,
+            tags: BTreeMap::new(),
+        };
+        let err = state
+            .dispatch(&RequestType::RemoveUdpFrontend(tagless).into())
+            .expect_err("a tagless remove must not match a tagged UDP frontend");
+        assert!(
+            matches!(err, StateError::NoChange),
+            "expected NoChange, got: {err}"
+        );
+        assert_eq!(
+            state.udp_fronts.get("udp_cluster").map(Vec::len),
+            Some(1usize),
+            "the tagless remove must leave the surviving tagged frontend in place"
+        );
+    }
+
+    fn udp_front(cluster_id: &str, address: SocketAddress, owner: &str) -> RequestUdpFrontend {
+        RequestUdpFrontend {
+            cluster_id: cluster_id.to_string(),
+            address,
+            tags: BTreeMap::from([("owner".to_string(), owner.to_string())]),
+        }
+    }
+
+    /// A UDP listener address is the ENTIRE routing key — no SNI, no `Host`
+    /// header, no path — so [`ConfigState::add_udp_frontend`] admits at most
+    /// one frontend per address, across every cluster.
+    ///
+    /// Both shapes refused here were admitted before and neither could be
+    /// represented by the worker: `UdpProxy::add_udp_front` (`lib/src/udp.rs`)
+    /// overwrites `listener.cluster_id` and the listener's tags, and
+    /// `cluster_for_listener: HashMap<Token, ClusterId>` maps one listener
+    /// token to exactly one cluster. The second of a same-address pair simply
+    /// replaced the first on the datapath.
+    ///
+    /// - The SAME-CLUSTER half: two frontends at one (cluster, address)
+    ///   differing only in their access-log tags. The old dedup compared the
+    ///   FULL `UdpFrontend { cluster_id, address, tags }`, so a different tag
+    ///   set walked straight past it.
+    /// - The CROSS-CLUSTER half: a second cluster claiming the address. The
+    ///   old scan never left `front.cluster_id`'s own bucket, so this met no
+    ///   check whatsoever.
+    ///
+    /// To SEE THESE RED (regression proof): restore the pre-fix body of
+    /// [`ConfigState::add_udp_frontend`] — open the bucket first with
+    /// `let udp_frontends = self.udp_fronts.entry(front.cluster_id.clone()).or_default();`
+    /// and replace the listener-wide `find` and both its `Err` returns with
+    /// the bucket-local
+    /// `if udp_frontends.contains(&udp_frontend) { return Err(StateError::Exists { .. }); }`.
+    /// Both `expect_err`s below then fail with
+    /// `a second UDP frontend on a taken address must be refused: ()`.
+    /// The DIFFERENT-address add and the add → remove → add sequence stay
+    /// green under that mutation — they are here to pin that the check refuses
+    /// only a genuine collision and leaks no state once the address is freed.
+    #[test]
+    fn add_udp_frontend_refuses_a_second_frontend_on_a_taken_address() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 5353);
+        let other_address = SocketAddress::new_v4(127, 0, 0, 1, 5354);
+        let mut state = ConfigState::new();
+
+        state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("dns", address, "team-a")).into())
+            .expect("the first claim on an address must be admitted");
+
+        // SAME cluster, same address, different tags.
+        state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("dns", address, "team-b")).into())
+            .expect_err("a second UDP frontend on a taken address must be refused");
+
+        // DIFFERENT cluster, same address — the case with no check at all
+        // before: it landed in another bucket.
+        state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("syslog", address, "team-c")).into())
+            .expect_err("a second UDP frontend on a taken address must be refused");
+
+        assert_eq!(
+            state.count_udp_frontends_raw(),
+            1,
+            "a refused claim must leave the state holding only the admitted frontend"
+        );
+        assert!(
+            state.udp_fronts.get("syslog").is_none_or(Vec::is_empty),
+            "a refused cross-cluster claim must not leave an opened bucket behind"
+        );
+
+        // A different address is a different listener: still admitted.
+        state
+            .dispatch(
+                &RequestType::AddUdpFrontend(udp_front("syslog", other_address, "team-c")).into(),
+            )
+            .expect("a UDP frontend on a free address must still be admitted");
+
+        // add -> remove -> add on the same address: the check must read live
+        // state, never a residue of the frontend that has been removed.
+        state
+            .dispatch(&RequestType::RemoveUdpFrontend(udp_front("dns", address, "team-a")).into())
+            .expect("removing the frontend holding the address must succeed");
+        state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("syslog", address, "team-c")).into())
+            .expect("a freed address must be claimable again, by any cluster");
+
+        assert_eq!(
+            state.count_udp_frontends_raw(),
+            2,
+            "the freed address must now be held by exactly one frontend, beside the other address"
+        );
+    }
+
+    /// The refusal names the frontend already holding the address, so an
+    /// operator can remove it without dumping the whole state.
+    ///
+    /// `doc/observability.md`'s sensitive-value logging boundary lists cluster
+    /// identifiers and access-log tags as protected material in error text, so
+    /// the identifiers travel in the variant's typed fields — lossless for a
+    /// caller that matches it — while `Display`/`Debug` render the address and
+    /// bounded metadata only. That is the same split `StateError::Exists` and
+    /// `StateError::InvalidTcpFrontend` already make.
+    ///
+    /// To SEE THIS RED: make the cross-cluster arm of
+    /// [`ConfigState::add_udp_frontend`] answer the generic
+    /// `StateError::Exists { kind: ObjectKind::UdpFrontend, id: format!("{udp_frontend:?}") }`
+    /// instead of `StateError::UdpFrontendAddressTaken`. The `match` below
+    /// fails with `expected UdpFrontendAddressTaken, got StateError(...)`, and
+    /// with it the operator's only pointer to the current owner.
+    #[test]
+    fn a_refused_udp_frontend_names_the_cluster_already_holding_the_address() {
+        const OWNER_SECRET: &str = "UDP_ADDRESS_OWNER_SECRET_SENTINEL";
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 5353);
+        let owner_cluster = format!("{OWNER_SECRET}-dns");
+        let owner_tag = format!("{OWNER_SECRET}-team-a");
+        let mut state = ConfigState::new();
+
+        state
+            .dispatch(
+                &RequestType::AddUdpFrontend(udp_front(&owner_cluster, address, &owner_tag)).into(),
+            )
+            .expect("the first claim on an address must be admitted");
+
+        let error = state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("syslog", address, "team-c")).into())
+            .expect_err("a second UDP frontend on a taken address must be refused");
+
+        match &error {
+            StateError::UdpFrontendAddressTaken {
+                address: refused_address,
+                cluster_id,
+                current_cluster_id,
+                current_tags,
+            } => {
+                assert_eq!(
+                    *refused_address,
+                    SocketAddr::from(address),
+                    "the refusal must name the contested address"
+                );
+                assert_eq!(
+                    &**cluster_id, "syslog",
+                    "the refusal must name the claimant"
+                );
+                assert_eq!(
+                    **current_cluster_id, *owner_cluster,
+                    "the refusal must name the cluster already holding the address"
+                );
+                assert_eq!(
+                    current_tags.get("owner"),
+                    Some(&owner_tag),
+                    "the refusal must carry the current owner's access-log tags"
+                );
+            }
+            other => panic!("expected UdpFrontendAddressTaken, got {other:?}"),
+        }
+
+        // The logging projection stays inside the sensitive-value boundary:
+        // the address is lossless, the identifiers are metadata only.
+        for (label, output) in [
+            ("Display", error.to_string()),
+            ("Debug", format!("{error:?}")),
+        ] {
+            assert!(
+                output.contains("127.0.0.1:5353"),
+                "StateError {label} must name the contested address: {output}"
+            );
+            assert!(
+                !output.contains(OWNER_SECRET),
+                "StateError {label} leaked a protected identifier: {output}"
+            );
+            assert!(
+                output.contains(&format!("current_cluster_id_bytes={}", owner_cluster.len())),
+                "StateError {label} omitted the bounded owner metadata: {output}"
+            );
+            assert!(
+                output.contains("current_tag_count=1"),
+                "StateError {label} omitted the bounded owner tag count: {output}"
+            );
+        }
+    }
+
+    /// A configuration holding one UDP frontend per address is what the new
+    /// admission rule accepts, and `SaveState` -> `LoadState` must carry it
+    /// through byte-for-byte: every entry the file holds is dispatched again
+    /// without a single refusal.
+    ///
+    /// This drives the real file format — `write_requests_to_file`'s
+    /// `\n\0`-separated JSON `WorkerRequest` records, read back through
+    /// `parse_several_requests`, the exact pair
+    /// `bin/src/command/requests.rs::{save_state, load_state}` uses — rather
+    /// than an in-memory `generate_requests` replay.
+    ///
+    /// To SEE THIS RED: key the listener-wide scan in
+    /// [`ConfigState::add_udp_frontend`] on the PORT alone,
+    /// `existing.address.port() == address.port()`, the plausible over-broad
+    /// reading of "one frontend per listener". The two frontends below share
+    /// port 5353 on different IPs, so the over-broad check refuses the second
+    /// while the state is being built and the test fails on
+    /// `one UDP frontend per address must be admitted: StateError(UDP frontend
+    /// address 127.0.0.2:5353 is already claimed by another frontend:
+    /// cluster_id_bytes=6 current_cluster_id_bytes=3 current_tag_count=1)` --
+    /// before it ever reaches the replay assertion, which is the point: an
+    /// address-keyed check must let two listeners share a port.
+    #[test]
+    fn a_saved_state_holding_one_udp_frontend_per_address_replays_unchanged() {
+        use std::io::Read;
+
+        use crate::parser::parse_several_requests;
+
+        let first = SocketAddress::new_v4(127, 0, 0, 1, 5353);
+        let second = SocketAddress::new_v4(127, 0, 0, 2, 5353);
+
+        let mut state = ConfigState::new();
+        for (cluster_id, address) in [("dns", first), ("syslog", second)] {
+            state
+                .dispatch(&RequestType::AddUdpListener(make_udp_listener(address, true)).into())
+                .expect("could not add udp listener");
+            state
+                .dispatch(
+                    &RequestType::ActivateListener(ActivateListener {
+                        interface: None,
+                        address,
+                        proxy: ListenerType::Udp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                )
+                .expect("could not activate udp listener");
+            state
+                .dispatch(
+                    &RequestType::AddUdpFrontend(udp_front(cluster_id, address, "team-a")).into(),
+                )
+                .expect("one UDP frontend per address must be admitted");
+        }
+
+        let directory = tempfile::tempdir().expect("a temporary directory for the state file");
+        let path = directory.path().join("udpaddr-roundtrip.state");
+        let mut file = File::create(&path).expect("the state file must be creatable");
+        let written = state
+            .write_requests_to_file(&mut file)
+            .expect("SaveState must serialise the state");
+        drop(file);
+
+        let mut saved = Vec::new();
+        File::open(&path)
+            .expect("the state file must be readable")
+            .read_to_end(&mut saved)
+            .expect("the state file must be readable");
+
+        let (remainder, requests) =
+            parse_several_requests::<WorkerRequest>(&saved).expect("the state file must parse");
+        assert!(
+            remainder.is_empty(),
+            "load_state would report leftover bytes: {} unparsed",
+            remainder.len()
+        );
+        assert_eq!(
+            requests.len(),
+            written,
+            "every record write_requests_to_file emitted must parse back"
+        );
+
+        let mut replayed = ConfigState::new();
+        for request in &requests {
+            replayed
+                .dispatch(&request.content)
+                .expect("every saved UDP entry must replay into a fresh state");
+        }
+
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+        assert_eq!(
+            logical(&state),
+            logical(&replayed),
+            "a SaveState -> LoadState round trip must reconstruct the UDP configuration"
+        );
+    }
+
+    // ── listener identity: (address, interface) ─────────────────────────────
+
+    fn with_interface<T>(mut listener: T, set: impl FnOnce(&mut T)) -> T {
+        set(&mut listener);
+        listener
+    }
+
+    /// Two listeners on the same address bound to different interfaces are two
+    /// distinct listeners: both are recorded, keyed `address%interface`, next
+    /// to the one on the same address with no interface, for every protocol.
+    #[test]
+    fn listeners_on_one_address_with_different_interfaces_coexist() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        for interface in [None, Some("lo"), Some("wg0")] {
+            let iface = interface.map(str::to_owned);
+            state
+                .dispatch(
+                    &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                        l.interface = iface.clone()
+                    }))
+                    .into(),
+                )
+                .expect("an HTTP listener on another interface must not collide");
+            state
+                .dispatch(
+                    &RequestType::AddHttpsListener(with_interface(
+                        make_https_listener(addr),
+                        |l| l.interface = iface.clone(),
+                    ))
+                    .into(),
+                )
+                .expect("an HTTPS listener on another interface must not collide");
+            state
+                .dispatch(
+                    &RequestType::AddTcpListener(with_interface(make_tcp_listener(addr), |l| {
+                        l.interface = iface.clone()
+                    }))
+                    .into(),
+                )
+                .expect("a TCP listener on another interface must not collide");
+            state
+                .dispatch(
+                    &RequestType::AddUdpListener(with_interface(
+                        make_udp_listener(addr, false),
+                        |l| l.interface = iface.clone(),
+                    ))
+                    .into(),
+                )
+                .expect("a UDP listener on another interface must not collide");
+        }
+
+        let expected = vec![
+            "0.0.0.0:8443".to_owned(),
+            "0.0.0.0:8443%lo".to_owned(),
+            "0.0.0.0:8443%wg0".to_owned(),
+        ];
+        let list = state.list_listeners();
+        assert_eq!(
+            list.http_listeners.keys().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            list.https_listeners.keys().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            list.tcp_listeners.keys().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            list.udp_listeners.keys().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            list.http_listeners["0.0.0.0:8443%wg0"].interface.as_deref(),
+            Some("wg0")
+        );
+
+        // The same (address, interface) twice is still a duplicate.
+        assert!(
+            state
+                .dispatch(
+                    &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                        l.interface = Some("lo".to_owned())
+                    }))
+                    .into(),
+                )
+                .is_err(),
+            "the same (address, interface) must still be refused as a duplicate"
+        );
+
+        // Activate, deactivate and remove target exactly one listener.
+        state
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    address: addr,
+                    proxy: ListenerType::Http.into(),
+                    from_scm: false,
+                    interface: Some("wg0".to_owned()),
+                })
+                .into(),
+            )
+            .expect("activating the wg0 listener");
+        let list = state.list_listeners();
+        assert!(list.http_listeners["0.0.0.0:8443%wg0"].active);
+        assert!(!list.http_listeners["0.0.0.0:8443%lo"].active);
+        assert!(!list.http_listeners["0.0.0.0:8443"].active);
+
+        state
+            .dispatch(
+                &RequestType::RemoveListener(RemoveListener {
+                    address: addr,
+                    proxy: ListenerType::Tcp.into(),
+                    interface: Some("lo".to_owned()),
+                })
+                .into(),
+            )
+            .expect("removing the lo TCP listener");
+        let list = state.list_listeners();
+        assert_eq!(
+            list.tcp_listeners.keys().cloned().collect::<Vec<_>>(),
+            vec!["0.0.0.0:8443".to_owned(), "0.0.0.0:8443%wg0".to_owned()]
+        );
+
+        // Removing an interface that was never added is an error, and does not
+        // fall back to the listener without an interface.
+        assert!(
+            state
+                .dispatch(
+                    &RequestType::RemoveListener(RemoveListener {
+                        address: addr,
+                        proxy: ListenerType::Tcp.into(),
+                        interface: Some("eth9".to_owned()),
+                    })
+                    .into(),
+                )
+                .is_err()
+        );
+
+        // A SaveState -> LoadState round trip rebuilds every listener with its
+        // interface, and the diff between the two states is empty.
+        let mut replayed = ConfigState::new();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("replaying generated requests");
+        }
+        assert_eq!(replayed.list_listeners(), state.list_listeners());
+        assert!(state.diff(&replayed).is_empty());
+    }
+
+    /// The diff between two states tells listeners apart by interface: moving a
+    /// listener from one interface to another removes one and adds the other,
+    /// and the remove request names the interface it removes.
+    #[test]
+    fn listener_diff_distinguishes_interfaces() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut before = ConfigState::new();
+        before
+            .dispatch(
+                &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                    l.interface = Some("eth0".to_owned())
+                }))
+                .into(),
+            )
+            .unwrap();
+        let mut after = ConfigState::new();
+        after
+            .dispatch(
+                &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                    l.interface = Some("wg0".to_owned())
+                }))
+                .into(),
+            )
+            .unwrap();
+
+        let diff = before.diff(&after);
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        for request in &diff {
+            match &request.request_type {
+                Some(RequestType::RemoveListener(remove)) => removed.push(remove.interface.clone()),
+                Some(RequestType::AddHttpListener(add)) => added.push(add.interface.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(removed, vec![Some("eth0".to_owned())]);
+        assert_eq!(added, vec![Some("wg0".to_owned())]);
+    }
+
+    /// The reload path: adding a listener on an interface next to one that
+    /// already routes frontends yields only that listener's add and
+    /// activation. The frontends are not sent again — they already sit on the
+    /// address — so the worker must give the new listener its sibling's routes
+    /// (`HttpProxy::add_listener`, `lib/src/http.rs`).
+    #[test]
+    fn reload_adding_an_interface_listener_sends_only_that_listener() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let front = RequestHttpFrontend {
+            cluster_id: Some("cluster_1".to_owned()),
+            hostname: "example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            address: addr,
+            ..Default::default()
+        };
+        let mut before = ConfigState::new();
+        for request in [
+            RequestType::AddHttpListener(make_http_listener(addr)),
+            RequestType::AddHttpFrontend(front),
+        ] {
+            before.dispatch(&request.into()).unwrap();
+        }
+        let mut after = before.clone();
+        after
+            .dispatch(
+                &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                    l.interface = Some("wg0".to_owned())
+                }))
+                .into(),
+            )
+            .unwrap();
+
+        let diff = before.diff(&after);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert!(matches!(
+            &diff[0].request_type,
+            Some(RequestType::AddHttpListener(listener))
+                if listener.interface.as_deref() == Some("wg0")
+        ));
+    }
+
+    /// An update patch names its listener by address only (the interface is
+    /// not patchable). With two listeners on that address it cannot tell them
+    /// apart, so it is refused rather than applied to an arbitrary one.
+    #[test]
+    fn update_listener_is_refused_when_the_address_is_ambiguous() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                    l.interface = Some("wg0".to_owned())
+                }))
+                .into(),
+            )
+            .unwrap();
+
+        // One listener on the address: the patch applies to it, interface or not.
+        state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: addr,
+                    front_timeout: Some(15),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("an unambiguous patch applies to the interface-bound listener");
+        assert_eq!(
+            state.list_listeners().http_listeners["0.0.0.0:8080%wg0"].front_timeout,
+            15
+        );
+
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+        let before = state.list_listeners();
+        let error = state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: addr,
+                    front_timeout: Some(20),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect_err("a patch matching two listeners must be refused");
+        assert!(
+            matches!(error, StateError::AmbiguousListenerAddress { count: 2, .. }),
+            "{error}"
+        );
+        assert_eq!(
+            before,
+            state.list_listeners(),
+            "a refused patch must leave the listeners untouched"
+        );
+    }
+
+    /// sozu-proxy/sozu#1253: header predicates are part of a frontend's
+    /// state key. A canary that differs from its base only by a predicate
+    /// is stored beside it, a respelling of the same conjunction (other
+    /// order, other name case) is the same key, removing the canary leaves
+    /// the base, and a frontend without predicates keeps its historical key.
+    #[test]
+    fn header_predicates_are_part_of_the_frontend_state_key() {
+        use crate::proto::command::{HeaderMatchKind, HeaderPredicate};
+
+        let predicate = |name: &str, kind: HeaderMatchKind, value: Option<&str>| HeaderPredicate {
+            name: name.to_owned(),
+            kind: kind as i32,
+            value: value.map(str::to_owned),
+        };
+        let base = RequestHttpFrontend {
+            cluster_id: Some("stable".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            hostname: "api.example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            ..Default::default()
+        };
+        let canary = RequestHttpFrontend {
+            cluster_id: Some("canary".to_owned()),
+            header_predicates: vec![
+                predicate("X-Canary", HeaderMatchKind::Exact, Some("always")),
+                predicate("X-Beta", HeaderMatchKind::Present, None),
+            ],
+            ..base.clone()
+        };
+        let canary_respelled = RequestHttpFrontend {
+            header_predicates: vec![
+                predicate("x-beta", HeaderMatchKind::Present, None),
+                predicate("x-canary", HeaderMatchKind::Exact, Some("always")),
+            ],
+            ..canary.clone()
+        };
+
+        assert_eq!(
+            base.to_string(),
+            "127.0.0.1:8080;api.example.com;P/",
+            "a frontend without predicates keeps its historical key"
+        );
+        assert_eq!(canary.to_string(), canary_respelled.to_string());
+
+        // The worker deduplicates repeated predicates, so a repeated
+        // predicate (even under another name case) shares the single key.
+        let single = RequestHttpFrontend {
+            header_predicates: vec![predicate("X-Beta", HeaderMatchKind::Present, None)],
+            ..base.clone()
+        };
+        let repeated = RequestHttpFrontend {
+            header_predicates: vec![
+                predicate("X-Beta", HeaderMatchKind::Present, None),
+                predicate("x-beta", HeaderMatchKind::Present, None),
+            ],
+            ..base.clone()
+        };
+        assert_eq!(single.to_string(), repeated.to_string());
+
+        let mut state = ConfigState::default();
+        state.add_http_frontend(&base).expect("base");
+        state
+            .add_http_frontend(&canary)
+            .expect("a canary must coexist with its base");
+        assert!(matches!(
+            state.add_http_frontend(&canary_respelled),
+            Err(StateError::Exists { .. })
+        ));
+        assert_eq!(state.http_fronts.len(), 2);
+
+        // A replay of the saved orders rebuilds the same state, predicates
+        // included.
+        let mut replayed = ConfigState::default();
+        for request in state.generate_requests() {
+            replayed.dispatch(&request).expect("replay must succeed");
+        }
+        assert_eq!(replayed.http_fronts, state.http_fronts);
+
+        // The replay (and any worker bound to it) sees the predicated
+        // frontend on its dedicated verb only, so an older worker refuses it
+        // instead of dropping the guard; the base keeps the historical one.
+        let replay_types: Vec<_> = state
+            .generate_requests()
+            .into_iter()
+            .filter_map(|request| request.request_type)
+            .collect();
+        assert!(replay_types.contains(&RequestType::AddHttpFrontend(base.clone())));
+        assert!(
+            replay_types.contains(&RequestType::AddHttpFrontendWithHeaderPredicates(
+                canary.clone()
+            ))
+        );
+        assert!(!replay_types.contains(&RequestType::AddHttpFrontend(canary.clone())));
+
+        // Rolling back a predicated addition removes that route only, on the
+        // matching verb, in either spelling of the add.
+        for add in [
+            RequestType::AddHttpFrontend(canary.clone()),
+            RequestType::AddHttpFrontendWithHeaderPredicates(canary.clone()),
+        ] {
+            assert_eq!(
+                rollback_request(&add).and_then(|request| request.request_type),
+                Some(RequestType::RemoveHttpFrontendWithHeaderPredicates(
+                    canary.clone()
+                ))
+            );
+        }
+        assert_eq!(
+            rollback_request(&RequestType::AddHttpFrontend(base.clone()))
+                .and_then(|request| request.request_type),
+            Some(RequestType::RemoveHttpFrontend(base.clone()))
+        );
+
+        state
+            .remove_http_frontend(&canary_respelled)
+            .expect("a respelled removal must find the canary");
+        assert_eq!(
+            state
+                .http_fronts
+                .values()
+                .map(|front| front.cluster_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("stable")],
+            "removing the canary must leave its base"
+        );
+    }
+
+    /// `CloseSessions` acts on live sessions only: the state accepts it,
+    /// stores nothing, and neither `generate_requests` (what `save_state`
+    /// writes and `load_state` / an upgrade replay) nor the cluster hashes
+    /// change.
+    #[test]
+    fn close_sessions_is_never_saved_nor_replayed() {
+        let mut state: ConfigState = Default::default();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        let requests_before = state.generate_requests();
+        let hashes_before = state.hash_state();
+
+        state
+            .dispatch(
+                &RequestType::CloseSessions(CloseSessions {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: Some(String::from("cluster_1-0")),
+                    address: Some(SocketAddress::new_v4(127, 0, 0, 1, 1026)),
+                })
+                .into(),
+            )
+            .expect("CloseSessions must be accepted by the state");
+
+        let requests_after = state.generate_requests();
+        assert_eq!(requests_after, requests_before);
+        assert!(
+            !requests_after
+                .iter()
+                .any(|request| matches!(request.request_type, Some(RequestType::CloseSessions(_))))
+        );
+        assert_eq!(state.hash_state(), hashes_before);
+    }
+}

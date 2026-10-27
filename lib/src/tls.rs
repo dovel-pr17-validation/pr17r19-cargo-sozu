@@ -1,0 +1,2005 @@
+//! A unified certificate resolver for rustls.
+//!
+//! Persists certificates in the Rustls
+//! [`CertifiedKey` format](https://docs.rs/rustls/latest/rustls/sign/struct.CertifiedKey.html),
+//! exposes them to the HTTPS listener for TLS handshakes.
+#[cfg(test)]
+use std::collections::HashSet;
+use std::{
+    collections::HashMap,
+    fmt,
+    str::FromStr,
+    sync::{Arc, LazyLock, Mutex},
+};
+
+use rustls::{
+    InconsistentKeys,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
+};
+
+use crate::crypto::any_supported_type;
+use sha2::{Digest, Sha256};
+use sozu_command::{
+    certificate::{
+        CertificateError, Fingerprint, get_cn_and_san_attributes, parse_pem, parse_x509,
+        split_certificate_chain,
+    },
+    logging::ansi_palette,
+    proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress},
+};
+
+use crate::metrics::names;
+use crate::router::MAX_HOSTNAME_LENGTH;
+use crate::router::pattern_trie::{InsertResult, Key, KeyValue, TrieNode};
+
+/// Module-level prefix used on every log line emitted from this module.
+/// Produces a bold bright-white `TLS-RESOLVER` label (uniform across every
+/// protocol) when the logger is in colored mode. The certificate resolver
+/// runs at listener scope -- it has no per-session state -- so this is the
+/// only macro the module needs. `RUSTLS` covers the protocol-side logs in
+/// `lib/src/protocol/rustls.rs`; `TLS-RESOLVER` is intentionally distinct so
+/// operators can tell handshake failures (RUSTLS) apart from cert-store
+/// management noise (TLS-RESOLVER).
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = ansi_palette();
+        format!(
+            "{open}TLS-RESOLVER{reset}\t >>>",
+            open = open,
+            reset = reset
+        )
+    }};
+}
+
+// -----------------------------------------------------------------------------
+// Default ParsedCertificateAndKey
+
+static DEFAULT_CERTIFICATE: LazyLock<Option<Arc<CertifiedKey>>> = LazyLock::new(|| {
+    let add = AddCertificate {
+        certificate: CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_string(),
+            certificate_chain: vec![include_str!("../assets/certificate_chain.pem").to_string()],
+            key: include_str!("../assets/key.pem").to_string(),
+            versions: vec![],
+            names: vec![],
+        },
+        address: SocketAddress::new_v4(0, 0, 0, 0, 8080), // not used anyway
+        expired_at: None,
+    };
+    build_validated_certificate(&add).ok().map(|c| c.inner)
+});
+
+#[derive(thiserror::Error, Debug)]
+pub enum CertificateResolverError {
+    #[error("failed to get common name and subject alternate names from pem, {0}")]
+    InvalidCommonNameAndSubjectAlternateNames(CertificateError),
+    #[error("invalid private key: {0}")]
+    InvalidPrivateKey(String),
+    #[error("empty key")]
+    EmptyKeys,
+    #[error("error parsing x509 cert from bytes: {0}")]
+    ParseX509(CertificateError),
+    #[error("error parsing pem formated certificate from bytes: {0}")]
+    ParsePem(CertificateError),
+    #[error("error parsing overriding names in new certificate: {0}")]
+    ParseOverridingNames(CertificateError),
+    #[error("the SNI route table cannot host a certificate name, name_bytes={}", .0.len())]
+    InvalidName(String),
+}
+
+/// A wrapper around the Rustls
+/// [`CertifiedKey` type](https://docs.rs/rustls/latest/rustls/sign/struct.CertifiedKey.html),
+/// stored and returned by the certificate resolver.
+#[derive(Clone)]
+pub struct CertifiedKeyWrapper {
+    inner: Arc<CertifiedKey>,
+    /// domain names, override what can be found in the cert
+    names: Vec<String>,
+    expiration: i64,
+    fingerprint: Fingerprint,
+    /// Canonical source material identity used to distinguish a true retry
+    /// from a same-leaf replacement that changes chain, key, protocol
+    /// versions, or names. It is deliberately omitted from `Debug`.
+    material_digest: [u8; 32],
+}
+
+impl fmt::Debug for CertifiedKeyWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names_len = self
+            .names
+            .iter()
+            .map(String::len)
+            .fold(0usize, usize::saturating_add);
+
+        f.debug_struct("CertifiedKeyWrapper")
+            .field("certificate", &"[redacted]")
+            .field("certificate_chain_count", &self.inner.cert.len())
+            .field("private_key", &"[redacted]")
+            .field("names_count", &self.names.len())
+            .field("names_len", &names_len)
+            .field("expiration", &self.expiration)
+            .field("fingerprint_bytes", &self.fingerprint.0.len())
+            .finish()
+    }
+}
+
+fn update_digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn certificate_material_digest(
+    certificate: &CertificateAndKey,
+    canonical_names: &[String],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sozu-certificate-material-v1");
+    update_digest_bytes(&mut hasher, certificate.certificate.as_bytes());
+    hasher.update((certificate.certificate_chain.len() as u64).to_be_bytes());
+    for chain_entry in &certificate.certificate_chain {
+        update_digest_bytes(&mut hasher, chain_entry.as_bytes());
+    }
+    update_digest_bytes(&mut hasher, certificate.key.as_bytes());
+    hasher.update((certificate.versions.len() as u64).to_be_bytes());
+    for version in &certificate.versions {
+        hasher.update(version.to_be_bytes());
+    }
+    hasher.update((canonical_names.len() as u64).to_be_bytes());
+    for name in canonical_names {
+        update_digest_bytes(&mut hasher, name.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+/// Convert an AddCertificate request into the Rustls format.
+/// Support RSA and ECDSA certificates.
+impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
+    type Error = CertificateResolverError;
+
+    fn try_from(add: &AddCertificate) -> Result<Self, Self::Error> {
+        let cert = add.certificate.clone();
+
+        let pem =
+            parse_pem(cert.certificate.as_bytes()).map_err(CertificateResolverError::ParsePem)?;
+
+        let x509 = parse_x509(&pem.contents).map_err(CertificateResolverError::ParseX509)?;
+
+        // ASCII-lowercase every name at the single point where the set
+        // is built, so the SNI trie key, the name index, the removal
+        // walk and the SAN snapshot all agree by construction.
+        //
+        // The lookup side is already lowercase and there is nothing we
+        // can do about it: rustls lowercases the SNI inside
+        // `process_client_hello` (`DnsName::to_lowercase_owned`) before
+        // `ResolvesServerCert::resolve` ever sees it, so a name stored
+        // with uppercase — an X.509 SAN carrying it (RFC 5280 does not
+        // forbid it) or an operator `names` override — was reachable by
+        // no SNI at all and every handshake for it fell back to
+        // `DEFAULT_CERTIFICATE`. DNS names compare case-insensitively
+        // (RFC 4343), so normalising loses nothing.
+        let canonical_names = if add.certificate.names.is_empty() {
+            get_cn_and_san_attributes(&x509)
+        } else {
+            add.certificate.names.clone()
+        };
+        let material_digest = certificate_material_digest(&cert, &canonical_names);
+        let overriding_names: Vec<String> = canonical_names
+            .into_iter()
+            .map(|mut name| {
+                name.make_ascii_lowercase();
+                name
+            })
+            .collect();
+
+        let expiration = add
+            .expired_at
+            .unwrap_or(x509.validity().not_after.timestamp());
+
+        let fingerprint = Fingerprint(Sha256::digest(&pem.contents).iter().cloned().collect());
+
+        // The leaf is at index 0; chain entries follow. ACME clients
+        // emitting `fullchain.pem` (Certbot default, lego, acme.sh)
+        // place the leaf at the start, which would store
+        // `[leaf, leaf, intermediate, root]` and fail strict
+        // validators (Node.js `UNABLE_TO_VERIFY_LEAF_SIGNATURE`).
+        // Each entry is split through `split_certificate_chain` so a
+        // single multi-PEM string fans out (`parse_pem` would
+        // otherwise stop at the first block); each split entry is
+        // dedup'd against the leaf's DER bytes.
+        let leaf_der = pem.contents;
+        let mut chain = vec![CertificateDer::from(leaf_der.to_owned())];
+        let mut dropped_duplicates = 0usize;
+        for cert in &cert.certificate_chain {
+            for split_pem in split_certificate_chain(cert.to_owned()) {
+                let chain_link = parse_pem(split_pem.as_bytes())
+                    .map_err(CertificateResolverError::ParsePem)?
+                    .contents;
+
+                if chain_link == leaf_der {
+                    dropped_duplicates += 1;
+                    continue;
+                }
+                chain.push(CertificateDer::from(chain_link));
+            }
+        }
+        if dropped_duplicates > 0 {
+            debug!(
+                "{} dropped {} duplicate leaf certificate(s) from the supplied chain",
+                log_module_context!(),
+                dropped_duplicates
+            );
+        }
+
+        // Parse the PEM-encoded private key into a `PrivateKeyDer` via
+        // `rustls-pki-types`'s `PemObject` trait. `from_pem_slice` accepts
+        // PKCS1 / PKCS8 / SEC1 key formats the same way the old
+        // `rustls-pemfile::read_one` + per-variant `From::from` chain did,
+        // and folds the empty-input / no-PEM-object / unsupported-format
+        // cases into a single `Err` we surface as `EmptyKeys` (the
+        // existing variant covers any failure to extract a key from the
+        // supplied PEM blob).
+        let private_key = PrivateKeyDer::from_pem_slice(cert.key.as_bytes())
+            .map_err(|_| CertificateResolverError::EmptyKeys)?;
+
+        // Postconditions of chain assembly: the leaf was pushed first, so the
+        // chain is never empty and its head is exactly the parsed leaf DER.
+        // Dedup only ever *drops* entries it recognises as the leaf, so the
+        // assembled length can never exceed leaf + supplied links.
+        debug_assert!(
+            !chain.is_empty(),
+            "assembled certificate chain must contain at least the leaf"
+        );
+        debug_assert_eq!(
+            chain[0].as_ref(),
+            leaf_der.as_slice(),
+            "the leaf must remain at index 0 of the chain"
+        );
+        // SHA-256 fingerprint is exactly 32 bytes — anything else means the
+        // digest pipeline changed underneath us.
+        debug_assert_eq!(
+            fingerprint.0.len(),
+            32,
+            "a SHA-256 fingerprint must be 32 bytes"
+        );
+
+        match any_supported_type(&private_key) {
+            Ok(signing_key) => {
+                let stored_certificate = CertifiedKeyWrapper {
+                    inner: Arc::new(CertifiedKey::new(chain, signing_key)),
+                    names: overriding_names,
+                    expiration,
+                    fingerprint,
+                    material_digest,
+                };
+                Ok(stored_certificate)
+            }
+            Err(sign_error) => Err(CertificateResolverError::InvalidPrivateKey(
+                sign_error.to_string(),
+            )),
+        }
+    }
+}
+
+/// Build the exact certificate representation a worker resolver will store,
+/// without mutating a resolver or publishing metrics.
+///
+/// The main process calls this before committing certificate material to
+/// `ConfigState`, and [`CertificateResolver::add_certificate`] calls it before
+/// touching its indexes. Keeping key consistency and SNI-name admission here
+/// prevents the control-plane preflight from drifting from the worker runtime.
+pub fn build_validated_certificate(
+    add: &AddCertificate,
+) -> Result<CertifiedKeyWrapper, CertificateResolverError> {
+    let certificate = CertifiedKeyWrapper::try_from(add)?;
+
+    match certificate.inner.keys_match() {
+        Ok(()) | Err(rustls::Error::InconsistentKeys(InconsistentKeys::Unknown)) => {}
+        Err(error) => {
+            return Err(CertificateResolverError::InvalidPrivateKey(
+                error.to_string(),
+            ));
+        }
+    }
+
+    let mut scratch: TrieNode<()> = TrieNode::root();
+    for name in &certificate.names {
+        if name.len() > MAX_HOSTNAME_LENGTH
+            || name.contains('/')
+            || scratch.domain_insert(name.to_owned().into_bytes(), ()) == InsertResult::Failed
+        {
+            return Err(CertificateResolverError::InvalidName(name.to_owned()));
+        }
+    }
+
+    Ok(certificate)
+}
+
+/// Parses and stores TLS certificates, makes them available to Rustls for TLS handshakes
+///
+/// the `domains` TrieNode is an addressing system to resolve a certificate
+/// for a given domain name.
+/// Certificates are stored in a hashmap that may contain unreachable certificates if
+/// no domain name points to it.
+/// `Clone` lets an HTTPS listener added next to a sibling on the same address
+/// take over its certificates (`HttpsProxy::add_listener`, `lib/src/https.rs`).
+#[derive(Default, Clone)]
+pub struct CertificateResolver {
+    /// routing one domain name to one certificate for fast resolving
+    pub domains: TrieNode<Fingerprint>,
+    /// a storage map: fingerprint -> stored_certificate
+    certificates: HashMap<Fingerprint, CertifiedKeyWrapper>,
+    /// maps each domain name to several compatible certificates, sorted by expiration date
+    /// map of domain_name -> all fingerprints (and expiration) linked to this domain name
+    //  the vector of (fingerprint, expiration) is sorted by expiration
+    name_fingerprint_idx: HashMap<String, Vec<(Fingerprint, i64)>>,
+}
+
+impl fmt::Debug for CertificateResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let indexed_certificate_links = self
+            .name_fingerprint_idx
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+
+        f.debug_struct("CertificateResolver")
+            .field("domains", &"[redacted]")
+            .field("certificates_count", &self.certificates.len())
+            .field("indexed_names_count", &self.name_fingerprint_idx.len())
+            .field("indexed_certificate_links", &indexed_certificate_links)
+            .finish()
+    }
+}
+
+impl CertificateResolver {
+    /// return the certificate in the Rustls-usable form
+    pub fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<CertifiedKeyWrapper> {
+        self.certificates.get(fingerprint).map(ToOwned::to_owned)
+    }
+
+    /// Recompute the aggregate `tls.cert.min_expires_at_seconds` gauge across
+    /// every certificate currently loaded. Per-SNI granularity would explode
+    /// statsd key cardinality (the resolver can easily hold tens of thousands
+    /// of names on a public endpoint) and the existing `gauge!` macro has no
+    /// label support, so we expose a single absolute unix-seconds reading of
+    /// the soonest-expiring cert. Dashboards alert on this as the "next cert
+    /// to rotate" deadline; operators query per-cert detail through the
+    /// command API. `x509` timestamps are signed but `set_gauge` takes a
+    /// `usize`, so we clamp already-expired certs to 0 (which is still a
+    /// monotonic "panic now" signal to any alerting rule).
+    ///
+    /// Called from `add_certificate` / `remove_certificate` — i.e. only when
+    /// the cert set actually changes, never on the hot TLS handshake path.
+    fn publish_min_expiration_gauge(&self) {
+        let Some(min_expiration) = self.certificates.values().map(|c| c.expiration).min() else {
+            // SECURITY: an empty resolver is not "every cert just
+            // expired"; it is "no cert
+            // has been loaded yet" — typical at process boot before the
+            // first AddCertificate request lands. Writing 0 here pages
+            // SOC tooling on every restart with the same alert as a real
+            // expired-cert event. Skip the emit so the gauge reflects the
+            // last known good state instead of being clobbered to 0.
+            return;
+        };
+        let clamped = min_expiration.max(0) as usize;
+        gauge!(names::tls::CERT_MIN_EXPIRES_AT_SECONDS, clamped);
+    }
+
+    /// Insert one already validated wrapper without publishing metrics.
+    /// Callers perform every fallible step before mutating the resolver.
+    fn insert_validated_certificate(&mut self, certificate: CertifiedKeyWrapper) {
+        for name in &certificate.names {
+            let fingerprints_for_this_name = self
+                .name_fingerprint_idx
+                .entry(name.to_owned())
+                .or_default();
+            fingerprints_for_this_name
+                .push((certificate.fingerprint.to_owned(), certificate.expiration));
+            fingerprints_for_this_name.sort_by_key(|(_, expiration)| *expiration);
+
+            let longest_lived_cert = fingerprints_for_this_name
+                .last()
+                .expect("inserting a certificate must leave its name index non-empty");
+            self.domains.remove(&name.to_owned().into_bytes());
+            let insert_result = self.domains.insert(
+                name.to_owned().into_bytes(),
+                longest_lived_cert.0.to_owned(),
+            );
+            debug_assert_ne!(
+                insert_result,
+                InsertResult::Failed,
+                "validated certificate names must remain insertable"
+            );
+            if insert_result == InsertResult::Failed {
+                error!(
+                    "{} the SNI trie rejected a certificate name despite passing \
+                     the shared preflight validation, name_bytes={}",
+                    log_module_context!(),
+                    name.len(),
+                );
+            }
+        }
+
+        self.certificates
+            .insert(certificate.fingerprint.to_owned(), certificate);
+    }
+
+    /// Remove one wrapper and all of its indexes without publishing metrics.
+    /// Returns whether the fingerprint was present.
+    fn remove_certificate_without_publishing(&mut self, fingerprint: &Fingerprint) -> bool {
+        let Some(certificate_to_remove) = self.certificates.get(fingerprint).cloned() else {
+            return false;
+        };
+
+        for name in certificate_to_remove.names {
+            self.domains.domain_remove(&name.as_bytes().to_vec());
+
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.name_fingerprint_idx.entry(name.to_owned())
+            {
+                entry.get_mut().retain(|(stored, _)| stored != fingerprint);
+                if let Some((longest_lived, _)) = entry.get().last() {
+                    let insert_result = self
+                        .domains
+                        .insert(name.as_bytes().to_vec(), longest_lived.to_owned());
+                    debug_assert_ne!(
+                        insert_result,
+                        InsertResult::Failed,
+                        "validated certificate names must remain insertable"
+                    );
+                    if insert_result == InsertResult::Failed {
+                        error!(
+                            "{} the SNI trie rejected a re-inserted certificate name \
+                             that was validated on add, name_bytes={}",
+                            log_module_context!(),
+                            name.len(),
+                        );
+                    }
+                }
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
+            }
+        }
+
+        self.certificates.remove(fingerprint);
+        true
+    }
+
+    /// persist a certificate, after ensuring validity, and checking if it can replace another certificate.
+    /// return the certificate fingerprint regardless of having inserted it or not
+    pub fn add_certificate(
+        &mut self,
+        add: &AddCertificate,
+    ) -> Result<Fingerprint, CertificateResolverError> {
+        let cert_to_add = build_validated_certificate(add)?;
+
+        trace!(
+            "{} adding certificate {:?}",
+            log_module_context!(),
+            cert_to_add
+        );
+
+        if self.certificates.contains_key(&cert_to_add.fingerprint) {
+            return Ok(cert_to_add.fingerprint);
+        }
+
+        // Past the duplicate guard the fingerprint is genuinely new, so the
+        // store will grow by exactly one. Snapshot the count to assert that
+        // delta below (ungated `let` — read only inside the debug_assert, so
+        // the optimizer drops it in release while it still compiles).
+        let certificates_before = self.certificates.len();
+        let new_fingerprint = cert_to_add.fingerprint.clone();
+        debug_assert!(
+            !self.certificates.contains_key(&new_fingerprint),
+            "add_certificate past the dedup guard must be inserting a new fingerprint"
+        );
+
+        self.insert_validated_certificate(cert_to_add.to_owned());
+        self.publish_min_expiration_gauge();
+
+        // Postconditions: the new fingerprint is now stored, the store grew by
+        // exactly one (the dedup guard above ruled out an overwrite), and
+        // every name the cert advertises now resolves to it through the index.
+        debug_assert!(
+            self.certificates.contains_key(&new_fingerprint),
+            "add_certificate must store the new certificate"
+        );
+        debug_assert_eq!(
+            self.certificates.len(),
+            certificates_before + 1,
+            "add_certificate must grow the store by exactly one"
+        );
+        debug_assert!(
+            cert_to_add.names.iter().all(|name| {
+                self.name_fingerprint_idx
+                    .get(name)
+                    .is_some_and(|fps| fps.iter().any(|(fp, _)| *fp == new_fingerprint))
+            }),
+            "every name of the added cert must be indexed to its fingerprint"
+        );
+
+        trace!("{} {:#?}", log_module_context!(), self);
+
+        Ok(cert_to_add.fingerprint)
+    }
+
+    /// Delete a certificate from the resolver. May fail if there is no alternative for
+    // a domain name
+    pub fn remove_certificate(
+        &mut self,
+        fingerprint: &Fingerprint,
+    ) -> Result<(), CertificateResolverError> {
+        // Snapshot the store size so the postcondition can assert that a
+        // present cert drops the count by exactly one and an absent one is a
+        // no-op. Ungated `let`: read only inside the debug_asserts below, so
+        // it compiles in release and the optimizer drops it.
+        let certificates_before = self.certificates.len();
+        let was_present = self.certificates.contains_key(fingerprint);
+        #[cfg(debug_assertions)]
+        let removed_names = self
+            .certificates
+            .get(fingerprint)
+            .map(|certificate| certificate.names.to_owned());
+        let removed = self.remove_certificate_without_publishing(fingerprint);
+        if removed {
+            self.publish_min_expiration_gauge();
+
+            // Postconditions on the present-cert path: the fingerprint is
+            // truly gone, the store shrank by exactly one, and no name still
+            // points at the removed fingerprint in the index (a leftover would
+            // let `resolve` hand back a fingerprint with no backing cert).
+            debug_assert!(
+                !self.certificates.contains_key(fingerprint),
+                "remove_certificate must evict the fingerprint"
+            );
+            debug_assert_eq!(
+                self.certificates.len(),
+                certificates_before - 1,
+                "removing a present cert must shrink the store by exactly one"
+            );
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                removed_names
+                    .as_ref()
+                    .is_some_and(|names| names.iter().all(|name| {
+                        self.name_fingerprint_idx
+                            .get(name)
+                            .is_none_or(|fingerprints| {
+                                fingerprints.iter().all(|(stored, _)| stored != fingerprint)
+                            })
+                    })),
+                "no name may still index the removed fingerprint"
+            );
+        } else {
+            // Absent-cert path is a pure no-op: the store size is unchanged.
+            debug_assert!(
+                !was_present,
+                "the absent-cert branch must only run when the fingerprint was not stored"
+            );
+            debug_assert_eq!(
+                self.certificates.len(),
+                certificates_before,
+                "removing an absent cert must not change the store"
+            );
+        }
+        trace!("{} {:#?}", log_module_context!(), self);
+
+        Ok(())
+    }
+
+    /// Validate the complete replacement before changing any resolver state,
+    /// then update the indexes and publish the aggregate gauge once.
+    /// A byte-for-byte effective retry keeps the existing wrapper in place so
+    /// it also preserves name-index ordering.
+    pub fn replace_certificate(
+        &mut self,
+        replace: &ReplaceCertificate,
+    ) -> Result<Fingerprint, CertificateResolverError> {
+        let add = AddCertificate {
+            address: replace.address.to_owned(),
+            certificate: replace.new_certificate.to_owned(),
+            expired_at: replace.new_expired_at.to_owned(),
+        };
+        let new_cert = build_validated_certificate(&add)?;
+        let new_fingerprint = new_cert.fingerprint.to_owned();
+        // `ConfigState` rejects an invalid hexadecimal old fingerprint before
+        // dispatching to a worker. Direct users of this public resolver method
+        // historically received `Ok(new_fingerprint)` after the replacement
+        // was stored, with a warning that the old entry could not be removed.
+        // Parse before mutation, but preserve that public 2.3.x contract and
+        // the existing `CertificateResolverError` variant set.
+        let old_fingerprint = Fingerprint::from_str(&replace.old_fingerprint);
+        let new_material_already_stored =
+            self.certificates
+                .get(&new_fingerprint)
+                .is_some_and(|stored| {
+                    stored.material_digest == new_cert.material_digest
+                        && stored.expiration == new_cert.expiration
+                });
+
+        if old_fingerprint
+            .as_ref()
+            .is_ok_and(|old| old == &new_fingerprint)
+            && new_material_already_stored
+        {
+            return Ok(new_fingerprint);
+        }
+
+        let mut resolver_changed = false;
+        if !new_material_already_stored {
+            self.remove_certificate_without_publishing(&new_fingerprint);
+            self.insert_validated_certificate(new_cert);
+            resolver_changed = true;
+        }
+        if let Ok(old_fingerprint) = old_fingerprint.as_ref()
+            && old_fingerprint != &new_fingerprint
+        {
+            resolver_changed |= self.remove_certificate_without_publishing(old_fingerprint);
+        }
+        if resolver_changed {
+            self.publish_min_expiration_gauge();
+        }
+
+        debug_assert!(
+            self.certificates.contains_key(&new_fingerprint),
+            "replace_certificate must leave the replacement stored"
+        );
+        debug_assert!(
+            old_fingerprint.as_ref().is_err()
+                || old_fingerprint.as_ref().is_ok_and(|old| {
+                    old == &new_fingerprint || !self.certificates.contains_key(old)
+                }),
+            "replace_certificate must remove a distinct old fingerprint"
+        );
+
+        if let Err(error) = old_fingerprint {
+            warn!(
+                "{} new certificate stored but could not remove old one: \
+                 failed to parse old fingerprint, {}",
+                log_module_context!(),
+                error
+            );
+        }
+
+        Ok(new_fingerprint)
+    }
+
+    /// return all fingerprints that are available for these domain names,
+    /// provided at least one name is given
+    #[cfg(test)]
+    fn find_certificates_by_names(
+        &self,
+        names: &HashSet<String>,
+    ) -> Result<HashSet<Fingerprint>, CertificateResolverError> {
+        let mut fingerprints = HashSet::new();
+        for name in names {
+            if let Some(fprints) = self.name_fingerprint_idx.get(name) {
+                fprints.iter().for_each(|fingerprint| {
+                    fingerprints.insert(fingerprint.to_owned().0);
+                });
+            }
+        }
+
+        Ok(fingerprints)
+    }
+
+    /// return the hashset of subjects that the certificate is able to handle.
+    /// the certificate must be already persisted for this check
+    #[cfg(test)]
+    fn certificate_names(
+        &self,
+        fingerprint: &Fingerprint,
+    ) -> Result<HashSet<String>, CertificateResolverError> {
+        if let Some(cert) = self.certificates.get(fingerprint) {
+            return Ok(cert.names.iter().cloned().collect());
+        }
+        Ok(HashSet::new())
+    }
+
+    pub fn domain_lookup(
+        &self,
+        domain: &[u8],
+        accept_wildcard: bool,
+    ) -> Option<&KeyValue<Key, Fingerprint>> {
+        self.domains.domain_lookup(domain, accept_wildcard)
+    }
+
+    /// Resolve the SAN set Sōzu would serve for `domain` (the same trie
+    /// lookup rustls uses, wildcard-aware via `domain_lookup`). Returns the
+    /// certificate's `names` exactly as stored — wildcards retain their
+    /// leading `*.` so the caller can apply RFC 6125 §6.4.3 matching. `None`
+    /// when no cert covers `domain` (rustls would fall back to
+    /// `DEFAULT_CERTIFICATE`).
+    ///
+    /// Mirrors `MutexCertificateResolver::resolve` minus the rustls glue, so
+    /// the SAN snapshot taken at handshake matches the certificate the peer
+    /// actually validated (RFC 7540 §9.1.1 / RFC 9113 §9.1.1 connection
+    /// reuse).
+    pub fn names_for_sni(&self, domain: &[u8]) -> Option<Vec<String>> {
+        let (_, fingerprint) = self.domain_lookup(domain, true)?;
+        self.certificates
+            .get(fingerprint)
+            .map(|cert| cert.names.clone())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// MutexWrappedCertificateResolver struct
+
+#[derive(Default)]
+pub struct MutexCertificateResolver(pub Mutex<CertificateResolver>);
+
+impl ResolvesServerCert for MutexCertificateResolver {
+    fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        let server_name = client_hello.server_name();
+        let sigschemes = client_hello.signature_schemes();
+
+        let Some(name) = server_name else {
+            error!(
+                "{} cannot look up certificate: no SNI from session",
+                log_module_context!()
+            );
+            return None;
+        };
+        trace!(
+            "{} trying to resolve certificate with name_bytes={} signature_schemes_count={}",
+            log_module_context!(),
+            name.len(),
+            sigschemes.len()
+        );
+        // Every other site uses blocking `lock()`, and silently falling
+        // back to `DEFAULT_CERTIFICATE` on lock
+        // contention is an attacker-detectable mismatch (different
+        // chain → different fingerprint) and a footgun the moment
+        // multi-threading enters the worker. Block here. Lock-poisoning
+        // (panic-while-holding) is mapped to the same default-cert
+        // fallback the previous `try_lock` Err arm produced — preserves
+        // the existing observable behaviour for that one corner case
+        // without inventing a new failure mode.
+        let resolver = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(_poisoned) => {
+                error!(
+                    "{} cert resolver mutex poisoned, returning default cert",
+                    log_module_context!()
+                );
+                return DEFAULT_CERTIFICATE.clone();
+            }
+        };
+        if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
+            trace!(
+                "{} looking for certificate with name_bytes={} fingerprint_bytes={}",
+                log_module_context!(),
+                name.len(),
+                fingerprint.0.len()
+            );
+
+            // Strict-binding invariant: when the SNI trie resolves a name to a
+            // fingerprint, the served cert is exactly the one stored under
+            // that fingerprint — never a substitute. This guards cert
+            // SELECTION (our own store consistency), not the peer-supplied SNI
+            // itself, so a `debug_assert` is correct here (a violation is a
+            // resolver bug, not hostile traffic). The cert may legitimately be
+            // `None` if the trie still indexes a fingerprint whose cert was
+            // concurrently removed; we only assert the positive case.
+            let cert = resolver
+                .certificates
+                .get(fingerprint)
+                .map(|cert| cert.inner.clone());
+            debug_assert!(
+                cert.is_none()
+                    || resolver
+                        .certificates
+                        .get(fingerprint)
+                        .is_some_and(|stored| Arc::ptr_eq(&stored.inner, cert.as_ref().unwrap())),
+                "resolved certificate must be the one stored under the looked-up fingerprint"
+            );
+
+            trace!(
+                "{} certificate lookup fingerprint_bytes={} found={}",
+                log_module_context!(),
+                fingerprint.0.len(),
+                cert.is_some()
+            );
+            return cert;
+        }
+        drop(resolver);
+
+        // error!("could not look up a certificate for server name '{}'", name);
+        // This certificate is used for TLS tunneling with another TLS termination endpoint
+        // Note that this is unsafe and you should provide a valid certificate
+        debug!(
+            "{} default certificate is used for name_bytes={}",
+            log_module_context!(),
+            name.len()
+        );
+        incr!(names::tls::DEFAULT_CERT_USED);
+        DEFAULT_CERTIFICATE.clone()
+    }
+}
+
+impl MutexCertificateResolver {
+    /// Snapshot of the SAN set Sōzu would serve for `domain`. Acquires the
+    /// resolver lock once. Returns `None` when the underlying mutex is
+    /// poisoned — the caller is expected to treat poison the same as
+    /// "default cert served" (legacy fallback), mirroring `resolve`'s
+    /// own poison handling at the rustls hot path.
+    pub fn names_for_sni(&self, domain: &[u8]) -> Option<Vec<String>> {
+        match self.0.lock() {
+            Ok(guard) => guard.names_for_sni(domain),
+            Err(_poisoned) => {
+                error!(
+                    "{} cert resolver mutex poisoned, treating as no SAN match",
+                    log_module_context!()
+                );
+                None
+            }
+        }
+    }
+}
+
+impl fmt::Debug for MutexCertificateResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MutexWrappedCertificateResolver")
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Unit tests
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashSet,
+        error::Error,
+        io::Cursor,
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
+
+    // use rand::{seq::SliceRandom, thread_rng};
+    use sozu_command::proto::command::{
+        AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress,
+    };
+
+    use super::{
+        CertificateResolver, CertificateResolverError, CertifiedKeyWrapper,
+        MutexCertificateResolver, build_validated_certificate,
+    };
+
+    fn drive_client_hello(resolver: Arc<MutexCertificateResolver>, server_name: String) {
+        let provider = Arc::new(crate::crypto::default_provider());
+        let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("test server provider must support TLS 1.3")
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("test client provider must support TLS 1.3")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from(server_name)
+            .expect("test SNI must be a valid DNS name");
+        let mut client = rustls::ClientConnection::new(Arc::new(client_config), server_name)
+            .expect("test client connection must initialize");
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config))
+            .expect("test server connection must initialize");
+
+        let mut client_hello = Vec::new();
+        client
+            .write_tls(&mut client_hello)
+            .expect("test client hello must serialize");
+        server
+            .read_tls(&mut Cursor::new(client_hello))
+            .expect("test server must read the client hello");
+        server
+            .process_new_packets()
+            .expect("test server must process the client hello");
+    }
+
+    /// A certificate carrying a name the SNI route table cannot host must
+    /// be rejected as a whole, BEFORE any resolver state is touched. On
+    /// `main` such a name panicked inside `TrieNode::insert`; once the
+    /// insert reports `InsertResult::Failed` gracefully, silently
+    /// discarding the result would register the certificate while
+    /// `domains` never learns the name -- a dead SNI route failing every
+    /// handshake with no diagnostic on either side.
+    #[test]
+    fn add_certificate_rejects_a_name_the_route_table_cannot_host() {
+        for name in ["sni-secret.example/", ".sni-secret.example"] {
+            let mut resolver = CertificateResolver::default();
+            let result = resolver.add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec![(*name).to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            });
+            assert!(result.is_err(), "{name:?} must be rejected, not stored");
+            assert!(
+                resolver.certificates.is_empty(),
+                "{name:?} was rejected but the certificate store was mutated",
+            );
+            assert!(
+                resolver.name_fingerprint_idx.is_empty(),
+                "{name:?} was rejected but the name index was mutated",
+            );
+            assert!(
+                resolver.domains.is_empty(),
+                "{name:?} was rejected but the SNI trie was mutated",
+            );
+        }
+    }
+
+    #[test]
+    fn shared_preflight_rejects_a_certificate_with_a_mismatched_private_key() {
+        let result = build_validated_certificate(&AddCertificate {
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            certificate: CertificateAndKey {
+                certificate: include_str!("../assets/tests/certificate-1y.pem").to_owned(),
+                key: include_str!("../assets/tests/key-2y.pem").to_owned(),
+                names: vec!["mismatch.example.com".to_owned()],
+                ..Default::default()
+            },
+            expired_at: None,
+        });
+
+        assert!(
+            matches!(result, Err(CertificateResolverError::InvalidPrivateKey(_))),
+            "a mismatched certificate/private-key pair must be refused, got {result:?}"
+        );
+    }
+
+    // Asserts on `trace!` output: gate on the same condition that compiles it in.
+    #[cfg(any(debug_assertions, feature = "logs-trace"))]
+    #[test]
+    fn certificate_resolver_logs_redact_matching_sni_and_fingerprint() {
+        const SNI_SECRET: &str = "resolver-sni-secret.example";
+
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            names: vec![SNI_SECRET.to_owned()],
+            ..Default::default()
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable")
+            .to_string();
+        let output = crate::capture_test_logs_at_level("trace", move || {
+            let resolver = Arc::new(MutexCertificateResolver::default());
+            resolver
+                .0
+                .lock()
+                .expect("test resolver lock must be available")
+                .add_certificate(&AddCertificate {
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                    certificate,
+                    expired_at: None,
+                })
+                .expect("test certificate must load into the resolver");
+            drive_client_hello(resolver, SNI_SECRET.to_owned());
+        });
+
+        assert!(
+            !output.contains(SNI_SECRET),
+            "TLS resolver logs leaked the matching SNI: {output}"
+        );
+        assert!(
+            !output.contains(&fingerprint),
+            "TLS resolver logs leaked the matching certificate fingerprint: {output}"
+        );
+        for metadata in [
+            format!("name_bytes={}", SNI_SECRET.len()),
+            "fingerprint_bytes=32".to_owned(),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "TLS resolver logs omitted bounded metadata {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 4096,
+            "TLS resolver log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    // Asserts on `trace!` output: gate on the same condition that compiles it in.
+    #[cfg(any(debug_assertions, feature = "logs-trace"))]
+    #[test]
+    fn certificate_resolver_logs_redact_fallback_sni() {
+        const SNI_SECRET: &str = "fallback-sni-secret.example";
+
+        let output = crate::capture_test_logs_at_level("trace", move || {
+            drive_client_hello(
+                Arc::new(MutexCertificateResolver::default()),
+                SNI_SECRET.to_owned(),
+            );
+        });
+
+        assert!(
+            !output.contains(SNI_SECRET),
+            "TLS resolver logs leaked the fallback SNI: {output}"
+        );
+        assert!(
+            output.contains(&format!("name_bytes={}", SNI_SECRET.len())),
+            "TLS resolver fallback log omitted bounded SNI metadata: {output}"
+        );
+        assert!(
+            output.len() <= 2048,
+            "TLS resolver fallback log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn certificate_resolver_poison_logs_are_bounded() {
+        const SNI_SECRET: &str = "poison-sni-secret.example";
+        const QUERY_SECRET: &str = "POISON_QUERY_SECRET_SENTINEL";
+
+        let query = format!("{QUERY_SECRET}{}", "x".repeat(4096));
+        let output = crate::capture_test_logs_at_level("trace", move || {
+            let resolver = Arc::new(MutexCertificateResolver::default());
+            let poison_target = resolver.clone();
+            assert!(
+                std::thread::spawn(move || {
+                    let _guard = poison_target
+                        .0
+                        .lock()
+                        .expect("test resolver lock must initially be available");
+                    panic!("intentionally poison the test resolver lock");
+                })
+                .join()
+                .is_err(),
+                "test poison thread must panic"
+            );
+
+            drive_client_hello(resolver.clone(), SNI_SECRET.to_owned());
+            assert!(resolver.names_for_sni(query.as_bytes()).is_none());
+        });
+
+        assert!(
+            !output.contains(SNI_SECRET),
+            "TLS resolver poison log leaked the handshake SNI: {output}"
+        );
+        assert!(
+            !output.contains(QUERY_SECRET),
+            "TLS resolver poison log leaked the 4 KiB direct query: {output}"
+        );
+        assert!(
+            output.len() <= 2048,
+            "TLS resolver poison log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn certified_key_wrapper_debug_redacts_runtime_certificate_material() {
+        const NAME_SECRET: &str = "CERTIFIED_KEY_NAME_SECRET_SENTINEL";
+
+        let add = AddCertificate {
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            certificate: CertificateAndKey {
+                certificate: include_str!("../assets/certificate.pem").to_owned(),
+                key: include_str!("../assets/key.pem").to_owned(),
+                names: vec![format!("{NAME_SECRET}{}", "x".repeat(4096))],
+                ..Default::default()
+            },
+            expired_at: None,
+        };
+        let certified_key =
+            CertifiedKeyWrapper::try_from(&add).expect("test certificate must parse");
+        let fingerprint = certified_key.fingerprint.to_string();
+        let output = format!("{certified_key:?}");
+
+        assert!(
+            !output.contains(NAME_SECRET),
+            "CertifiedKeyWrapper Debug leaked an overridden certificate name: {output}"
+        );
+        assert!(
+            !output.contains(&fingerprint),
+            "CertifiedKeyWrapper Debug leaked the certificate fingerprint: {output}"
+        );
+        assert!(
+            output.contains("fingerprint_bytes: 32"),
+            "CertifiedKeyWrapper Debug omitted bounded fingerprint metadata: {output}"
+        );
+        assert!(
+            output.contains("[redacted]"),
+            "CertifiedKeyWrapper Debug must make certificate redaction explicit: {output}"
+        );
+        assert!(
+            output.len() <= 1024,
+            "CertifiedKeyWrapper Debug output is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn certificate_resolver_debug_redacts_indexed_names() {
+        const NAME_SECRET: &str = "CERTIFICATE_RESOLVER_NAME_SECRET_SENTINEL";
+
+        let mut resolver = CertificateResolver::default();
+        resolver
+            .add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    // Below `MAX_HOSTNAME_LENGTH` so the name passes the
+                    // add-time validation and reaches the Debug formatting
+                    // under test; the redaction property is
+                    // length-independent.
+                    names: vec![format!("{NAME_SECRET}{}", "x".repeat(2048))],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect("test certificate must load into the resolver");
+        let output = format!("{resolver:?}");
+
+        assert!(
+            !output.contains(NAME_SECRET),
+            "CertificateResolver Debug leaked an indexed certificate name: {output}"
+        );
+        assert!(
+            output.len() <= 1024,
+            "CertificateResolver Debug output is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn lifecycle() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+        let certificate_and_key = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/certificate.pem")),
+            key: String::from(include_str!("../assets/key.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint = resolver
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate_and_key,
+                expired_at: None,
+            })
+            .expect("could not add certificate");
+
+        if resolver.get_certificate(&fingerprint).is_none() {
+            return Err("failed to retrieve certificate".into());
+        }
+
+        // get the names to try and retrieve the certificate AFTER it is supposed to be removed
+        let names = resolver.certificate_names(&fingerprint)?;
+
+        if let Err(err) = resolver.remove_certificate(&fingerprint) {
+            return Err(format!("the certificate was not removed, {err}").into());
+        }
+
+        if resolver.get_certificate(&fingerprint).is_some() {
+            return Err("We have retrieved the certificate that should be deleted".into());
+        }
+
+        if !resolver.find_certificates_by_names(&names)?.is_empty() {
+            return Err(
+                "The certificate should be deleted but one of its names is in the index".into(),
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn name_override() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+        let certificate_and_key = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/certificate.pem")),
+            key: String::from(include_str!("../assets/key.pem")),
+            names: vec!["localhost".into(), "lolcatho.st".into()],
+            ..Default::default()
+        };
+
+        let fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: certificate_and_key,
+            expired_at: None,
+        })?;
+
+        if resolver.get_certificate(&fingerprint).is_none() {
+            return Err("failed to retrieve certificate".into());
+        }
+
+        let mut lolcat = HashSet::new();
+        lolcat.insert(String::from("lolcatho.st"));
+        if resolver.find_certificates_by_names(&lolcat)?.is_empty()
+            || resolver.get_certificate(&fingerprint).is_none()
+        {
+            return Err("failed to retrieve certificate with custom names".into());
+        }
+
+        if let Err(err) = resolver.remove_certificate(&fingerprint) {
+            return Err(format!("the certificate could not be removed, {err}").into());
+        }
+
+        let names = resolver.certificate_names(&fingerprint)?;
+        if !resolver.find_certificates_by_names(&names)?.is_empty()
+            && resolver.get_certificate(&fingerprint).is_some()
+        {
+            return Err("We have retrieved the certificate that should be deleted".into());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn keep_resolving_with_wildcard() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        // ---------------------------------------------------------------------
+        // load the wildcard certificate,  expiring in 3 years
+        let wildcard_example_org = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-3.pem")),
+            key: String::from(include_str!("../assets/tests/key.pem")),
+            ..Default::default()
+        };
+
+        let wildcard_example_org_fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: wildcard_example_org,
+            expired_at: Some(
+                (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
+                    + Duration::from_secs(365 * 24 * 3600))
+                .as_secs() as i64,
+            ),
+        })?;
+
+        if resolver
+            .get_certificate(&wildcard_example_org_fingerprint)
+            .is_none()
+        {
+            return Err("could not load the 2-year-valid certificate".into());
+        }
+
+        // ---------------------------------------------------------------------
+        // try loading the ordinary certificate, expiring in 2 years
+        // this one has two names: example.org and www.example.org
+        let www_example_org = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-2.pem")),
+            key: String::from(include_str!("../assets/tests/key.pem")),
+            ..Default::default()
+        };
+
+        let www_example_org_fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: www_example_org,
+            expired_at: Some(
+                (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
+                    + Duration::from_secs(2 * 365 * 24 * 3600))
+                .as_secs() as i64,
+            ),
+        })?;
+
+        let www_example_org = resolver
+            .domain_lookup("www.example.org".as_bytes(), true)
+            .expect("there should be a www.example.org cert");
+        assert_eq!(www_example_org.1, www_example_org_fingerprint);
+
+        let test_example_org = resolver
+            .domain_lookup("test.example.org".as_bytes(), true)
+            .expect("there should be a test.example.org cert");
+        assert_eq!(test_example_org.1, wildcard_example_org_fingerprint);
+
+        let example_org = resolver
+            .domain_lookup("example.org".as_bytes(), true)
+            .expect("there should be a example.org cert");
+        assert_eq!(example_org.1, www_example_org_fingerprint);
+
+        // check that when removing the www.example.org certificate
+        // the resolver falls back on the wildcard
+        resolver
+            .remove_certificate(&www_example_org_fingerprint)
+            .expect("should be able to remove the 2-year certificate");
+
+        let should_be_wildcard_fingerprint = resolver
+            .domain_lookup("www.example.org".as_bytes(), true)
+            .expect("there should be a www.example.org cert");
+        assert_eq!(
+            should_be_wildcard_fingerprint.1,
+            wildcard_example_org_fingerprint
+        );
+
+        assert!(
+            resolver
+                .domain_lookup("example.org".as_bytes(), true)
+                .is_none()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_the_longer_lived_cert() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        // ---------------------------------------------------------------------
+        // load the 2-year valid certificate
+        let certificate_and_key_2y = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
+            key: String::from(include_str!("../assets/tests/key-2y.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint_2y = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: certificate_and_key_2y,
+            expired_at: None,
+        })?;
+
+        if resolver.get_certificate(&fingerprint_2y).is_none() {
+            return Err("could not load the 2-year-valid certificate".into());
+        }
+
+        // ---------------------------------------------------------------------
+        // try loading the 1-year valid certificate
+        let certificate_and_key_1y = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint_1y = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: certificate_and_key_1y,
+            ..Default::default()
+        })?;
+
+        let localhost_cert = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("there should be a localhost cert");
+
+        assert_eq!(localhost_cert.1, fingerprint_2y);
+
+        // check that when removing the longer-lived certificate,
+        // the resolver falls back on the shorter-lived one
+
+        resolver
+            .remove_certificate(&fingerprint_2y)
+            .expect("should be able to remove the 2-year certificate");
+
+        let localhost_cert = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("there should be a localhost cert");
+
+        assert_eq!(localhost_cert.1, fingerprint_1y);
+
+        Ok(())
+    }
+
+    #[test]
+    fn expiration_override() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        // ---------------------------------------------------------------------
+        // load first certificate
+        let certificate_and_key_1y = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint_1y_overriden = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: certificate_and_key_1y,
+            expired_at: Some(
+                (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
+                    + Duration::from_secs(3 * 365 * 24 * 3600))
+                .as_secs() as i64,
+            ),
+        })?;
+
+        if resolver
+            .get_certificate(&fingerprint_1y_overriden)
+            .is_none()
+        {
+            return Err("failed to retrieve certificate".into());
+        }
+
+        // ---------------------------------------------------------------------
+        // load second certificate
+        let certificate_and_key_2y = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
+            key: String::from(include_str!("../assets/tests/key-2y.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint_2y = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: certificate_and_key_2y,
+            expired_at: None,
+        })?;
+
+        let localhost_cert = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("there should be a localhost cert");
+
+        assert_eq!(localhost_cert.1, fingerprint_1y_overriden);
+
+        // check that when removing the overriden certificate,
+        // the resolver falls back on the other one
+
+        resolver
+            .remove_certificate(&fingerprint_1y_overriden)
+            .expect("should be able to remove the 1-year (3-year-overriden) certificate");
+
+        let localhost_cert = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("there should be a localhost cert");
+
+        assert_eq!(localhost_cert.1, fingerprint_2y);
+
+        Ok(())
+    }
+
+    /// Verify that `replace_certificate` adds the new cert before removing
+    /// the old one, so lookup always returns a valid certificate.
+    #[test]
+    fn replace_certificate_add_before_remove() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        // add the initial (1-year) certificate
+        let cert_1y = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint_1y = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: cert_1y,
+            expired_at: None,
+        })?;
+
+        // sanity: the 1y cert is resolvable
+        assert!(
+            resolver
+                .domain_lookup("localhost".as_bytes(), true)
+                .is_some(),
+            "initial certificate should be resolvable"
+        );
+
+        // replace with the 2-year certificate
+        let cert_2y = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
+            key: String::from(include_str!("../assets/tests/key-2y.pem")),
+            ..Default::default()
+        };
+
+        let new_fingerprint = resolver.replace_certificate(&ReplaceCertificate {
+            address,
+            new_certificate: cert_2y,
+            old_fingerprint: fingerprint_1y.to_string(),
+            new_expired_at: None,
+        })?;
+
+        // the old certificate should be gone
+        assert!(
+            resolver.get_certificate(&fingerprint_1y).is_none(),
+            "old certificate should have been removed"
+        );
+
+        // the new certificate should be present and resolvable
+        assert!(
+            resolver.get_certificate(&new_fingerprint).is_some(),
+            "new certificate should be present"
+        );
+        let resolved = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("a certificate should resolve for localhost");
+        assert_eq!(
+            resolved.1, new_fingerprint,
+            "resolved certificate should be the replacement"
+        );
+
+        Ok(())
+    }
+
+    /// Direct resolver callers historically receive success when the old
+    /// fingerprint is malformed: the validated replacement is stored, the
+    /// unaddressable old entry is retained, and the cleanup failure is logged.
+    /// `ConfigState` rejects this input before worker dispatch, but the public
+    /// resolver API must retain its 2.3.x behavior.
+    #[test]
+    fn replace_certificate_with_invalid_old_fingerprint_keeps_compatibility()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+        let old_fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: CertificateAndKey {
+                certificate: include_str!("../assets/tests/certificate-1y.pem").to_owned(),
+                key: include_str!("../assets/tests/key-1y.pem").to_owned(),
+                ..Default::default()
+            },
+            expired_at: None,
+        })?;
+
+        let new_fingerprint = resolver.replace_certificate(&ReplaceCertificate {
+            address,
+            new_certificate: CertificateAndKey {
+                certificate: include_str!("../assets/tests/certificate-2y.pem").to_owned(),
+                key: include_str!("../assets/tests/key-2y.pem").to_owned(),
+                ..Default::default()
+            },
+            old_fingerprint: "not-a-hex-fingerprint".to_owned(),
+            new_expired_at: None,
+        })?;
+
+        assert!(resolver.certificates.contains_key(&old_fingerprint));
+        assert!(resolver.certificates.contains_key(&new_fingerprint));
+
+        Ok(())
+    }
+
+    /// When `ReplaceCertificate` carries the same certificate / fingerprint
+    /// as the existing entry, the previous implementation called
+    /// `add_certificate` (which early-returns on duplicate fingerprint
+    /// without inserting) and then unconditionally removed the old
+    /// fingerprint — i.e. the *current* entry — leaving the resolver
+    /// without a certificate for that name. The fix short-circuits the
+    /// idempotent case and keeps the existing entry in place. An
+    /// idempotent ACME / operator retry must therefore still resolve.
+    #[test]
+    fn replace_certificate_with_same_fingerprint_is_noop()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        let cert = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            ..Default::default()
+        };
+
+        let initial_fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: cert.clone(),
+            expired_at: None,
+        })?;
+
+        // Replace with the SAME PEM/key — identical fingerprint expected.
+        let returned_fingerprint = resolver.replace_certificate(&ReplaceCertificate {
+            address,
+            new_certificate: cert,
+            old_fingerprint: initial_fingerprint.to_string(),
+            new_expired_at: None,
+        })?;
+
+        assert_eq!(
+            returned_fingerprint, initial_fingerprint,
+            "idempotent replace should return the existing fingerprint"
+        );
+
+        assert!(
+            resolver.get_certificate(&initial_fingerprint).is_some(),
+            "idempotent replace must NOT delete the existing certificate"
+        );
+
+        let resolved = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("certificate should still resolve after idempotent replace");
+        assert_eq!(
+            resolved.1, initial_fingerprint,
+            "resolver should still hand back the original fingerprint"
+        );
+
+        Ok(())
+    }
+
+    /// A strict retry must keep the exact stored wrapper and the stable
+    /// tie-break between certificates that cover the same name with the same
+    /// expiration. Rebuilding the wrapper is observably different even when
+    /// the winner happens to stay the same after the stable index sort.
+    #[test]
+    fn strict_same_fingerprint_retry_preserves_tie_break_and_wrapper()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+        let shared_expiration = 2_000_000_000;
+
+        let other_certificate = CertificateAndKey {
+            certificate: include_str!("../assets/tests/certificate-2y.pem").to_owned(),
+            key: include_str!("../assets/tests/key-2y.pem").to_owned(),
+            names: vec!["tie.example.com".to_owned()],
+            ..Default::default()
+        };
+        resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: other_certificate,
+            expired_at: Some(shared_expiration),
+        })?;
+
+        let target_certificate = CertificateAndKey {
+            certificate: include_str!("../assets/tests/certificate-1y.pem").to_owned(),
+            key: include_str!("../assets/tests/key-1y.pem").to_owned(),
+            names: vec!["tie.example.com".to_owned()],
+            ..Default::default()
+        };
+        let target_fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: target_certificate.to_owned(),
+            expired_at: Some(shared_expiration),
+        })?;
+
+        let index_before = resolver.name_fingerprint_idx.to_owned();
+        let domains_before = format!("{:?}", resolver.domains);
+        let winner_before = resolver
+            .domain_lookup(b"tie.example.com", true)
+            .expect("the tied certificates must have a selected winner")
+            .1
+            .to_owned();
+        let wrapper_before = resolver
+            .certificates
+            .get(&target_fingerprint)
+            .expect("the target certificate must be stored")
+            .inner
+            .to_owned();
+
+        let returned_fingerprint = resolver.replace_certificate(&ReplaceCertificate {
+            address,
+            new_certificate: target_certificate,
+            old_fingerprint: target_fingerprint.to_string(),
+            new_expired_at: Some(shared_expiration),
+        })?;
+
+        assert_eq!(returned_fingerprint, target_fingerprint);
+        assert_eq!(winner_before, target_fingerprint);
+        assert_eq!(resolver.name_fingerprint_idx, index_before);
+        assert_eq!(format!("{:?}", resolver.domains), domains_before);
+        assert_eq!(
+            resolver
+                .domain_lookup(b"tie.example.com", true)
+                .expect("the strict retry must preserve the selected winner")
+                .1,
+            target_fingerprint,
+        );
+        assert!(Arc::ptr_eq(
+            &wrapper_before,
+            &resolver
+                .certificates
+                .get(&target_fingerprint)
+                .expect("the strict retry must preserve the stored certificate")
+                .inner,
+        ));
+
+        Ok(())
+    }
+
+    /// Verify that removing the last certificate for a domain cleans up
+    /// the empty entry in `name_fingerprint_idx` (no memory leak).
+    #[test]
+    fn removal_cleans_up_empty_index_entries() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        let cert = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: cert,
+            expired_at: None,
+        })?;
+
+        // record the names associated with this cert
+        let names = resolver.certificate_names(&fingerprint)?;
+        assert!(
+            !names.is_empty(),
+            "certificate should have at least one name"
+        );
+
+        // verify index is populated
+        for name in &names {
+            assert!(
+                resolver.name_fingerprint_idx.contains_key(name),
+                "name_fingerprint_idx should contain '{name}' before removal"
+            );
+        }
+
+        resolver.remove_certificate(&fingerprint)?;
+
+        // after removal, all index entries for these names should be gone
+        for name in &names {
+            assert!(
+                !resolver.name_fingerprint_idx.contains_key(name),
+                "name_fingerprint_idx should not contain empty entry for '{name}' after removal"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Many ACME clients (Certbot's `fullchain.pem`, lego, acme.sh) emit
+    /// the leaf certificate at the START of the chain file. Without
+    /// dedup, the resolver previously stored `[leaf, leaf, ...]` and
+    /// the on-wire TLS handshake replayed the leaf twice — accepted by
+    /// browsers but rejected by stricter validators (Node.js,
+    /// `UNABLE_TO_VERIFY_LEAF_SIGNATURE`). The fix in
+    /// `TryFrom<&AddCertificate> for CertifiedKeyWrapper` drops any
+    /// chain entry whose DER bytes match the leaf. Closes #1135 / #1148.
+    ///
+    /// This test passes the SAME leaf PEM as both `certificate` and the
+    /// sole `certificate_chain` entry (the `fullchain.pem` shape). The
+    /// stored chain length must be `1` (leaf only), not `2`
+    /// (`[leaf, leaf]`).
+    #[test]
+    fn certificate_chain_dedup_drops_duplicate_leaf() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        let leaf_pem = String::from(include_str!("../assets/certificate.pem"));
+
+        let cert_with_duplicated_leaf = CertificateAndKey {
+            certificate: leaf_pem.clone(),
+            certificate_chain: vec![leaf_pem],
+            key: String::from(include_str!("../assets/key.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: cert_with_duplicated_leaf,
+            expired_at: None,
+        })?;
+
+        let stored = resolver
+            .get_certificate(&fingerprint)
+            .ok_or("resolver lost the certificate after add")?;
+
+        assert_eq!(
+            stored.inner.cert.len(),
+            1,
+            "expected dedup to drop the duplicate leaf, got chain of {} cert(s)",
+            stored.inner.cert.len()
+        );
+
+        Ok(())
+    }
+
+    /// When an operator passes the entire `fullchain.pem` content as a
+    /// SINGLE chain entry (one string containing multiple
+    /// `-----BEGIN CERTIFICATE-----` blocks back-to-back), the previous
+    /// code called `parse_pem` once on the multi-PEM string, which only
+    /// consumes the first PEM block and silently drops the rest. The
+    /// fix splits each chain entry through
+    /// `split_certificate_chain` so multi-PEM strings fan out into one
+    /// entry per CA before parsing.
+    ///
+    /// This test concatenates two PEM blocks into a single chain entry
+    /// (the leaf duplicated, so dedup also kicks in). The stored chain
+    /// must end up with length 1 — the leaf — proving (a) the multi-PEM
+    /// entry was split correctly, (b) the duplicate leaf was dropped.
+    #[test]
+    fn certificate_chain_handles_multi_pem_single_entry() -> Result<(), Box<dyn Error + Send + Sync>>
+    {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        let leaf_pem = String::from(include_str!("../assets/certificate.pem"));
+        // Two PEM blocks concatenated into one string; both are the
+        // leaf so dedup brings the result back to length 1.
+        let multi_pem_chain_entry = format!("{leaf_pem}\n{leaf_pem}");
+
+        let cert = CertificateAndKey {
+            certificate: leaf_pem,
+            certificate_chain: vec![multi_pem_chain_entry],
+            key: String::from(include_str!("../assets/key.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: cert,
+            expired_at: None,
+        })?;
+
+        let stored = resolver
+            .get_certificate(&fingerprint)
+            .ok_or("resolver lost the certificate after add")?;
+
+        // Without the split, `parse_pem` would only consume the first
+        // PEM block and drop the second; with the split + dedup, both
+        // get fanned out, both get recognised as the leaf, both get
+        // dropped — leaving the original leaf at index 0 only.
+        assert_eq!(
+            stored.inner.cert.len(),
+            1,
+            "expected split + dedup to leave only the leaf, got chain of {} cert(s)",
+            stored.inner.cert.len()
+        );
+
+        Ok(())
+    }
+
+    /// The SNI half of the same add/lookup case asymmetry, with the two
+    /// sides swapped.
+    ///
+    /// RFC 4343 makes DNS names compare case-insensitively, and rustls
+    /// hands `ResolvesServerCert::resolve` an SNI it has ALREADY
+    /// lowercased: `rustls::server::hs::process_client_hello` stores
+    /// `dns_name.to_lowercase_owned()` (rustls 0.23,
+    /// `rustls-pki-types`' `DnsName::to_lowercase_owned` is an
+    /// `to_ascii_lowercase`), and `ClientHello::server_name()` surfaces
+    /// that field. The ADD side had no such normalisation: a SAN read off
+    /// the X.509 (`command/src/certificate.rs`'s
+    /// `get_cn_and_san_attributes`) or an operator-supplied `names`
+    /// override went into the SNI trie and the name index verbatim.
+    ///
+    /// So a certificate carrying `MiXeD.Example.COM` was reachable by no
+    /// SNI at all — every handshake for that name fell through to the
+    /// `DEFAULT_CERTIFICATE` arm of `MutexCertificateResolver::resolve`,
+    /// which also increments `names::tls::DEFAULT_CERT_USED`, while the
+    /// certificate stayed recorded and queryable.
+    ///
+    /// To SEE THIS RED: in `CertifiedKeyWrapper::try_from`, delete the
+    /// `let overriding_names: Vec<String> = overriding_names …` rebind
+    /// that maps `|mut name| { name.make_ascii_lowercase(); name }`, so
+    /// the names reach the trie as written. The FIRST assertion below
+    /// fails — `domain_lookup(b"mixed.example.com", true)` is `None`, so
+    /// the test panics there and the later ones are never reached.
+    #[test]
+    fn a_mixed_case_certificate_name_resolves_for_the_lowercased_sni() {
+        const MIXED: &str = "MiXeD.Example.COM";
+        const LOWER: &str = "mixed.example.com";
+
+        let mut resolver = CertificateResolver::default();
+        let fingerprint = resolver
+            .add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec![MIXED.to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect("the mixed-case certificate must load");
+
+        assert!(
+            resolver.domain_lookup(LOWER.as_bytes(), true).is_some(),
+            "rustls only ever asks for the lowercased SNI, so that is the \
+             only key the trie can usefully hold",
+        );
+        assert_eq!(
+            resolver.names_for_sni(LOWER.as_bytes()),
+            Some(vec![LOWER.to_owned()]),
+            "the SAN snapshot feeding the H2 `:authority` binding must \
+             carry the normalised name",
+        );
+
+        // Removal walks the certificate's stored names, so it stays
+        // symmetric with the add path by construction: normalise once at
+        // the single point where `names` is built and both verbs agree.
+        resolver
+            .remove_certificate(&fingerprint)
+            .expect("the mixed-case certificate must be removable");
+        assert!(
+            resolver.domain_lookup(LOWER.as_bytes(), true).is_none(),
+            "removing the certificate must retire its normalised trie key",
+        );
+    }
+
+    /// A certificate name enters the SNI `TrieNode` verbatim, and that
+    /// trie is the same `lib/src/router/pattern_trie.rs` the HTTP router
+    /// uses: a dot-separated label wrapped in `/.../` is compiled as a
+    /// REGEX segment (`insert_recursive` -> `anchored_segment` ->
+    /// `Regex::new`). So an operator `names` entry such as
+    /// `/te.*/.example.com` bound ONE certificate to an open-ended class
+    /// of SNI values -- measured on `c7ac070e`, that name was served for
+    /// both `test.example.com` and `tenant.example.com`
+    /// (sozu-proxy/sozu#1378). A name like `/.*/.example.com` is one
+    /// character away from a plausible typo, and the certificate
+    /// inventory an operator reads shows a SAN-shaped string while the
+    /// trie holds a pattern.
+    ///
+    /// The validation that already existed could not catch it: it
+    /// dry-runs every name into a scratch trie and asks only whether the
+    /// name INSERTS, and a regex segment inserts perfectly well. The
+    /// check therefore has to be on the name's BYTES, and it has to run
+    /// in the same pre-mutation block as the `MAX_HOSTNAME_LENGTH` bound
+    /// so nothing is half-registered. `/` cannot occur in a DNS name, so
+    /// nothing legitimate is refused -- and the ordinary `*.` wildcard
+    /// name, which the trie handles as a wildcard and not as a regex,
+    /// still loads; the second half of this test pins that the guard was
+    /// not widened into "refuse anything that is not a literal".
+    ///
+    /// This mirrors `validate_sni_pattern` (`command/src/config.rs`),
+    /// which already rejects `/` on every path into the TCP SNI route
+    /// table; the certificate trie was the one SNI table left open.
+    ///
+    /// To SEE THIS RED: in `build_validated_certificate`'s pre-mutation
+    /// dry-run, delete the `|| name.contains('/')` disjunct from the rejection
+    /// condition. The certificate then loads and `expect_err` panics on the
+    /// returned `Ok(fingerprint)`, so the test fails at its first statement.
+    #[test]
+    fn a_certificate_name_carrying_a_regex_segment_is_refused() {
+        const REGEX_NAME: &str = "/te.*/.example.com";
+
+        let mut resolver = CertificateResolver::default();
+        let error = resolver
+            .add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec![REGEX_NAME.to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect_err("a certificate name carrying a regex segment must be refused");
+
+        assert!(
+            matches!(&error, CertificateResolverError::InvalidName(name) if name == REGEX_NAME),
+            "the refusal must be InvalidName, got {error:?}",
+        );
+
+        // Refused BEFORE any mutation, exactly like the
+        // `MAX_HOSTNAME_LENGTH` bound it sits beside: no certificate
+        // stored, no name indexed, and -- the point of the report -- no
+        // open-ended class of SNI values bound in the trie.
+        assert!(
+            resolver.certificates.is_empty(),
+            "a refused certificate must not be stored",
+        );
+        assert!(
+            resolver.name_fingerprint_idx.is_empty(),
+            "a refused certificate must not index any name",
+        );
+        for sni in ["test.example.com", "tenant.example.com", REGEX_NAME] {
+            assert!(
+                resolver.domain_lookup(sni.as_bytes(), true).is_none(),
+                "a refused certificate name must bind no SNI, yet {sni} resolved",
+            );
+        }
+
+        // The guard is on `/` alone. An ordinary wildcard SAN is not a
+        // regex segment, still loads, and still serves its subtree.
+        resolver
+            .add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec!["*.example.com".to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect("a wildcard certificate name must still load");
+        assert!(
+            resolver
+                .domain_lookup(b"tenant.example.com", true)
+                .is_some(),
+            "the wildcard certificate must still serve a subdomain",
+        );
+    }
+}

@@ -1,0 +1,5224 @@
+//! HTTPS proxy entry point.
+//!
+//! Owns the TLS listener config (rustls), the ALPN-driven post-handshake
+//! mux dispatch (`h2` → `ConnectionH2`, `http/1.1` → `ConnectionH1`,
+//! neither → reject + `https.alpn.rejected.{unsupported,http11_disabled}`
+//! metrics), the SNI binding policy (`strict_sni_binding`), and the
+//! listener-update surface called from the command socket. Front-end H2
+//! is gated by ALPN here; `cluster.http2` is a backend-capability hint.
+//! Frontend rustls handshake I/O lives in `lib/src/protocol/rustls.rs`;
+//! certificate resolution lives in `lib/src/tls.rs`.
+
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, hash_map::Entry},
+    io::ErrorKind,
+    net::SocketAddr as StdSocketAddr,
+    rc::{Rc, Weak},
+    str::{from_utf8, from_utf8_unchecked},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use mio::{
+    Interest, Registry, Token,
+    net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
+};
+use rustls::{
+    CipherSuite, ProtocolVersion, RootCertStore, ServerConfig as RustlsServerConfig,
+    ServerConnection, SupportedCipherSuite,
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, CertificateRevocationListDer, pem::PemObject},
+    server::WebPkiClientVerifier,
+};
+use rusty_ulid::Ulid;
+use socket2::SockRef;
+use sozu_command::{
+    certificate::Fingerprint,
+    config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_LIST},
+    listener_key::ListenerKey,
+    proto::command::{
+        AddCertificate, CertificateSummary, CertificatesByAddress, ClientAuthMode,
+        ClientAuthPolicy, Cluster, ForwardedHeaders, HttpsListenerConfig,
+        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
+        UpdateHttpsListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
+        response_content::ContentType,
+    },
+    ready::Ready,
+    response::HttpFrontend,
+    state::{
+        ClusterId, validate_alpn_protocols, validate_forwarded_headers,
+        validate_h2_flood_knobs_https, validate_sozu_id_header,
+    },
+};
+
+use crate::metrics::names;
+use crate::{
+    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    backends::BackendMap,
+    crypto::{cipher_suite_by_name, default_provider, kx_group_by_name},
+    pool::Pool,
+    protocol::{
+        Pipe, SessionState,
+        http::answers::HttpAnswers,
+        http::parser::{Method, hostname_and_port},
+        mux::{self, Mux, MuxTls},
+        proxy_protocol::expect::ExpectProxyProtocol,
+        rustls::TlsHandshake,
+    },
+    router::{RequestHeaders, RouteResult, Router},
+    server::{ListenToken, SessionManager},
+    socket::{FrontRustls, RecvMemory, server_bind},
+    timer::TimeoutContainer,
+    tls::MutexCertificateResolver,
+};
+
+StateMachineBuilder! {
+    /// The various Stages of an HTTPS connection:
+    ///
+    /// - optional (ExpectProxyProtocol)
+    /// - TLS handshake
+    /// - HTTP or HTTP2 (via Mux)
+    /// - WebSocket (passthrough), only from HTTP/1.1
+    enum HttpsStateMachine impl SessionState {
+        Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
+        Handshake(TlsHandshake),
+        Mux(MuxTls),
+        WebSocket(Pipe<FrontRustls, HttpsListener>),
+    }
+}
+
+enum AlpnProtocol {
+    H2,
+    Http11,
+}
+
+/// Monotonic rank of an HTTPS lifecycle stage, used only by `debug_assert!`s to
+/// check that upgrades move strictly forward (Expect → Handshake → Mux →
+/// WebSocket) and never re-enter an earlier stage. Gated to debug builds so it
+/// does not register as dead code in release.
+#[cfg(debug_assertions)]
+fn https_stage_rank(marker: StateMarker) -> u8 {
+    match marker {
+        StateMarker::Expect => 0,
+        StateMarker::Handshake => 1,
+        StateMarker::Mux => 2,
+        StateMarker::WebSocket => 3,
+    }
+}
+
+/// Module-level prefix for log lines emitted from this file when no session
+/// is in scope. Produces a bold bright-white `HTTPS` label in colored mode.
+/// Used by [`HttpsProxy`] / [`HttpsListener`] callbacks (`notify`,
+/// `add_cluster`, `add_*_frontend`, `accept`, `soft_stop`, `hard_stop`)
+/// which own a token map keyed by listener and have no `frontend_token` of
+/// their own.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = sozu_command::logging::ansi_palette();
+        format!("{open}HTTPS{reset}\t >>>", open = open, reset = reset)
+    }};
+}
+
+/// Per-session prefix for log lines emitted with an [`HttpsSession`] in
+/// scope. Renders the canonical `\tHTTPS\tSession(...)\t >>>` envelope from
+/// the session's `frontend_token` and `peer_address`. Operators can grep-
+/// correlate against the token id (and the peer address when present)
+/// across log lines for the same TLS connection.
+macro_rules! log_context {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = sozu_command::logging::ansi_palette();
+        format!(
+            "{open}HTTPS{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            frontend = $self.frontend_token.0,
+            peer = $self.peer_address.map(|a| a.to_string()).unwrap_or_else(|| "<none>".to_string()),
+        )
+    }};
+}
+
+fn successful_tls_handshake_summary(sni: Option<&str>, alpn: Option<&str>) -> String {
+    format!(
+        "successful TLS handshake (sni_bytes={:?}, alpn_bytes={:?})",
+        sni.map(str::len),
+        alpn.map(str::len),
+    )
+}
+
+/// The readiness events the upgraded mux frontend starts with.
+///
+/// WRITABLE always: the H2 server must send its SETTINGS whatever the peer
+/// does next, and an upgrade from `TlsHandshake::writable` has no fresh event.
+///
+/// READABLE only when a read is due without a new edge:
+///
+/// - `handshake_event` still carries READABLE. `handshake_read`
+///   (`lib/src/protocol/rustls.rs`) drops it exactly when a `recv` proved the
+///   receive queue empty — EAGAIN or a short read — and any segment that
+///   arrived since raised an edge that `TlsHandshake::update_readiness` put
+///   back;
+/// - `rustls_holds_input`: `ServerConnection::wants_read()` is false, so
+///   rustls already decrypted plaintext — the HTTP/2 preface or an HTTP/1.1
+///   request that shared a segment with the client `Finished` — or received
+///   `close_notify`. Neither will raise an edge, and the mux read serves both
+///   without a `recv`.
+///
+/// Anything else means the socket was drained after the last edge, and bytes
+/// arriving later raise their own event (mio registers edge-triggered, see
+/// `plain_socket_read` in `lib/src/socket.rs`), so an unconditional READABLE
+/// only bought a `recv` that answered EAGAIN on every TLS connection.
+///
+/// HUP and WRITE_CLOSED survive the upgrade: their edge does not fire again,
+/// and WRITE_CLOSED is what tells the mux a hang-up from a half-close. A client that
+/// half-closed with its request (`TlsHandshake::ready` in
+/// `lib/src/protocol/rustls.rs` reads past that HUP) is served by the mux,
+/// which closes the session on the HUP once the response is complete
+/// (`Mux::ready_inner`). Dropping it left that session open after its
+/// response until the frontend timeout.
+fn upgraded_frontend_events(handshake_event: Ready, rustls_holds_input: bool) -> Ready {
+    // WRITE_CLOSED too: it is what tells a hang-up from a half-close.
+    let hup = handshake_event & (Ready::HUP | Ready::WRITE_CLOSED);
+    if handshake_event.is_readable() || rustls_holds_input {
+        Ready::READABLE | Ready::WRITABLE | hup
+    } else {
+        Ready::WRITABLE | hup
+    }
+}
+
+/// Render an SNI trie key as the `domain` of a [`CertificateSummary`].
+///
+/// Unreachable in practice: every key enters the trie as
+/// `String::into_bytes()` (`tls.rs` `add_certificate`/`remove_certificate`),
+/// so it is always valid UTF-8. `TrieNode`'s key type is `Vec<u8>` though, and
+/// a read-only certificate listing must degrade rather than abort the worker.
+///
+/// The degradation is not silent: `CertificateSummary::domain` is a protobuf
+/// `string`, so a non-UTF-8 name has no faithful rendering, and the U+FFFD
+/// substitutions mean the name handed to the operator will NOT match a later
+/// `RemoveCertificate` for that certificate. That is worth an `error!` rather
+/// than a quietly mangled row. The log carries byte counts only — never the
+/// key — to stay inside the redaction bound the `query_*` log tests assert.
+fn certificate_summary_domain(key: &[u8]) -> String {
+    match from_utf8(key) {
+        Ok(domain) => domain.to_owned(),
+        Err(error) => {
+            error!(
+                "{} certificate domain is not valid UTF-8; the reported name is lossy and will not \
+                 match a later RemoveCertificate, domain_bytes={} valid_up_to={}",
+                log_module_context!(),
+                key.len(),
+                error.valid_up_to(),
+            );
+            String::from_utf8_lossy(key).into_owned()
+        }
+    }
+}
+
+pub struct HttpsSession {
+    configured_backend_timeout: Duration,
+    configured_connect_timeout: Duration,
+    configured_frontend_timeout: Duration,
+    frontend_token: Token,
+    has_been_closed: bool,
+    last_event: Instant,
+    listener: Rc<RefCell<HttpsListener>>,
+    metrics: SessionMetrics,
+    peer_address: Option<StdSocketAddr>,
+    pool: Weak<RefCell<Pool>>,
+    proxy: Rc<RefCell<HttpsProxy>>,
+    public_address: StdSocketAddr,
+    state: HttpsStateMachine,
+}
+
+impl HttpsSession {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
+        configured_frontend_timeout: Duration,
+        configured_request_timeout: Duration,
+        expect_proxy: bool,
+        listener: Rc<RefCell<HttpsListener>>,
+        pool: Weak<RefCell<Pool>>,
+        proxy: Rc<RefCell<HttpsProxy>>,
+        public_address: StdSocketAddr,
+        rustls_details: ServerConnection,
+        sock: MioTcpStream,
+        peer: StdSocketAddr,
+        token: Token,
+        wait_time: Duration,
+    ) -> HttpsSession {
+        // Timeouts are wired from the listener config and feed `TimeoutContainer`s
+        // that arm the event loop. A zero request timeout would arm a deadline that
+        // fires on the very next tick, so reaching this constructor with one signals
+        // a config-loading bug upstream rather than hostile input.
+        debug_assert!(
+            !configured_request_timeout.is_zero(),
+            "HTTPS session request timeout must be non-zero (would arm an immediate deadline)"
+        );
+        debug_assert!(
+            !configured_frontend_timeout.is_zero() && !configured_backend_timeout.is_zero(),
+            "HTTPS session front/back timeouts must be non-zero"
+        );
+
+        let peer_address = if expect_proxy {
+            // Will be defined later once the expect proxy header has been received and parsed
+            None
+        } else {
+            // The address `accept(2)` returned with `sock`.
+            Some(peer)
+        };
+
+        let request_id = Ulid::generate();
+        let container_frontend_timeout = TimeoutContainer::new(configured_request_timeout, token);
+
+        let state = if expect_proxy {
+            trace!("{} starting in expect proxy state", log_module_context!());
+            gauge_add!(names::protocol::PROXY_EXPECT, 1);
+            HttpsStateMachine::Expect(
+                ExpectProxyProtocol::new(container_frontend_timeout, sock, token, request_id),
+                rustls_details,
+            )
+        } else {
+            gauge_add!(names::protocol::TLS_HANDSHAKE, 1);
+            HttpsStateMachine::Handshake(TlsHandshake::new(
+                container_frontend_timeout,
+                rustls_details,
+                sock,
+                token,
+                request_id,
+                peer_address,
+            ))
+        };
+
+        // The freshly built state must reflect the entry-protocol choice exactly:
+        // `expect_proxy` enters via PROXY-protocol parsing, otherwise straight into
+        // the TLS handshake. No other entry state is legal, and `peer_address` is
+        // unknown until the PROXY header is parsed (mirror of the `if` above).
+        debug_assert_eq!(
+            matches!(state, HttpsStateMachine::Expect(..)),
+            expect_proxy,
+            "fresh HTTPS session must start in Expect iff expect_proxy is set"
+        );
+        debug_assert!(
+            expect_proxy || matches!(state, HttpsStateMachine::Handshake(_)),
+            "non-expect-proxy HTTPS session must start in the TLS Handshake state"
+        );
+        debug_assert!(
+            !expect_proxy || peer_address.is_none(),
+            "expect-proxy peer address is only known after the PROXY header is parsed"
+        );
+
+        let metrics = SessionMetrics::new(Some(wait_time));
+        HttpsSession {
+            configured_backend_timeout,
+            configured_connect_timeout,
+            configured_frontend_timeout,
+            frontend_token: token,
+            has_been_closed: false,
+            last_event: Instant::now(),
+            listener,
+            metrics,
+            peer_address,
+            pool,
+            proxy,
+            public_address,
+            state,
+        }
+    }
+
+    pub fn upgrade(&mut self) -> SessionIsToBeClosed {
+        debug!("{} upgrade", log_context!(self));
+        // `take()` swaps in a FailedUpgrade carrying the marker of the state we
+        // are leaving, so the marker observed here is the *origin* of this
+        // upgrade. Capture it to check the transition is forward-only below.
+        // Read only by debug-only asserts → cfg-gated so release has no unused
+        // binding.
+        #[cfg(debug_assertions)]
+        let from_marker = self.state.marker();
+        let new_state = match self.state.take() {
+            HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
+            HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
+            HttpsStateMachine::Mux(mux) => self.upgrade_mux(mux),
+            HttpsStateMachine::WebSocket(wss) => self.upgrade_websocket(wss),
+            HttpsStateMachine::FailedUpgrade(_) => {
+                // Reaching this arm means a prior upgrade already returned
+                // `None` and the session should have been closed. Fall back
+                // to closing cleanly instead of panicking the worker.
+                error!(
+                    "{} upgrade called on FailedUpgrade state; closing session",
+                    log_context!(self)
+                );
+                None
+            }
+        };
+
+        match new_state {
+            Some(state) => {
+                // The HTTPS lifecycle is strictly forward: Expect → Handshake →
+                // Mux → WebSocket. A successful upgrade must move to a strictly
+                // later stage and never re-enter the one it came from (no
+                // re-handshake mid-stream, no fall-back to Expect). `WebSocket`
+                // is terminal: `upgrade_websocket` returns the same state, so we
+                // exempt the self-loop there. The whole assert is cfg-gated (not
+                // just `debug_assert!`'s runtime guard) because its argument calls
+                // the debug-only `https_stage_rank`; leaving the call to compile
+                // in release would be an E0425 (HARD RULE #2).
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    https_stage_rank(state.marker()) > https_stage_rank(from_marker)
+                        || matches!(from_marker, StateMarker::WebSocket),
+                    "HTTPS upgrade must advance the lifecycle (from {:?} to {:?})",
+                    from_marker,
+                    state.marker()
+                );
+                debug_assert!(
+                    !state.failed(),
+                    "a successful HTTPS upgrade must not yield a FailedUpgrade state"
+                );
+                self.state = state;
+                false
+            }
+            // The state stays FailedUpgrade, but the Session should be closed right after
+            None => {
+                // On a refused upgrade `take()` left a FailedUpgrade behind that
+                // still remembers the origin stage, so `close()` can restore the
+                // right gauge. Guard that the marker survived the failed attempt.
+                debug_assert!(
+                    self.state.failed(),
+                    "a refused HTTPS upgrade must leave the state in FailedUpgrade"
+                );
+                // cfg-gated for the same E0425 reason as the success arm above.
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    https_stage_rank(self.state.marker()) == https_stage_rank(from_marker),
+                    "FailedUpgrade must retain the origin stage marker for gauge restoration"
+                );
+                true
+            }
+        }
+    }
+
+    fn upgrade_expect(
+        &mut self,
+        mut expect: ExpectProxyProtocol<MioTcpStream>,
+        ssl: ServerConnection,
+    ) -> Option<HttpsStateMachine> {
+        if let Some(ref addresses) = expect.addresses
+            && let (Some(public_address), Some(session_address)) =
+                (addresses.destination(), addresses.source())
+        {
+            self.public_address = public_address;
+            self.peer_address = Some(session_address);
+
+            let ExpectProxyProtocol {
+                container_frontend_timeout,
+                frontend,
+                frontend_readiness: readiness,
+                request_id,
+                ..
+            } = expect;
+
+            let mut handshake = TlsHandshake::new(
+                container_frontend_timeout,
+                ssl,
+                frontend,
+                self.frontend_token,
+                request_id,
+                self.peer_address,
+            );
+            // Transfer both interest and event from the proxy protocol state,
+            // so the event loop properly monitors the socket after the transition.
+            handshake.frontend_readiness = readiness;
+            handshake.frontend_readiness.event.insert(Ready::READABLE);
+
+            // The PROXY header just resolved both endpoints; the session now
+            // knows its true peer, and the handshake must watch for readable
+            // bytes or the TLS ClientHello will never be serviced.
+            debug_assert_eq!(
+                self.peer_address,
+                Some(session_address),
+                "expect upgrade must adopt the PROXY-advertised source as the peer address"
+            );
+            debug_assert!(
+                handshake.frontend_readiness.event.is_readable(),
+                "handshake handed off from expect must be armed for READABLE"
+            );
+
+            gauge_add!(names::protocol::PROXY_EXPECT, -1);
+            gauge_add!(names::protocol::TLS_HANDSHAKE, 1);
+            return Some(HttpsStateMachine::Handshake(handshake));
+        }
+
+        // currently, only happens in expect proxy protocol with AF_UNSPEC address
+        if !expect.container_frontend_timeout.cancel() {
+            error!(
+                "{} failed to cancel request timeout on expect upgrade phase for 'expect proxy protocol with AF_UNSPEC address'",
+                log_context!(self)
+            );
+        }
+
+        None
+    }
+
+    fn upgrade_handshake(&mut self, handshake: TlsHandshake) -> Option<HttpsStateMachine> {
+        // Capture the SNI as an owned, already-lowercased String so it outlives
+        // the `handshake.session` move below. Lowercasing here once avoids
+        // doing it on every route decision (RFC 9110 §4.2.3 says hostnames are
+        // case-insensitive); no port is ever part of an SNI value (RFC 6066
+        // §3 — `HostName` is a dns_name, no port).
+        // RFC 1034 §3.1 absolute-form: `example.com.` and `example.com`
+        // are the same host. rustls hands us the wire-form SNI verbatim;
+        // strip a single trailing dot so a legitimate client emitting
+        // absolute-form SNI does not get its
+        // `host` / `:authority` rejected by `authority_matches_sni` for a
+        // length mismatch. Empty / no-SNI is unaffected.
+        let sni_owned: Option<String> = handshake
+            .session
+            .server_name()
+            .map(|s| s.to_ascii_lowercase())
+            .map(|mut s| {
+                if s.ends_with('.') {
+                    s.pop();
+                }
+                s
+            });
+        let alpn = handshake.session.alpn_protocol();
+        let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
+        debug!(
+            "{} {}",
+            log_context!(self),
+            successful_tls_handshake_summary(sni_owned.as_deref(), alpn)
+        );
+
+        // Reject clients that fail to negotiate `h2` when the listener is
+        // configured as H2-only: silently falling back to HTTP/1.1 would let a
+        // downgrade-capable peer bypass H2-specific protections advertised
+        // for this listener (Pass 5 Medium #4 of the security audit).
+        let disable_http11 = self.listener.borrow().is_http11_disabled();
+        // Pair the parsed AlpnProtocol with the on-the-wire label so the
+        // access log can record it as a `&'static str` without re-stringifying
+        // the protocol enum on every request. Unknown ALPN values still bail
+        // out below — only successful negotiations propagate to the log.
+        let (alpn, alpn_label): (AlpnProtocol, Option<&'static str>) = match alpn {
+            Some("http/1.1") => {
+                if disable_http11 {
+                    incr!(names::https::ALPN_REJECTED_HTTP11_DISABLED);
+                    warn!(
+                        "{} rejecting TLS connection: listener is H2-only but client negotiated http/1.1",
+                        log_context!(self)
+                    );
+                    return None;
+                }
+                (AlpnProtocol::Http11, Some("http/1.1"))
+            }
+            Some("h2") => (AlpnProtocol::H2, Some("h2")),
+            Some(other) => {
+                // This branch was not metered, so any operator dashboard
+                // graphing `https.alpn.rejected.*`
+                // missed unknown-protocol refusals (e.g. an `h3` mistake
+                // bleeding through some misconfiguration). Add a dedicated
+                // counter so the SOC's "ALPN refusal" ratebar matches the
+                // sum of the labelled buckets.
+                incr!(names::https::ALPN_REJECTED_UNSUPPORTED);
+                error!(
+                    "{} unsupported ALPN protocol: alpn_bytes={}",
+                    log_context!(self),
+                    other.len()
+                );
+                return None;
+            }
+            // Some clients don't fill in the ALPN protocol. By default we
+            // downgrade to HTTP/1.1 to preserve compatibility; on an H2-only
+            // listener we instead drop the connection.
+            None => {
+                if disable_http11 {
+                    incr!(names::https::ALPN_REJECTED_HTTP11_DISABLED);
+                    warn!(
+                        "{} rejecting TLS connection: listener is H2-only but client did not negotiate ALPN",
+                        log_context!(self)
+                    );
+                    return None;
+                }
+                (AlpnProtocol::Http11, None)
+            }
+        };
+
+        // Post-decision invariant: every refusal path above already returned, so
+        // reaching here means the negotiated protocol is one Sōzu serves. An
+        // H2-only listener must therefore have landed on H2 — never on the H1
+        // dispatch — or the `disable_http11` guard leaked a downgrade. The label,
+        // when present, must name exactly the protocol we are about to build.
+        debug_assert!(
+            !disable_http11 || matches!(alpn, AlpnProtocol::H2),
+            "H2-only listener must not dispatch an HTTP/1.1 session past ALPN"
+        );
+        debug_assert!(
+            match (&alpn, alpn_label) {
+                (AlpnProtocol::H2, Some(l)) => l == "h2",
+                (AlpnProtocol::Http11, Some(l)) => l == "http/1.1",
+                // Absent label only for ALPN-less HTTP/1.1 downgrade.
+                (AlpnProtocol::Http11, None) => true,
+                (AlpnProtocol::H2, None) => false,
+            },
+            "negotiated ALPN protocol and its wire label must agree"
+        );
+
+        // Capture the negotiated TLS metadata as `&'static str` labels for the
+        // access log alongside the existing metric counters. Both calls are
+        // single rustls accessors — duplicating them keeps the metric path
+        // unchanged and avoids mutating-after-move on `handshake.session`.
+        let tls_version_label = handshake
+            .session
+            .protocol_version()
+            .and_then(rustls_version_label);
+        let tls_cipher_label = handshake
+            .session
+            .negotiated_cipher_suite()
+            .and_then(rustls_ciphersuite_label);
+        if let Some(version) = handshake.session.protocol_version() {
+            incr!(rustls_version_str(version));
+        };
+        if let Some(cipher) = handshake.session.negotiated_cipher_suite() {
+            incr!(rustls_ciphersuite_str(cipher));
+        };
+
+        gauge_add!(names::protocol::TLS_HANDSHAKE, -1);
+
+        // Read before `handshake.session` moves into `FrontRustls` below.
+        let frontend_events = upgraded_frontend_events(
+            handshake.frontend_readiness.event,
+            !handshake.session.wants_read(),
+        );
+        // No READABLE left in the handshake's event: its last `recv` proved
+        // the socket empty and no data event was delivered since, so the
+        // first mux read serves what rustls holds without a `recv`.
+        let recv_memory =
+            RecvMemory::after_handshake(!handshake.frontend_readiness.event.is_readable());
+
+        let session_ulid = rusty_ulid::Ulid::generate();
+        let front_stream = FrontRustls {
+            stream: handshake.stream,
+            session: handshake.session,
+            peer_disconnected: false,
+            peer_reset: false,
+            tls_fatal: false,
+            session_ulid,
+            // `self.peer_address`, NOT `stream.peer_addr()`. On an expect-proxy
+            // frontend `upgrade_expect` has already adopted the PROXY-advertised
+            // source here, while the socket's own peer is the load balancer: the
+            // raw lookup compiles, passes, and silently makes the `MUX-*` lines
+            // name a different host than the `HTTPS` line for the same request
+            // id. This is the same value handed to `Context::new` below, so the
+            // two halves of the session agree by construction.
+            configured_peer: self.peer_address,
+            recv_memory,
+        };
+        let router = mux::Router::new(
+            self.configured_backend_timeout,
+            self.configured_connect_timeout,
+        );
+        let mut context = mux::Context::new(
+            session_ulid,
+            self.pool.clone(),
+            self.listener.clone(),
+            self.peer_address,
+            self.public_address,
+        );
+        // Snapshot the SAN set of the certificate this handshake actually
+        // served. Frozen at handshake to match browser behaviour (Firefox
+        // and Chrome cache the validated cert per connection — RFC 7540
+        // §9.1.1 / RFC 9113 §9.1.1) and so the H2 router can accept
+        // coalesced streams whose `:authority` is covered by any SAN
+        // (RFC 6125 §6.4.3 wildcards).
+        //
+        // # Known race window (accepted risk)
+        //
+        // This is a SECOND lookup, separate from rustls's `resolve()`
+        // callback. Between rustls's `resolve()` (during ClientHello
+        // processing) and this block (post-`Finished`), the mio loop may
+        // dispatch the command-channel token — handlers there call
+        // `add_certificate` / `remove_certificate`, which mutate the same
+        // resolver trie. The single-threaded-worker invariant prevents
+        // simultaneous mutation, but not interleaving between mio
+        // iterations.
+        //
+        // Realistic threat model: internal misuse — a tenant operator
+        // with config-IPC privilege races a `remove_certificate(A)` plus
+        // `add_certificate(B covering same SNI)` inside the handshake
+        // window. The snapshot below then reflects B instead of A. The
+        // attacker already holds the trust boundary they would need to
+        // mint a malicious cert outright (config IPC == resolver write
+        // privilege), so the race grants no privilege the attacker did
+        // not already have. Closing it structurally would require either
+        // (a) rustls API support to recover the served cert chain
+        // post-handshake (`server_cert_chain` is `pub(crate)` in rustls
+        // 0.23.x) or (b) threading per-session state from `resolve()` to
+        // here through a side-channel that handles out-of-order handshake
+        // completion — both deferred. Keep the second lookup; document
+        // the window honestly.
+        //
+        // Cases handled:
+        //   * SNI absent → `None`; routing falls back to the legacy
+        //     `authority_matches_sni` predicate (no SNI ⇒ predicate no-ops).
+        //   * SNI present and the resolver returned a SAN-bearing cert →
+        //     `Some(snapshot)` (lowercase + trailing-dot strip + dedup).
+        //     Routing accepts `:authority` covered by the SAN set with
+        //     RFC 6125 §6.4.3 wildcard handling — this is the H2
+        //     connection-coalescing fix (RFC 7540 §9.1.1 / RFC 9113
+        //     §9.1.1, Firefox + Chrome semantics).
+        //   * SNI present but no matching cert (rustls served the default
+        //     cert) → `None`. The legacy exact-match fallback applies:
+        //     accept iff `:authority == SNI`, identical to the pre-fix
+        //     behaviour. Returning `Some(empty)` here would block every
+        //     authority — including configurations where the operator
+        //     intentionally keeps a frontend reachable on a different cert
+        //     (test fixtures, dev setups, misconfigured listeners). The
+        //     real defence stays on the client: a browser will refuse the
+        //     default cert when SNI doesn't validate against it; a
+        //     deliberate insecure client choosing to ignore that is
+        //     responsible for its own behaviour and is not a trust-boundary
+        //     concern for the proxy.
+        let tls_cert_names: Option<Arc<Vec<String>>> = match sni_owned.as_deref() {
+            Some(sni) => self
+                .listener
+                .borrow()
+                .resolver()
+                .names_for_sni(sni.as_bytes())
+                .and_then(|names| {
+                    let mut snapshot: Vec<String> = names
+                        .into_iter()
+                        .map(|mut name| {
+                            name.make_ascii_lowercase();
+                            if name.ends_with('.') {
+                                name.pop();
+                            }
+                            name
+                        })
+                        .collect();
+                    snapshot.sort();
+                    snapshot.dedup();
+                    if snapshot.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(snapshot))
+                    }
+                }),
+            None => None,
+        };
+        // Structural postcondition of the SAN-snapshot builder above: a cert-name
+        // snapshot only exists when the client sent an SNI (the `None => None`
+        // arm), and when present it is non-empty (empty collapses to `None`) and
+        // sorted+deduped (so the H2 router's coalescing check sees a canonical
+        // set). These hold regardless of `strict_sni_binding`; the binding policy
+        // is *enforced* later at routing, but the snapshot feeding it must be
+        // well-formed here.
+        debug_assert!(
+            tls_cert_names.is_none() || sni_owned.is_some(),
+            "cert-name snapshot must not exist without an SNI to key it"
+        );
+        debug_assert!(
+            tls_cert_names
+                .as_ref()
+                .is_none_or(|names| { !names.is_empty() && names.windows(2).all(|w| w[0] < w[1]) }),
+            "cert-name snapshot must be non-empty and strictly sorted (sorted + deduped)"
+        );
+
+        // Bind the TLS SNI to this session so the routing layer can reject any
+        // H2 stream whose `:authority` crosses the TLS trust boundary (see
+        // `route_from_request`).
+        context.tls_server_name = sni_owned;
+        context.tls_cert_names = tls_cert_names;
+        // Stamp the connection-scoped TLS metadata so every per-stream
+        // HttpContext created by `Context::create_stream` inherits it for
+        // the access log without re-querying rustls.
+        context.tls_version = tls_version_label;
+        context.tls_cipher = tls_cipher_label;
+        context.tls_alpn = alpn_label;
+        let mut frontend = match alpn {
+            AlpnProtocol::Http11 => {
+                incr!(names::http::ALPN_HTTP11);
+                context.create_stream(handshake.request_id, 1 << 16)?;
+                mux::Connection::new_h1_server(
+                    session_ulid,
+                    front_stream,
+                    handshake.container_frontend_timeout.duration(),
+                )
+            }
+            AlpnProtocol::H2 => {
+                incr!(names::http::ALPN_H2);
+                let flood_config = self.listener.borrow().get_h2_flood_config();
+                let connection_config = self.listener.borrow().get_h2_connection_config();
+                let stream_idle_timeout = self.listener.borrow().get_h2_stream_idle_timeout();
+                let graceful_shutdown_deadline =
+                    self.listener.borrow().get_h2_graceful_shutdown_deadline();
+                mux::Connection::new_h2_server(
+                    session_ulid,
+                    front_stream,
+                    &mut *context.buffers,
+                    handshake.container_frontend_timeout.duration(),
+                    flood_config,
+                    connection_config,
+                    stream_idle_timeout,
+                    graceful_shutdown_deadline,
+                )?
+            }
+        };
+        // Arm the upgraded connection. With TLS 1.3 + NewSessionTicket, the
+        // upgrade may happen from writable() where READABLE is no longer in the
+        // event (consumed by the prior readable() call). The HTTP/2 preface may
+        // already be in rustls's plaintext buffer (not on the TCP socket), so no
+        // new READABLE event from epoll will arrive: `upgraded_frontend_events`
+        // arms READABLE for it, and for an edge the handshake has not read yet,
+        // but not for a socket the handshake proved empty (#1609). Without
+        // WRITABLE in the event, the H2 state machine cannot transition from
+        // reading the preface to writing SETTINGS, causing a deadlock with
+        // clients (like hyper) that wait for the server's SETTINGS before
+        // proceeding.
+        frontend.readiness_mut().event.insert(frontend_events);
+
+        // Post-handoff: the mux frontend MUST be armed for WRITABLE, and for
+        // READABLE whenever a read is due without a new edge, or the H2
+        // preface→SETTINGS exchange deadlocks (see the comment above). This is
+        // the structural guarantee the insert just made — assert it survived.
+        debug_assert!(
+            frontend.readiness_mut().event.is_writable()
+                && (!frontend_events.is_readable() || frontend.readiness_mut().event.is_readable()),
+            "post-handshake mux frontend must be armed for WRITABLE, and READABLE when due"
+        );
+        // The two crate halves of the H2/H1 session reference streams by a shared
+        // ulid; the handshake-derived ulid must thread through both the connection
+        // and its context unchanged, otherwise per-stream lookups cross sessions.
+        debug_assert_eq!(
+            context.session_ulid, session_ulid,
+            "mux context and connection must share the handshake-derived session ulid"
+        );
+
+        gauge_add!(names::protocol::HTTPS, 1);
+        Some(HttpsStateMachine::Mux(Mux {
+            configured_frontend_timeout: self.configured_frontend_timeout,
+            frontend_token: self.frontend_token,
+            frontend,
+            context,
+            router,
+            session_ulid,
+            // Carry the already-armed handshake entry into the adapter rather
+            // than dropping it and arming a fresh one: the session's request
+            // timeout started when the socket was accepted.
+            timeouts: mux::MuxTimeouts::new(handshake.container_frontend_timeout),
+            backend_registry: mux::BackendRegistry::default(),
+            // Read once, at the upgrade: the proxy is not borrowed while a
+            // session runs, and `HttpsProxy::backends` is never reassigned,
+            // so this is the map the session would have reached on every dial.
+            backends: Rc::clone(&self.proxy.borrow().backends),
+        }))
+    }
+
+    fn upgrade_mux(&self, mut mux: MuxTls) -> Option<HttpsStateMachine> {
+        debug!("{} mux switching to wss", log_context!(self));
+        let Some(stream) = mux.context.streams.pop() else {
+            error!(
+                "{} upgrade_mux: no stream attached to the TLS mux session, closing",
+                log_context!(self)
+            );
+            return None;
+        };
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs before MuxResult::Upgrade was returned to us.
+
+        // The cores no longer own a wheel handle; the `Mux` adapter does. Move
+        // the frontend's out of the adapter before dismantling the
+        // connection, so the WebSocket `Pipe` inherits the same live entry it
+        // used to inherit from `ConnectionH1`.
+        let mut container_frontend_timeout = mux.timeouts.frontend;
+        let (frontend_readiness, frontend_socket) = match mux.frontend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                readiness, socket, ..
+            }) => (readiness, socket),
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
+
+        let mux::StreamState::Linked(back_token) = stream.state else {
+            error!(
+                "{} upgrading stream should be linked to a backend",
+                log_context!(self)
+            );
+            return None;
+        };
+        let Some(backend) = mux.router.backends.remove(&back_token) else {
+            error!(
+                "{} upgrade_mux: backend for token {:?} is missing (already disconnected?), closing",
+                log_context!(self),
+                back_token
+            );
+            return None;
+        };
+        let mut container_backend_timeout = mux
+            .timeouts
+            .backends
+            .remove(&back_token)
+            .unwrap_or_else(|| TimeoutContainer::new_empty(mux.router.configured_backend_timeout));
+        let (cluster_id, backend_id, backend_readiness, backend_socket) = match backend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                position: mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
+                readiness,
+                socket,
+                ..
+            }) => (cluster_id, backend, readiness, socket),
+            mux::Connection::H1(_) => {
+                error!(
+                    "{} the backend disconnected just after upgrade, abort",
+                    log_context!(self)
+                );
+                return None;
+            }
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
+
+        // The mux core carries an opaque `BackendId` (#1340, Q12); the
+        // WebSocket `Pipe` that takes this backend over still owns the
+        // registry handle, so resolve it here, on the embedder's side of that
+        // perimeter, through the one accessor there is.
+        let Some(backend) = mux.backend_registry.handle(&backend_id).cloned() else {
+            error!(
+                "{} upgrade_mux: backend {:?} names a slot this session never minted, closing",
+                log_context!(self),
+                backend_id.backend_id
+            );
+            return None;
+        };
+        let metric_incarnation = backend_id.metric_incarnation();
+        let backend_id = backend_id.backend_id.to_string();
+
+        let ws_context = stream.context.websocket_context();
+
+        container_frontend_timeout.reset();
+        container_backend_timeout.reset();
+
+        // Unwrap the `SessionTcpStream` that the mux put around every backend
+        // TCP socket — `Pipe::backend_socket` is typed `Option<TcpStream>`.
+        let backend_socket = backend_socket.stream;
+        let mut pipe = Pipe::new(
+            stream.back.storage.buffer,
+            Some(backend_id),
+            Some(backend_socket),
+            Some(backend),
+            Some(container_backend_timeout),
+            Some(container_frontend_timeout),
+            Some(cluster_id),
+            stream.front.storage.buffer,
+            self.frontend_token,
+            frontend_socket,
+            self.listener.clone(),
+            Protocol::HTTPS,
+            stream.context.session_id,
+            stream.context.id,
+            stream.context.session_address,
+            ws_context,
+        );
+        pipe.set_cluster_metrics_incarnation(metric_incarnation);
+
+        pipe.restore_readiness_events(frontend_readiness.event, backend_readiness.event);
+        pipe.set_back_token(back_token);
+        // The WSS pipe is a frontend↔backend bridge: it only exists because the
+        // upgrading stream was `Linked(back_token)` to a *connected* backend (the
+        // guard arms above already rejected `!Connected` and missing backends).
+        // So the back token must be set, and set to exactly the token we routed.
+        debug_assert!(
+            pipe.back_token().contains(&back_token),
+            "WSS pipe back token must be the connected backend token carried from the mux"
+        );
+        // Carry the connection-scoped TLS metadata captured at handshake time
+        // into the post-upgrade WSS pipe so its access log records the same
+        // version/cipher/sni/alpn the H1 request log already emitted. `clone`
+        // on the SNI is the only heap touch — the other three are
+        // `&'static str` borrows into the rustls label tables.
+        pipe.set_tls_metadata(
+            stream.context.tls_version,
+            stream.context.tls_cipher,
+            stream.context.tls_server_name.clone(),
+            stream.context.tls_alpn,
+        );
+
+        // Gauge accounting for the Mux→WebSocket transition is a balanced
+        // hand-off: exactly one HTTPS gauge leaves and one WSS gauge arrives, so
+        // the live-session total is conserved. The readiness events captured from
+        // the mux frontend/backend must survive the transfer into the pipe — a
+        // lost event would silently park the bridge with no epoll wake-up.
+        debug_assert_eq!(
+            pipe.frontend_readiness.event, frontend_readiness.event,
+            "WSS pipe must inherit the mux frontend readiness event verbatim"
+        );
+        debug_assert_eq!(
+            pipe.backend_readiness.event, backend_readiness.event,
+            "WSS pipe must inherit the mux backend readiness event verbatim"
+        );
+
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
+        gauge_add!(names::protocol::HTTPS, -1);
+        gauge_add!(names::protocol::WSS, 1);
+        gauge_add!(names::websocket::ACTIVE_REQUESTS, 1);
+        Some(HttpsStateMachine::WebSocket(pipe))
+    }
+
+    fn upgrade_websocket(
+        &self,
+        wss: Pipe<FrontRustls, HttpsListener>,
+    ) -> Option<HttpsStateMachine> {
+        // what do we do here?
+        error!(
+            "{} upgrade called on WSS, this should not happen",
+            log_context!(self)
+        );
+        Some(HttpsStateMachine::WebSocket(wss))
+    }
+
+    /// Full cross-field invariant sweep for the session state machine, run as a
+    /// run-to-completion postcondition at the end of `ready()` (the public
+    /// mutating entry point). Encodes only relationships that must hold for any
+    /// live HTTPS session regardless of network input; a violation here is a
+    /// Sōzu logic bug, never a property of hostile traffic.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        // Timeouts are immutable for the session's lifetime and were validated as
+        // non-zero at construction; they must never drift to zero (which would
+        // arm an immediate-firing deadline on the next state hand-off).
+        debug_assert!(
+            !self.configured_frontend_timeout.is_zero()
+                && !self.configured_backend_timeout.is_zero()
+                && !self.configured_connect_timeout.is_zero(),
+            "HTTPS session timeouts must stay non-zero for the session lifetime"
+        );
+        // The marker is total over the four live stages plus FailedUpgrade; a
+        // FailedUpgrade session is awaiting close and must report `failed()`,
+        // while any of the four live stages must not. This is the structural
+        // bridge the gauge-restore logic in `close()` relies on.
+        if self.state.failed() {
+            debug_assert!(
+                matches!(
+                    self.state.marker(),
+                    StateMarker::Expect
+                        | StateMarker::Handshake
+                        | StateMarker::Mux
+                        | StateMarker::WebSocket
+                ),
+                "FailedUpgrade must retain a valid origin-stage marker"
+            );
+        } else {
+            debug_assert!(
+                !self.state.failed(),
+                "a non-failed session must not also report FailedUpgrade"
+            );
+        }
+        // Before the PROXY header resolves, the Expect stage has no peer address;
+        // once any later stage is reached the address is either the real peer
+        // (direct TLS) or the PROXY-advertised source. We only assert the Expect
+        // direction, since direct-TLS `peer_addr()` may legitimately fail and
+        // leave `None` at handshake time.
+        debug_assert!(
+            !matches!(self.state.marker(), StateMarker::Expect)
+                || self.peer_address.is_none()
+                || self.state.failed(),
+            "a live Expect-stage session has no resolved peer address yet"
+        );
+    }
+}
+
+impl ProxySession for HttpsSession {
+    fn close(&mut self) {
+        if self.has_been_closed {
+            return;
+        }
+        // Reaching past the idempotency guard means this is the *first* close.
+        // Every exit below sets `has_been_closed = true`, so a clear flag here is
+        // a real precondition (the gauge restore that follows must run exactly
+        // once or the per-protocol gauge underflows / over-counts).
+        debug_assert!(
+            !self.has_been_closed,
+            "close() body must run only on a not-yet-closed session"
+        );
+
+        trace!("{} closing HTTPS session", log_context!(self));
+        self.metrics.service_stop();
+
+        // Restore gauges
+        match self.state.marker() {
+            StateMarker::Expect => gauge_add!(names::protocol::PROXY_EXPECT, -1),
+            StateMarker::Handshake => gauge_add!(names::protocol::TLS_HANDSHAKE, -1),
+            StateMarker::Mux => gauge_add!(names::protocol::HTTPS, -1),
+            StateMarker::WebSocket => {
+                gauge_add!(names::protocol::WSS, -1);
+                gauge_add!(names::websocket::ACTIVE_REQUESTS, -1);
+            }
+        }
+
+        if self.state.failed() {
+            match self.state.marker() {
+                StateMarker::Expect => incr!(names::https::UPGRADE_EXPECT_FAILED),
+                StateMarker::Handshake => incr!(names::https::UPGRADE_HANDSHAKE_FAILED),
+                StateMarker::Mux => incr!(names::https::UPGRADE_MUX_FAILED),
+                StateMarker::WebSocket => incr!(names::https::UPGRADE_WSS_FAILED),
+            }
+            // FailedUpgrade means the socket was consumed by a failed upgrade
+            // attempt, so we can only close the state (no-op) and remove the
+            // session — cancel_timeouts / front_socket are unreachable.
+            self.state.close(self.proxy.clone(), &mut self.metrics);
+            self.proxy.borrow().remove_session(self.frontend_token);
+            self.has_been_closed = true;
+            return;
+        }
+
+        self.state.cancel_timeouts();
+        // defer backend closing to the state
+        // in case of https it should also send a close notify on the client before the socket is closed below
+        self.state.close(self.proxy.clone(), &mut self.metrics);
+
+        // Shut down the write side only. shutdown(Both) includes SHUT_RD which
+        // discards unread data in the receive buffer (e.g. client's GOAWAY, ACKs).
+        // On Linux, close() after SHUT_RD with discarded receive data sends TCP RST
+        // instead of FIN, destroying any data still in the send buffer — including
+        // TLS records that the drain loop just flushed. Using SHUT_WR only sends
+        // FIN after all send buffer data is delivered, preserving the response.
+        // Skipped once the client has closed its side: the close that follows
+        // sends the same FIN or RST on its own (`mux::shutdown_write`). Over
+        // TLS that includes a client whose EOF or `close_notify` a read has
+        // already met (`FrontRustls::peer_disconnected`), which no epoll
+        // event reports when the close follows in the same pass.
+        let peer_closed = match &self.state {
+            HttpsStateMachine::Mux(mux) => {
+                mux.frontend_peer_closed()
+                    || match &mux.frontend {
+                        mux::Connection::H1(connection) => connection.socket.peer_disconnected,
+                        mux::Connection::H2(connection) => connection.socket.peer_disconnected,
+                    }
+            }
+            _ => false,
+        };
+        let front_socket = self.state.front_socket();
+        if let Err(e) = mux::shutdown_write(front_socket, peer_closed) {
+            // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
+            if e.kind() != ErrorKind::NotConnected {
+                error!(
+                    "{} error shutting down front socket({:?}): {:?}",
+                    log_context!(self),
+                    front_socket,
+                    e
+                );
+            }
+        }
+
+        // No `EPOLL_CTL_DEL` for the front socket: its only descriptor closes
+        // when this session drops, which `shut_down_sessions_by_frontend_tokens`
+        // (`lib/src/server.rs`) does before the event loop's next `epoll_wait`,
+        // and Linux removes a file from every epoll set on its last close.
+        // That holds because nothing duplicates a session socket: no `dup` or
+        // `try_clone`, no fork from a worker, and SCM_RIGHTS only carries
+        // listeners. The explicit deregister was one syscall per connection
+        // that bought nothing; see §11 of `doc/lifetime_of_a_session.md`.
+        let proxy = self.proxy.borrow();
+        proxy.remove_session(self.frontend_token);
+
+        self.has_been_closed = true;
+        // Postcondition: a session that completed `close()` is sealed — any later
+        // `close()` short-circuits on the guard above, keeping the gauge restore
+        // single-shot.
+        debug_assert!(
+            self.has_been_closed,
+            "close() must leave the session marked closed"
+        );
+    }
+
+    fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
+        let session_result = self.state.timeout(token, &mut self.metrics);
+        if session_result == StateResult::CloseSession {
+            debug!(
+                "{} HTTPS timeout requested close: token={:?}, marker={:?}",
+                log_context!(self),
+                token,
+                self.state.marker()
+            );
+        }
+        session_result == StateResult::CloseSession
+    }
+
+    fn needs_ready_pass(&self) -> bool {
+        matches!(&self.state, HttpsStateMachine::Mux(mux) if mux.has_pending_backend_failure())
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTPS
+    }
+
+    fn update_readiness(&mut self, token: Token, events: Ready) {
+        trace!(
+            "{} token {:?} got event {}",
+            log_context!(self),
+            token,
+            super::ready_to_string(events)
+        );
+        self.last_event = Instant::now();
+        self.metrics.wait_start();
+        if token == self.frontend_token {
+            // Whatever a `recv` proved about the frontend's receive queue,
+            // bytes may have arrived since: `RecvMemory` (`lib/src/socket.rs`).
+            match &mut self.state {
+                HttpsStateMachine::Mux(mux) => mux
+                    .frontend
+                    .socket_handler_mut()
+                    .readiness_delivered(events),
+                HttpsStateMachine::WebSocket(pipe) => {
+                    pipe.front_socket_handler_mut().readiness_delivered(events)
+                }
+                // No `FrontRustls` yet, or none any more.
+                HttpsStateMachine::Expect(..)
+                | HttpsStateMachine::Handshake(_)
+                | HttpsStateMachine::FailedUpgrade(_) => {}
+            }
+        }
+        self.state.update_readiness(token, events);
+    }
+
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+        self.metrics.service_start();
+
+        let session_result =
+            self.state
+                .ready(session.clone(), self.proxy.clone(), &mut self.metrics);
+
+        let to_be_closed = match session_result {
+            SessionResult::Close => true,
+            SessionResult::Continue => false,
+            SessionResult::Upgrade => match self.upgrade() {
+                false => self.ready(session),
+                true => true,
+            },
+        };
+        if to_be_closed {
+            debug!(
+                "{} HTTPS ready requested close: marker={:?}",
+                log_context!(self),
+                self.state.marker()
+            );
+        }
+
+        // Run-to-completion postcondition: whatever state `ready()` (and any
+        // nested upgrade) left the session in must satisfy the full cross-field
+        // invariant set before we yield back to the event loop.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+
+        self.metrics.service_stop();
+        to_be_closed
+    }
+
+    fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        self.state.shutting_down()
+    }
+
+    fn targets(&self, target: &crate::SessionTarget) -> bool {
+        self.state.targets(target)
+    }
+
+    fn last_event(&self) -> Instant {
+        self.last_event
+    }
+
+    fn print_session(&self) {
+        self.state.print_state("HTTPS");
+        error!("{} Metrics: {:?}", log_context!(self), self.metrics);
+    }
+
+    fn frontend_token(&self) -> Token {
+        self.frontend_token
+    }
+}
+
+pub type HostName = String;
+pub type PathBegin = String;
+
+pub struct HttpsListener {
+    active: bool,
+    address: StdSocketAddr,
+    answers: Rc<RefCell<HttpAnswers>>,
+    config: HttpsListenerConfig,
+    fronts: Router,
+    listener: Option<MioTcpListener>,
+    /// A socket this listener holds but has NOT registered.
+    ///
+    /// `activate()` parks an inherited socket here when `Registry::register`
+    /// fails, instead of letting the `?` drop and close a descriptor
+    /// `Listeners::get_*` has already removed from the SCM table (sozu#1342).
+    /// The next activation reuses it rather than binding a second one.
+    ///
+    /// Deliberately NOT `listener`: every other consumer reads that field's `Some` as
+    /// "registered and live" — `soft_stop` and `hard_stop` deregister it and
+    /// report the failure, `give_back_listener` hands it back as an activated
+    /// socket, `accept` accepts on it. A parked socket is none of those things,
+    /// and putting it there made a failed registration answer `ENOENT` from
+    /// `deregister` and fail the whole soft stop.
+    parked_listener: Option<MioTcpListener>,
+    /// Set by `activate()`, cleared by the first `accept()` that answers
+    /// `WouldBlock`: while set, `accept()` sets `TCP_NODELAY` on each socket
+    /// it returns, because a connection queued before `activate()` set the
+    /// flag on the listener did not inherit it. See the field of the same
+    /// name on `HttpListener` (`lib/src/http.rs`).
+    nodelay_backlog: bool,
+    resolver: Arc<MutexCertificateResolver>,
+    rustls_details: Arc<RustlsServerConfig>,
+    tags: BTreeMap<String, CachedTags>,
+    token: Token,
+}
+
+impl ListenerHandler for HttpsListener {
+    fn get_addr(&self) -> &StdSocketAddr {
+        &self.address
+    }
+
+    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
+        self.tags.get(key)
+    }
+
+    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
+        match tags {
+            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
+            None => self.tags.remove(&key),
+        };
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTPS
+    }
+
+    fn public_address(&self) -> StdSocketAddr {
+        self.config
+            .public_address
+            .map(|addr| addr.into())
+            .unwrap_or(self.address)
+    }
+}
+
+impl L7ListenerHandler for HttpsListener {
+    fn get_sticky_name(&self) -> &str {
+        &self.config.sticky_name
+    }
+
+    fn get_sozu_id_header(&self) -> &str {
+        self.config
+            .sozu_id_header
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Sozu-Id")
+    }
+
+    fn get_connect_timeout(&self) -> u32 {
+        self.config.connect_timeout
+    }
+
+    fn frontend_from_request(
+        &self,
+        host: &str,
+        uri: &str,
+        method: &Method,
+        headers: &dyn RequestHeaders,
+    ) -> Result<RouteResult, FrontendFromRequestError> {
+        let start = Instant::now();
+        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
+            Ok(tuple) => tuple,
+            Err(parse_error) => {
+                // parse_error contains a slice of given_host, which should NOT escape this scope
+                return Err(FrontendFromRequestError::HostParse {
+                    host: host.to_owned(),
+                    error: parse_error.to_string(),
+                });
+            }
+        };
+
+        if remaining_input != &b""[..] {
+            return Err(FrontendFromRequestError::InvalidCharsAfterHost(
+                host.to_owned(),
+            ));
+        }
+
+        // it is alright to call from_utf8_unchecked,
+        // we already verified that there are only ascii
+        // chars in there
+        // SAFETY: `hostname` was just produced by `hostname_and_port`
+        // (`lib/src/protocol/kawa_h1/parser.rs`), which only accepts
+        // bytes matching `is_hostname_char` (alphanumeric, `-`, `.`, plus
+        // `_` under the tolerant-http1-parser feature). All accepted
+        // bytes are ASCII (≤ 0x7F), so the slice is valid single-byte UTF-8.
+        let host = unsafe { from_utf8_unchecked(hostname) };
+
+        let route = self
+            .fronts
+            .lookup_with_headers(host, uri, method, headers)
+            .map_err(|e| {
+                incr!(names::http::FAILED_BACKEND_MATCHING);
+                FrontendFromRequestError::NoClusterFound(e)
+            })?;
+
+        let now = Instant::now();
+
+        if let Some(cluster) = route.cluster_id.as_deref() {
+            time!(
+                names::event_loop::FRONTEND_MATCHING_TIME,
+                cluster,
+                (now - start).as_millis()
+            );
+        }
+
+        Ok(route)
+    }
+
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
+        &self.answers
+    }
+
+    fn get_h2_flood_config(&self) -> crate::protocol::mux::H2FloodConfig {
+        // `H2FloodConfig`'s fields are private and `from_optional` applies the
+        // `.max(1)` clamp `new` carries (sozu-proxy/sozu#1418). This used to be
+        // a raw struct literal, which skipped that clamp on the only path that
+        // carries operator-set thresholds: config load rejects an out-of-range
+        // knob (`ConfigError::H2ThresholdBelowMinimum`), and the clamp is the
+        // structural backstop for a raw protobuf `AddHttpsListener` or a
+        // state file saved before that gate existed.
+        crate::protocol::mux::H2FloodConfig::from_optional(
+            self.config.h2_max_rst_stream_per_window,
+            self.config.h2_max_ping_per_window,
+            self.config.h2_max_settings_per_window,
+            self.config.h2_max_empty_data_per_window,
+            self.config.h2_max_window_update_stream0_per_window,
+            self.config.h2_max_continuation_frames,
+            self.config.h2_max_glitch_count,
+            self.config.h2_max_rst_stream_lifetime,
+            self.config.h2_max_rst_stream_abusive_lifetime,
+            self.config.h2_max_rst_stream_emitted_lifetime,
+            self.config.h2_max_header_list_size,
+            self.config.h2_max_header_table_size,
+            self.config.h2_max_header_fields,
+            self.config.h2_stream_refusal_percent,
+        )
+    }
+
+    fn get_h2_connection_config(&self) -> crate::protocol::mux::H2ConnectionConfig {
+        crate::protocol::mux::H2ConnectionConfig::from_optional(
+            self.config.h2_initial_connection_window,
+            self.config.h2_max_concurrent_streams,
+            self.config.h2_stream_shrink_ratio,
+        )
+    }
+
+    fn get_strict_sni_binding(&self) -> bool {
+        // SNI↔:authority binding is enforced by default (closes
+        // CWE-346 / CWE-444); this listener knob preserves that
+        // behavior by default and lets operators opt out when cross-SNI
+        // routing is intentional.
+        //
+        // Note: `strict_sni_binding = false` theoretically allows an
+        // attacker to present many distinct SNIs on the same TCP
+        // connection. rustls 0.23 **bans TLS renegotiation outright** (see
+        // `rustls::server::ClientHello` which is consumed during the initial
+        // handshake only), so a single TCP connection gets exactly one SNI
+        // for its lifetime — the cross-SNI-flood vector is not reachable in
+        // practice. Kept documented here so a future rustls upgrade that
+        // reintroduces renegotiation (vanishingly unlikely) surfaces the
+        // assumption during review.
+        self.config.strict_sni_binding.unwrap_or(true)
+    }
+
+    fn get_elide_x_real_ip(&self) -> bool {
+        self.config.elide_x_real_ip.unwrap_or(false)
+    }
+
+    fn get_send_x_real_ip(&self) -> bool {
+        self.config.send_x_real_ip.unwrap_or(false)
+    }
+
+    fn get_forwarded_headers(&self) -> ForwardedHeaders {
+        // An unknown wire value reads as the default, like prost's own
+        // getter; `update_config` and the main-process state refuse one.
+        self.config.forwarded_headers()
+    }
+
+    fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
+        // Inherit `back_timeout` when the knob is unset so listeners tuned for
+        // long-running backends do not cancel streams at the 30 s security
+        // floor. The `max(30, …)` keeps the baseline slow-multiplex mitigation
+        // when `back_timeout` is shorter than 30 s. Explicit values (including
+        // ones below 30 s) win — operators under a slow-multiplex attack can
+        // lower the per-stream deadline to cap buffer pinning.
+        let seconds = self
+            .config
+            .h2_stream_idle_timeout_seconds
+            .map(|s| u64::from(s.max(1)))
+            .unwrap_or_else(|| u64::from(self.config.back_timeout).max(30));
+        std::time::Duration::from_secs(seconds)
+    }
+
+    fn get_h2_graceful_shutdown_deadline(&self) -> Option<std::time::Duration> {
+        match self.config.h2_graceful_shutdown_deadline_seconds {
+            None => Some(std::time::Duration::from_secs(5)),
+            Some(0) => None,
+            Some(s) => Some(std::time::Duration::from_secs(u64::from(s))),
+        }
+    }
+}
+
+impl HttpsListener {
+    /// This listener's identity: its address, plus the network interface its
+    /// socket is bound to when it has one.
+    pub fn key(&self) -> ListenerKey {
+        ListenerKey::new(self.address, self.config.interface.as_deref())
+    }
+
+    /// Whether this listener is the one `key` names.
+    pub fn is(&self, key: &ListenerKey) -> bool {
+        key.matches(&self.address, self.config.interface.as_deref())
+    }
+
+    /// Whether this listener rejects clients that do not negotiate `h2`
+    /// via TLS ALPN (including those that omit ALPN). Reads the
+    /// `disable_http11` knob; defaults to `false` to preserve the
+    /// historical behavior where a missing ALPN silently downgrades
+    /// to HTTP/1.1.
+    pub fn is_http11_disabled(&self) -> bool {
+        self.config.disable_http11.unwrap_or(false)
+    }
+
+    /// Borrow the listener's certificate resolver. Used by the TLS handshake
+    /// path to snapshot the SAN set of the certificate Sōzu serves for a
+    /// given SNI, so the H2 router can accept connection coalescing
+    /// (RFC 7540 §9.1.1 / RFC 9113 §9.1.1) on every authority covered by
+    /// that cert (RFC 6125 §6.4.3 wildcard handling).
+    pub fn resolver(&self) -> &Arc<MutexCertificateResolver> {
+        &self.resolver
+    }
+
+    pub fn try_new(
+        config: HttpsListenerConfig,
+        token: Token,
+    ) -> Result<HttpsListener, ListenerError> {
+        // Defense in depth, as `update_config`: the main-process state
+        // refuses an unknown mode, a raw protobuf client may not.
+        if let Some(v) = config.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+        let resolver = Arc::new(MutexCertificateResolver::default());
+
+        let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
+
+        let answers = Self::build_answers(&config)?;
+
+        Ok(HttpsListener {
+            listener: None,
+            parked_listener: None,
+            nodelay_backlog: false,
+            address: config.address.into(),
+            resolver,
+            rustls_details: server_config,
+            active: false,
+            fronts: Router::new(),
+            answers: Rc::new(RefCell::new(answers)),
+            config,
+            token,
+            tags: BTreeMap::new(),
+        })
+    }
+
+    /// Build the listener's HTTP answer templates from its config, reconciling
+    /// the legacy `http_answers` per-status fields with the new `answers`
+    /// template map (the new map wins on collision; legacy fields fill any
+    /// status not yet migrated). Shared by [`Self::try_new`] and
+    /// [`Self::validate_config`] so the master-side pre-commit check cannot
+    /// drift from worker construction.
+    fn build_answers(config: &HttpsListenerConfig) -> Result<HttpAnswers, ListenerError> {
+        let mut answers_map = config.answers.clone();
+        if let Some(ref legacy) = config.http_answers {
+            crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+        }
+        HttpAnswers::new(&answers_map)
+            .map_err(|(name, error)| ListenerError::TemplateParse(name, error))
+    }
+
+    /// Validate that a worker can build this HTTPS listener configuration — the
+    /// rustls context and the answer templates — WITHOUT constructing the full
+    /// listener or binding a socket. Runs the exact fallible steps of
+    /// [`Self::try_new`] (via the shared [`Self::create_rustls_context`] /
+    /// `Self::build_answers` helpers), so master-side validation is faithful
+    /// to what the worker will do.
+    ///
+    /// The main process calls this before committing an `AddHttpsListener` to
+    /// its `ConfigState` and fanning it out, so an invalid listener never
+    /// reserves its address and blocks a corrected reload (sozu#1301).
+    pub fn validate_config(config: &HttpsListenerConfig) -> Result<(), ListenerError> {
+        // Buildability only; the H2 knob floors are enforced beside their
+        // audience in `bin/src/command/requests.rs::validate_h2_knob_floors`
+        // (sozu#1418), because a worker CAN build an out-of-range listener —
+        // `H2FloodConfig::from_optional` clamps it.
+        //
+        // An empty resolver matches `try_new`: the default certificate is added
+        // later via `AddCertificate`, so only the config-level TLS parameters
+        // (versions, ciphers, groups, ALPN) and the answer templates are
+        // exercised here.
+        Self::create_rustls_context(config, Arc::new(MutexCertificateResolver::default()))?;
+        Self::build_answers(config)?;
+        Ok(())
+    }
+
+    pub fn activate(
+        &mut self,
+        registry: &Registry,
+        tcp_listener: Option<MioTcpListener>,
+    ) -> Result<Token, ListenerError> {
+        if self.active {
+            return Ok(self.token);
+        }
+        let address: StdSocketAddr = self.config.address.into();
+
+        // Reuse a socket a previous attempt parked here after a failed
+        // registration, rather than binding a second one. Taking it
+        // unconditionally is what keeps the two from coexisting: if the caller
+        // ALSO handed one over, the parked socket is disposed of deliberately
+        // below instead of being silently overwritten.
+        let parked = self.parked_listener.take();
+        let mut listener = match (tcp_listener, parked) {
+            (Some(inherited), Some(parked)) => {
+                // Not reachable while `Listeners::get_*` removes the entry it
+                // hands over and `scm_listeners` is written once: a parked
+                // socket means this address's entry was already consumed, so
+                // the caller cannot have another. Neither of those is enforced
+                // here, so dispose of the loser explicitly and loudly rather
+                // than letting an assignment close it — that silent close is
+                // sozu#1342 itself.
+                warn!(
+                    "{} closing the socket parked on the HTTPS listener for {}: an \
+                     inherited socket arrived for the same address and is the one being \
+                     activated",
+                    log_module_context!(),
+                    address
+                );
+                drop(parked);
+                inherited
+            }
+            (Some(inherited), None) => inherited,
+            (None, Some(parked)) => parked,
+            (None, None) => server_bind(address, self.config.interface.as_deref()).map_err(
+                |server_bind_error| ListenerError::Activation {
+                    address,
+                    error: server_bind_error.to_string(),
+                },
+            )?,
+        };
+
+        // Once per listener, on whichever socket won above — freshly bound,
+        // inherited over SCM_RIGHTS, or parked. Every socket accepted from now
+        // on inherits it; see `nodelay_backlog` for the ones already queued.
+        if let Err(e) = SockRef::from(&listener).set_tcp_nodelay(true) {
+            error!(
+                "{} error setting nodelay on listen socket({:?}): {:?}",
+                log_module_context!(),
+                listener,
+                e
+            );
+        }
+
+        let registration = registry
+            .register(&mut listener, self.token, Interest::READABLE)
+            .map_err(ListenerError::SocketRegistration);
+        if let Err(error) = registration {
+            // Park the socket instead of letting the `?` drop it. `register`
+            // is fallible (EEXIST for a descriptor still registered because
+            // `notify_deactivate_listener` only logs a failed deregister,
+            // EBADF, ENOMEM), and a socket still held in a local is dropped —
+            // and closed — on the way out. For an SCM-inherited socket that is
+            // the sozu#1342 close in a second place: `Listeners::get_*` has
+            // already removed the entry, so nothing else owns the descriptor.
+            // It goes to `parked_listener`, never to `listener`, because every other
+            // consumer of that field reads `Some` as "registered and live".
+            self.parked_listener = Some(listener);
+            return Err(error);
+        }
+
+        self.listener = Some(listener);
+        self.nodelay_backlog = true;
+        self.active = true;
+        // Post: an activated listener owns a bound socket and is flagged active,
+        // so a later `activate()` short-circuits on the `self.active` guard and
+        // `give_back_listener*` find a socket to hand back. The two must move in
+        // lockstep — an active listener with no socket would silently accept
+        // nothing.
+        debug_assert!(
+            self.active && self.listener.is_some(),
+            "an activated HTTPS listener must hold a bound socket and be flagged active"
+        );
+        Ok(self.token)
+    }
+
+    pub fn create_rustls_context(
+        config: &HttpsListenerConfig,
+        resolver: Arc<MutexCertificateResolver>,
+    ) -> Result<RustlsServerConfig, ListenerError> {
+        let cipher_names = if config.cipher_list.is_empty() {
+            DEFAULT_CIPHER_LIST.to_vec()
+        } else {
+            config
+                .cipher_list
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        let ciphers = cipher_names
+            .into_iter()
+            .filter_map(|cipher| {
+                cipher_suite_by_name(cipher).or_else(|| {
+                    error!(
+                        "{} unknown or unsupported cipher: {:?}",
+                        log_module_context!(),
+                        cipher
+                    );
+                    None
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let versions = config
+            .versions
+            .iter()
+            .filter_map(|version| match TlsVersion::try_from(*version) {
+                Ok(TlsVersion::TlsV12) => Some(&rustls::version::TLS12),
+                Ok(TlsVersion::TlsV13) => Some(&rustls::version::TLS13),
+                Ok(other_version) => {
+                    error!(
+                        "{} unsupported TLS version {:?}",
+                        log_module_context!(),
+                        other_version
+                    );
+                    None
+                }
+                Err(_) => {
+                    error!("{} unsupported TLS version", log_module_context!());
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let kx_groups = if config.groups_list.is_empty() {
+            default_provider().kx_groups
+        } else {
+            config
+                .groups_list
+                .iter()
+                .filter_map(|group| match kx_group_by_name(group) {
+                    Some(kx) => Some(kx),
+                    None => {
+                        debug!("key exchange group {:?} not supported by the compiled crypto provider, skipping", group);
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let provider = Arc::new(CryptoProvider {
+            cipher_suites: ciphers,
+            kx_groups,
+            ..default_provider()
+        });
+
+        let builder = RustlsServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&versions[..])
+            .map_err(|err| ListenerError::BuildRustls(err.to_string()))?;
+
+        // mTLS: `client_auth` decodes to `ClientAuthMode` (NONE at field 0).
+        // NONE keeps the historical `.with_no_client_auth()`; OPTIONAL and
+        // REQUIRED install a WebPki client-certificate verifier built from the
+        // listener's trusted CA bundle (and optional CRLs). OPTIONAL differs
+        // only by allowing connections that present no certificate at all. The
+        // verifier is built from the same `provider` as the server config so it
+        // works in single-provider builds (`crypto-openssl`-only) and in
+        // multi-provider builds (`--all-features`) where no process-default
+        // provider is installed.
+        let builder = match Self::client_cert_verifier(config, &provider)? {
+            Some(verifier) => builder.with_client_cert_verifier(verifier),
+            None => builder.with_no_client_auth(),
+        };
+
+        let mut server_config = builder.with_cert_resolver(resolver);
+        server_config.send_tls13_tickets = config.send_tls13_tickets as usize;
+
+        server_config.alpn_protocols = if config.alpn_protocols.is_empty() {
+            DEFAULT_ALPN_PROTOCOLS
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect()
+        } else {
+            config
+                .alpn_protocols
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect()
+        };
+
+        Ok(server_config)
+    }
+
+    /// Refuse two CRLs of one CA whose scopes overlap: webpki checks a
+    /// certificate against the first configured CRL that is authoritative for
+    /// it and never reads the others, so the order alone would decide, and an
+    /// old CRL listed before its replacement would hide every revocation the
+    /// replacement adds. A CRL without an `IssuingDistributionPoint` covers
+    /// everything its CA issued; partitions of one CA, each with its own
+    /// distribution point, do not overlap and are accepted together.
+    ///
+    /// Issuers and distribution points are compared as the raw DER webpki
+    /// compares. The check does not depend on time, so every worker runs it
+    /// when it builds the listener; [`Self::check_crls_current`] is the one
+    /// that does.
+    fn check_crl_set(crls: &[CertificateRevocationListDer<'_>]) -> Result<(), ListenerError> {
+        let mut scopes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(crls.len());
+        for (index, crl) in crls.iter().enumerate() {
+            let parsed = webpki::BorrowedCertRevocationList::from_der(crl.as_ref())
+                .map_err(|e| ListenerError::ClientAuth(format!("invalid CRL: {e}")))?;
+            let parsed = webpki::CertRevocationList::from(parsed);
+            let issuer = parsed.issuer().to_vec();
+            let distribution_point = parsed.issuing_distribution_point().map(<[u8]>::to_vec);
+            let overlapping = scopes.iter().position(|(seen_issuer, seen_point)| {
+                *seen_issuer == issuer
+                    && (seen_point.is_none()
+                        || distribution_point.is_none()
+                        || *seen_point == distribution_point)
+            });
+            if let Some(first) = overlapping {
+                return Err(ListenerError::ClientAuth(format!(
+                    "CRLs #{} and #{} (counted across client_ca_crls) are issued by the \
+                     same CA for overlapping certificates, and only the first would be \
+                     consulted: configure one CRL per issuer, or one per distribution point",
+                    first + 1,
+                    index + 1
+                )));
+            }
+            scopes.push((issuer, distribution_point));
+        }
+        Ok(())
+    }
+
+    /// Refuse a CRL already past its `nextUpdate` at `now` (seconds since the
+    /// Unix epoch): with revocation expiry enforced it would reject every
+    /// client it covers, which is better reported when the operator states it
+    /// than found at the first handshake.
+    ///
+    /// Main process only, on what an operator states (configuration load,
+    /// reload, a client request), never on a replay or in a worker: a CRL
+    /// that lapses while the listener runs must not stop a worker started
+    /// later from building the listener, or the reload that brings a current
+    /// CRL would find nothing to patch there. Such a worker builds it and
+    /// rejects the clients at handshake until that reload.
+    pub fn check_crls_current(crls: &[String], now: i64) -> Result<(), ListenerError> {
+        let mut index = 0;
+        for pem in crls {
+            for crl in CertificateRevocationListDer::pem_slice_iter(pem.as_bytes()) {
+                let crl =
+                    crl.map_err(|e| ListenerError::ClientAuth(format!("invalid CRL PEM: {e}")))?;
+                index += 1;
+                if let Some(next_update) = sozu_command::certificate::crl_next_update(crl.as_ref())
+                    && next_update <= now
+                {
+                    return Err(ListenerError::ClientAuth(format!(
+                        "CRL #{index} (counted across client_ca_crls) expired {} seconds ago: \
+                         its nextUpdate is past, refresh it",
+                        now - next_update
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check a client authentication policy the way a listener would build
+    /// it, without a listener: the main process runs this on an
+    /// `UpdateHttpsListenerConfig.client_auth_policy` patch before it commits
+    /// the patch to its state, so a policy no worker could build is refused
+    /// up front rather than fanned out.
+    pub fn validate_client_auth_policy(policy: &ClientAuthPolicy) -> Result<(), ListenerError> {
+        let mut config = HttpsListenerConfig::default();
+        config.apply_client_auth_policy(policy);
+        Self::client_cert_verifier(&config, &Arc::new(default_provider())).map(|_| ())
+    }
+
+    /// Build the rustls client-certificate verifier for a listener's mTLS
+    /// configuration, or `None` when client auth is disabled.
+    ///
+    /// Returns `None` only for [`ClientAuthMode::ClientAuthNone`] (and for an
+    /// absent `client_auth` field, which decodes to that variant), preserving
+    /// the historical `.with_no_client_auth()` path. For OPTIONAL/REQUIRED it
+    /// parses `client_ca_certificates` into a root store and, when present,
+    /// `client_ca_crls` into revocation lists. OPTIONAL additionally allows
+    /// unauthenticated clients (no certificate presented); REQUIRED aborts the
+    /// handshake in that case.
+    ///
+    /// The verifier is built with the caller's `provider` so it never relies on
+    /// a process-default crypto provider (which may be absent or ambiguous). An
+    /// unknown `client_auth` value is rejected rather than treated as NONE, so a
+    /// malformed or future enum value can never silently disable client auth.
+    fn client_cert_verifier(
+        config: &HttpsListenerConfig,
+        provider: &Arc<CryptoProvider>,
+    ) -> Result<Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>, ListenerError> {
+        // Reject unknown enum values instead of failing open to NONE.
+        let raw = config
+            .client_auth
+            .unwrap_or(ClientAuthMode::ClientAuthNone as i32);
+        let mode = ClientAuthMode::try_from(raw).map_err(|_| {
+            ListenerError::ClientAuth(format!("unknown client_auth mode value {raw}"))
+        })?;
+        if mode == ClientAuthMode::ClientAuthNone {
+            return Ok(None);
+        }
+
+        // Parse every trusted-CA PEM entry into the root store. Each entry may
+        // itself hold a concatenated PEM chain, so iterate per entry. An entry
+        // that contributes no certificate (empty text, or PEM carrying another
+        // section type) is rejected rather than skipped: it would start the
+        // listener with only a subset of the configured trust anchors, so
+        // clients issued by the omitted CA would fail with no visible cause.
+        let mut roots = RootCertStore::empty();
+        for pem in &config.client_ca_certificates {
+            let before = roots.len();
+            for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+                let cert =
+                    cert.map_err(|e| ListenerError::ClientAuth(format!("invalid CA PEM: {e}")))?;
+                roots
+                    .add(cert)
+                    .map_err(|e| ListenerError::ClientAuth(format!("untrusted CA: {e}")))?;
+            }
+            if roots.len() == before {
+                return Err(ListenerError::ClientAuth(
+                    "a configured trusted-CA entry contained no certificate".to_owned(),
+                ));
+            }
+        }
+        if roots.is_empty() {
+            return Err(ListenerError::ClientAuth(
+                "client auth requested but no trusted CA certificate was provided".to_owned(),
+            ));
+        }
+
+        // Parse CRLs per configured entry. An entry that yields zero CRLs (empty
+        // text, or PEM carrying another section type) is a misconfiguration: it
+        // would silently disable revocation, so reject it rather than build a
+        // verifier that skips `with_crls`.
+        let mut crls = Vec::new();
+        for pem in &config.client_ca_crls {
+            let before = crls.len();
+            for crl in CertificateRevocationListDer::pem_slice_iter(pem.as_bytes()) {
+                crls.push(
+                    crl.map_err(|e| ListenerError::ClientAuth(format!("invalid CRL PEM: {e}")))?,
+                );
+            }
+            if crls.len() == before {
+                return Err(ListenerError::ClientAuth(
+                    "a configured CRL entry contained no certificate revocation list".to_owned(),
+                ));
+            }
+        }
+        Self::check_crl_set(&crls)?;
+
+        let mut builder =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone());
+        if !crls.is_empty() {
+            // rustls defaults to `ExpirationPolicy::Ignore`, which keeps trusting
+            // a CRL past its `nextUpdate`. Enforce expiration so a stale CRL is
+            // rejected rather than silently accepting certificates whose
+            // revocation status is no longer known.
+            builder = builder.with_crls(crls).enforce_revocation_expiration();
+        }
+        if mode == ClientAuthMode::ClientAuthOptional {
+            builder = builder.allow_unauthenticated();
+        }
+        let verifier = builder
+            .build()
+            .map_err(|e| ListenerError::ClientAuth(e.to_string()))?;
+        Ok(Some(verifier))
+    }
+
+    /// Apply a partial-update patch to this listener's live configuration.
+    ///
+    /// Fields absent in the patch (i.e. `None`) are preserved unchanged.
+    /// If `alpn_protocols` is present the rustls `ServerConfig` is rebuilt —
+    /// in-flight handshakes keep the old Arc; new ones see the new one.
+    /// If `http_answers` is present only the listener-default templates are
+    /// replaced; per-cluster overrides in `cluster_custom_answers` are kept.
+    ///
+    /// All-or-nothing (sozu-proxy/sozu#1703): the patch is validated, then
+    /// applied to a copy of the configuration, and every fallible artifact
+    /// (the rustls context, the answer registry) is built from that copy.
+    /// Only once all of it succeeded are the copy and the artifacts
+    /// committed and the inheriting frontends' HSTS refreshed, so a refused
+    /// patch leaves the listener exactly as it was. The copy is one
+    /// `HttpsListenerConfig` clone per patch, on the command path only.
+    pub fn update_config(
+        &mut self,
+        patch: &UpdateHttpsListenerConfig,
+    ) -> Result<(), ListenerError> {
+        // Defense-in-depth validation: main-process ConfigState::dispatch
+        // validates before scatter, but a raw protobuf client or state replay
+        // may reach the worker without that check. `StateError` lifts into
+        // `ListenerError` via `From` so `?` suffices. The main process runs
+        // the same checks (`ConfigState::update_https_listener` and, for the
+        // templates, `validate_listener_request` in
+        // `bin/src/command/requests.rs`), so both refuse the same patches.
+        validate_h2_flood_knobs_https(patch)?;
+        if let Some(ref alpn) = patch.alpn_protocols {
+            validate_alpn_protocols(&alpn.values)?;
+        }
+        if let Some(ref hdr) = patch.sozu_id_header {
+            validate_sozu_id_header(hdr)?;
+        }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+        // HSTS is a full-object replacement, and `enabled` is the explicit
+        // disambiguator between "disable" and "enable" semantics: the
+        // operator must signal one or the other on every update, so a block
+        // without it is refused. The main process refuses it too, with
+        // `StateError::InvalidValue` (`validate_hsts_patch`,
+        // `command/src/state.rs`).
+        if patch.hsts.is_some_and(|hsts| hsts.enabled.is_none()) {
+            return Err(ListenerError::HstsEnabledRequired);
+        }
+        HttpAnswers::validate_patch_templates(patch.http_answers.as_ref(), &patch.answers)
+            .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
+
+        let mut config = self.config.clone();
+
+        // --- simple field patches ---
+        if let Some(v) = patch.public_address {
+            config.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            config.expect_proxy = v;
+        }
+        if let Some(ref v) = patch.sticky_name {
+            config.sticky_name = v.to_owned();
+        }
+        if let Some(v) = patch.front_timeout {
+            config.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            config.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            config.connect_timeout = v;
+        }
+        if let Some(v) = patch.request_timeout {
+            config.request_timeout = v;
+        }
+        if let Some(v) = patch.strict_sni_binding {
+            config.strict_sni_binding = Some(v);
+        }
+        if let Some(v) = patch.disable_http11 {
+            config.disable_http11 = Some(v);
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            config.sozu_id_header = Some(v.to_owned());
+        }
+        if let Some(v) = patch.elide_x_real_ip {
+            config.elide_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.send_x_real_ip {
+            config.send_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.forwarded_headers {
+            config.forwarded_headers = Some(v);
+        }
+
+        // --- H2 flood knobs ---
+        if let Some(v) = patch.h2_max_rst_stream_per_window {
+            config.h2_max_rst_stream_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_ping_per_window {
+            config.h2_max_ping_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_settings_per_window {
+            config.h2_max_settings_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_empty_data_per_window {
+            config.h2_max_empty_data_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_continuation_frames {
+            config.h2_max_continuation_frames = Some(v);
+        }
+        if let Some(v) = patch.h2_max_glitch_count {
+            config.h2_max_glitch_count = Some(v);
+        }
+        if let Some(v) = patch.h2_initial_connection_window {
+            config.h2_initial_connection_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_concurrent_streams {
+            config.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_shrink_ratio {
+            config.h2_stream_shrink_ratio = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_lifetime {
+            config.h2_max_rst_stream_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
+            config.h2_max_rst_stream_abusive_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
+            config.h2_max_rst_stream_emitted_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_list_size {
+            config.h2_max_header_list_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_table_size {
+            config.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_fields {
+            config.h2_max_header_fields = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_refusal_percent {
+            config.h2_stream_refusal_percent = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_idle_timeout_seconds {
+            config.h2_stream_idle_timeout_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
+            config.h2_graceful_shutdown_deadline_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_max_window_update_stream0_per_window {
+            config.h2_max_window_update_stream0_per_window = Some(v);
+        }
+
+        if let Some(new_hsts) = patch.hsts {
+            config.hsts = Some(new_hsts);
+        }
+        if let Some(ref alpn_wrapper) = patch.alpn_protocols {
+            // Empty values vec = reset to default (runtime treats empty as default)
+            config.alpn_protocols = alpn_wrapper.values.clone();
+        }
+        if let Some(ref policy) = patch.client_auth_policy {
+            config.apply_client_auth_policy(policy);
+        }
+
+        // --- ALPN rebuild (may force a rustls ServerConfig rebuild) ---
+        //
+        // Built from the candidate config, which carries the new ALPN, and
+        // published below only once every other fallible step succeeded, so
+        // a rustls failure (crypto provider transient, resolver error, etc.)
+        // leaves the listener observably unchanged. The main-process state
+        // would still diverge from that worker-side refusal: the main process
+        // cannot build this worker's rustls context before it commits.
+        // A client authentication policy lives in the rustls context's client
+        // certificate verifier, so a new policy needs the same rebuild; an
+        // invalid one fails it here and the listener keeps its old policy.
+        let new_rustls = if patch.alpn_protocols.is_some() || patch.client_auth_policy.is_some() {
+            Some(Arc::new(Self::create_rustls_context(
+                &config,
+                self.resolver.clone(),
+            )?))
+        } else {
+            None
+        };
+
+        // HTTP answers: merge legacy `http_answers` and the new `answers`
+        // map on top of the candidate config, then build the listener-level
+        // template registry from it. It is fallible, so it is built here and
+        // published below with the config, never before.
+        let answers_changed = patch.http_answers.is_some() || !patch.answers.is_empty();
+        let rebuilt = if answers_changed {
+            if let Some(ref new_answers) = patch.http_answers {
+                crate::sozu_command::state::merge_custom_http_answers(
+                    &mut config.http_answers,
+                    new_answers,
+                );
+            }
+            for (code, body) in &patch.answers {
+                if !body.is_empty() {
+                    config.answers.insert(code.clone(), body.clone());
+                }
+            }
+
+            let mut answers_map = config.answers.clone();
+            if let Some(ref legacy) = config.http_answers {
+                crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+            }
+            Some(
+                HttpAnswers::new(&answers_map)
+                    .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?,
+            )
+        } else {
+            None
+        };
+
+        // Commit: nothing below can fail.
+        self.config = config;
+        if let Some(new_rustls) = new_rustls {
+            self.rustls_details = new_rustls;
+        }
+        if let Some(alpn_wrapper) = &patch.alpn_protocols {
+            // Post: the live config must now name exactly the patched ALPN
+            // set. New handshakes negotiate against this set, so the
+            // `upgrade_handshake` "protocol ∈ configured ALPN" property is
+            // anchored to what we just stored.
+            debug_assert_eq!(
+                self.config.alpn_protocols, alpn_wrapper.values,
+                "committed ALPN config must match the patch values exactly"
+            );
+        }
+        if let Some(mut rebuilt) = rebuilt {
+            // The rebuilt registry is PUBLISHED under a new `Rc`, not written
+            // through the old one. Every request already in flight captured
+            // the old handle when it arrived (`mux::Context::create_stream`)
+            // and renders its default answers from that, so a reload landing
+            // mid-request cannot change the page that request is about to
+            // emit; requests arriving after this point capture the new handle.
+            // That is the one-request staleness window of
+            // `lib/src/protocol/mux/LIFECYCLE.md` §2.5.
+            //
+            // The per-cluster overrides are therefore COPIED, not
+            // `mem::take`n: taking them would empty the registry those
+            // in-flight requests still hold and strip their cluster templates
+            // mid-response. The copy is a map clone over `Rc<Template>`, so
+            // both registries share the compiled templates themselves.
+            rebuilt.cluster_answers = self.answers.borrow().cluster_answers.clone();
+            self.answers = Rc::new(RefCell::new(rebuilt));
+        }
+
+        // HSTS: full-object replacement when present in the patch (stored
+        // into the candidate config above; a block without `enabled` was
+        // refused before the first write). Absent patch field preserves
+        // current value (matches the rest of this partial-update handler).
+        //
+        // Inheriting frontends are refreshed in place via
+        // `Router::refresh_inheriting_hsts`: every frontend that declared no
+        // `hsts` of its own at add time
+        // (`Frontend.inherits_listener_hsts == true`) gets its
+        // `headers_response` re-materialised against the new value.
+        // Explicit per-frontend overrides
+        // (`inherits_listener_hsts == false`) are untouched. The
+        // `http.hsts.listener_default_patched` counter still fires so
+        // dashboards can correlate patches with the new
+        // `http.hsts.frontend_refreshed` counter (sum of refreshed
+        // frontends from this patch).
+        if patch.hsts.is_some() {
+            let refreshed = self
+                .fronts
+                .refresh_inheriting_hsts(self.config.hsts.as_ref());
+            for _ in 0..refreshed {
+                crate::incr!(names::http::HSTS_FRONTEND_REFRESHED);
+            }
+            info!(
+                "{} HTTPS listener {:?} HSTS default patched; refreshed {} inheriting \
+                 frontend(s). Explicit per-frontend overrides untouched.",
+                log_module_context!(),
+                self.config.address,
+                refreshed,
+            );
+            crate::incr!(names::http::HSTS_LISTENER_DEFAULT_PATCHED);
+        }
+
+        Ok(())
+    }
+
+    pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
+        self.add_https_front_with_hsts_origin(tls_front, crate::router::HstsOrigin::Explicit)
+    }
+
+    /// Variant of [`Self::add_https_front`] that records the origin of
+    /// `tls_front.hsts` so listener-default patches can reflow inheriting
+    /// frontends without disturbing explicit per-frontend overrides. The
+    /// caller passes [`crate::router::HstsOrigin::InheritedFromListenerDefault`] when
+    /// the value was filled in from `self.config.hsts` rather than from
+    /// the operator's per-frontend configuration.
+    pub fn add_https_front_with_hsts_origin(
+        &mut self,
+        tls_front: HttpFrontend,
+        hsts_origin: crate::router::HstsOrigin,
+    ) -> Result<(), ListenerError> {
+        self.fronts
+            .add_http_front_with_hsts_origin(&tls_front, hsts_origin)
+            .map_err(ListenerError::AddFrontend)
+    }
+
+    pub fn remove_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
+        debug!(
+            "{} removing tls_front {:?}",
+            log_module_context!(),
+            tls_front
+        );
+        self.fronts
+            .remove_http_front(&tls_front)
+            .map_err(ListenerError::RemoveFrontend)
+    }
+
+    fn accept(&mut self) -> Result<(MioTcpStream, StdSocketAddr), AcceptError> {
+        if let Some(ref sock) = self.listener {
+            match sock.accept() {
+                Ok((frontend_sock, peer)) => {
+                    if self.nodelay_backlog
+                        && let Err(e) = frontend_sock.set_nodelay(true)
+                    {
+                        error!(
+                            "{} error setting nodelay on front socket({:?}): {:?}",
+                            log_module_context!(),
+                            frontend_sock,
+                            e
+                        );
+                    }
+                    Ok((frontend_sock, peer))
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // The backlog queued before `activate()` is drained.
+                    self.nodelay_backlog = false;
+                    Err(AcceptError::WouldBlock)
+                }
+                Err(e) => {
+                    error!("{} accept() IO error: {:?}", log_module_context!(), e);
+                    Err(AcceptError::IoError)
+                }
+            }
+        } else {
+            error!(
+                "{} cannot accept connections, no listening socket available",
+                log_module_context!()
+            );
+            Err(AcceptError::IoError)
+        }
+    }
+}
+
+pub struct HttpsProxy {
+    listeners: HashMap<Token, Rc<RefCell<HttpsListener>>>,
+    clusters: HashMap<ClusterId, Cluster>,
+    backends: Rc<RefCell<BackendMap>>,
+    pool: Rc<RefCell<Pool>>,
+    registry: Registry,
+    sessions: Rc<RefCell<SessionManager>>,
+}
+
+impl HttpsProxy {
+    pub fn new(
+        registry: Registry,
+        sessions: Rc<RefCell<SessionManager>>,
+        pool: Rc<RefCell<Pool>>,
+        backends: Rc<RefCell<BackendMap>>,
+    ) -> HttpsProxy {
+        HttpsProxy {
+            listeners: HashMap::new(),
+            clusters: HashMap::new(),
+            backends,
+            pool,
+            registry,
+            sessions,
+        }
+    }
+
+    pub fn add_listener(
+        &mut self,
+        config: HttpsListenerConfig,
+        token: Token,
+    ) -> Result<Token, ProxyError> {
+        if self.listeners.contains_key(&token) {
+            return Err(ProxyError::ListenerAlreadyPresent);
+        }
+        let mut https_listener =
+            HttpsListener::try_new(config, token).map_err(ProxyError::AddListener)?;
+        // Frontends and certificates name their listener by address alone, so
+        // a listener added next to one already on its address (on another
+        // interface) takes over the routes and certificates that one serves:
+        // every listener on an address holds the same ones, whenever it was
+        // added (sozu-proxy/sozu#719). The certificates are copied into this
+        // listener's own resolver, the one its rustls configuration already
+        // points at, so later changes keep reaching it through the fan-out.
+        if let Some(sibling) = self
+            .listeners_at(https_listener.address)
+            .ok()
+            .and_then(|listeners| listeners.into_iter().next())
+        {
+            let sibling = sibling.borrow();
+            https_listener.fronts = sibling.fronts.clone();
+            // Frontends that declared no `hsts` of their own inherit this
+            // listener's default instead of the sibling's, whether or not the
+            // sibling had one (sozu-proxy/sozu#1691).
+            https_listener
+                .fronts
+                .refresh_inheriting_hsts(https_listener.config.hsts.as_ref());
+            https_listener.tags = sibling.tags.clone();
+            let certificates = sibling
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))?
+                .clone();
+            *https_listener
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))? = certificates;
+        }
+        match self.listeners.entry(token) {
+            Entry::Vacant(entry) => {
+                entry.insert(Rc::new(RefCell::new(https_listener)));
+                Ok(token)
+            }
+            _ => Err(ProxyError::ListenerAlreadyPresent),
+        }
+    }
+
+    /// Add one listener and restore routes and certificates retained in the
+    /// worker state when no live sibling can provide them.
+    ///
+    /// A sibling already carries the address-wide state and `add_listener`
+    /// clones it. When the last listener on an address was removed, replay the
+    /// retained objects onto the new listener before the server commits its
+    /// session slot. Any failure drops only that new listener and its resolver.
+    pub(crate) fn add_listener_with_retained_state(
+        &mut self,
+        config: HttpsListenerConfig,
+        token: Token,
+        retained_frontends: Vec<RequestHttpFrontend>,
+        retained_certificates: Vec<AddCertificate>,
+    ) -> Result<Token, ProxyError> {
+        let address = config.address.into();
+        let had_sibling = self.listeners_at(address).is_ok();
+        self.add_listener(config, token)?;
+
+        if !had_sibling {
+            for frontend in retained_frontends {
+                if let Err(error) = self.add_https_frontend(frontend) {
+                    self.listeners.remove(&token);
+                    return Err(error);
+                }
+            }
+            for certificate in retained_certificates {
+                if let Err(error) = self.add_certificate(certificate) {
+                    self.listeners.remove(&token);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(token)
+    }
+
+    pub fn remove_listener(
+        &mut self,
+        remove: RemoveListener,
+    ) -> Result<Option<ResponseContent>, ProxyError> {
+        let len = self.listeners.len();
+
+        let remove_address = remove.listener_key();
+        self.listeners
+            .retain(|_, listener| !listener.borrow().is(&remove_address));
+
+        if !self.listeners.len() < len {
+            info!(
+                "{} no HTTPS listener to remove at address {}",
+                log_module_context!(),
+                remove_address
+            )
+        }
+        Ok(None)
+    }
+
+    pub fn soft_stop(&mut self) -> Result<(), ProxyError> {
+        let listeners = std::mem::take(&mut self.listeners);
+        let mut socket_errors = vec![];
+        for l in listeners.values() {
+            if let Some(mut sock) = l.borrow_mut().listener.take() {
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
+                if let Err(e) = self.registry.deregister(&mut sock) {
+                    let error = format!("socket {sock:?}: {e:?}");
+                    socket_errors.push(error);
+                }
+            }
+        }
+
+        if !socket_errors.is_empty() {
+            return Err(ProxyError::SoftStop {
+                proxy_protocol: "HTTPS".to_string(),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn hard_stop(&mut self) -> Result<(), ProxyError> {
+        let mut listeners = std::mem::take(&mut self.listeners);
+        let mut socket_errors = vec![];
+        for (_, l) in listeners.drain() {
+            if let Some(mut sock) = l.borrow_mut().listener.take() {
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
+                if let Err(e) = self.registry.deregister(&mut sock) {
+                    let error = format!("socket {sock:?}: {e:?}");
+                    socket_errors.push(error);
+                }
+            }
+        }
+
+        if !socket_errors.is_empty() {
+            return Err(ProxyError::HardStop {
+                proxy_protocol: "HTTPS".to_string(),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn query_all_certificates(&mut self) -> Result<Option<ResponseContent>, ProxyError> {
+        let certificates = self
+            .listeners
+            .values()
+            .map(|listener| {
+                let owned = listener.borrow();
+                // Same handling as the `add`/`remove`/`replace` siblings: a
+                // poisoned resolver is reported as `ProxyError::Lock`, never
+                // unwrapped. A read-only query must not be the one control-
+                // plane request that kills the worker.
+                let resolver = owned
+                    .resolver
+                    .0
+                    .lock()
+                    .map_err(|e| ProxyError::Lock(e.to_string()))?;
+                let certificate_summaries = resolver
+                    .domains
+                    .to_hashmap()
+                    .drain()
+                    .map(|(k, fingerprint)| CertificateSummary {
+                        domain: certificate_summary_domain(&k),
+                        fingerprint: fingerprint.to_string(),
+                    })
+                    .collect();
+
+                Ok(CertificatesByAddress {
+                    address: owned.address.into(),
+                    certificate_summaries,
+                })
+            })
+            .collect::<Result<Vec<CertificatesByAddress>, ProxyError>>()?;
+
+        let listeners_count = certificates.len();
+        let certificates_count = certificates
+            .iter()
+            .map(|entry| entry.certificate_summaries.len())
+            .fold(0usize, |total, count| total.saturating_add(count));
+
+        info!(
+            "{} got Certificates::All query, listeners_count={} certificates_count={}",
+            log_module_context!(),
+            listeners_count,
+            certificates_count,
+        );
+
+        Ok(Some(
+            ContentType::CertificatesByAddress(ListOfCertificatesByAddress { certificates }).into(),
+        ))
+    }
+
+    pub fn query_certificate_for_domain(
+        &mut self,
+        domain: String,
+    ) -> Result<Option<ResponseContent>, ProxyError> {
+        // The resolver keys its SNI trie on ASCII-lowercased certificate
+        // names (`CertifiedKeyWrapper::try_from`), because that is the
+        // only form rustls ever asks it for. An operator query has to
+        // ask the same question a handshake does, or
+        // `sozu query certificates --domain Example.COM` reports the
+        // certificate missing while the proxy happily serves it.
+        let domain_key = domain.to_ascii_lowercase();
+        let certificates = self
+            .listeners
+            .values()
+            .map(|listener| {
+                let owned = listener.borrow();
+                // See `query_all_certificates`: lock like the
+                // `add`/`remove`/`replace` siblings do.
+                let resolver = owned
+                    .resolver
+                    .0
+                    .lock()
+                    .map_err(|e| ProxyError::Lock(e.to_string()))?;
+                let mut certificate_summaries = vec![];
+
+                if let Some((k, fingerprint)) = resolver.domain_lookup(domain_key.as_bytes(), true)
+                {
+                    certificate_summaries.push(CertificateSummary {
+                        domain: certificate_summary_domain(k),
+                        fingerprint: fingerprint.to_string(),
+                    });
+                }
+                Ok(CertificatesByAddress {
+                    address: owned.address.into(),
+                    certificate_summaries,
+                })
+            })
+            .collect::<Result<Vec<CertificatesByAddress>, ProxyError>>()?;
+
+        let listeners_count = certificates.len();
+        let certificates_count = certificates
+            .iter()
+            .map(|entry| entry.certificate_summaries.len())
+            .fold(0usize, |total, count| total.saturating_add(count));
+
+        info!(
+            "{} got Certificates::Domain query, domain_bytes={} listeners_count={} certificates_count={}",
+            log_module_context!(),
+            domain.len(),
+            listeners_count,
+            certificates_count,
+        );
+
+        Ok(Some(
+            ContentType::CertificatesByAddress(ListOfCertificatesByAddress { certificates }).into(),
+        ))
+    }
+
+    /// What this proxy would do with a socket handed to
+    /// [`activate_listener`](Self::activate_listener) for `addr`. See
+    /// [`crate::InheritedSocketFate`].
+    ///
+    /// The event loop is single-threaded, so nothing can change the listener's
+    /// `active` flag between this answer and the `activate_listener` call that
+    /// acts on it.
+    pub fn inherited_socket_fate(&self, addr: &ListenerKey) -> crate::InheritedSocketFate {
+        use crate::InheritedSocketFate;
+        match self
+            .listeners
+            .values()
+            .find(|listener| listener.borrow().is(addr))
+        {
+            None => InheritedSocketFate::Unclaimed,
+            Some(listener) if listener.borrow().active => InheritedSocketFate::Refused,
+            Some(_) => InheritedSocketFate::Adopted,
+        }
+    }
+
+    pub fn activate_listener(
+        &mut self,
+        addr: &ListenerKey,
+        tcp_listener: Option<MioTcpListener>,
+    ) -> Result<Token, ProxyError> {
+        let listener = self
+            .listeners
+            .values()
+            .find(|listener| listener.borrow().is(addr))
+            .ok_or(ProxyError::NoListenerFound(addr.clone()))?;
+
+        listener
+            .borrow_mut()
+            .activate(&self.registry, tcp_listener)
+            .map_err(|listener_error| ProxyError::ListenerActivation {
+                address: addr.address,
+                listener_error,
+            })
+    }
+
+    /// The slab token reserved for the listener at `address`, if this proxy
+    /// holds one.
+    ///
+    /// A listener owns exactly one slab slot for its whole `AddListener` ->
+    /// `RemoveListener` lifetime, and no `remove_listener` implementation
+    /// touches the session slab. `Server` therefore reads the token here
+    /// BEFORE dropping the listener, so that reserved slot is released exactly
+    /// once, at the end of the lifetime.
+    pub fn listener_token(&self, address: &ListenerKey) -> Option<Token> {
+        self.listeners
+            .iter()
+            .find(|(_, listener)| listener.borrow().is(address))
+            .map(|(token, _)| *token)
+    }
+
+    pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, MioTcpListener)> {
+        self.listeners
+            .values()
+            .filter_map(|listener| {
+                let mut owned = listener.borrow_mut();
+                if let Some(listener) = owned.listener.take() {
+                    // Reset `active` so a subsequent `activate()` re-binds
+                    // instead of short-circuiting on the stale flag.
+                    owned.active = false;
+                    return Some((owned.key(), listener));
+                }
+
+                None
+            })
+            .collect()
+    }
+
+    pub fn give_back_listener(
+        &mut self,
+        address: &ListenerKey,
+    ) -> Result<(Token, MioTcpListener), ProxyError> {
+        let listener = self
+            .listeners
+            .values()
+            .find(|listener| listener.borrow().is(address))
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
+
+        let mut owned = listener.borrow_mut();
+
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
+
+        // Reset `active` so a subsequent `activate()` re-binds instead of
+        // short-circuiting on the stale flag.
+        owned.active = false;
+
+        Ok((owned.token, taken_listener))
+    }
+
+    /// Every listener on `address`, whatever its interface. Frontends and
+    /// certificates name their listener by address alone, so they apply to
+    /// all the listeners sharing that address on different interfaces.
+    fn listeners_at(
+        &self,
+        address: StdSocketAddr,
+    ) -> Result<Vec<Rc<RefCell<HttpsListener>>>, ProxyError> {
+        let mut listeners: Vec<_> = self
+            .listeners
+            .iter()
+            .filter(|(_, listener)| listener.borrow().address == address)
+            .map(|(token, listener)| (*token, listener.clone()))
+            .collect();
+        // Token order, so a failure is reported the same way on every run.
+        listeners.sort_by_key(|(token, _)| *token);
+        let listeners: Vec<_> = listeners
+            .into_iter()
+            .map(|(_, listener)| listener)
+            .collect();
+        if listeners.is_empty() {
+            return Err(ProxyError::NoListenerFound(address.into()));
+        }
+        Ok(listeners)
+    }
+
+    /// Apply a partial-update patch to the identified HTTPS listener.
+    pub fn update_listener(&mut self, patch: UpdateHttpsListenerConfig) -> Result<(), ProxyError> {
+        let address: std::net::SocketAddr = patch.address.into();
+        let listener = self
+            .listeners
+            .values()
+            .find(|l| l.borrow().address == address)
+            .ok_or(ProxyError::NoListenerFound(address.into()))?;
+        listener
+            .borrow_mut()
+            .update_config(&patch)
+            .map_err(|listener_error| ProxyError::ListenerActivation {
+                address,
+                listener_error,
+            })
+    }
+
+    pub fn add_cluster(
+        &mut self,
+        mut cluster: Cluster,
+    ) -> Result<Option<ResponseContent>, ProxyError> {
+        let mut cluster_overrides = cluster.answers.clone();
+        if let Some(answer_503) = cluster.answer_503.take() {
+            cluster_overrides
+                .entry("503".to_owned())
+                .or_insert(answer_503);
+        }
+        if !cluster_overrides.is_empty() {
+            for listener in self.listeners.values() {
+                listener
+                    .borrow()
+                    .answers
+                    .borrow_mut()
+                    .add_cluster_answers(&cluster.cluster_id, &cluster_overrides)
+                    .map_err(|(status, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    })?;
+            }
+        }
+        self.clusters
+            .insert(cluster.cluster_id.as_str().into(), cluster);
+        Ok(None)
+    }
+
+    pub fn remove_cluster(
+        &mut self,
+        cluster_id: &str,
+    ) -> Result<Option<ResponseContent>, ProxyError> {
+        self.clusters.remove(cluster_id);
+        for listener in self.listeners.values() {
+            listener
+                .borrow()
+                .answers
+                .borrow_mut()
+                .remove_cluster_answers(cluster_id);
+        }
+
+        Ok(None)
+    }
+
+    pub fn add_https_frontend(
+        &mut self,
+        front: RequestHttpFrontend,
+    ) -> Result<Option<ResponseContent>, ProxyError> {
+        let front = front.clone().to_frontend().map_err(|request_error| {
+            ProxyError::WrongInputFrontend {
+                front: Box::new(front),
+                error: request_error.to_string(),
+            }
+        })?;
+
+        for listener in self.listeners_at(front.address)? {
+            let mut listener = listener.borrow_mut();
+            let mut front = front.clone();
+
+            // ── HSTS listener-default → frontend inheritance ─────────────────
+            // When the frontend declares no `hsts` block, fall back to the
+            // listener default so the operator can opt into HSTS once at the
+            // listener and have every HTTPS frontend inherit it.
+            // `enabled = Some(false)` on the frontend is the explicit-disable
+            // signal: it stays as-is and suppresses the inherited default.
+            //
+            // The `hsts_origin` flag records the frontend's own intent — it
+            // declared no `hsts` — rather than whether a default existed, so
+            // the resulting `Frontend` carries the inheritance bit even when
+            // the listener has no default yet. A later
+            // `UpdateHttpsListenerConfig.hsts` patch, or the copy into a
+            // listener added on the same address (`HttpsProxy::add_listener`), then
+            // resolves it against that listener's own default via
+            // `Router::refresh_inheriting_hsts` without disturbing explicit
+            // per-frontend overrides (sozu-proxy/sozu#1691).
+            let hsts_origin = if front.hsts.is_none() {
+                front.hsts = listener.config.hsts;
+                crate::router::HstsOrigin::InheritedFromListenerDefault
+            } else {
+                crate::router::HstsOrigin::Explicit
+            };
+
+            listener.set_tags(front.hostname.to_owned(), front.tags.to_owned());
+            listener
+                .add_https_front_with_hsts_origin(front, hsts_origin)
+                .map_err(ProxyError::AddFrontend)?;
+        }
+        Ok(None)
+    }
+
+    pub fn remove_https_frontend(
+        &mut self,
+        front: RequestHttpFrontend,
+    ) -> Result<Option<ResponseContent>, ProxyError> {
+        let front = front.clone().to_frontend().map_err(|request_error| {
+            ProxyError::WrongInputFrontend {
+                front: Box::new(front),
+                error: request_error.to_string(),
+            }
+        })?;
+
+        // Every listener on the address drops the route, even when another
+        // one fails: a sibling must never keep a route the others removed.
+        // The first failure, in token order, is the one reported.
+        let mut result = Ok(None);
+        for listener in self.listeners_at(front.address)? {
+            let mut listener = listener.borrow_mut();
+            let hostname = front.hostname.to_owned();
+
+            if let Err(error) = listener.remove_https_front(front.clone())
+                && result.is_ok()
+            {
+                result = Err(ProxyError::RemoveFrontend(error));
+            }
+
+            if !listener.fronts.has_hostname(&hostname) {
+                listener.set_tags(hostname, None);
+            }
+        }
+        result
+    }
+
+    pub fn add_certificate(
+        &mut self,
+        add_certificate: AddCertificate,
+    ) -> Result<Option<ResponseContent>, ProxyError> {
+        let address = add_certificate.address.into();
+
+        for listener in self.listeners_at(address)? {
+            let listener = listener.borrow();
+            let mut resolver = listener
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))?;
+
+            resolver
+                .add_certificate(&add_certificate)
+                .map_err(ProxyError::AddCertificate)?;
+        }
+
+        Ok(None)
+    }
+
+    //FIXME: should return an error if certificate still has fronts referencing it
+    pub fn remove_certificate(
+        &mut self,
+        remove_certificate: RemoveCertificate,
+    ) -> Result<Option<ResponseContent>, ProxyError> {
+        let address = remove_certificate.address.into();
+
+        let fingerprint = Fingerprint(
+            hex::decode(&remove_certificate.fingerprint)
+                .map_err(ProxyError::WrongCertificateFingerprint)?,
+        );
+
+        // Every listener on the address applies the change, even when another
+        // one fails, so none keeps a certificate its siblings dropped; the
+        // first failure, in token order, is the one reported.
+        let mut result = Ok(None);
+        for listener in self.listeners_at(address)? {
+            let listener = listener.borrow();
+            let applied = listener
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))
+                .and_then(|mut resolver| {
+                    resolver
+                        .remove_certificate(&fingerprint)
+                        .map_err(ProxyError::RemoveCertificate)
+                });
+            if let Err(error) = applied
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    //FIXME: should return an error if certificate still has fronts referencing it
+    pub fn replace_certificate(
+        &mut self,
+        replace_certificate: ReplaceCertificate,
+    ) -> Result<Option<ResponseContent>, ProxyError> {
+        let address = replace_certificate.address.into();
+
+        // Every listener on the address applies the change, even when another
+        // one fails, so none keeps a certificate its siblings dropped; the
+        // first failure, in token order, is the one reported.
+        let mut result = Ok(None);
+        for listener in self.listeners_at(address)? {
+            let listener = listener.borrow();
+            let applied = listener
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))
+                .and_then(|mut resolver| {
+                    resolver
+                        .replace_certificate(&replace_certificate)
+                        .map_err(ProxyError::ReplaceCertificate)
+                });
+            if let Err(error) = applied
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
+}
+
+impl ProxyConfiguration for HttpsProxy {
+    fn accept(&mut self, token: ListenToken) -> Result<(MioTcpStream, StdSocketAddr), AcceptError> {
+        match self.listeners.get(&Token(token.0)) {
+            Some(listener) => listener.borrow_mut().accept(),
+            None => Err(AcceptError::IoError),
+        }
+    }
+
+    fn create_session(
+        &mut self,
+        mut frontend_sock: MioTcpStream,
+        peer: StdSocketAddr,
+        token: ListenToken,
+        wait_time: Duration,
+        proxy: Rc<RefCell<Self>>,
+    ) -> Result<(), AcceptError> {
+        let listener = self
+            .listeners
+            .get(&Token(token.0))
+            .ok_or(AcceptError::IoError)?;
+        // No `set_nodelay` here: the socket has `TCP_NODELAY` from its
+        // listener, or from `HttpsListener::accept` if it was queued before
+        // the listener set it.
+
+        let owned = listener.borrow();
+        let rustls_details = ServerConnection::new(owned.rustls_details.clone()).map_err(|e| {
+            error!(
+                "{} failed to create server session: {:?}",
+                log_module_context!(),
+                e
+            );
+            AcceptError::IoError
+        })?;
+
+        let mut session_manager = self.sessions.borrow_mut();
+        let entry = session_manager.slab.vacant_entry();
+        let session_token = Token(entry.key());
+        // The session token IS the slab key: the event loop later indexes the
+        // slab directly by the mio `Token` it receives, so any divergence here
+        // would route readiness to the wrong session slot. Snapshot the key to
+        // re-check after `entry.insert` consumes the entry.
+        debug_assert_eq!(
+            session_token.0,
+            entry.key(),
+            "HTTPS session token must equal its slab key"
+        );
+
+        self.registry
+            .register(
+                &mut frontend_sock,
+                session_token,
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .map_err(|register_error| {
+                error!(
+                    "{} error registering front socket({:?}): {:?}",
+                    log_module_context!(),
+                    frontend_sock,
+                    register_error
+                );
+                AcceptError::RegisterError
+            })?;
+
+        let public_address: StdSocketAddr = match owned.config.public_address {
+            Some(pub_addr) => pub_addr.into(),
+            None => owned.config.address.into(),
+        };
+
+        let session = Rc::new(RefCell::new(HttpsSession::new(
+            Duration::from_secs(owned.config.back_timeout as u64),
+            Duration::from_secs(owned.config.connect_timeout as u64),
+            Duration::from_secs(owned.config.front_timeout as u64),
+            Duration::from_secs(owned.config.request_timeout as u64),
+            owned.config.expect_proxy,
+            listener.clone(),
+            Rc::downgrade(&self.pool),
+            proxy,
+            public_address,
+            rustls_details,
+            frontend_sock,
+            peer,
+            session_token,
+            wait_time,
+        )));
+        // The freshly built session must own exactly the token it is filed under,
+        // so event-loop dispatch (slab key → session) and self-removal
+        // (`frontend_token()` → slab key) agree.
+        debug_assert_eq!(
+            session.borrow().frontend_token(),
+            session_token,
+            "stored HTTPS session must report the slab token as its frontend token"
+        );
+        entry.insert(session);
+
+        Ok(())
+    }
+
+    fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
+        let request_id = request.id.clone();
+
+        let request_type = match request.content.request_type {
+            Some(t) => t,
+            None => return WorkerResponse::error(request_id, "Empty request"),
+        };
+
+        let content_result = match request_type {
+            RequestType::AddCluster(cluster) => {
+                debug!(
+                    "{} {} add cluster {:?}",
+                    log_module_context!(),
+                    request_id,
+                    cluster
+                );
+                self.add_cluster(cluster)
+            }
+            RequestType::RemoveCluster(cluster_id) => {
+                debug!(
+                    "{} {} remove cluster {:?}",
+                    log_module_context!(),
+                    request_id,
+                    cluster_id
+                );
+                self.remove_cluster(&cluster_id)
+            }
+            RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithSilentClose(front)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
+                debug!(
+                    "{} {} add https front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
+                self.add_https_frontend(front)
+            }
+            RequestType::RemoveHttpsFrontend(front)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front) => {
+                debug!(
+                    "{} {} remove https front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
+                self.remove_https_frontend(front)
+            }
+            RequestType::AddCertificate(add_certificate) => {
+                debug!(
+                    "{} {} add certificate: {:?}",
+                    log_module_context!(),
+                    request_id,
+                    add_certificate
+                );
+                self.add_certificate(add_certificate)
+            }
+            RequestType::RemoveCertificate(remove_certificate) => {
+                debug!(
+                    "{} {} remove certificate: {:?}",
+                    log_module_context!(),
+                    request_id,
+                    remove_certificate
+                );
+                self.remove_certificate(remove_certificate)
+            }
+            RequestType::ReplaceCertificate(replace_certificate) => {
+                debug!(
+                    "{} {} replace certificate: {:?}",
+                    log_module_context!(),
+                    request_id,
+                    replace_certificate
+                );
+                self.replace_certificate(replace_certificate)
+            }
+            RequestType::RemoveListener(remove) => {
+                debug!(
+                    "{} removing HTTPS listener at address {:?}",
+                    log_module_context!(),
+                    remove.address
+                );
+                self.remove_listener(remove)
+            }
+            RequestType::SoftStop(_) => {
+                debug!(
+                    "{} {} processing soft shutdown",
+                    log_module_context!(),
+                    request_id
+                );
+                match self.soft_stop() {
+                    Ok(_) => {
+                        info!(
+                            "{} {} soft stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
+                        return WorkerResponse::processing(request.id);
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            RequestType::HardStop(_) => {
+                debug!(
+                    "{} {} processing hard shutdown",
+                    log_module_context!(),
+                    request_id
+                );
+                match self.hard_stop() {
+                    Ok(_) => {
+                        debug!(
+                            "{} {} hard stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
+                        return WorkerResponse::processing(request.id);
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            RequestType::Status(_) => {
+                debug!("{} {} status", log_module_context!(), request_id);
+                Ok(None)
+            }
+            RequestType::QueryCertificatesFromWorkers(filters) => {
+                if let Some(domain) = filters.domain {
+                    debug!(
+                        "{} {} query certificate for domain_bytes={}",
+                        log_module_context!(),
+                        request_id,
+                        domain.len(),
+                    );
+                    self.query_certificate_for_domain(domain)
+                } else {
+                    debug!(
+                        "{} {} query all certificates",
+                        log_module_context!(),
+                        request_id
+                    );
+                    self.query_all_certificates()
+                }
+            }
+            other_request => {
+                debug!(
+                    "{} {} unsupported message for HTTPS proxy, ignoring {:?}",
+                    log_module_context!(),
+                    request.id,
+                    other_request
+                );
+                Err(ProxyError::UnsupportedMessage)
+            }
+        };
+
+        match content_result {
+            Ok(content) => {
+                debug!("{} {} successful", log_module_context!(), request_id);
+                match content {
+                    Some(content) => WorkerResponse::ok_with_content(request_id, content),
+                    None => WorkerResponse::ok(request_id),
+                }
+            }
+            Err(proxy_error) => {
+                debug!(
+                    "{} {} unsuccessful: {}",
+                    log_module_context!(),
+                    request_id,
+                    proxy_error
+                );
+                WorkerResponse::error(request_id, proxy_error)
+            }
+        }
+    }
+}
+impl L7Proxy for HttpsProxy {
+    fn kind(&self) -> ListenerType {
+        ListenerType::Https
+    }
+
+    fn register_socket(
+        &self,
+        socket: &mut MioTcpStream,
+        token: Token,
+        interest: Interest,
+    ) -> Result<(), std::io::Error> {
+        self.registry.register(socket, token, interest)
+    }
+
+    fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token {
+        let mut session_manager = self.sessions.borrow_mut();
+        let entry = session_manager.slab.vacant_entry();
+        let token = Token(entry.key());
+        let _entry = entry.insert(session);
+        token
+    }
+
+    fn remove_session(&self, token: Token) -> bool {
+        let mut sessions = self.sessions.borrow_mut();
+        // Mirror of HttpProxy::remove_session — drain the per-(cluster,
+        // source-IP) accounting before the slab slot is reused.
+        sessions.untrack_all_cluster_ip(token);
+        sessions.slab.try_remove(token.0).is_some()
+    }
+
+    fn clusters(&self) -> &HashMap<ClusterId, Cluster> {
+        &self.clusters
+    }
+
+    fn sessions(&self) -> Rc<RefCell<SessionManager>> {
+        self.sessions.clone()
+    }
+}
+
+/// Used for metrics keeping
+fn rustls_version_str(version: ProtocolVersion) -> &'static str {
+    match version {
+        ProtocolVersion::SSLv2 => "tls.version.SSLv2",
+        ProtocolVersion::SSLv3 => "tls.version.SSLv3",
+        ProtocolVersion::TLSv1_0 => "tls.version.TLSv1_0",
+        ProtocolVersion::TLSv1_1 => "tls.version.TLSv1_1",
+        ProtocolVersion::TLSv1_2 => "tls.version.TLSv1_2",
+        ProtocolVersion::TLSv1_3 => "tls.version.TLSv1_3",
+        ProtocolVersion::DTLSv1_0 => "tls.version.DTLSv1_0",
+        ProtocolVersion::DTLSv1_2 => "tls.version.DTLSv1_2",
+        ProtocolVersion::DTLSv1_3 => "tls.version.DTLSv1_3",
+        ProtocolVersion::Unknown(_) => "tls.version.Unknown",
+        _ => "tls.version.unimplemented",
+    }
+}
+
+/// Short label suitable for access logs (e.g. `"TLSv1.3"`).
+///
+/// Distinct from [`rustls_version_str`] which prefixes with `tls.version.`
+/// for metric ingestion. Returns `None` for variants Sōzu does not know how
+/// to label, so the access log records `tls_version` as absent rather than
+/// emitting a misleading `"unimplemented"` literal.
+pub(crate) fn rustls_version_label(version: ProtocolVersion) -> Option<&'static str> {
+    match version {
+        ProtocolVersion::SSLv2 => Some("SSLv2"),
+        ProtocolVersion::SSLv3 => Some("SSLv3"),
+        ProtocolVersion::TLSv1_0 => Some("TLSv1.0"),
+        ProtocolVersion::TLSv1_1 => Some("TLSv1.1"),
+        ProtocolVersion::TLSv1_2 => Some("TLSv1.2"),
+        ProtocolVersion::TLSv1_3 => Some("TLSv1.3"),
+        ProtocolVersion::DTLSv1_0 => Some("DTLSv1.0"),
+        ProtocolVersion::DTLSv1_2 => Some("DTLSv1.2"),
+        ProtocolVersion::DTLSv1_3 => Some("DTLSv1.3"),
+        _ => None,
+    }
+}
+
+/// Used for metrics keeping
+fn rustls_ciphersuite_str(cipher: SupportedCipherSuite) -> &'static str {
+    match cipher.suite() {
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            "tls.cipher.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            "tls.cipher.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => {
+            "tls.cipher.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
+            "tls.cipher.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+        }
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => {
+            "tls.cipher.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+        }
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => {
+            "tls.cipher.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+        }
+        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => "tls.cipher.TLS13_CHACHA20_POLY1305_SHA256",
+        CipherSuite::TLS13_AES_256_GCM_SHA384 => "tls.cipher.TLS13_AES_256_GCM_SHA384",
+        CipherSuite::TLS13_AES_128_GCM_SHA256 => "tls.cipher.TLS13_AES_128_GCM_SHA256",
+        _ => "tls.cipher.Unsupported",
+    }
+}
+
+/// Short label suitable for access logs (e.g. `"TLS_AES_128_GCM_SHA256"`).
+///
+/// Distinct from [`rustls_ciphersuite_str`] which prefixes with `tls.cipher.`
+/// for metric ingestion. Returns `None` for cipher suites Sōzu does not know
+/// how to label, so the access log records `tls_cipher` as absent rather
+/// than emitting a misleading `"Unsupported"` literal.
+pub(crate) fn rustls_ciphersuite_label(cipher: SupportedCipherSuite) -> Option<&'static str> {
+    match cipher.suite() {
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            Some("TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            Some("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => {
+            Some("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
+            Some("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384")
+        }
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => {
+            Some("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => {
+            Some("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384")
+        }
+        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => Some("TLS13_CHACHA20_POLY1305_SHA256"),
+        CipherSuite::TLS13_AES_256_GCM_SHA384 => Some("TLS13_AES_256_GCM_SHA384"),
+        CipherSuite::TLS13_AES_128_GCM_SHA256 => Some("TLS13_AES_128_GCM_SHA256"),
+        _ => None,
+    }
+}
+
+pub mod testing {
+    use crate::testing::*;
+
+    /// this function is not used, but is available for example and testing purposes
+    pub fn start_https_worker(
+        config: HttpsListenerConfig,
+        channel: ProxyChannel,
+        max_buffers: usize,
+        buffer_size: usize,
+    ) -> anyhow::Result<()> {
+        let address = config.address.into();
+
+        let ServerParts {
+            event_loop,
+            registry,
+            sessions,
+            pool,
+            backends,
+            client_scm_socket: _,
+            server_scm_socket,
+            server_config,
+        } = prebuild_server(max_buffers, buffer_size, true)?;
+
+        let token = {
+            let mut sessions = sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            let _ = entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::HTTPSListen,
+            })));
+            Token(key)
+        };
+
+        let mut proxy = HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+        proxy
+            .add_listener(config, token)
+            .with_context(|| "Failed at creating adding the listener")?;
+        proxy
+            .activate_listener(&address, None)
+            .with_context(|| "Failed at creating activating the listener")?;
+
+        let mut server = Server::new(
+            event_loop,
+            channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            Some(proxy),
+            None,
+            server_config,
+            None,
+            false,
+        )
+        .with_context(|| "Failed at creating server")?;
+
+        debug!("{} starting event loop", log_module_context!());
+        server.run();
+        debug!("{} ending event loop", log_module_context!());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{CertificateAndKey, SocketAddress},
+    };
+
+    use super::*;
+    use crate::{
+        router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode},
+        socket::SocketHandler,
+    };
+
+    /// A handshake whose last `recv` proved the socket empty hands over no
+    /// READABLE: the upgraded mux must not `recv` for an EAGAIN (#1609).
+    /// READABLE survives when the handshake still had it, or when rustls
+    /// holds decrypted input; WRITABLE always does.
+    #[test]
+    fn the_upgraded_frontend_reads_only_when_a_read_is_due() {
+        assert_eq!(
+            upgraded_frontend_events(Ready::EMPTY, false),
+            Ready::WRITABLE,
+            "a drained socket and an empty rustls need no read"
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::WRITABLE, false),
+            Ready::WRITABLE
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::READABLE, false),
+            Ready::READABLE | Ready::WRITABLE,
+            "an edge not yet read must survive the upgrade"
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::EMPTY, true),
+            Ready::READABLE | Ready::WRITABLE,
+            "plaintext rustls already holds raises no edge"
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::READABLE | Ready::HUP, true),
+            Ready::READABLE | Ready::WRITABLE | Ready::HUP,
+            "a half-close seen during the handshake must reach the mux"
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::HUP, false),
+            Ready::WRITABLE | Ready::HUP,
+            "HUP survives even when no read is due"
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::READABLE | Ready::HUP | Ready::WRITE_CLOSED, true),
+            Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::WRITE_CLOSED,
+            "a hang-up seen during the handshake must reach the mux as one"
+        );
+    }
+
+    #[test]
+    fn successful_tls_handshake_log_bounds_sni_and_alpn() {
+        const SNI_SECRET: &str = "HTTPS_HANDSHAKE_SNI_SECRET_SENTINEL";
+        const ALPN_SECRET: &str = "HTTPS_HANDSHAKE_ALPN_SECRET_SENTINEL";
+
+        let sni = format!("{SNI_SECRET}{}", "x".repeat(4096));
+        let alpn = format!("{ALPN_SECRET}{}", "x".repeat(4096));
+        let sni_len = sni.len();
+        let alpn_len = alpn.len();
+        let output = successful_tls_handshake_summary(Some(&sni), Some(&alpn));
+
+        for secret in [SNI_SECRET, ALPN_SECRET] {
+            assert!(
+                !output.contains(secret),
+                "successful TLS handshake log leaked {secret}: {output}"
+            );
+        }
+        for metadata in [
+            format!("sni_bytes=Some({sni_len})"),
+            format!("alpn_bytes=Some({alpn_len})"),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "successful TLS handshake log omitted {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 512,
+            "successful TLS handshake log is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    fn proxy_with_certificate_domain(domain: String) -> HttpsProxy {
+        let crate::testing::ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = crate::testing::prebuild_server(16, 16_384, false)
+            .expect("test HTTPS proxy dependencies must initialize");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
+        let mut config = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("test HTTPS listener config must build");
+        config.cipher_list = vec!["TLS13_AES_256_GCM_SHA384".to_owned()];
+        config.groups_list = vec!["P-256".to_owned()];
+        let mut proxy = HttpsProxy::new(registry, sessions, pool, backends);
+        proxy
+            .add_listener(config, Token(10))
+            .expect("test HTTPS listener must be added");
+        proxy
+            .add_certificate(AddCertificate {
+                address,
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    certificate_chain: Vec::new(),
+                    versions: Vec::new(),
+                    names: vec![domain],
+                },
+                expired_at: None,
+            })
+            .expect("test certificate must be added");
+        proxy
+    }
+
+    /// The two `query_*` paths take the resolver mutex with `unwrap_msg!`,
+    /// while every `add`/`remove`/`replace` sibling takes it with
+    /// `.lock().map_err(|e| ProxyError::Lock(e.to_string()))?`
+    /// (https.rs `add_certificate`/`remove_certificate`/`replace_certificate`).
+    /// That asymmetry is the finding: a poisoned resolver — any earlier panic
+    /// while the lock was held — turns a read-only `QueryCertificates`
+    /// control-plane request into a worker kill instead of an error response.
+    ///
+    /// To SEE THIS RED: put `unwrap_msg!(owned.resolver.0.lock())` back in
+    /// `query_all_certificates` and `query_certificate_for_domain` (restoring
+    /// the `util::UnwrapLog` import the removal made unused) — both calls
+    /// below then panic with `PoisonError` instead of returning
+    /// `ProxyError::Lock`.
+    #[test]
+    fn a_poisoned_resolver_fails_the_certificate_queries_instead_of_the_worker() {
+        let mut proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+
+        let resolver = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .borrow()
+            .resolver()
+            .clone();
+
+        // Poison the mutex exactly as a panic inside the worker would: hold
+        // the guard, unwind. `join` swallows the unwind so the test process
+        // survives to observe the poisoned state.
+        let poisoner = resolver.clone();
+        let unwound = std::thread::spawn(move || {
+            let _guard = poisoner.0.lock().expect("first lock is not poisoned");
+            panic!("simulated worker panic while holding the resolver lock");
+        })
+        .join();
+        assert!(unwound.is_err(), "the poisoning thread must have unwound");
+        assert!(
+            resolver.0.lock().is_err(),
+            "the resolver mutex must now be poisoned"
+        );
+
+        assert!(
+            matches!(proxy.query_all_certificates(), Err(ProxyError::Lock(_))),
+            "Certificates::All on a poisoned resolver must report a lock error"
+        );
+        assert!(
+            matches!(
+                proxy.query_certificate_for_domain("lolcatho.st".to_owned()),
+                Err(ProxyError::Lock(_))
+            ),
+            "Certificates::Domain on a poisoned resolver must report a lock error"
+        );
+    }
+
+    /// `String::from_utf8(trie_key).unwrap()` in `query_all_certificates` is a
+    /// second unconditional panic on a value the function does not own. The
+    /// control plane cannot currently reach it — `AddCertificate.names` is
+    /// `Vec<String>` and `tls.rs::add_certificate` inserts
+    /// `String::into_bytes()`, while `TrieNode::to_hashmap` clones the stored
+    /// key back verbatim — so this is an invariant, and the red below is BY
+    /// MUTATION of the trie: `TrieNode<Fingerprint>` is `pub` and its key type
+    /// is `Vec<u8>`, so the type permits what the control plane does not. A
+    /// certificate listing must not be able to kill the worker over a key it
+    /// merely echoes.
+    ///
+    /// To SEE THIS RED: put `String::from_utf8(k).unwrap()` back in
+    /// `query_all_certificates` — this test then panics with
+    /// `FromUtf8Error`.
+    #[test]
+    fn a_non_utf8_resolver_key_is_listed_lossily_not_panicked() {
+        let mut proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+
+        let resolver = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .borrow()
+            .resolver()
+            .clone();
+        {
+            let mut owned = resolver.0.lock().expect("resolver lock");
+            let inserted = owned
+                .domains
+                .insert(vec![0xff, 0xfe], Fingerprint(vec![0x01, 0x02]));
+            assert_ne!(
+                inserted,
+                crate::router::pattern_trie::InsertResult::Failed,
+                "the SNI trie must accept the non-UTF-8 key this test relies on"
+            );
+        }
+
+        let response = proxy
+            .query_all_certificates()
+            .expect("a non-UTF-8 trie key must not fail the query");
+        assert!(
+            response.is_some(),
+            "Certificates::All must still answer with a listing"
+        );
+    }
+
+    #[test]
+    fn query_all_certificates_log_redacts_response_domains() {
+        const DOMAIN_SECRET: &str = "QUERY_ALL_CERTIFICATE_DOMAIN_SECRET_SENTINEL";
+
+        // Below `router::MAX_HOSTNAME_LENGTH` so the certificate passes
+        // add-time name validation; the redaction property under test is
+        // length-independent.
+        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(2048));
+        let output = crate::capture_test_logs(move || {
+            let mut proxy = proxy_with_certificate_domain(domain);
+            proxy
+                .query_all_certificates()
+                .expect("certificate query must succeed");
+        });
+
+        assert!(
+            !output.contains(DOMAIN_SECRET),
+            "Certificates::All log leaked response domain {DOMAIN_SECRET}"
+        );
+        for metadata in ["listeners_count=1", "certificates_count=1"] {
+            assert!(
+                output.contains(metadata),
+                "Certificates::All log omitted bounded metadata {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 1024,
+            "Certificates::All log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn query_certificate_for_domain_log_redacts_request_and_response_domain() {
+        const DOMAIN_SECRET: &str = "QUERY_ONE_CERTIFICATE_DOMAIN_SECRET_SENTINEL";
+
+        // Below `router::MAX_HOSTNAME_LENGTH` -- see
+        // `query_all_certificates_log_redacts_response_domains`.
+        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(2048));
+        let domain_len = domain.len();
+        let output = crate::capture_test_logs_at_level("debug", move || {
+            let mut proxy = proxy_with_certificate_domain(domain.clone());
+            let response = proxy.notify(WorkerRequest {
+                id: "query-domain-redaction-test".to_owned(),
+                content: RequestType::QueryCertificatesFromWorkers(
+                    sozu_command::proto::command::QueryCertificatesFilters {
+                        domain: Some(domain),
+                        fingerprint: None,
+                    },
+                )
+                .into(),
+            });
+            assert_eq!(
+                response.status,
+                sozu_command::proto::command::ResponseStatus::Ok as i32,
+                "domain certificate query must succeed: {}",
+                response.message
+            );
+        });
+
+        assert!(
+            !output.contains(DOMAIN_SECRET),
+            "Certificates::Domain log leaked request or response domain {DOMAIN_SECRET}"
+        );
+        for metadata in [
+            format!("domain_bytes={domain_len}"),
+            "listeners_count=1".to_owned(),
+            "certificates_count=1".to_owned(),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "Certificates::Domain log omitted bounded metadata {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 1024,
+            "Certificates::Domain log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn frontend_from_request_test() {
+        let cluster_id1 = ClusterId::from("cluster_1");
+        let cluster_id2 = ClusterId::from("cluster_2");
+        let cluster_id3 = ClusterId::from("cluster_3");
+        let uri1 = "/".to_owned();
+        let uri2 = "/yolo".to_owned();
+        let uri3 = "/yolo/swag".to_owned();
+
+        let mut fronts = Router::new();
+        assert!(fronts.add_tree_rule(
+            "lolcatho.st".as_bytes(),
+            &PathRule::Prefix(uri1),
+            &MethodRule::new(None),
+            &Route::ClusterId(cluster_id1.clone())
+        ));
+        assert!(fronts.add_tree_rule(
+            "lolcatho.st".as_bytes(),
+            &PathRule::Prefix(uri2),
+            &MethodRule::new(None),
+            &Route::ClusterId(cluster_id2)
+        ));
+        assert!(fronts.add_tree_rule(
+            "lolcatho.st".as_bytes(),
+            &PathRule::Prefix(uri3),
+            &MethodRule::new(None),
+            &Route::ClusterId(cluster_id3)
+        ));
+        assert!(fronts.add_tree_rule(
+            "other.domain".as_bytes(),
+            &PathRule::Prefix("test".to_string()),
+            &MethodRule::new(None),
+            &Route::ClusterId(cluster_id1)
+        ));
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
+        let resolver = Arc::new(MutexCertificateResolver::default());
+
+        let crypto_provider = Arc::new(default_provider());
+
+        let server_config = RustlsServerConfig::builder_with_provider(crypto_provider)
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+            .expect("could not create rustls config server")
+            .with_no_client_auth()
+            .with_cert_resolver(resolver.clone());
+
+        let rustls_details = Arc::new(server_config);
+
+        let default_config = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("Could not create default HTTPS listener config");
+
+        println!("it doesn't even matter");
+
+        let listener = HttpsListener {
+            parked_listener: None,
+            nodelay_backlog: false,
+            listener: None,
+            address: address.into(),
+            fronts,
+            rustls_details,
+            resolver,
+            answers: Rc::new(RefCell::new(
+                HttpAnswers::new(&std::collections::BTreeMap::new()).unwrap(),
+            )),
+            config: default_config,
+            token: Token(0),
+            active: true,
+            tags: BTreeMap::new(),
+        };
+
+        println!("TEST {}", line!());
+        let frontend1 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        assert_eq!(
+            frontend1
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
+        );
+        println!("TEST {}", line!());
+        let frontend2 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/test",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        assert_eq!(
+            frontend2
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
+        );
+        println!("TEST {}", line!());
+        let frontend3 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/yolo/test",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        assert_eq!(
+            frontend3
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_2")
+        );
+        println!("TEST {}", line!());
+        let frontend4 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/yolo/swag",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        assert_eq!(
+            frontend4
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_3")
+        );
+        println!("TEST {}", line!());
+        let frontend5 =
+            listener.frontend_from_request("domain", "/", &Method::Get, &crate::router::NoHeaders);
+        assert!(frontend5.is_err());
+        // assert!(false);
+    }
+
+    #[test]
+    fn wildcard_certificate_names() {
+        let mut trie = TrieNode::root();
+
+        trie.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
+        trie.domain_insert("*.clever-cloud.com".as_bytes().to_vec(), 2u8);
+        trie.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
+        trie.domain_insert(
+            "abprefix.services.clever-cloud.com".as_bytes().to_vec(),
+            3u8,
+        );
+        trie.domain_insert(
+            "cdprefix.services.clever-cloud.com".as_bytes().to_vec(),
+            4u8,
+        );
+
+        let res = trie.domain_lookup(b"test.services.clever-cloud.com", true);
+        println!("query result: {res:?}");
+
+        assert_eq!(
+            trie.domain_lookup(b"pgstudio.services.clever-cloud.com", true),
+            Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8))
+        );
+        assert_eq!(
+            trie.domain_lookup(b"test-prefix.services.clever-cloud.com", true),
+            Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8))
+        );
+    }
+
+    #[test]
+    fn wildcard_with_subdomains() {
+        let mut trie = TrieNode::root();
+
+        trie.domain_insert("*.test.example.com".as_bytes().to_vec(), 1u8);
+        trie.domain_insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
+
+        let res = trie.domain_lookup(b"sub.test.example.com", true);
+        println!("query result: {res:?}");
+
+        assert_eq!(
+            trie.domain_lookup(b"sub.test.example.com", true),
+            Some(&("*.test.example.com".as_bytes().to_vec(), 1u8))
+        );
+        assert_eq!(
+            trie.domain_lookup(b"hello.sub.test.example.com", true),
+            Some(&("hello.sub.test.example.com".as_bytes().to_vec(), 2u8))
+        );
+
+        // now try in a different order
+        let mut trie = TrieNode::root();
+
+        trie.domain_insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
+        trie.domain_insert("*.test.example.com".as_bytes().to_vec(), 1u8);
+
+        let res = trie.domain_lookup(b"sub.test.example.com", true);
+        println!("query result: {res:?}");
+
+        assert_eq!(
+            trie.domain_lookup(b"sub.test.example.com", true),
+            Some(&("*.test.example.com".as_bytes().to_vec(), 1u8))
+        );
+        assert_eq!(
+            trie.domain_lookup(b"hello.sub.test.example.com", true),
+            Some(&("hello.sub.test.example.com".as_bytes().to_vec(), 2u8))
+        );
+    }
+
+    /// sozu#322: the HTTPS twin of `lib/src/http.rs`'s
+    /// `a_listener_with_an_unknown_forwarded_headers_value_is_refused`.
+    #[test]
+    fn a_listener_with_an_unknown_forwarded_headers_value_is_refused() {
+        let build = |forwarded_headers: Option<i32>| {
+            let mut cfg = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 1043))
+                .to_tls(None)
+                .expect("default HTTPS listener config");
+            cfg.forwarded_headers = forwarded_headers;
+            HttpsListener::try_new(cfg, Token(0))
+        };
+        assert!(build(Some(-1)).is_err(), "an unknown mode must be refused");
+        let listener = build(Some(ForwardedHeaders::None as i32)).expect("a known mode");
+        assert_eq!(listener.get_forwarded_headers(), ForwardedHeaders::None);
+    }
+
+    /// The HTTPS twin of `lib/src/http.rs`'s
+    /// `get_h2_flood_config_maps_every_listener_knob_to_its_own_threshold`
+    /// (sozu-proxy/sozu#1418): the same thirteen positional arguments are
+    /// spelled out a second time here, so the two copies need the same
+    /// transposition guard. Every value is distinct.
+    #[test]
+    fn get_h2_flood_config_maps_every_listener_knob_to_its_own_threshold() {
+        let mut cfg = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 1042))
+            .to_tls(None)
+            .expect("default HTTPS listener config");
+        cfg.h2_max_rst_stream_per_window = Some(101);
+        cfg.h2_max_ping_per_window = Some(102);
+        cfg.h2_max_settings_per_window = Some(103);
+        cfg.h2_max_empty_data_per_window = Some(104);
+        cfg.h2_max_window_update_stream0_per_window = Some(105);
+        cfg.h2_max_continuation_frames = Some(106);
+        cfg.h2_max_glitch_count = Some(107);
+        cfg.h2_max_rst_stream_lifetime = Some(108);
+        cfg.h2_max_rst_stream_abusive_lifetime = Some(109);
+        cfg.h2_max_rst_stream_emitted_lifetime = Some(110);
+        cfg.h2_max_header_list_size = Some(111);
+        cfg.h2_max_header_table_size = Some(112);
+        cfg.h2_max_header_fields = Some(113);
+        cfg.h2_stream_refusal_percent = Some(114);
+
+        let listener = HttpsListener::try_new(cfg, Token(0)).expect("build listener");
+        let flood = listener.get_h2_flood_config();
+
+        assert_eq!(flood.max_rst_stream_per_window(), 101);
+        assert_eq!(flood.max_ping_per_window(), 102);
+        assert_eq!(flood.max_settings_per_window(), 103);
+        assert_eq!(flood.max_empty_data_per_window(), 104);
+        assert_eq!(flood.max_window_update_stream0_per_window(), 105);
+        assert_eq!(flood.max_continuation_frames(), 106);
+        assert_eq!(flood.max_glitch_count(), 107);
+        assert_eq!(flood.max_rst_stream_lifetime(), 108);
+        assert_eq!(flood.max_rst_stream_abusive_lifetime(), 109);
+        assert_eq!(flood.max_rst_stream_emitted_lifetime(), 110);
+        assert_eq!(flood.max_header_list_size(), 111);
+        assert_eq!(flood.max_header_table_size(), 112);
+        assert_eq!(flood.max_header_fields(), 113);
+        assert_eq!(flood.stream_refusal_percent(), 114);
+    }
+
+    #[test]
+    fn h2_stream_idle_timeout_inherits_back_timeout() {
+        use std::time::Duration;
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1041);
+        let build = |back_timeout: u32, explicit: Option<u32>| -> HttpsListener {
+            let mut cfg = ListenerBuilder::new_https(address)
+                .to_tls(None)
+                .expect("default HTTPS listener config");
+            cfg.back_timeout = back_timeout;
+            cfg.h2_stream_idle_timeout_seconds = explicit;
+            HttpsListener::try_new(cfg, Token(0)).expect("build listener")
+        };
+
+        // Knob unset: inherit back_timeout when it exceeds the 30s floor.
+        assert_eq!(
+            build(180, None).get_h2_stream_idle_timeout(),
+            Duration::from_secs(180)
+        );
+
+        // Knob unset, back_timeout below floor: stay at 30s.
+        assert_eq!(
+            build(5, None).get_h2_stream_idle_timeout(),
+            Duration::from_secs(30)
+        );
+
+        // Explicit values win in both directions.
+        assert_eq!(
+            build(180, Some(10)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            build(5, Some(600)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(600)
+        );
+
+        // `Some(0)` is clamped to 1s.
+        assert_eq!(
+            build(180, Some(0)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(1)
+        );
+    }
+
+    // ── FrontRustls peer snapshot (the PROXY-protocol seeding decision) ──
+
+    /// Source address a PROXY v2 header advertises. Non-loopback so it can
+    /// never collide with the address of the connection the test really opens.
+    const PROXY_ADVERTISED_PEER: &str = "10.0.0.42:12345";
+
+    /// The peer snapshot handed to [`FrontRustls`] is the session's known peer
+    /// address — on an expect-proxy frontend, the source the PROXY header
+    /// advertised — and NOT `getpeername(2)` on the accepted socket, which on
+    /// such a frontend is the load balancer.
+    ///
+    /// This is the one substitution a future editor is most likely to make
+    /// here. Hoisting `let raw_peer = handshake.stream.peer_addr().ok();` above
+    /// the struct literal and seeding from that compiles, passes every other
+    /// test in this file, and silently restores the split this change exists to
+    /// remove: the `HTTPS` line naming the client while the `MUX-*` lines name
+    /// the load balancer, for one and the same request id.
+    ///
+    /// The test drives the real `upgrade_handshake`, so it pins the seeding
+    /// site rather than the accessor. `session.peer_address` is set the way
+    /// `upgrade_expect` sets it (https.rs, `self.peer_address =
+    /// Some(session_address)` on the PROXY-header branch) instead of feeding a
+    /// real PROXY header — that adoption already has its own `debug_assert_eq!`
+    /// in `upgrade_expect` and its own e2e coverage; what is unguarded, and
+    /// what this test guards, is the hand-off from there into the socket
+    /// handler. `handshake.peer_address` is set to the same value because
+    /// `upgrade_expect` passes `self.peer_address` straight into
+    /// `TlsHandshake::new`: in production the two are always equal, so the test
+    /// must not be able to pass or fail on the difference between them.
+    ///
+    /// To SEE THIS RED: in `upgrade_handshake`, put
+    /// `let raw_peer = handshake.stream.peer_addr().ok();` before the
+    /// `FrontRustls` literal and replace `configured_peer: self.peer_address,`
+    /// with `configured_peer: raw_peer,`. (Reading `handshake.stream` inside
+    /// the literal itself does not compile — the `stream:` field has already
+    /// moved it — which is the only reason the mutation needs the hoist.)
+    #[test]
+    fn front_rustls_peer_snapshot_is_the_session_peer_not_the_accepted_socket() {
+        let advertised: StdSocketAddr = PROXY_ADVERTISED_PEER
+            .parse()
+            .expect("the advertised peer literal must parse");
+
+        let proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+        let listener = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .clone();
+        let pool = Rc::downgrade(&proxy.pool);
+        let rustls_details = ServerConnection::new(listener.borrow().rustls_details.clone())
+            .expect("a test rustls server session must be created");
+        let public_address = *listener.borrow().get_addr();
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        // A genuinely established loopback connection stands in for the one the
+        // load balancer opened. `getpeername(2)` on it answers the balancer's
+        // address and keeps answering it — the point being that the snapshot
+        // must disagree with a live lookup that is perfectly healthy.
+        let balancer = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let balancer_peer = balancer
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream =
+            std::net::TcpStream::connect(balancer_peer).expect("loopback connect must complete");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        let stream = MioTcpStream::from_std(stream);
+
+        let mut session = HttpsSession::new(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            // Built on the direct route so the session owns exactly one stream
+            // and one rustls session; the PROXY adoption is then applied below.
+            false,
+            listener,
+            pool,
+            proxy,
+            public_address,
+            rustls_details,
+            stream,
+            // What `accept(2)` reports for this connection: the far end, which
+            // for the stand-in is the balancer.
+            balancer_peer,
+            Token(0),
+            Duration::from_secs(0),
+        );
+
+        assert_eq!(
+            session.peer_address,
+            Some(balancer_peer),
+            "a direct-route session starts out with the accepted socket's peer"
+        );
+
+        let mut handshake = match session.state.take() {
+            HttpsStateMachine::Handshake(handshake) => handshake,
+            _ => panic!("a non-expect-proxy session must start in the TLS handshake state"),
+        };
+
+        // What `upgrade_expect` does once the PROXY header parses.
+        session.peer_address = Some(advertised);
+        handshake.peer_address = Some(advertised);
+        assert_ne!(
+            advertised, balancer_peer,
+            "the advertised and connection peers must differ for this test to discriminate"
+        );
+
+        let upgraded = session
+            .upgrade_handshake(handshake)
+            .expect("the handshake must upgrade to a mux session");
+        // Borrowed rather than moved out: `ConnectionH2` implements `Drop`, so
+        // its `socket` field cannot leave the connection.
+        let (snapshot, live_lookup) = match &upgraded {
+            HttpsStateMachine::Mux(mux) => match &mux.frontend {
+                mux::Connection::H1(connection) => (
+                    connection.socket.peer_addr(),
+                    connection.socket.socket_ref().peer_addr().ok(),
+                ),
+                mux::Connection::H2(connection) => (
+                    connection.socket.peer_addr(),
+                    connection.socket.socket_ref().peer_addr().ok(),
+                ),
+            },
+            _ => panic!("a completed TLS handshake must upgrade into the mux state"),
+        };
+
+        // Premise: the live lookup is healthy and still reports the balancer,
+        // so the assertion below cannot pass for the wrong reason.
+        assert_eq!(
+            live_lookup,
+            Some(balancer_peer),
+            "the frontend socket must still be connected to the stand-in balancer"
+        );
+        assert_eq!(
+            snapshot,
+            Some(advertised),
+            "FrontRustls must carry the PROXY-advertised source, not the accepted socket's peer"
+        );
+    }
+
+    /// The `or_else` arm of [`FrontRustls::peer_addr`] answers for a handler
+    /// built with no peer address. No production route builds one any more:
+    /// the direct (non-expect-proxy) route seeds `peer_address` with the
+    /// address `accept(2)` returned (sozu-proxy/sozu#1586), and the
+    /// expect-proxy route only reaches the handshake with the PROXY-advertised
+    /// source. The arm stays as defence in depth — without it a `None` would
+    /// blank the `peer=` slot for the whole connection even though the socket
+    /// is healthy and the kernel would answer — so the test builds that
+    /// handler by hand.
+    ///
+    /// `SessionTcpStream`'s identical arm has had
+    /// `socket::tests::session_tcp_stream_peer_addr_falls_back_to_the_live_lookup`
+    /// since it was written; this is the missing twin for `FrontRustls`.
+    ///
+    /// To SEE THIS RED: in `impl SocketHandler for FrontRustls`, drop the
+    /// `.or_else(|| self.stream.peer_addr().ok())` from `peer_addr`. The
+    /// handler then answers `None` for a perfectly healthy connection.
+    #[test]
+    fn front_rustls_peer_addr_falls_back_to_the_live_lookup() {
+        let proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+        let listener = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .clone();
+        let pool = Rc::downgrade(&proxy.pool);
+        let rustls_details = ServerConnection::new(listener.borrow().rustls_details.clone())
+            .expect("a test rustls server session must be created");
+        let public_address = *listener.borrow().get_addr();
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        let peer = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let live_peer = peer
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream =
+            std::net::TcpStream::connect(live_peer).expect("loopback connect must complete");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        let stream = MioTcpStream::from_std(stream);
+
+        let mut session = HttpsSession::new(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            false,
+            listener,
+            pool,
+            proxy,
+            public_address,
+            rustls_details,
+            stream,
+            live_peer,
+            Token(0),
+            Duration::from_secs(0),
+        );
+
+        let mut handshake = match session.state.take() {
+            HttpsStateMachine::Handshake(handshake) => handshake,
+            _ => panic!("a non-expect-proxy session must start in the TLS handshake state"),
+        };
+
+        // A session that knows no peer, which the handler must fall back from.
+        session.peer_address = None;
+        handshake.peer_address = None;
+
+        let upgraded = session
+            .upgrade_handshake(handshake)
+            .expect("the handshake must upgrade to a mux session");
+        let snapshot = match &upgraded {
+            HttpsStateMachine::Mux(mux) => match &mux.frontend {
+                mux::Connection::H1(connection) => connection.socket.peer_addr(),
+                mux::Connection::H2(connection) => connection.socket.peer_addr(),
+            },
+            _ => panic!("a completed TLS handshake must upgrade into the mux state"),
+        };
+
+        assert_eq!(
+            snapshot,
+            Some(live_peer),
+            "with nothing cached, FrontRustls::peer_addr must degrade to getpeername(2)"
+        );
+    }
+
+    /// `sozu query certificates --domain <d>` must ask the resolver the
+    /// same question a TLS handshake asks it.
+    ///
+    /// The resolver keys its SNI trie on ASCII-lowercased certificate
+    /// names (`CertifiedKeyWrapper::try_from`, `lib/src/tls.rs`), because
+    /// rustls hands `ResolvesServerCert::resolve` an SNI it has already
+    /// lowercased and no other key can ever be looked up at handshake
+    /// time. The operator query has to be normalised the same way, or
+    /// `sozu query certificates --domain MiXeD.Example.COM` reports the
+    /// certificate missing while the proxy is serving it on every
+    /// handshake for that name.
+    ///
+    /// To SEE THIS RED: in `query_certificate_for_domain`, look the
+    /// domain up with `domain.as_bytes()` instead of
+    /// `domain_key.as_bytes()`. The two case-varying queries return zero
+    /// summaries.
+    #[test]
+    fn query_certificate_for_domain_answers_any_spelling_of_the_name() {
+        let mut proxy = proxy_with_certificate_domain("MiXeD.Example.COM".to_owned());
+
+        let mut summaries_for = |query: &str| {
+            let response = proxy
+                .query_certificate_for_domain(query.to_owned())
+                .expect("the domain certificate query must succeed")
+                .expect("the domain certificate query must return content");
+            match response.content_type {
+                Some(ContentType::CertificatesByAddress(list)) => list
+                    .certificates
+                    .iter()
+                    .map(|entry| entry.certificate_summaries.len())
+                    .sum::<usize>(),
+                _ => panic!("the domain query must answer with CertificatesByAddress"),
+            }
+        };
+
+        for query in [
+            "MiXeD.Example.COM",
+            "mixed.example.com",
+            "MIXED.EXAMPLE.COM",
+        ] {
+            assert_eq!(
+                summaries_for(query),
+                1,
+                "querying {query:?} must find the certificate stored as MiXeD.Example.COM",
+            );
+        }
+
+        assert_eq!(
+            summaries_for("other.example.com"),
+            0,
+            "normalising the query must not make an unrelated domain match",
+        );
+    }
+
+    /// An HTTPS session upgraded to the mux over a live loopback connection,
+    /// with the accepted peer standing in for the client. The TLS handshake
+    /// never ran; nothing here reads what the client receives beyond the FIN.
+    fn https_mux_session_with_peer() -> (HttpsSession, std::net::TcpStream) {
+        let proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+        let listener = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .clone();
+        let pool = Rc::downgrade(&proxy.pool);
+        let rustls_details = ServerConnection::new(listener.borrow().rustls_details.clone())
+            .expect("a test rustls server session must be created");
+        let public_address = *listener.borrow().get_addr();
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        let accepting = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let address = accepting
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream = std::net::TcpStream::connect(address).expect("loopback connect must complete");
+        let (client, client_address) = accepting.accept().expect("loopback accept must complete");
+        client
+            .set_nonblocking(true)
+            .expect("the client stand-in must be nonblocking");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+
+        let mut session = HttpsSession::new(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            false,
+            listener,
+            pool,
+            proxy,
+            public_address,
+            rustls_details,
+            MioTcpStream::from_std(stream),
+            client_address,
+            Token(0),
+            Duration::from_secs(0),
+        );
+        let handshake = match session.state.take() {
+            HttpsStateMachine::Handshake(handshake) => handshake,
+            _ => panic!("a non-expect-proxy session must start in the TLS handshake state"),
+        };
+        session.state = session
+            .upgrade_handshake(handshake)
+            .expect("the handshake must upgrade to a mux session");
+        (session, client)
+    }
+
+    /// Close `session`, drop it as the event loop does, and return the
+    /// `shutdown(SHUT_WR)` calls the close issued and whether `client` then
+    /// observed the FIN.
+    fn frontend_shutdowns_of_a_close(
+        mut session: HttpsSession,
+        client: &mut std::net::TcpStream,
+    ) -> (usize, bool) {
+        use std::io::Read;
+
+        let before = mux::shutdown_writes();
+        session.close();
+        let shutdowns = mux::shutdown_writes() - before;
+        drop(session);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut chunk = [0u8; 4096];
+        let saw_fin = loop {
+            match client.read(&mut chunk) {
+                Ok(0) => break true,
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break false,
+            }
+        };
+        (shutdowns, saw_fin)
+    }
+
+    /// Issue #1603: once the client has closed its side, `HttpsSession::close`
+    /// does not `shutdown(SHUT_WR)` the frontend socket — on an H2 client that
+    /// had already reset, that call failed with `ENOTCONN` on every
+    /// connection. The client, which only half-closed here and is still
+    /// reading, gets its FIN from the close alone.
+    ///
+    /// TO SEE THIS RED: make `mux::shutdown_write` ignore `peer_closed`, or
+    /// drop the `peer_disconnected` arm from `HttpsSession::close` (then only
+    /// the `read EOF` case fails). The first assertion fails with `left: 1`,
+    /// `right: 0`.
+    ///
+    /// Two ways to know it: the HUP the event loop records for the client's
+    /// FIN, and `FrontRustls::peer_disconnected`, set by the read that met the
+    /// EOF or the `close_notify` — the H2 case, where the close follows in
+    /// the same pass and no epoll event reports it.
+    #[test]
+    fn https_close_skips_the_frontend_shutdown_once_the_client_closed() {
+        for how in ["epoll HUP", "read EOF"] {
+            let (mut session, mut client) = https_mux_session_with_peer();
+            client
+                .shutdown(std::net::Shutdown::Write)
+                .expect("the client stand-in must send its FIN");
+            let HttpsStateMachine::Mux(mux) = &mut session.state else {
+                unreachable!("https_mux_session_with_peer returns a mux session")
+            };
+            if how == "epoll HUP" {
+                mux.frontend.readiness_mut().event.insert(Ready::HUP);
+            } else {
+                match &mut mux.frontend {
+                    mux::Connection::H1(connection) => connection.socket.peer_disconnected = true,
+                    mux::Connection::H2(connection) => connection.socket.peer_disconnected = true,
+                }
+            }
+
+            let (shutdowns, saw_fin) = frontend_shutdowns_of_a_close(session, &mut client);
+            assert_eq!(
+                shutdowns, 0,
+                "a frontend whose client closed ({how}) must not be shut down before its close"
+            );
+            assert!(
+                saw_fin,
+                "the close alone must still deliver the FIN to a half-closed client ({how})"
+            );
+        }
+    }
+
+    /// The other half of #1603: a client that is still there keeps the
+    /// frontend `shutdown(SHUT_WR)` and observes the FIN.
+    #[test]
+    fn https_close_keeps_the_frontend_shutdown_while_the_client_is_there() {
+        let (session, mut client) = https_mux_session_with_peer();
+        let (shutdowns, saw_fin) = frontend_shutdowns_of_a_close(session, &mut client);
+        assert_eq!(
+            shutdowns, 1,
+            "a frontend whose client is still there must keep its shutdown(SHUT_WR)"
+        );
+        assert!(saw_fin, "the client must observe the FIN");
+    }
+}
+
+#[cfg(test)]
+mod listener_sibling_tests {
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{
+            CertificateAndKey, HstsConfig, PathRule, RequestHttpFrontend, SocketAddress,
+        },
+    };
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+    fn proxy() -> HttpsProxy {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        HttpsProxy::new(registry, sessions, pool, backends)
+    }
+
+    fn add(proxy: &mut HttpsProxy, address: SocketAddress, interface: Option<&str>, token: usize) {
+        let config = ListenerBuilder::new_https(address)
+            .with_interface(interface)
+            .to_tls(None)
+            .expect("could not build the listener config");
+        proxy
+            .add_listener(config, Token(token))
+            .expect("could not add the listener");
+    }
+
+    fn certificate(address: SocketAddress) -> AddCertificate {
+        AddCertificate {
+            address,
+            certificate: CertificateAndKey {
+                certificate: include_str!("../assets/certificate.pem").to_owned(),
+                key: include_str!("../assets/key.pem").to_owned(),
+                certificate_chain: Vec::new(),
+                versions: Vec::new(),
+                names: vec!["example.com".to_owned()],
+            },
+            expired_at: None,
+        }
+    }
+
+    fn front(address: SocketAddress) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some("cluster-a".to_owned()),
+            address,
+            hostname: "example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn serves_certificate(proxy: &HttpsProxy, token: usize) -> bool {
+        proxy.listeners[&Token(token)]
+            .borrow()
+            .resolver
+            .0
+            .lock()
+            .expect("resolver lock")
+            .domains
+            .domain_lookup(b"example.com", true)
+            .is_some()
+    }
+
+    fn routes(proxy: &HttpsProxy, token: usize) -> bool {
+        proxy.listeners[&Token(token)]
+            .borrow()
+            .fronts
+            .lookup("example.com", "/", &Method::Get)
+            .is_ok()
+    }
+
+    /// An HTTPS listener added on an address that already serves a certificate
+    /// and a frontend takes both over from the listener already there, so it
+    /// completes TLS handshakes and routes from its first connection
+    /// (sozu-proxy/sozu#719). It gets its own copy of the certificates: a
+    /// later change reaches it through the fan-out, like its sibling.
+    #[test]
+    fn a_listener_added_next_to_a_sibling_takes_over_its_certificates_and_frontends() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, address, None, 0);
+        proxy
+            .add_certificate(certificate(address))
+            .expect("add the certificate");
+        proxy
+            .add_https_frontend(front(address))
+            .expect("add the frontend");
+        add(&mut proxy, address, Some("lo"), 1);
+
+        assert!(serves_certificate(&proxy, 0));
+        assert!(
+            serves_certificate(&proxy, 1),
+            "the listener added after the certificate must serve it too"
+        );
+        assert!(
+            routes(&proxy, 1),
+            "the listener added after the frontend must route it too"
+        );
+
+        proxy
+            .remove_https_frontend(front(address))
+            .expect("remove the frontend");
+        assert!(!routes(&proxy, 0));
+        assert!(!routes(&proxy, 1));
+    }
+    fn hsts(max_age: u32) -> HstsConfig {
+        HstsConfig {
+            enabled: Some(true),
+            max_age: Some(max_age),
+            ..Default::default()
+        }
+    }
+
+    fn add_with_hsts(
+        proxy: &mut HttpsProxy,
+        address: SocketAddress,
+        interface: Option<&str>,
+        token: usize,
+        hsts: Option<HstsConfig>,
+    ) {
+        let mut config = ListenerBuilder::new_https(address)
+            .with_interface(interface)
+            .to_tls(None)
+            .expect("could not build the listener config");
+        config.hsts = hsts;
+        proxy
+            .add_listener(config, Token(token))
+            .expect("could not add the listener");
+    }
+
+    /// A frontend carrying policy (here, tags) so the router stores it as a
+    /// `Route::Frontend` rather than the lightweight `Route::ClusterId`.
+    fn tagged_front(address: SocketAddress) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            tags: BTreeMap::from([("owner".to_owned(), "team-a".to_owned())]),
+            ..front(address)
+        }
+    }
+
+    /// The `Strict-Transport-Security` value the listener emits for
+    /// `example.com/`, if any.
+    fn served_hsts(proxy: &HttpsProxy, token: usize) -> Option<String> {
+        let route = proxy.listeners[&Token(token)]
+            .borrow()
+            .fronts
+            .lookup("example.com", "/", &Method::Get)
+            .expect("the listener must route example.com");
+        route
+            .headers_response
+            .iter()
+            .find(|edit| edit.key.eq_ignore_ascii_case(b"strict-transport-security"))
+            .map(|edit| String::from_utf8_lossy(&edit.val).into_owned())
+    }
+
+    fn patch_hsts(proxy: &HttpsProxy, token: usize, address: SocketAddress, hsts: HstsConfig) {
+        proxy.listeners[&Token(token)]
+            .borrow_mut()
+            .update_config(&UpdateHttpsListenerConfig {
+                address,
+                hsts: Some(hsts),
+                ..Default::default()
+            })
+            .expect("patch the listener HSTS default");
+    }
+
+    /// A patch the worker refuses leaves the HTTPS listener exactly as it was
+    /// (sozu-proxy/sozu#1703): its configuration, its rustls context, its
+    /// answer registry and the HSTS its frontends serve. Each patch carries
+    /// fields that validate — an ALPN change among them, which rebuilds the
+    /// rustls context — then one refused field: an `hsts` block without
+    /// `enabled`, which the old code checked after committing every other
+    /// field, the new ALPN context and the new templates, or an answer
+    /// template that does not parse.
+    ///
+    /// To SEE THIS RED: in `HttpsListener::update_config`, move the
+    /// `HstsEnabledRequired` check back to the HSTS block at the end, and
+    /// write the fields into `self.config` instead of the candidate copy.
+    #[test]
+    fn a_rejected_patch_leaves_the_listener_unchanged() {
+        use sozu_command::proto::command::{AlpnProtocols, UpdateHttpsListenerConfig};
+
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add_with_hsts(&mut proxy, address, None, 0, Some(hsts(100)));
+        proxy
+            .add_https_frontend(tagged_front(address))
+            .expect("add the frontend");
+
+        let valid_prefix = UpdateHttpsListenerConfig {
+            address,
+            front_timeout: Some(99),
+            sozu_id_header: Some("X-Edge-Id".to_owned()),
+            alpn_protocols: Some(AlpnProtocols {
+                values: vec!["http/1.1".to_owned()],
+            }),
+            answers: BTreeMap::from([(
+                "404".to_owned(),
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned(),
+            )]),
+            ..Default::default()
+        };
+        let rejected = [
+            UpdateHttpsListenerConfig {
+                hsts: Some(HstsConfig {
+                    enabled: None,
+                    max_age: Some(200),
+                    ..Default::default()
+                }),
+                ..valid_prefix.clone()
+            },
+            UpdateHttpsListenerConfig {
+                answers: BTreeMap::from([(
+                    "503".to_owned(),
+                    "not a valid http response".to_owned(),
+                )]),
+                hsts: Some(hsts(200)),
+                ..valid_prefix.clone()
+            },
+        ];
+        for patch in rejected {
+            let listener = &proxy.listeners[&Token(0)];
+            let config_before = listener.borrow().config.clone();
+            let rustls_before = listener.borrow().rustls_details.clone();
+            let answers_before = listener.borrow().get_answers().clone();
+            listener
+                .borrow_mut()
+                .update_config(&patch)
+                .expect_err("the patch must be refused");
+            let listener = listener.borrow();
+            assert_eq!(
+                listener.config, config_before,
+                "a refused patch must leave the listener configuration unchanged"
+            );
+            assert!(
+                Arc::ptr_eq(&rustls_before, &listener.rustls_details),
+                "a refused patch must not publish a new rustls context"
+            );
+            assert!(
+                Rc::ptr_eq(&answers_before, listener.get_answers()),
+                "a refused patch must not publish a new answer registry"
+            );
+            drop(listener);
+            assert_eq!(
+                served_hsts(&proxy, 0).as_deref(),
+                Some("max-age=100"),
+                "a refused patch must not refresh the frontends' HSTS"
+            );
+        }
+
+        proxy.listeners[&Token(0)]
+            .borrow_mut()
+            .update_config(&valid_prefix)
+            .expect("the valid prefix alone must apply");
+        let listener = proxy.listeners[&Token(0)].borrow();
+        assert_eq!(listener.config.front_timeout, 99);
+        assert_eq!(listener.config.alpn_protocols, vec!["http/1.1".to_owned()]);
+    }
+
+    /// A policy-carrying frontend with no `hsts` of its own, added while the
+    /// listener on its address had no HSTS default, is copied into a listener
+    /// added later on that address. Each listener serves its own default: the
+    /// new listener its HSTS header, the first one none (sozu-proxy/sozu#1691).
+    #[test]
+    fn a_copied_frontend_without_hsts_inherits_the_new_listener_default() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add_with_hsts(&mut proxy, address, None, 0, None);
+        proxy
+            .add_https_frontend(tagged_front(address))
+            .expect("add the frontend");
+        add_with_hsts(&mut proxy, address, Some("lo"), 1, Some(hsts(100)));
+
+        assert_eq!(served_hsts(&proxy, 0), None);
+        assert_eq!(
+            served_hsts(&proxy, 1).as_deref(),
+            Some("max-age=100"),
+            "the listener added after the frontend must serve its own HSTS default"
+        );
+
+        // Both copies keep following their own listener's default.
+        patch_hsts(&proxy, 0, address, hsts(200));
+        patch_hsts(&proxy, 1, address, hsts(300));
+        assert_eq!(served_hsts(&proxy, 0).as_deref(), Some("max-age=200"));
+        assert_eq!(served_hsts(&proxy, 1).as_deref(), Some("max-age=300"));
+    }
+
+    /// A frontend with its own `hsts` keeps it on every listener of its
+    /// address, whatever their defaults, at copy time and on later patches.
+    #[test]
+    fn a_frontend_with_explicit_hsts_is_never_overridden_by_a_listener_default() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add_with_hsts(&mut proxy, address, None, 0, Some(hsts(100)));
+        proxy
+            .add_https_frontend(RequestHttpFrontend {
+                hsts: Some(hsts(42)),
+                ..tagged_front(address)
+            })
+            .expect("add the frontend");
+        add_with_hsts(&mut proxy, address, Some("lo"), 1, Some(hsts(300)));
+
+        assert_eq!(served_hsts(&proxy, 0).as_deref(), Some("max-age=42"));
+        assert_eq!(served_hsts(&proxy, 1).as_deref(), Some("max-age=42"));
+
+        patch_hsts(&proxy, 0, address, hsts(500));
+        patch_hsts(&proxy, 1, address, hsts(600));
+        assert_eq!(served_hsts(&proxy, 0).as_deref(), Some("max-age=42"));
+        assert_eq!(served_hsts(&proxy, 1).as_deref(), Some("max-age=42"));
+    }
+
+    /// On a single listener, patching the HSTS default reaches a
+    /// policy-carrying frontend that declared no `hsts` of its own, whether
+    /// the listener had a default when the frontend was added or not.
+    #[test]
+    fn a_listener_hsts_patch_refreshes_every_frontend_without_its_own_hsts() {
+        for initial in [None, Some(hsts(100))] {
+            let mut proxy = proxy();
+            let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+            add_with_hsts(&mut proxy, address, None, 0, initial);
+            proxy
+                .add_https_frontend(tagged_front(address))
+                .expect("add the frontend");
+
+            patch_hsts(&proxy, 0, address, hsts(700));
+            assert_eq!(served_hsts(&proxy, 0).as_deref(), Some("max-age=700"));
+
+            patch_hsts(
+                &proxy,
+                0,
+                address,
+                HstsConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(served_hsts(&proxy, 0), None);
+        }
+    }
+
+    /// A self-signed cert usable as a CA root anchor in the verifier tests.
+    const TEST_CA_PEM: &str = include_str!("../assets/certificate.pem");
+
+    fn test_crypto_provider() -> Arc<CryptoProvider> {
+        Arc::new(default_provider())
+    }
+
+    fn https_config_with_client_auth(
+        mode: ClientAuthMode,
+        cas: &[&str],
+        crls: &[&str],
+    ) -> HttpsListenerConfig {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1049);
+        let mut config = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("default HTTPS listener config");
+        config.client_auth = Some(mode as i32);
+        config.client_ca_certificates = cas.iter().map(|s| s.to_string()).collect();
+        config.client_ca_crls = crls.iter().map(|s| s.to_string()).collect();
+        config
+    }
+
+    #[test]
+    fn client_cert_verifier_none_is_disabled() {
+        // NONE (and an absent field) must keep the no-client-auth path.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(ClientAuthMode::ClientAuthNone, &[], &[]);
+        assert!(
+            HttpsListener::client_cert_verifier(&config, &provider)
+                .expect("verifier build")
+                .is_none()
+        );
+
+        let mut absent = config;
+        absent.client_auth = None;
+        assert!(
+            HttpsListener::client_cert_verifier(&absent, &provider)
+                .expect("verifier build")
+                .is_none(),
+            "absent client_auth must decode to NONE"
+        );
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_unknown_mode() {
+        // An unknown (future/garbage) enum value must be rejected, never fold
+        // to NONE and silently accept unauthenticated clients.
+        let provider = test_crypto_provider();
+        let mut config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[TEST_CA_PEM], &[]);
+        config.client_auth = Some(999);
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_required_builds_with_ca() {
+        let provider = test_crypto_provider();
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[TEST_CA_PEM], &[]);
+        assert!(
+            HttpsListener::client_cert_verifier(&config, &provider)
+                .expect("verifier build")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn client_cert_verifier_optional_builds_with_ca() {
+        let provider = test_crypto_provider();
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthOptional, &[TEST_CA_PEM], &[]);
+        assert!(
+            HttpsListener::client_cert_verifier(&config, &provider)
+                .expect("verifier build")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn client_cert_verifier_requires_a_trusted_ca() {
+        // A non-NONE mode with an empty CA bundle is a configuration error, not
+        // a silently-permissive listener.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[], &[]);
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_malformed_ca() {
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &["not a pem certificate"],
+            &[],
+        );
+        // A CA entry that parses to zero anchors is a configuration error.
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_empty_ca_entry_among_valid_ones() {
+        // A valid CA followed by an entry contributing no certificate must be
+        // rejected, not silently dropped, so the configured trust set is never
+        // quietly reduced to a subset.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[TEST_CA_PEM, "not a certificate"],
+            &[],
+        );
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_empty_crl_entry() {
+        // A configured CRL entry that yields zero CRLs would silently disable
+        // revocation; it must be rejected rather than skipped.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[TEST_CA_PEM],
+            &["not a crl"],
+        );
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    // ── Client certificate revocation ──
+    //
+    // The fixtures come from `lib/assets/mtls/generate.sh`: one CA, one
+    // client it issued, and CRLs that each leave exactly one reason to accept
+    // or reject that client. The verdict is checked on the rustls error, not
+    // only on accept/reject, because a handshake rejected for the wrong
+    // reason would still look like a pass at the TLS level.
+
+    const MTLS_CA_PEM: &str = include_str!("../assets/mtls/ca-cert.pem");
+    const MTLS_CLIENT_PEM: &str = include_str!("../assets/mtls/client-cert.pem");
+    /// Issued by the CA, nextUpdate in 2125, revokes nothing.
+    const MTLS_CRL_CURRENT: &str = include_str!("../assets/mtls/crl-current.pem");
+    /// Issued by the CA, nextUpdate in 2125, revokes the client.
+    const MTLS_CRL_REVOKED: &str = include_str!("../assets/mtls/crl-revoked.pem");
+    /// Issued by the CA, nextUpdate in January 2020, revokes nothing.
+    const MTLS_CRL_EXPIRED: &str = include_str!("../assets/mtls/crl-expired.pem");
+    /// Issued by another CA: covers nothing in the client's chain.
+    const MTLS_CRL_OTHER_CA: &str = include_str!("../assets/mtls/crl-other-ca.pem");
+    /// Two partitions of the CA's list, each with its own
+    /// IssuingDistributionPoint, neither covering the client.
+    const MTLS_CRL_PARTITION_A: &str = include_str!("../assets/mtls/crl-partition-a.pem");
+    const MTLS_CRL_PARTITION_B: &str = include_str!("../assets/mtls/crl-partition-b.pem");
+
+    /// The verdict of a `required` listener trusting the test CA with `crls`
+    /// on the test client's certificate, at the current time.
+    fn verify_mtls_client(crls: &[&str]) -> Result<(), rustls::Error> {
+        verify_mtls_client_at(crls, rustls::pki_types::UnixTime::now())
+    }
+
+    /// The same verdict, for a handshake at `time`.
+    fn verify_mtls_client_at(
+        crls: &[&str],
+        time: rustls::pki_types::UnixTime,
+    ) -> Result<(), rustls::Error> {
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[MTLS_CA_PEM], crls);
+        let verifier = HttpsListener::client_cert_verifier(&config, &test_crypto_provider())
+            .expect("a CA and well-formed CRLs must build a verifier")
+            .expect("required client auth must install a verifier");
+        let client = CertificateDer::from_pem_slice(MTLS_CLIENT_PEM.as_bytes())
+            .expect("the client fixture is a PEM certificate");
+        verifier.verify_client_cert(&client, &[], time).map(|_| ())
+    }
+
+    /// Whether a `required` listener can be built with `crls`, and the
+    /// reason when it cannot.
+    fn build_mtls_listener(crls: &[&str]) -> Result<(), String> {
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[MTLS_CA_PEM], crls);
+        match HttpsListener::client_cert_verifier(&config, &test_crypto_provider()) {
+            Ok(_) => Ok(()),
+            Err(ListenerError::ClientAuth(reason)) => Err(reason),
+            Err(other) => panic!("unexpected listener error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_revocation_accepts_a_client_no_crl_revokes() {
+        assert_eq!(
+            verify_mtls_client(&[]),
+            Ok(()),
+            "precondition: the client chains to the CA"
+        );
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_CURRENT]),
+            Ok(()),
+            "a current CRL from the client's issuer that does not list it must not reject it"
+        );
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_revoked_client() {
+        // The CRL is current, so only the serial lookup can reject the client.
+        // Without `with_crls`, the client would be accepted.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_REVOKED]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        );
+    }
+
+    #[test]
+    fn client_revocation_refuses_an_expired_crl_only_where_the_operator_states_it() {
+        // The main process refuses a CRL already past its nextUpdate in what
+        // an operator states: it would reject every client it covers.
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock after 1970")
+                .as_secs(),
+        )
+        .expect("a clock within i64");
+        let refused = HttpsListener::check_crls_current(&[MTLS_CRL_EXPIRED.to_owned()], now);
+        assert!(
+            matches!(refused, Err(ListenerError::ClientAuth(ref reason)) if reason.contains("expired")),
+            "an expired CRL must be refused when stated, got {refused:?}"
+        );
+        assert!(
+            HttpsListener::check_crls_current(
+                &[MTLS_CRL_CURRENT.to_owned(), MTLS_CRL_OTHER_CA.to_owned()],
+                now
+            )
+            .is_ok()
+        );
+        // A worker still builds a listener whose CRL lapsed while it ran (a
+        // restarted worker replaying the state), so a later reload has a
+        // listener to patch; the lapsed CRL rejects clients at handshake.
+        assert_eq!(build_mtls_listener(&[MTLS_CRL_EXPIRED]), Ok(()));
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[MTLS_CA_PEM],
+            &[MTLS_CRL_EXPIRED],
+        );
+        assert!(HttpsListener::try_new(config, Token(0)).is_ok());
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_client_once_its_crl_has_lapsed() {
+        // A CRL current when the listener was built lapses while it runs.
+        // In June 2125 the current CRL (nextUpdate January 2125) has lapsed
+        // and the client certificate (notAfter 2126) has not, so only the
+        // CRL expiry can reject the client. Without
+        // `enforce_revocation_expiration`, rustls keeps trusting the stale CRL
+        // and accepts it.
+        let june_2125 =
+            rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(4_905_100_800));
+        let verdict = verify_mtls_client_at(&[MTLS_CRL_CURRENT], june_2125);
+        assert!(
+            matches!(
+                verdict,
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ExpiredRevocationList
+                        | rustls::CertificateError::ExpiredRevocationListContext { .. }
+                ))
+            ),
+            "a CRL past its nextUpdate must reject the client, got {verdict:?}"
+        );
+        // Positive space: without CRLs the client is still valid then, so the
+        // rejection above is the CRL expiry and nothing else.
+        assert_eq!(verify_mtls_client_at(&[], june_2125), Ok(()));
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_client_no_configured_crl_covers() {
+        // Once any CRL is configured, a client whose issuer no CRL covers has
+        // an unknown revocation status, which rustls's default
+        // `UnknownStatusPolicy::Deny` rejects.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_OTHER_CA]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownRevocationStatus
+            ))
+        );
+        // Adding the issuer's own current CRL restores the verdict.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_OTHER_CA, MTLS_CRL_CURRENT]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn client_revocation_refuses_two_crls_of_one_issuer_with_overlapping_scopes() {
+        // webpki would only read the first of them, so the order alone would
+        // decide: listing the revoking CRL second accepts the revoked client.
+        // Every order must fail the listener instead.
+        for crls in [
+            vec![MTLS_CRL_CURRENT, MTLS_CRL_REVOKED],
+            vec![MTLS_CRL_REVOKED, MTLS_CRL_CURRENT],
+            // A full CRL covers every partition of its CA.
+            vec![MTLS_CRL_CURRENT, MTLS_CRL_PARTITION_A],
+            vec![MTLS_CRL_PARTITION_A, MTLS_CRL_CURRENT],
+            // The same partition twice.
+            vec![MTLS_CRL_PARTITION_A, MTLS_CRL_PARTITION_A],
+        ] {
+            let refused = build_mtls_listener(&crls);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|reason| reason.contains("overlapping")),
+                "overlapping CRLs of one issuer must fail the listener, got {refused:?}"
+            );
+        }
+        // Two CRLs in one configured entry count the same as two entries.
+        assert!(build_mtls_listener(&[&format!("{MTLS_CRL_CURRENT}{MTLS_CRL_REVOKED}")]).is_err());
+    }
+
+    #[test]
+    fn client_revocation_takes_the_partitions_of_one_issuer() {
+        // Partitions told apart by their distribution point cover disjoint
+        // certificates, so a CA publishing its list that way stays usable.
+        assert_eq!(
+            build_mtls_listener(&[MTLS_CRL_PARTITION_A, MTLS_CRL_PARTITION_B]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn client_revocation_takes_one_crl_per_issuer() {
+        // Positive space of the rule above: CRLs from distinct issuers are
+        // all kept, and none shadows another.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_OTHER_CA, MTLS_CRL_REVOKED]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        );
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_REVOKED, MTLS_CRL_OTHER_CA]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        );
+    }
+
+    /// The in-place refresh of a running listener's client authentication
+    /// policy: the patch replaces the policy and rebuilds the rustls context
+    /// that holds the verifier; a policy the verifier cannot be built from
+    /// leaves the listener exactly as it was. Its effect on handshakes is
+    /// covered by `test_mtls_policy_patch_*` in `e2e/src/tests/tls_tests.rs`.
+    #[test]
+    fn a_client_auth_policy_patch_rebuilds_the_listener_verifier() {
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[MTLS_CA_PEM],
+            &[MTLS_CRL_CURRENT],
+        );
+        let mut listener =
+            HttpsListener::try_new(config.clone(), Token(0)).expect("build the mTLS listener");
+        let original_context = listener.rustls_details.clone();
+
+        let refreshed = HttpsListenerConfig {
+            client_ca_crls: vec![MTLS_CRL_REVOKED.to_owned()],
+            ..config.clone()
+        }
+        .client_auth_policy();
+        listener
+            .update_config(&UpdateHttpsListenerConfig {
+                address: config.address,
+                client_auth_policy: Some(refreshed.clone()),
+                ..Default::default()
+            })
+            .expect("a buildable policy must be applied");
+        assert_eq!(listener.config.client_auth_policy(), refreshed);
+        assert!(
+            !Arc::ptr_eq(&listener.rustls_details, &original_context),
+            "the verifier lives in the rustls context, which must be rebuilt"
+        );
+
+        let applied_context = listener.rustls_details.clone();
+        let unbuildable = ClientAuthPolicy {
+            client_auth: Some(ClientAuthMode::ClientAuthRequired as i32),
+            client_ca_certificates: vec![],
+            client_ca_crls: vec![],
+        };
+        assert!(
+            listener
+                .update_config(&UpdateHttpsListenerConfig {
+                    address: config.address,
+                    client_auth_policy: Some(unbuildable.clone()),
+                    ..Default::default()
+                })
+                .is_err(),
+            "required client auth with no trusted CA must be refused"
+        );
+        assert!(HttpsListener::validate_client_auth_policy(&unbuildable).is_err());
+        assert_eq!(
+            listener.config.client_auth_policy(),
+            refreshed,
+            "a refused policy leaves the applied one in place"
+        );
+        assert!(Arc::ptr_eq(&listener.rustls_details, &applied_context));
+    }
+}

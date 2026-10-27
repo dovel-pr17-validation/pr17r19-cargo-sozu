@@ -1,0 +1,111 @@
+# Release process
+
+Sozu has a lot of moving pieces and some dependent projects, so coordinate releases carefully.
+
+## Checklist
+
+### Documentation
+
+In cases of changes to:
+
+- the configuration file format: update `bin/config.toml`, `doc/configure.md`, and `doc/how_to_use.md`
+- the configuration state: update `lib/src/lib.rs` documentation, and examples in `lib/examples`
+- the command messages: update `command/README.md` and `lib/src/lib.rs`
+- the user-visible behaviour: add an entry under `## [Unreleased]` in `CHANGELOG.md`. `.gitattributes` merges that file with Git's `union` driver, so a local merge or rebase keeps both sides' entries without a conflict (GitHub's mergeability check ignores it); write each entry as one self-contained bullet block, and check the blank line between adjacent entries after such a merge; because GitHub ignores the union driver, `<!-- changelog-slot:<topic> -->` comments under `## [Unreleased]` separate independent insertions, so when a matching topic anchor is present, place that topic's entry immediately after the matching comment, and preserve the comments, every other entry, each self-contained bullet block and the blank line between them
+
+### Testing
+
+### Worker liveness
+
+Launch sozu with `worker_automatic_restart` on, test a request, kill a worker, test a request.
+
+### Upgrades
+
+- compile a sozu of the previous published version, store the binary somewhere
+- compile a sozu of the latest version
+- start the old sozu version
+- query its configuration state via the unix command socket (`sozu` CLI)
+- replace the old sozu binary with the new one
+- launch a hot upgrade through the unix command socket
+- check that the new sozu runs properly (listens for new connections, handles requests, etc.)
+- check the new sozu's state, compared to the previous one
+- verify that the old workers quit correctly (if they were handling WebSocket connections, check that the master detects when you kill them)
+
+For minor and patch releases, the upgrade process must always pass correctly.
+
+The previous stable release is a distinct immutable-artifact gate, not a second
+build of the candidate. The mandatory crypto-ring process-observer cell verifies
+the published archive and executable hashes and runs
+`published_2_3_2_upgrades_to_current_and_drains_all_workers` with two workers.
+It checks every replacement executable and process state, complete per-process
+cluster queries, saved routing state, and HTTP/HTTPS/TCP/UDP traffic. Retain the
+older 2.2.1 bridge and 2.3.1 certificate-metadata cases when advancing this gate.
+
+For the first transition from 2.2.1, use the exact published release and follow
+the [legacy upgrade preconditions](doc/how_to_use.md#first-hot-upgrade-from-221):
+quiesce the control plane, verify preserved traffic and state, and verify every
+worker's replacement. A main-only success is insufficient. Record the tested
+source SHA, binary checksums, platform and supervisor. The legacy bridge refuses
+notify-supervised handoffs; qualifying a hot upgrade with the shipped systemd
+units remains a release gate, or requires an explicitly accepted controlled
+restart procedure for that deployment.
+
+### Update the changelog
+
+Move the contents of `## [Unreleased]` into a new `## X.Y.Z - DATE` release section and reset the unreleased block. Do this **before** pushing the tag — the release workflow's `awk` extractor at `.github/workflows/release.yml` keys off the `## <version>` heading (the `## X.Y.Z - DATE` form used by every released section; a bracketed `## [X.Y.Z]` is also accepted) and reads until the next `## ` heading or an exact `<!-- release-notes:end -->` line. For a long changelog, put a concise release summary and a link to the complete tagged changelog before that boundary, and preserve the detailed entries below it. GitHub release bodies are limited to 125000 characters; the workflow fails explicitly above that limit. If the section is missing, the draft release body falls back to a placeholder and the workflow emits a `::warning::`.
+
+## Publish the new version
+
+Update `version` in each per-crate `[package]` table, keeping all six in lockstep — the five workspace members plus the out-of-workspace `fuzz/` crate:
+
+- `bin/Cargo.toml`, `lib/Cargo.toml`, `command/Cargo.toml`, `e2e/Cargo.toml`
+- `sim/Cargo.toml` (workspace member) and `fuzz/Cargo.toml` (excluded from the workspace by its own `[workspace]` table, but version-locked to the release)
+
+The release workflow's preflight job (`.github/workflows/release.yml`) validates that all six match the pushed tag and aborts the release if any drift remains. It covered only the first four until 2.2.0, which is why 2.1.1 shipped and then needed a follow-up commit to align `fuzz/`.
+
+Also bump `Version:` in `os-build/linux-rpm/sozu.spec` — its `Source0` resolves `…/archive/%{version}.tar.gz`, so a stale value fetches the wrong source tarball. (`os-build/archlinux/PKGBUILD` needs no bump: `pkgname` is `sozu-git` and its `pkgver()` derives the real version from `git describe --tags`.)
+
+Bump the two `[workspace.dependencies]` requirements in the root `Cargo.toml` as well — `sozu-command-lib` and `sozu-lib` — since those reqs are what get baked into the published manifests.
+
+The crates published from this repository, in mandatory dependency order, are:
+
+1. `command/` (`sozu-command-lib`)
+2. `lib/` (`sozu-lib`)
+3. `bin/` (`sozu`)
+
+`e2e/` (`sozu-e2e`), `sim/` (`sozu-sim`) and `fuzz/` (`sozu-fuzz`) all carry `publish = false` and are never published.
+
+Refresh both lockfiles through Cargo after the version changes:
+
+```sh
+cargo update --workspace
+cargo update --manifest-path fuzz/Cargo.toml --workspace
+cargo build --locked
+```
+
+Commit all changed manifests, both lockfiles, the RPM version and the changelog.
+
+Wait for the GitHub Actions build to pass (<https://github.com/sozu-proxy/sozu/actions>).
+
+## Pre-built binaries
+
+After the tag triggers `.github/workflows/release.yml`, ten `sozu-${VERSION}-${TARGET}-${PROVIDER}.tar.gz` archives plus a `SHA256SUMS` file (signed with sigstore cosign keyless — `SHA256SUMS.sig` + `SHA256SUMS.pem`) land on a GitHub draft release alongside SLSA build provenance. The matrix covers three published targets (`x86_64-unknown-linux-{gnu,musl}`, `aarch64-unknown-linux-gnu`) crossed with four crypto providers — `crypto-ring` (default, all 3 published targets), `crypto-aws-lc-rs` (all 3 published targets), `crypto-openssl` (gnu targets only — `rustls-openssl` needs a vendored OpenSSL on musl), and `fips` (gnu targets only — `aws-lc-fips-sys` precompiled FIPS module assumes glibc). `aarch64-unknown-linux-musl` is intentionally excluded from the prebuilt matrix: `jemalloc-sys 0.5.4+5.3.0-patched`'s autoconf cross-compile probe (host=aarch64-unknown-linux-musl, build=…-gnu) cannot link any of its three atomics test programs against the `musl-tools`-supplied `musl-gcc` wrapper on the arm64 runner, so jemalloc 5.3.0 falls through to `#error "Don't have atomics implemented on this platform."`. Re-introduce the cell once a real `aarch64-linux-musl-gcc` cross toolchain is wired into CI. Each tarball contains the stripped `sozu` binary, `LICENSE-AGPL3`, `LICENSE-LGPL3`, `README.md`, `CHANGELOG.md`, the production-shaped `os-build/config.toml`, both shipped systemd units, and a `SOURCE.txt` corresponding-source pointer that records the target and crypto provider for the cell.
+
+For stable tags (`X.Y.Z`), the workflow also pushes `clevercloud/sozu:${VERSION}` and `clevercloud/sozu:latest` to Docker Hub. RC tags (`X.Y.Z-rc.N`) are marked as GitHub prereleases and skip the `:latest` move; they also do not push a tagged Docker image. `workflow_dispatch` rebuilds of an existing stable tag publish only `clevercloud/sozu:${VERSION}` and do **not** move `clevercloud/sozu:latest`. To deliberately move `:latest` you must push the corresponding git tag (force-push of an immutable tag is blocked by repo policy — bump the patch version instead).
+
+The pre-existing `dockerhub` job in `.github/workflows/ci.yml` is gated off on tag pushes — version-pinned and `:latest` images come exclusively from the release workflow. Branch and PR pushes still produce `clevercloud/sozu:${SHA}` aliases as before.
+
+Verify the Docker Hub tag, then click 'Publish' on the draft release.
+
+## Following checks
+
+Verify that the [Docker container](https://hub.docker.com/r/clevercloud/sozu/) was built correctly.
+
+Update related projects to use the latest version of `sozu-command-lib`:
+
+- [sozu-client](https://github.com/CleverCloud/sozu-client)
+- [kawa](https://github.com/CleverCloud/kawa)
+- [clever-operator](https://github.com/CleverCloud/clever-operator)
+- [sozu-acme](https://github.com/sozu-proxy/sozu-acme)
+- [sozu-demo](https://github.com/sozu-proxy/sozu-demo)
+- the family of `sozu-*-connector` and `sozu-*-discovery` repositories under `CleverCloud`

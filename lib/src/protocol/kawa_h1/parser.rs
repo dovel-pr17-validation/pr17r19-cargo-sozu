@@ -1,0 +1,404 @@
+//! Kawa-adjacent H1 parsing helpers.
+//!
+//! Hosts the byte-comparison primitives, the `Method` enum, and the small
+//! nom helpers Kawa relies on when its tolerant/strict mode boundaries do
+//! not cover Sōzu-specific cases (custom methods, ASCII-fast-path
+//! comparisons). Pure-function module; no session state.
+
+use std::{
+    cmp::min,
+    fmt::{self, Write},
+    ops::Deref,
+};
+
+use nom::{
+    AsChar, Err, IResult, Parser,
+    bytes::{self, complete::take_while},
+    character::complete::digit1,
+    combinator::opt,
+    error::{Error, ErrorKind},
+    sequence::preceded,
+};
+
+pub fn compare_no_case(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.iter().zip(right).all(|(a, b)| match (*a, *b) {
+        (0..=64, 0..=64) | (91..=96, 91..=96) | (123..=255, 123..=255) => a == b,
+        (65..=90, 65..=90) | (97..=122, 97..=122) | (65..=90, 97..=122) | (97..=122, 65..=90) => {
+            *a | 0b00_10_00_00 == *b | 0b00_10_00_00
+        }
+        _ => false,
+    })
+}
+
+#[derive(PartialEq, Eq, Clone)]
+pub enum Method {
+    Get,
+    Post,
+    Head,
+    Options,
+    Put,
+    Delete,
+    Trace,
+    Connect,
+    Custom(String),
+}
+
+impl fmt::Debug for Method {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Get => f.write_str("Get"),
+            Self::Post => f.write_str("Post"),
+            Self::Head => f.write_str("Head"),
+            Self::Options => f.write_str("Options"),
+            Self::Put => f.write_str("Put"),
+            Self::Delete => f.write_str("Delete"),
+            Self::Trace => f.write_str("Trace"),
+            Self::Connect => f.write_str("Connect"),
+            Self::Custom(custom) => write!(f, "Custom(bytes={})", custom.len()),
+        }
+    }
+}
+
+impl Method {
+    /// Classify a method token.
+    ///
+    /// RFC 9110 §9.1 makes the method token case-SENSITIVE, and the origin
+    /// server receives the bytes the client actually sent. The match is
+    /// therefore exact: anything that is not one of the eight canonical
+    /// spellings becomes [`Method::Custom`], carrying the token verbatim.
+    /// A lowercase `get` is a custom method, not [`Method::Get`]
+    /// (sozu-proxy/sozu#1451).
+    pub fn new(s: &[u8]) -> Method {
+        match s {
+            b"GET" => Method::Get,
+            b"POST" => Method::Post,
+            b"HEAD" => Method::Head,
+            b"OPTIONS" => Method::Options,
+            b"PUT" => Method::Put,
+            b"DELETE" => Method::Delete,
+            b"TRACE" => Method::Trace,
+            b"CONNECT" => Method::Connect,
+            _ => Method::Custom(String::from_utf8_lossy(s).into_owned()),
+        }
+    }
+
+    /// RFC 9110 §9.2.2: is re-issuing this request equivalent to issuing it
+    /// once?
+    ///
+    /// Used by the mux to decide whether a request already written to a
+    /// pooled upstream connection may be replayed on a fresh one after the
+    /// peer turned out to have closed it (`Stream::can_replay_on_fresh_
+    /// upstream`). `Method::Custom` is deliberately NOT idempotent: an
+    /// extension method sozu does not know the semantics of is treated like
+    /// POST, matching nginx's closed `POST, LOCK, PATCH` list being an
+    /// opt-in carve-out rather than an inferred property, and pingora's
+    /// `http::Method::is_idempotent` returning false for anything it does
+    /// not recognise as safe.
+    ///
+    /// `CONNECT` is excluded: RFC 9110 §9.3.6 makes it neither safe nor
+    /// idempotent, and sozu upgrades it out of the request/response path
+    /// anyway.
+    ///
+    /// The classification this reads is case-sensitive, so it agrees with
+    /// what the origin sees: [`Method::new`] matches the eight canonical
+    /// spellings exactly (RFC 9110 §9.1), and a lowercase `get` is a
+    /// [`Method::Custom`] judged non-idempotent here rather than a
+    /// [`Method::Get`] judged replayable. That divergence was real until
+    /// sozu-proxy/sozu#1451 made the match exact; the stale-upstream replay
+    /// (sozu-proxy/sozu#1442) was the caller for which it was load-bearing.
+    pub fn is_idempotent(&self) -> bool {
+        match self {
+            Method::Get
+            | Method::Head
+            | Method::Put
+            | Method::Delete
+            | Method::Options
+            | Method::Trace => true,
+            Method::Post | Method::Connect | Method::Custom(_) => false,
+        }
+    }
+}
+
+impl AsRef<str> for Method {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+            Self::Trace => "TRACE",
+            Self::Connect => "CONNECT",
+            Self::Custom(custom) => custom,
+        }
+    }
+}
+
+impl Deref for Method {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl fmt::Display for Method {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
+#[cfg(feature = "tolerant-http1-parser")]
+fn is_hostname_char(i: u8) -> bool {
+    i.is_alphanum() ||
+  // the domain name should not start with a hyphen or dot
+  // but is it important here, since we will match this to
+  // the list of accepted clusters?
+  // BTW each label between dots has a max of 63 chars,
+  // and the whole domain should not be larger than 253 chars
+  //
+  // this tolerant parser also allows underscore, which is wrong
+  // in domain names but accepted by some proxies and web servers
+  // see https://github.com/sozu-proxy/sozu/issues/480
+  b"-._".contains(&i)
+}
+
+#[cfg(not(feature = "tolerant-http1-parser"))]
+fn is_hostname_char(i: u8) -> bool {
+    i.is_alphanum() ||
+  // the domain name should not start with a hyphen or dot
+  // but is it important here, since we will match this to
+  // the list of accepted clusters?
+  // BTW each label between dots has a max of 63 chars,
+  // and the whole domain should not be larger than 253 chars
+  b"-.".contains(&i)
+}
+
+pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<u16>)> {
+    let (i, host) = take_while(is_hostname_char)(i)?;
+    if host.is_empty() {
+        return Err(Err::Error(Error::new(i, ErrorKind::Alpha)));
+    }
+    let (i, port_bytes) = opt(preceded(bytes::complete::tag(":"), digit1)).parse(i)?;
+    let port = match port_bytes {
+        // `digit1` guarantees ASCII digits, so the slice is always valid UTF-8;
+        // `parse::<u16>()` rejects values that overflow the 16-bit port space
+        // (RFC 6335 §6) and `Ok(0)` is explicitly rejected because port 0 is
+        // reserved by the same RFC and not a routable authority.
+        Some(bytes) => match std::str::from_utf8(bytes).unwrap().parse::<u16>() {
+            Ok(p) if p != 0 => Some(p),
+            _ => return Err(Err::Error(Error::new(bytes, ErrorKind::Digit))),
+        },
+        None => None,
+    };
+
+    if !i.is_empty() {
+        return Err(Err::Error(Error::new(i, ErrorKind::Eof)));
+    }
+    Ok((i, (host, port)))
+}
+
+pub fn view(buf: &[u8], size: usize, points: &[usize]) -> String {
+    let mut view = format!("{points:?} => ");
+    let mut end = 0;
+    for (i, point) in points.iter().enumerate() {
+        if *point > buf.len() {
+            break;
+        }
+        let start = if end + size < *point {
+            view.push_str("... ");
+            point - size
+        } else {
+            end
+        };
+        let stop = if i + 1 < points.len() {
+            min(buf.len(), points[i + 1])
+        } else {
+            buf.len()
+        };
+        end = if point + size > stop {
+            stop
+        } else {
+            point + size
+        };
+        for element in &buf[start..*point] {
+            let _ = view.write_fmt(format_args!("{element:02X} "));
+        }
+        view.push_str("| ");
+        for element in &buf[*point..end] {
+            let _ = view.write_fmt(format_args!("{element:02X} "));
+        }
+    }
+    if end < buf.len() {
+        view.push_str("...")
+    }
+    view
+}
+
+#[test]
+fn test_view_out_of_bound() {
+    println!(
+        "{}",
+        view(
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            2,
+            &[5, 5, 8, 9, 9, 13, 80]
+        )
+    );
+}
+
+#[test]
+fn custom_method_does_not_assume_utf8() {
+    let method = Method::new(b"\xFFBAD");
+
+    assert_eq!(method, Method::Custom("\u{FFFD}BAD".to_owned()));
+}
+
+#[test]
+fn custom_method_debug_is_bounded() {
+    const METHOD_SECRET: &str = "CUSTOM_METHOD_DEBUG_SECRET_SENTINEL";
+
+    let custom = format!("{METHOD_SECRET}{}", "x".repeat(4096));
+    let custom_len = custom.len();
+    let output = format!("{:?}", Method::Custom(custom));
+
+    assert!(
+        !output.contains(METHOD_SECRET),
+        "custom Method Debug leaked its payload: {output}"
+    );
+    assert!(
+        output.contains(&format!("bytes={custom_len}")),
+        "custom Method Debug omitted its byte length: {output}"
+    );
+    assert!(
+        output.len() <= 128,
+        "custom Method Debug is not bounded: {} bytes",
+        output.len()
+    );
+}
+
+#[test]
+fn hostname_and_port_rejects_empty_host() {
+    assert!(hostname_and_port(b":80").is_err());
+}
+
+#[test]
+fn hostname_and_port_rejects_out_of_range_port() {
+    assert!(hostname_and_port(b"example.com:65536").is_err());
+}
+
+#[test]
+fn hostname_and_port_rejects_port_zero() {
+    // RFC 6335 §6 reserves port 0; it cannot identify a TCP/UDP service.
+    assert!(hostname_and_port(b"example.com:0").is_err());
+}
+
+#[test]
+fn hostname_and_port_accepts_u16_port() {
+    let (remaining, (host, port)) = hostname_and_port(b"example.com:65535").unwrap();
+
+    assert!(remaining.is_empty());
+    assert_eq!(host, b"example.com");
+    assert_eq!(port, Some(65535));
+}
+
+#[test]
+fn hostname_and_port_returns_no_port_when_absent() {
+    let (remaining, (host, port)) = hostname_and_port(b"example.com").unwrap();
+
+    assert!(remaining.is_empty());
+    assert_eq!(host, b"example.com");
+    assert_eq!(port, None);
+}
+
+/// The ASCII constraint `router::DomainRule::from_str` cites when it
+/// explains why leaving its hostname regexes on the regex crate's
+/// default Unicode case folding is unobservable: no byte outside ASCII
+/// ever reaches `Router::lookup` as part of a hostname.
+///
+/// `is_hostname_char` gates the `take_while`, so a non-ASCII byte ends
+/// the host early and the leftover trips this function's own
+/// `if !i.is_empty()` guard — the whole authority is refused with
+/// `ErrorKind::Eof`, which `frontend_from_request` (`lib/src/http.rs`,
+/// `lib/src/https.rs`) surfaces as `FrontendFromRequestError::HostParse`
+/// and the mux answers 400. Note that it is this guard, not the
+/// `InvalidCharsAfterHost` branch in the callers, that does the refusing:
+/// a successful return always carries an empty remainder.
+///
+/// The byte sweep is exhaustive rather than exemplary: one `é` would only
+/// show that ONE non-ASCII byte is refused.
+///
+/// To SEE THIS RED: make `is_hostname_char` admit non-ASCII — add
+/// `|| i >= 0x80` to it. The sweep reports the first accepted byte above
+/// 0x7F, and `café.example.com` starts parsing instead of erroring.
+#[test]
+fn is_hostname_char_admits_only_ascii() {
+    for byte in u8::MIN..=u8::MAX {
+        assert!(
+            !is_hostname_char(byte) || byte.is_ascii(),
+            "is_hostname_char accepted the non-ASCII byte {byte:#04x}; \
+             DomainRule::from_str's Unicode case folding stops being \
+             unobservable the moment one of these can reach a hostname",
+        );
+    }
+
+    // `café.example.com`: `é` is U+00E9, two UTF-8 bytes, neither ASCII.
+    // The host stops at `caf` and the rest is refused outright.
+    assert!(
+        hostname_and_port("café.example.com".as_bytes()).is_err(),
+        "a non-ASCII byte must fail the whole authority, not truncate it to `caf`",
+    );
+
+    // Control: the same name spelled in ASCII parses whole, so the
+    // rejection above is the non-ASCII byte and not the shape.
+    let (remaining, (host, port)) =
+        hostname_and_port(b"cafe.example.com").expect("the ASCII spelling must parse");
+    assert!(remaining.is_empty());
+    assert_eq!(host, b"cafe.example.com");
+    assert_eq!(port, None);
+}
+
+#[test]
+fn lowercase_verb_is_custom_and_not_idempotent() {
+    // RFC 9110 §9.1 makes the method token case-sensitive, and the origin
+    // receives the bytes the client actually sent. A lowercase or mixed-case
+    // spelling must therefore NOT be classified as the canonical verb it
+    // resembles — above all it must not inherit that verb's idempotence and
+    // become replayable on a fresh upstream (sozu-proxy/sozu#1451).
+    let spellings: [&[u8]; 11] = [
+        b"get", b"Get", b"gEt", b"put", b"Put", b"delete", b"head", b"options", b"trace", b"post",
+        b"Post",
+    ];
+
+    for raw in spellings {
+        let method = Method::new(raw);
+        let spelling = String::from_utf8_lossy(raw).into_owned();
+
+        assert_eq!(
+            method,
+            Method::Custom(spelling.clone()),
+            "{spelling} must parse as a custom method, not as a known verb"
+        );
+        assert!(
+            !method.is_idempotent(),
+            "{spelling} must not be judged idempotent"
+        );
+    }
+}
+
+#[test]
+fn canonical_verbs_keep_their_variant() {
+    assert_eq!(Method::new(b"GET"), Method::Get);
+    assert_eq!(Method::new(b"POST"), Method::Post);
+    assert_eq!(Method::new(b"HEAD"), Method::Head);
+    assert_eq!(Method::new(b"OPTIONS"), Method::Options);
+    assert_eq!(Method::new(b"PUT"), Method::Put);
+    assert_eq!(Method::new(b"DELETE"), Method::Delete);
+    assert_eq!(Method::new(b"TRACE"), Method::Trace);
+    assert_eq!(Method::new(b"CONNECT"), Method::Connect);
+}

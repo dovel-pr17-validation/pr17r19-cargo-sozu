@@ -1,0 +1,334 @@
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+};
+
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, Response, body::Bytes, service::service_fn};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as ServerBuilder,
+};
+use tokio::runtime::Runtime;
+
+use crate::port_registry::bind_tokio_listener;
+
+/// One row of the H2 backend's request log. Cardinality tests use this
+/// to assert deep equality on what reached the wire after Sōzu applied
+/// frontend rewrites + header edits — counters alone do not catch a
+/// rewrite bug that lands the request on the right path with the wrong
+/// authority, etc.
+///
+/// Header values are stored as `Vec<u8>` so a regression that forwards a
+/// non-UTF-8 byte (a corrupted upstream header, a smuggled control char)
+/// surfaces in the assertion diff rather than being silently lossily
+/// downgraded to an empty string by `HeaderValue::to_str`.
+#[derive(Debug, Clone)]
+pub struct RecordedH2Request {
+    pub method: String,
+    pub authority: String,
+    pub path: String,
+    pub headers: Vec<(String, Vec<u8>)>,
+    /// The request trailer fields, recorded only by a backend started with
+    /// [`H2Backend::start_recording_trailers`]; empty otherwise.
+    pub trailers: Vec<(String, Vec<u8>)>,
+}
+
+/// An HTTP/2 mock backend that accepts cleartext H2 connections (h2c).
+///
+/// Sozu connects to backends over plain TCP and speaks HTTP/2 directly
+/// (no TLS on the backend side). This backend uses hyper's server builder
+/// with HTTP/2 support to handle those connections.
+pub struct H2Backend {
+    pub name: String,
+    stop: Arc<AtomicBool>,
+    pub requests_received: Arc<AtomicUsize>,
+    pub responses_sent: Arc<AtomicUsize>,
+    /// TCP connections the backend accepted.
+    pub connections_accepted: Arc<AtomicUsize>,
+    requests_log: Arc<Mutex<Vec<RecordedH2Request>>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl H2Backend {
+    pub fn start(name: impl Into<String>, address: SocketAddr, body: impl Into<String>) -> Self {
+        Self::start_inner(name, address, body, false, None, None)
+    }
+
+    /// Like [`H2Backend::start`], but answer 401 to every request whose
+    /// `authorization` header is not exactly `expected`, and 200 otherwise.
+    /// What a health-check probe with a configured credential must satisfy.
+    pub fn start_requiring_authorization(
+        name: impl Into<String>,
+        address: SocketAddr,
+        body: impl Into<String>,
+        expected: impl Into<String>,
+    ) -> Self {
+        Self::start_inner(name, address, body, false, None, Some(expected.into()))
+    }
+
+    /// Like [`H2Backend::start`], but read each request body to its end
+    /// before answering, and record its trailer fields in
+    /// [`RecordedH2Request::trailers`]. Opt-in, because waiting for the body
+    /// changes when the response is sent.
+    pub fn start_recording_trailers(
+        name: impl Into<String>,
+        address: SocketAddr,
+        body: impl Into<String>,
+    ) -> Self {
+        Self::start_inner(name, address, body, true, None, None)
+    }
+
+    /// Like [`H2Backend::start_recording_trailers`], reading each request
+    /// body to its end, but advertising `window` as its
+    /// `SETTINGS_INITIAL_WINDOW_SIZE` (RFC 9113 §6.5.2), so a sender that
+    /// ignores it over-runs the stream window.
+    pub fn start_with_stream_window(
+        name: impl Into<String>,
+        address: SocketAddr,
+        body: impl Into<String>,
+        window: u32,
+    ) -> Self {
+        Self::start_inner(name, address, body, true, Some(window), None)
+    }
+
+    fn start_inner(
+        name: impl Into<String>,
+        address: SocketAddr,
+        body: impl Into<String>,
+        record_trailers: bool,
+        initial_stream_window: Option<u32>,
+        required_authorization: Option<String>,
+    ) -> Self {
+        let name = name.into();
+        let required_authorization: Option<Bytes> = required_authorization.map(Bytes::from);
+        let body: Bytes = Bytes::from(body.into());
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests_received = Arc::new(AtomicUsize::new(0));
+        let responses_sent = Arc::new(AtomicUsize::new(0));
+        let connections_accepted = Arc::new(AtomicUsize::new(0));
+        let accepted = connections_accepted.clone();
+        let requests_log: Arc<Mutex<Vec<RecordedH2Request>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let stop_clone = stop.clone();
+        let req_count = requests_received.clone();
+        let resp_count = responses_sent.clone();
+        let req_log = requests_log.clone();
+        let thread_name = name.clone();
+
+        // Synchronous readiness handshake: the spawned tokio thread must
+        // signal it has bound the listener AND entered the accept loop
+        // before `H2Backend::start` returns. Without this, the test
+        // request can race the accept-loop spin-up on slow CI runners
+        // (observed on `Test (false, beta)` of run 24916520793 where
+        // FIX-18 / FIX-22 sessions saw a 503 from sozu because the
+        // backend wasn't yet draining its accept queue when sozu opened
+        // the outbound TCP connection — sozu's H2 handshake then timed
+        // out, the cluster marked the backend down for a window, and
+        // the test returned the wrong status code).
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+        let thread = thread::spawn(move || {
+            let rt = Runtime::new().expect("could not create tokio runtime");
+            rt.block_on(async move {
+                let listener = bind_tokio_listener(address, "h2 backend");
+                // Notify the caller now that we are about to enter the
+                // accept loop. After this point a TCP SYN to `address`
+                // will be drained by `listener.accept()` within ≤50 ms.
+                let _ = ready_tx.send(());
+
+                loop {
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let accept = tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        listener.accept(),
+                    )
+                    .await;
+
+                    let (stream, _peer) = match accept {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            eprintln!("{thread_name}: accept error: {e}");
+                            continue;
+                        }
+                        Err(_) => continue, // timeout, check stop flag
+                    };
+                    accepted.fetch_add(1, Ordering::Relaxed);
+
+                    let body = body.clone();
+                    let req_count = req_count.clone();
+                    let resp_count = resp_count.clone();
+                    let req_log = req_log.clone();
+                    let name = thread_name.clone();
+                    let required_authorization = required_authorization.clone();
+
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                            let body = body.clone();
+                            let req_count = req_count.clone();
+                            let resp_count = resp_count.clone();
+                            let req_log = req_log.clone();
+                            let name = name.clone();
+                            let required_authorization = required_authorization.clone();
+                            async move {
+                                req_count.fetch_add(1, Ordering::Relaxed);
+                                println!(
+                                    "{name}: received {} {} (h2 backend)",
+                                    req.method(),
+                                    req.uri()
+                                );
+                                // Snapshot the request shape so cardinality
+                                // tests can assert on the rewritten authority
+                                // / path / forwarded headers that reached the
+                                // backend wire.
+                                let mut recorded = RecordedH2Request {
+                                    method: req.method().as_str().to_owned(),
+                                    authority: req
+                                        .uri()
+                                        .authority()
+                                        .map(|a| a.as_str().to_owned())
+                                        .unwrap_or_default(),
+                                    path: req.uri().path().to_owned(),
+                                    headers: req
+                                        .headers()
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            (k.as_str().to_owned(), v.as_bytes().to_vec())
+                                        })
+                                        .collect(),
+                                    trailers: Vec::new(),
+                                };
+                                if record_trailers {
+                                    match req.into_body().collect().await {
+                                        Ok(collected) => {
+                                            recorded.trailers = collected
+                                                .trailers()
+                                                .map(|trailers| {
+                                                    trailers
+                                                        .iter()
+                                                        .map(|(k, v)| {
+                                                            (
+                                                                k.as_str().to_owned(),
+                                                                v.as_bytes().to_vec(),
+                                                            )
+                                                        })
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                        }
+                                        Err(e) => {
+                                            eprintln!("{name}: request body error: {e}");
+                                        }
+                                    }
+                                }
+                                let status = match &required_authorization {
+                                    Some(expected)
+                                        if !recorded.headers.iter().any(|(name, value)| {
+                                            name == "authorization" && value == expected.as_ref()
+                                        }) =>
+                                    {
+                                        401
+                                    }
+                                    _ => 200,
+                                };
+                                if let Ok(mut log) = req_log.lock() {
+                                    log.push(recorded);
+                                }
+
+                                let response = Response::builder()
+                                    .status(status)
+                                    .header("content-type", "text/plain")
+                                    .body(Full::new(body))
+                                    .unwrap();
+
+                                resp_count.fetch_add(1, Ordering::Relaxed);
+                                Ok::<_, hyper::Error>(response)
+                            }
+                        });
+
+                        let mut builder = ServerBuilder::new(TokioExecutor::new());
+                        if let Some(window) = initial_stream_window {
+                            builder.http2().initial_stream_window_size(window);
+                        }
+                        if let Err(e) = builder.serve_connection(io, service).await {
+                            eprintln!("h2 backend connection error: {e}");
+                        }
+                    });
+                }
+            });
+        });
+
+        // Block until the spawned thread has bound the listener and is
+        // about to call accept(). Cap at 5 s so a misconfigured runtime
+        // does not hang the test forever — that would manifest as a
+        // panic instead of the silent 503 race we are trying to close.
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("H2Backend: accept loop did not signal readiness within 5 s");
+
+        Self {
+            name,
+            stop,
+            requests_received,
+            responses_sent,
+            connections_accepted,
+            requests_log,
+            thread: Some(thread),
+        }
+    }
+
+    /// Snapshot of every request the backend received since [`start`].
+    /// Cardinality tests use this to assert on the authority/path/headers
+    /// the backend actually saw on the wire.
+    pub fn recorded_requests(&self) -> Vec<RecordedH2Request> {
+        self.requests_log
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            // Join the spawned thread so its tokio runtime drops in
+            // lockstep with the test exit. Detaching it (the previous
+            // `drop(thread)`) leaves the runtime — and its threadpool —
+            // alive across subsequent tests in the same process, which
+            // cumulatively starves cargo's default thread budget on
+            // contended CI and amplifies otherwise-unrelated flakes.
+            // The accept loop polls the stop flag every 50 ms (see the
+            // timeout inside `start`) so this join completes within
+            // ~100 ms of the stop signal.
+            if let Err(payload) = thread.join() {
+                eprintln!("H2Backend: spawned thread panicked: {payload:?}");
+            }
+        }
+    }
+
+    pub fn get_requests_received(&self) -> usize {
+        self.requests_received.load(Ordering::Relaxed)
+    }
+
+    pub fn get_responses_sent(&self) -> usize {
+        self.responses_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn get_connections_accepted(&self) -> usize {
+        self.connections_accepted.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for H2Backend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}

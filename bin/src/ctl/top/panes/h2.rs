@@ -1,0 +1,402 @@
+//! H2 pane — HTTP/2 health snapshot.
+//!
+//! Operators reading this pane want three answers fast:
+//!
+//! 1. How much H2 is happening right now? (active streams gauge,
+//!    connection count by ALPN class.)
+//! 2. Is anything backed up? (`flow_control_stall` rate,
+//!    `pending_window_updates` gauge, RST_STREAM/GOAWAY rates.)
+//! 3. Has a flood detector tripped? (every `h2.flood.violation.*` key the
+//!    H2 flood detector emits — CVE-2023-44487 / CVE-2024-27316 /
+//!    CVE-2025-8671 / CVE-2019-9512 / CVE-2019-9515 / CVE-2019-9518
+//!    mitigations — plus `h2.flood.stream_refused`, surfaced as
+//!    critical-tier counters.)
+//!
+//! All metric keys are pulled from the freshest `AggregatedMetrics`
+//! snapshot's `proxying` map (the per-cluster `clusters[*].cluster` map
+//! aggregates the same names). The pane reads gauges directly and computes
+//! per-second rates for counters via the shared `App.rates`-style logic
+//! the OVERVIEW pane already exercises.
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
+use sozu_command_lib::proto::command::AggregatedMetrics;
+use sozu_lib::metrics::names;
+
+use super::super::app::{App, count_value as count, gauge_value as gauge};
+use super::super::theme::Skin;
+
+pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" H2 · streams · flow control · flood mitigations ")
+        .style(Style::default().fg(skin.muted));
+
+    let metrics = match app.last_metrics.as_ref() {
+        Some(m) => m,
+        None => {
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            f.render_widget(
+                Paragraph::new(
+                    "No snapshot yet. The H2 pane reads from the same QueryMetrics \
+                     poll as OVERVIEW; data appears once the first poll lands.",
+                )
+                .style(Style::default().fg(skin.secondary)),
+                inner,
+            );
+            return;
+        }
+    };
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7), // streams + connections gauges
+            Constraint::Length(7), // flow control + frame counters
+            Constraint::Min(5),    // flood mitigations
+        ])
+        .split(inner);
+
+    render_streams(f, chunks[0], app, skin, metrics);
+    render_flow(f, chunks[1], app, skin, metrics);
+    render_floods(f, chunks[2], app, skin, metrics);
+}
+
+fn render_streams(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &AggregatedMetrics) {
+    let active_streams = gauge(m.proxying.get(names::h2::CONNECTION_ACTIVE_STREAMS)).unwrap_or(0);
+    let alpn_h2 = count(m.proxying.get(names::http::ALPN_H2)).unwrap_or(0);
+    let alpn_http11 = count(m.proxying.get(names::http::ALPN_HTTP11)).unwrap_or(0);
+    let total_alpn = alpn_h2 + alpn_http11;
+    let h2_pct = if total_alpn > 0 {
+        (alpn_h2 as f64 / total_alpn as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let big = Line::from(vec![
+        Span::styled(
+            format!("{active_streams}"),
+            Style::default()
+                .fg(skin.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" active H2 streams · ", Style::default().fg(skin.secondary)),
+        Span::styled(
+            format!("{h2_pct:.1} %"),
+            Style::default()
+                .fg(skin.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" of accepts on H2", Style::default().fg(skin.secondary)),
+    ]);
+
+    let header = Row::new(vec!["metric", "value", "trend (60 s)"]).style(
+        Style::default()
+            .fg(skin.primary)
+            .add_modifier(Modifier::BOLD),
+    );
+    // Trend columns render a Unicode-bar sparkline from the per-key
+    // SparkRing populated each snapshot by `App::fold_h2_trends`. The
+    // first sample lands as a single bar; the ring fills out to the
+    // 60-sample width as more snapshots arrive.
+    let rows = [
+        Row::new(vec![
+            Cell::from("active streams"),
+            Cell::from(format!("{active_streams}")),
+            Cell::from(app.h2_trend_bars(names::h2::CONNECTION_ACTIVE_STREAMS)),
+        ])
+        .style(Style::default().fg(skin.secondary)),
+        Row::new(vec![
+            Cell::from("H2 connections accepted"),
+            Cell::from(format!("{alpn_h2}")),
+            Cell::from(app.h2_trend_bars(names::http::ALPN_H2)),
+        ])
+        .style(Style::default().fg(skin.secondary)),
+        Row::new(vec![
+            Cell::from("HTTP/1.1 accepted"),
+            Cell::from(format!("{alpn_http11}")),
+            Cell::from(app.h2_trend_bars(names::http::ALPN_HTTP11)),
+        ])
+        .style(Style::default().fg(skin.secondary)),
+        Row::new(vec![
+            Cell::from("client.connections (gauge)"),
+            Cell::from(format!("{}", app.overview.client_connections)),
+            Cell::from(app.h2_trend_bars(names::client::CONNECTIONS)),
+        ])
+        .style(Style::default().fg(skin.secondary)),
+    ];
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+    f.render_widget(Paragraph::new(big), chunks[0]);
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Min(28),
+                Constraint::Length(16),
+                Constraint::Min(16),
+            ],
+        )
+        .header(header),
+        chunks[1],
+    );
+}
+
+fn render_flow(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &AggregatedMetrics) {
+    let header = Row::new(vec!["flow control", "value", "trend (60 s)"]).style(
+        Style::default()
+            .fg(skin.primary)
+            .add_modifier(Modifier::BOLD),
+    );
+    let gauge_at = |key: &str| gauge(m.proxying.get(key)).map(|v| v as i64);
+    let count_at = |key: &str| count(m.proxying.get(key));
+    let rows = [
+        metric_row(
+            "connection.window_bytes",
+            gauge_at(names::h2::CONNECTION_WINDOW_BYTES),
+            app.h2_trend_bars(names::h2::CONNECTION_WINDOW_BYTES),
+            skin,
+            false,
+        ),
+        metric_row(
+            "pending_window_updates",
+            gauge_at(names::h2::CONNECTION_PENDING_WINDOW_UPDATES),
+            app.h2_trend_bars(names::h2::CONNECTION_PENDING_WINDOW_UPDATES),
+            skin,
+            false,
+        ),
+        metric_row(
+            "flow_control_stall",
+            count_at(names::h2::FLOW_CONTROL_STALL),
+            app.h2_trend_bars(names::h2::FLOW_CONTROL_STALL),
+            skin,
+            true,
+        ),
+        metric_row(
+            "frames.tx.window_update",
+            count_at(names::h2::FRAMES_TX_WINDOW_UPDATE),
+            app.h2_trend_bars(names::h2::FRAMES_TX_WINDOW_UPDATE),
+            skin,
+            false,
+        ),
+        metric_row(
+            "frames.tx.rst_stream",
+            count_at(names::h2::FRAMES_TX_RST_STREAM),
+            app.h2_trend_bars(names::h2::FRAMES_TX_RST_STREAM),
+            skin,
+            true,
+        ),
+        metric_row(
+            "frames.tx.goaway",
+            count_at(names::h2::FRAMES_TX_GOAWAY),
+            app.h2_trend_bars(names::h2::FRAMES_TX_GOAWAY),
+            skin,
+            true,
+        ),
+        metric_row(
+            "headers.rejected.budget_overrun",
+            count_at(names::h2::HEADERS_REJECTED_BUDGET_OVERRUN),
+            app.h2_trend_bars(names::h2::HEADERS_REJECTED_BUDGET_OVERRUN),
+            skin,
+            true,
+        ),
+    ];
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Min(36),
+                Constraint::Length(16),
+                Constraint::Min(16),
+            ],
+        )
+        .header(header),
+        area,
+    );
+}
+
+/// Counters of the flood-mitigation block, as `(metric key, label)`.
+/// Most severe first: a short terminal drops the bottom rows.
+const FLOOD_ROWS: &[(&str, &str)] = &[
+    (
+        names::h2::FLOOD_VIOLATION_RST_STREAM_PRE_RESPONSE_LIFETIME,
+        "rst_stream_pre_response_lifetime",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_RST_STREAM_LIFETIME,
+        "rst_stream_lifetime",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_RST_STREAM_EMITTED_LIFETIME,
+        "rst_stream_emitted_lifetime",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_RST_STREAM_WINDOW,
+        "rst_stream_window",
+    ),
+    (names::h2::FLOOD_STREAM_REFUSED, "stream_refused"),
+    (
+        names::h2::FLOOD_VIOLATION_CONTINUATION_PER_BLOCK,
+        "continuation_per_block",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_HEADER_SIZE_PER_BLOCK,
+        "header_size_per_block",
+    ),
+    (names::h2::FLOOD_VIOLATION_PING_WINDOW, "ping_window"),
+    (names::h2::FLOOD_VIOLATION_PING_LIFETIME, "ping_lifetime"),
+    (
+        names::h2::FLOOD_VIOLATION_SETTINGS_WINDOW,
+        "settings_window",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_SETTINGS_LIFETIME,
+        "settings_lifetime",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_EMPTY_DATA_WINDOW,
+        "empty_data_window",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_WINDOW_UPDATE_STREAM0_WINDOW,
+        "window_update_stream0_window",
+    ),
+    (names::h2::FLOOD_VIOLATION_GLITCH_WINDOW, "glitch_window"),
+    (names::h2::WINDOW_UPDATE_DROPPED, "window_update_dropped"),
+    (names::h2::RST_STREAM_DROPPED, "rst_stream_dropped"),
+    (
+        names::h2::CLOSE_WITH_ACTIVE_STREAMS,
+        "close_with_active_streams",
+    ),
+];
+
+fn render_floods(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &AggregatedMetrics) {
+    // Critical-tier counters: any non-zero value is a documented attack
+    // mitigation firing. Keep them in their own block with a hot-tier title
+    // so the eye is drawn here when it should be.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" flood mitigations · CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 ")
+        .style(Style::default().fg(skin.hot));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let header = Row::new(vec!["counter", "value", "trend (60 s)"]).style(
+        Style::default()
+            .fg(skin.primary)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows: Vec<Row<'_>> = FLOOD_ROWS
+        .iter()
+        .map(|(key, label)| {
+            let v = count(m.proxying.get(*key)).unwrap_or(0);
+            let style = if v > 0 {
+                Style::default().fg(skin.hot).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(skin.secondary)
+            };
+            Row::new(vec![
+                Cell::from(*label),
+                Cell::from(format!("{v}")),
+                Cell::from(app.h2_trend_bars(key)),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Min(28),
+                Constraint::Length(16),
+                Constraint::Min(16),
+            ],
+        )
+        .header(header),
+        inner,
+    );
+}
+
+/// Render one numeric metric as a labelled table row. `value` is pre-
+/// extracted (`gauge(...)` for gauges, `count(...)` for counters) and
+/// widened to `i64` so the helper does not need to know the underlying
+/// variant. `trend_bars` is a Unicode-bar sparkline string produced by
+/// `App::h2_trend_bars`. `warn_when_nonzero` flips the row to the
+/// critical tint when the value is a flood / error counter the
+/// operator should see.
+fn metric_row<'a>(
+    label: &'a str,
+    value: Option<i64>,
+    trend_bars: String,
+    skin: &Skin,
+    warn_when_nonzero: bool,
+) -> Row<'a> {
+    let style = row_style(skin, value.unwrap_or(0) > 0 && warn_when_nonzero);
+    Row::new(vec![
+        Cell::from(label),
+        Cell::from(value.map(|v| format!("{v}")).unwrap_or_else(|| "—".into())),
+        Cell::from(trend_bars),
+    ])
+    .style(style)
+}
+
+fn row_style(skin: &Skin, warn: bool) -> Style {
+    if warn {
+        skin.row_critical()
+    } else {
+        Style::default().fg(skin.secondary)
+    }
+}
+
+// `gauge` / `count` helpers come from `super::super::app` (renamed at
+// import time) so the H2 pane and the App-side rate calculators share
+// one source of truth for `FilteredMetrics -> Option<{i64,u64}>`
+// extraction.
+
+#[cfg(test)]
+mod tests {
+    use sozu_lib::metrics::names;
+
+    use super::FLOOD_ROWS;
+    use crate::ctl::top::app::H2_TRACKED_KEYS;
+
+    /// Every flood counter the pane reads is one the H2 flood detector
+    /// emits, every one it emits has a row, and every row has a trend.
+    #[test]
+    fn flood_rows_read_the_emitted_flood_metric_names() {
+        let row_keys: Vec<&str> = FLOOD_ROWS.iter().map(|(key, _)| *key).collect();
+        for key in row_keys.iter().filter(|k| k.starts_with("h2.flood.")) {
+            assert!(
+                names::h2::FLOOD_VIOLATION_KEYS.contains(key)
+                    || *key == names::h2::FLOOD_STREAM_REFUSED,
+                "the H2 pane reads {key}, which the flood detector never emits",
+            );
+        }
+        for key in names::h2::FLOOD_VIOLATION_KEYS
+            .iter()
+            .chain([&names::h2::FLOOD_STREAM_REFUSED])
+        {
+            assert!(row_keys.contains(key), "the H2 pane has no row for {key}");
+        }
+        for key in &row_keys {
+            assert!(
+                H2_TRACKED_KEYS.contains(key),
+                "{key} has a row but no trend in H2_TRACKED_KEYS",
+            );
+        }
+    }
+}

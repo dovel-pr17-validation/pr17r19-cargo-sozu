@@ -1,0 +1,9182 @@
+//! event loop management
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
+    hash::{DefaultHasher, Hash, Hasher},
+    io::Error as IoError,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    rc::{Rc, Weak},
+    str::FromStr,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
+
+use mio::{
+    Events, Interest, Poll, Token,
+    net::{TcpListener as MioTcpListener, TcpStream, UdpSocket as MioUdpSocket},
+};
+use slab::Slab;
+use sozu_command::{
+    channel::{Channel, ChannelError},
+    config::MetricDetailLevel,
+    listener_key::ListenerKey,
+    logging,
+    proto::command::{
+        ActivateListener, AddBackend, CertificatesWithFingerprints, ClosedSessions, Cluster,
+        ClusterHashes, ClusterInformations, DeactivateListener, Event, EventKind,
+        HttpListenerConfig, HttpsListenerConfig, InitialState, ListenerType,
+        LoadBalancingAlgorithms, LoadMetric, MetricDetail, MetricsConfiguration,
+        ProtectedHealthCheckPhase, RemoveBackend, Request, ResponseContent, ResponseStatus,
+        ServerConfig, TcpListenerConfig as CommandTcpListener,
+        UdpListenerConfig as CommandUdpListener, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerRequest,
+        WorkerResponse, request::RequestType, response_content::ContentType,
+    },
+    ready::Ready,
+    scm_socket::{Listeners, ScmSocket, ScmSocketError},
+    state::{ClusterId, ConfigState, StateError},
+};
+
+use crate::metrics::names;
+use crate::{
+    AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed, SessionTarget,
+    backends::{Backend, BackendMap},
+    features::FEATURES,
+    health_check::HealthChecker,
+    http, https,
+    load_balancing::ShuffleSharding,
+    metrics::METRICS,
+    pool::Pool,
+    protected_health_check::ProtectedWorker,
+    tcp,
+    timer::Timer,
+    udp,
+};
+
+/// Number of bounded buckets for the per-source connect-rate counter.
+///
+/// `incr!` requires a `&'static str`, so per-IP labelling would either need
+/// runtime `Box::leak` per unique source (unbounded under SYN flood — direct
+/// OWASP A05 / NIST SP 800-92 cardinality-blow-up risk) or a fixed bucket
+/// table. We pick the bucket table: 256 static labels precomputed at startup,
+/// each masked subnet hashes into one of them.
+///
+/// Bucket-noise vs per-IP fidelity is a deliberate trade. Operators wanting
+/// per-IP attribution should pair these counters with structured access logs
+/// or a downstream rate-limiter; the metric here is for "is some /24 spamming
+/// us right now?", not "which IP exactly". 256 buckets keep the memory + UDP
+/// statsd cost flat regardless of attacker effort.
+pub const PER_SOURCE_BUCKETS: usize = 256;
+
+/// Pre-leaked `&'static str` table for per-source bucket counters.
+/// `incr!` requires `&'static str`; we leak once at first access (LazyLock)
+/// for `PER_SOURCE_BUCKETS` keys, totalling ~10 KB heap. The leak is bounded
+/// by `PER_SOURCE_BUCKETS` and never grows with traffic.
+static PER_SOURCE_BUCKET_KEYS: LazyLock<[&'static str; PER_SOURCE_BUCKETS]> = LazyLock::new(|| {
+    let mut keys: [&'static str; PER_SOURCE_BUCKETS] = [""; PER_SOURCE_BUCKETS];
+    for (i, slot) in keys.iter_mut().enumerate() {
+        // e.g. "client.connect.per_source.bucket_042"
+        let owned = format!("client.connect.per_source.bucket_{i:03}");
+        *slot = Box::leak(owned.into_boxed_str());
+    }
+    keys
+});
+
+/// Mask an IP address to its bounded prefix (/24 for IPv4, /48 for IPv6) and
+/// hash it into one of `PER_SOURCE_BUCKETS` slots. The hash is `DefaultHasher`,
+/// which is deterministic within a process but salted across runs — fine for
+/// telemetry, not suitable for cross-host correlation.
+fn per_source_bucket(peer: &SocketAddr) -> &'static str {
+    let mut hasher = DefaultHasher::new();
+    match peer.ip() {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // /24 mask: keep first three octets, zero the host portion.
+            let masked = Ipv4Addr::new(octets[0], octets[1], octets[2], 0);
+            masked.hash(&mut hasher);
+        }
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            // /48 mask: keep first 6 bytes, zero the rest.
+            let mut masked_octets = [0u8; 16];
+            masked_octets[..6].copy_from_slice(&octets[..6]);
+            Ipv6Addr::from(masked_octets).hash(&mut hasher);
+        }
+    }
+    let idx = (hasher.finish() as usize) % PER_SOURCE_BUCKETS;
+    PER_SOURCE_BUCKET_KEYS[idx]
+}
+
+/// Period between two `accept_queue.saturated_seconds` ticks. The counter is
+/// incremented once per period while [`SessionManager::can_accept`] is `false`,
+/// distinguishing "queue spent N seconds at max" from "queue briefly hit max"
+/// — the binary `accept_queue.backpressure` gauge collapses that duration.
+const ACCEPT_SATURATION_TICK: Duration = Duration::from_secs(1);
+
+pub type ProxyChannel = Channel<WorkerResponse, WorkerRequest>;
+
+thread_local! {
+  pub static QUEUE: RefCell<VecDeque<WorkerResponse>> = const { RefCell::new(VecDeque::new()) };
+}
+
+thread_local! {
+  pub static TIMER: RefCell<Timer<Token>> = RefCell::new(Timer::default());
+}
+
+pub fn push_queue(message: WorkerResponse) {
+    QUEUE.with(|queue| {
+        (*queue.borrow_mut()).push_back(message);
+    });
+}
+
+pub fn push_event(event: Event) {
+    QUEUE.with(|queue| {
+        (*queue.borrow_mut()).push_back(WorkerResponse {
+            id: "EVENT".to_string(),
+            message: String::new(),
+            status: ResponseStatus::Processing.into(),
+            content: Some(ContentType::Event(event).into()),
+        });
+    });
+}
+
+/// Whether `request` removes a frontend, of any protocol.
+fn is_frontend_removal(request: &Request) -> bool {
+    matches!(
+        request.request_type,
+        Some(
+            RequestType::RemoveHttpFrontend(_)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
+                | RequestType::RemoveHttpsFrontend(_)
+                | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
+                | RequestType::RemoveTcpFrontend(_)
+                | RequestType::RemoveUdpFrontend(_)
+        )
+    )
+}
+
+/// Build the `WorkerMetricDetailStatus` content payload returned in
+/// every successful `SetMetricDetail` worker response. The master
+/// collects these across the fan-out and assembles them into
+/// `MetricDetailStatus.workers[<worker_id>]` so the TUI sees each
+/// worker's actual aggregator state instead of the master's view.
+fn worker_metric_detail_status_content(
+    configured: MetricDetailLevel,
+    effective: MetricDetailLevel,
+    previous_effective: MetricDetailLevel,
+    active_lease_count: u32,
+) -> ResponseContent {
+    use sozu_command::proto::command::WorkerMetricDetailStatus;
+    ContentType::WorkerMetricDetailStatus(WorkerMetricDetailStatus {
+        configured: MetricDetail::from(configured) as i32,
+        effective: MetricDetail::from(effective) as i32,
+        previous_effective: MetricDetail::from(previous_effective) as i32,
+        active_lease_count,
+    })
+    .into()
+}
+
+/// Build a `METRIC_DETAIL_CHANGED` event carrying the worker-local
+/// transition payload (previous/effective levels + transition kind).
+/// `client_id` is `Some(_)` for explicit apply/clear, `None` for the
+/// polled janitor's bulk expiry. The master folds this Event into the
+/// audit log alongside operator-initiated transitions emitted at the
+/// dispatch site in `bin/src/command/requests.rs::worker_request`.
+fn push_metric_detail_transition(
+    previous: MetricDetailLevel,
+    effective: MetricDetailLevel,
+    transition_kind: &'static str,
+    client_id: Option<String>,
+) {
+    use sozu_command::proto::command::MetricDetailTransition;
+    // No-op when nothing actually changed. Defence-in-depth — every
+    // caller already gates on `previous != effective`, but
+    // double-checking here means future call sites can't accidentally
+    // emit a "ghost" transition.
+    if previous == effective {
+        return;
+    }
+    push_event(Event {
+        kind: EventKind::MetricDetailChanged as i32,
+        cluster_id: None,
+        backend_id: None,
+        address: None,
+        metric_detail: Some(MetricDetailTransition {
+            previous_effective: MetricDetail::from(previous) as i32,
+            effective: MetricDetail::from(effective) as i32,
+            transition_kind: transition_kind.to_owned(),
+            client_id,
+        }),
+    });
+}
+
+/// Polled lease-expiry janitor: `SetMetricDetail` leases self-expire after
+/// their TTL so a crashed `sozu top` cannot permanently elevate metrics
+/// cardinality. Called once per event-loop iteration from [`Server::run`],
+/// which wakes at least once per `poll_timeout` (1 s) even with no traffic
+/// and no command, and from [`Server::notify`]. `lease_tick_due` gates the
+/// HashMap walk to once per `LEASE_TICK_INTERVAL` (5 s), so an abandoned
+/// lease is retired within TTL + 5 s + one poll timeout (#1831).
+fn tick_metric_detail_leases(now: Instant) {
+    // Capture (previous, effective) before releasing the borrow so we can
+    // emit an Event afterwards. Holding `METRICS.borrow_mut` across
+    // `push_event` would re-enter the same thread-local from inside
+    // `QUEUE.with` (safe but conceptually noisy); the two-step split keeps
+    // the borrow scopes minimal. Single-threaded worker, so `borrow_mut` is
+    // safe here.
+    let lease_tick_transition = METRICS.with(|metrics| {
+        let mut m = metrics.borrow_mut();
+        if !m.lease_tick_due(now) {
+            return None;
+        }
+        let previous = m.lease_tick(now)?;
+        let effective = m.detail_effective();
+        Some((previous, effective))
+    });
+    if let Some((previous, effective)) = lease_tick_transition {
+        // The janitor retired one or more leases AND the effective level
+        // moved. Surface the worker-local transition as an Event so the
+        // master folds it into the audit log. `client_id` is `None` because
+        // the janitor may have retired multiple leases at once.
+        push_metric_detail_transition(previous, effective, "lease_tick_expired", None);
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ListenToken(pub usize);
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionToken(pub usize);
+
+impl From<usize> for ListenToken {
+    fn from(val: usize) -> ListenToken {
+        ListenToken(val)
+    }
+}
+
+impl From<ListenToken> for usize {
+    fn from(val: ListenToken) -> usize {
+        val.0
+    }
+}
+
+impl From<usize> for SessionToken {
+    fn from(val: usize) -> SessionToken {
+        SessionToken(val)
+    }
+}
+
+impl From<SessionToken> for usize {
+    fn from(val: SessionToken) -> usize {
+        val.0
+    }
+}
+
+/// Mask `address` down to the network named by `prefix` bits.
+///
+/// `prefix` is validated at config-load time
+/// (`ConfigError::InvalidSubnetPrefix` in `command/src/config.rs`), but
+/// this runs on the per-request hot path and does not assume that
+/// happened: a prefix at or above the address width returns the address
+/// unmasked.
+///
+/// Both ends are handled by an explicit branch rather than by the shift.
+/// `u32::MAX << 32` is an overflowing shift — it panics under
+/// `debug_assertions` and silently wraps to a no-op shift in release —
+/// so a full-width prefix must never reach the shift. A zero prefix is
+/// branched from the other end for the same reason.
+fn mask_ipv4(address: Ipv4Addr, prefix: u32) -> Ipv4Addr {
+    if prefix >= u32::BITS {
+        return address;
+    }
+    if prefix == 0 {
+        return Ipv4Addr::UNSPECIFIED;
+    }
+    // Only a strictly-interior prefix reaches the shift, which is what
+    // makes `u32::BITS - prefix` a legal shift amount in 1..32.
+    debug_assert!(
+        prefix > 0 && prefix < u32::BITS,
+        "both shift-overflowing ends must have returned before the shift"
+    );
+    let mask = u32::MAX << (u32::BITS - prefix);
+    let masked = Ipv4Addr::from(u32::from(address) & mask);
+    // Pair assertion, positive then negative space: the result keeps
+    // every masked-in bit of the input, and holds none of the host bits
+    // the prefix is supposed to erase.
+    debug_assert_eq!(
+        u32::from(masked),
+        u32::from(address) & mask,
+        "masking must keep exactly the network bits of the source address"
+    );
+    debug_assert_eq!(
+        u32::from(masked) & !mask,
+        0,
+        "masking must clear every host bit below the prefix"
+    );
+    masked
+}
+
+/// IPv6 twin of [`mask_ipv4`]. The same two shift-overflowing ends are
+/// branched explicitly: `u128::MAX << 128` is as ill-defined as its
+/// 32-bit counterpart.
+fn mask_ipv6(address: Ipv6Addr, prefix: u32) -> Ipv6Addr {
+    if prefix >= u128::BITS {
+        return address;
+    }
+    if prefix == 0 {
+        return Ipv6Addr::UNSPECIFIED;
+    }
+    debug_assert!(
+        prefix > 0 && prefix < u128::BITS,
+        "both shift-overflowing ends must have returned before the shift"
+    );
+    let mask = u128::MAX << (u128::BITS - prefix);
+    let masked = Ipv6Addr::from(u128::from(address) & mask);
+    debug_assert_eq!(
+        u128::from(masked),
+        u128::from(address) & mask,
+        "masking must keep exactly the network bits of the source address"
+    );
+    debug_assert_eq!(
+        u128::from(masked) & !mask,
+        0,
+        "masking must clear every host bit below the prefix"
+    );
+    masked
+}
+
+/// Derive the per-(cluster, source-SUBNET) counter key for `address`.
+///
+/// An IPv4-mapped IPv6 address is canonicalised to its IPv4 form and
+/// charged to `ipv4_prefix`. This matters: a dual-stack `[::]` listener
+/// hands every IPv4 client back as `::ffff:a.b.c.d`, and masking those
+/// with an IPv6 prefix would collapse the entire IPv4 internet into the
+/// single `::/56` bucket — the subnet cap would then fire on unrelated
+/// clients the moment it was switched on. The per-IP counter is NOT
+/// canonicalised: it keeps charging the address exactly as it arrived,
+/// which is part of what leaves its behaviour untouched by this feature.
+pub fn subnet_key(address: &IpAddr, ipv4_prefix: u32, ipv6_prefix: u32) -> IpAddr {
+    let canonical_v4 = match address {
+        IpAddr::V4(v4) => Some(*v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    };
+    let key = match (canonical_v4, address) {
+        (Some(v4), _) => IpAddr::V4(mask_ipv4(v4, ipv4_prefix)),
+        (None, IpAddr::V6(v6)) => IpAddr::V6(mask_ipv6(*v6, ipv6_prefix)),
+        // Unreachable: `canonical_v4` is `Some` for every `IpAddr::V4`.
+        (None, IpAddr::V4(v4)) => IpAddr::V4(mask_ipv4(*v4, ipv4_prefix)),
+    };
+    // Pair assertion: the key stays in the family it will be compared
+    // against — a mapped source yields a V4 key (positive space), and a
+    // genuine IPv6 source never yields one (negative space).
+    debug_assert_eq!(
+        key.is_ipv4(),
+        canonical_v4.is_some(),
+        "subnet key family must follow the canonicalised source family"
+    );
+    debug_assert_eq!(
+        key.is_ipv6(),
+        canonical_v4.is_none(),
+        "a genuine IPv6 source must never produce an IPv4 subnet key"
+    );
+    key
+}
+
+pub struct SessionManager {
+    pub max_connections: usize,
+    pub nb_connections: usize,
+    pub can_accept: bool,
+    pub slab: Slab<Rc<RefCell<dyn ProxySession>>>,
+    /// Default per-(cluster, source-IP) connection limit. `0` disables
+    /// the feature; cluster-level overrides take precedence at check
+    /// time.
+    pub max_connections_per_ip: u64,
+    /// Default `Retry-After` header value (seconds) for HTTP 429
+    /// responses emitted on per-(cluster, source-IP) limit hit. `0`
+    /// omits the header.
+    pub retry_after: u32,
+    /// Active **frontend connections** per `(cluster_id, source_ip)`.
+    /// Each frontend session contributes AT MOST 1 to the count for any
+    /// given `(cluster, ip)` pair, regardless of how many streams it
+    /// multiplexes to that cluster (an H2 connection serving 100
+    /// streams to cluster X from IP 1.2.3.4 still counts as 1). The
+    /// counter is incremented the first time a session's
+    /// `Router::plan_connect` resolves to a fresh `(cluster, ip)` pair, and
+    /// decremented when the session closes. Empty when the feature is
+    /// unused.
+    ///
+    /// ── Why nested maps instead of `HashMap<(String, IpAddr), usize>` ──
+    ///
+    /// The per-request hot path (`cluster_ip_at_limit`, called from
+    /// `mux/router::plan_connect` for every cluster-resolving request) used
+    /// to allocate a `String` to build the compound key on every
+    /// lookup. Splitting the storage so the outer key is a [`ClusterId`]
+    /// lets the lookup take `&str` — `HashMap::get(cluster_id)` on a
+    /// `HashMap<ClusterId, _>` accepts a borrow via the `Borrow<str>`
+    /// impl. The hot path no longer allocates, and `track_cluster_ip`
+    /// keys the maps with the caller's reference-counted handle, so no
+    /// key is ever a copy of the id. Memory footprint is unchanged
+    /// in steady state — entries are still reaped to zero on session
+    /// close.
+    connections_per_cluster_ip: HashMap<ClusterId, HashMap<IpAddr, usize>>,
+    /// Reverse index: per-token map of `cluster_id` → set of source IPs
+    /// already counted against `connections_per_cluster_ip`. Used to
+    /// make `track_cluster_ip` idempotent within a session (so H2
+    /// streams to the same cluster from the same client only consume
+    /// one slot in the limit) and to drain a session's contributions on
+    /// close. Same nesting rationale as above.
+    cluster_ip_tracks: HashMap<Token, HashMap<ClusterId, HashSet<IpAddr>>>,
+    /// Default per-(cluster, source-SUBNET) connection limit. `0`
+    /// disables the subnet limiter, which is the default; cluster-level
+    /// overrides take precedence at check time.
+    ///
+    /// This is a SECOND, INDEPENDENT counter standing beside
+    /// `max_connections_per_ip`, not a replacement for it. The per-IP
+    /// cap serves the API-gateway case — one abusive client, one
+    /// address. The per-subnet cap serves the denial-of-service case,
+    /// where an attacker holding a routed prefix (an ordinary
+    /// residential IPv6 `/64`) defeats a per-address counter outright
+    /// by taking a fresh address for every connection
+    /// (sozu-proxy/sozu#1270). Both gates are consulted and BOTH must
+    /// admit, so "10 per IP AND 100 per /64" is expressible.
+    pub max_connections_per_subnet: u64,
+    /// IPv4 prefix length, in bits, defining a "subnet" for the counter
+    /// above. Boot-time only: changing a mask would re-key every live
+    /// counter, so there is no runtime setter for it. 32 masks nothing.
+    pub subnet_ipv4_prefix: u32,
+    /// IPv6 prefix length, in bits. Boot-time only, as above. 128 masks
+    /// nothing.
+    pub subnet_ipv6_prefix: u32,
+    /// Active frontend connections per `(cluster_id, masked_source_ip)`.
+    /// Exact mirror of `connections_per_cluster_ip`, keyed on the subnet
+    /// key from `subnet_key` instead of the raw address; the same
+    /// nesting rationale applies verbatim.
+    ///
+    /// Stays EMPTY while the subnet limiter is disabled: unlike the
+    /// per-IP index, which is populated unconditionally, this one is
+    /// only written when a positive limit resolves for the cluster (see
+    /// `SessionManager::track_cluster_subnet`). That is what makes the
+    /// default genuinely free rather than merely inert — no second
+    /// allocation, no second hash, no second entry per session for an
+    /// operator who never turns the feature on.
+    connections_per_cluster_subnet: HashMap<ClusterId, HashMap<IpAddr, usize>>,
+    /// Reverse index for `connections_per_cluster_subnet`, mirroring
+    /// `cluster_ip_tracks`. Also empty while the limiter is disabled.
+    cluster_subnet_tracks: HashMap<Token, HashMap<ClusterId, HashSet<IpAddr>>>,
+    /// Default backend connection attempt budget of a request, the first
+    /// attempt included: `ServerConfig::max_connection_attempts`, changed at
+    /// runtime by `SetMaxConnectionAttempts`. A cluster's own
+    /// `max_connection_attempts` takes precedence
+    /// ([`Self::effective_max_connection_attempts`]). Validated, so between
+    /// 1 and 255.
+    pub max_connection_attempts: u32,
+}
+
+impl SessionManager {
+    pub fn new(
+        slab: Slab<Rc<RefCell<dyn ProxySession>>>,
+        max_connections: usize,
+        max_connections_per_ip: u64,
+        retry_after: u32,
+        max_connections_per_subnet: u64,
+        subnet_ipv4_prefix: u32,
+        subnet_ipv6_prefix: u32,
+    ) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(SessionManager {
+            max_connections,
+            nb_connections: 0,
+            can_accept: true,
+            slab,
+            max_connections_per_ip,
+            retry_after,
+            connections_per_cluster_ip: HashMap::new(),
+            cluster_ip_tracks: HashMap::new(),
+            max_connections_per_subnet,
+            subnet_ipv4_prefix,
+            subnet_ipv6_prefix,
+            connections_per_cluster_subnet: HashMap::new(),
+            cluster_subnet_tracks: HashMap::new(),
+            max_connection_attempts: sozu_command::config::DEFAULT_MAX_CONNECTION_ATTEMPTS,
+        }))
+    }
+
+    /// Resolve the backend connection attempt budget of a request routed to
+    /// a cluster whose own setting is `override_value`: the cluster's value
+    /// when it sets one, the global default otherwise (sozu-proxy/sozu#1800).
+    pub fn effective_max_connection_attempts(&self, override_value: Option<u32>) -> u32 {
+        override_value.unwrap_or(self.max_connection_attempts)
+    }
+
+    /// Resolve the effective per-(cluster, source-IP) limit. `override_value`
+    /// is the cluster-level setting from the proto `Cluster` message:
+    /// `None` inherits the global default, `Some(0)` is explicit
+    /// "unlimited", `Some(n > 0)` overrides.
+    pub fn effective_max_connections_per_ip(&self, override_value: Option<u64>) -> u64 {
+        override_value.unwrap_or(self.max_connections_per_ip)
+    }
+
+    /// Resolve the effective `Retry-After` header value. `Some(0)` (or
+    /// the global default of 0) signals "omit the header" — caller
+    /// must skip emission rather than render `Retry-After: 0`.
+    pub fn effective_retry_after(&self, override_value: Option<u32>) -> u32 {
+        override_value.unwrap_or(self.retry_after)
+    }
+
+    /// Resolve the effective per-(cluster, source-SUBNET) limit. Same
+    /// three-state contract as `effective_max_connections_per_ip`:
+    /// `None` inherits the global default, `Some(0)` is explicit
+    /// "unlimited", `Some(n > 0)` overrides.
+    pub fn effective_max_connections_per_subnet(&self, override_value: Option<u64>) -> u64 {
+        override_value.unwrap_or(self.max_connections_per_subnet)
+    }
+
+    /// Derive the subnet counter key for `ip` under this manager's
+    /// configured prefixes. Allocation-free — `IpAddr` is `Copy`.
+    pub fn subnet_key(&self, ip: &IpAddr) -> IpAddr {
+        subnet_key(ip, self.subnet_ipv4_prefix, self.subnet_ipv6_prefix)
+    }
+
+    /// Returns `true` when admitting `token` to one more connection for
+    /// `(cluster, subnet_of(ip))` would exceed the resolved subnet
+    /// limit. Exact mirror of `cluster_ip_at_limit` on the subnet
+    /// counter: `0` is unlimited, and a token already holding a slot
+    /// for this `(cluster, subnet)` is never at the limit.
+    ///
+    /// The subnet key is derived only AFTER the `limit == 0` early
+    /// return, so a deployment that never enables this feature pays no
+    /// masking work on the hot path at all.
+    pub fn cluster_subnet_at_limit(
+        &self,
+        token: Token,
+        cluster_id: &str,
+        ip: &IpAddr,
+        override_value: Option<u64>,
+    ) -> bool {
+        let limit = self.effective_max_connections_per_subnet(override_value);
+        if limit == 0 {
+            return false;
+        }
+        debug_assert!(
+            limit > 0,
+            "limit==0 (unlimited) must have returned before reaching the bounded check"
+        );
+        let subnet = self.subnet_key(ip);
+        let already_tracked = self
+            .cluster_subnet_tracks
+            .get(&token)
+            .and_then(|by_cluster| by_cluster.get(cluster_id))
+            .is_some_and(|subnets| subnets.contains(&subnet));
+        if already_tracked {
+            debug_assert!(
+                self.connections_per_cluster_subnet
+                    .get(cluster_id)
+                    .and_then(|by_subnet| by_subnet.get(&subnet))
+                    .is_some_and(|c| *c > 0),
+                "a tracked (token, cluster, subnet) slot must have a positive forward count"
+            );
+            return false;
+        }
+        self.connections_per_cluster_subnet
+            .get(cluster_id)
+            .and_then(|by_subnet| by_subnet.get(&subnet))
+            .is_some_and(|c| (*c as u64) >= limit)
+    }
+
+    /// THE gate. Returns `true` when EITHER the per-IP cap or the
+    /// per-subnet cap would be exceeded by admitting `token` to one more
+    /// connection for `cluster_id` from `ip`.
+    ///
+    /// Both enforcement points — the H1+H2 mux router and raw TCP — call
+    /// this rather than the two halves, so the conjunction "admit only
+    /// if BOTH caps allow it" is stated once and cannot drift between
+    /// protocols. The per-IP half is evaluated first and is byte-for-byte
+    /// the pre-existing check; the subnet half is the single line this
+    /// feature adds to the admission path.
+    pub fn cluster_connection_at_limit(
+        &self,
+        token: Token,
+        cluster_id: &str,
+        ip: &IpAddr,
+        ip_override: Option<u64>,
+        subnet_override: Option<u64>,
+    ) -> bool {
+        self.cluster_ip_at_limit(token, cluster_id, ip, ip_override)
+            || self.cluster_subnet_at_limit(token, cluster_id, ip, subnet_override)
+    }
+
+    /// Returns `true` when admitting `token` to one more connection for
+    /// `(cluster, ip)` would exceed the resolved limit. `0` is treated
+    /// as unlimited. A token that already holds a slot for this
+    /// `(cluster, ip)` is NEVER at the limit — H2 sessions multiplex
+    /// many streams to the same cluster on a single connection, and
+    /// the limit governs distinct frontend connections, not streams.
+    ///
+    /// Hot-path: called for every cluster-resolving request from
+    /// `mux/router::plan_connect`. The nested-map storage lets both lookups
+    /// borrow `cluster_id` and `ip`; no per-call allocation runs here
+    /// in steady state.
+    pub fn cluster_ip_at_limit(
+        &self,
+        token: Token,
+        cluster_id: &str,
+        ip: &IpAddr,
+        override_value: Option<u64>,
+    ) -> bool {
+        let limit = self.effective_max_connections_per_ip(override_value);
+        if limit == 0 {
+            return false;
+        }
+        // Pure query: the limit==0 branch already returned, so any work below
+        // runs only with a positive cap.
+        debug_assert!(
+            limit > 0,
+            "limit==0 (unlimited) must have returned before reaching the bounded check"
+        );
+        let already_tracked = self
+            .cluster_ip_tracks
+            .get(&token)
+            .and_then(|by_cluster| by_cluster.get(cluster_id))
+            .is_some_and(|ips| ips.contains(ip));
+        if already_tracked {
+            // Reverse-index/forward-count coherence: if this token already
+            // holds a slot for (cluster, ip), the forward count must be > 0
+            // (decrement-to-zero reaps the inner entry in untrack_all).
+            debug_assert!(
+                self.connections_per_cluster_ip
+                    .get(cluster_id)
+                    .and_then(|by_ip| by_ip.get(ip))
+                    .is_some_and(|c| *c > 0),
+                "a tracked (token, cluster, ip) slot must have a positive forward count"
+            );
+            return false;
+        }
+        self.connections_per_cluster_ip
+            .get(cluster_id)
+            .and_then(|by_ip| by_ip.get(ip))
+            .is_some_and(|c| (*c as u64) >= limit)
+    }
+
+    /// Account `token`'s active connection against `(cluster, ip)`.
+    /// Idempotent within a token: a second call for the same
+    /// `(cluster, ip)` is a no-op so H2 retries / multi-stream opens
+    /// to the same cluster do not double-count.
+    ///
+    /// Copies no cluster id: `entry(cluster_id.clone())` only bumps the
+    /// [`ClusterId`] count. A first `(token, cluster)` observation
+    /// allocates the new slot's IP set; later IPs under it reuse the
+    /// set, and a repeat call allocates nothing.
+    ///
+    /// ── A FAILED backend dial keeps the slot, and that is deliberate ──
+    ///
+    /// `Router::plan_connect` (`lib/src/protocol/mux/router.rs`) claims
+    /// here, after the `Self::cluster_ip_at_limit` gate but BEFORE
+    /// backend selection and the dial. Six fallible exits follow the
+    /// claim and none of them releases. Since sozu-proxy/sozu#1519 they
+    /// sit in two functions rather than one: `Router::plan_connect`
+    /// keeps the two pool-reuse refusals, and `Mux::dial_backend` with the
+    /// `Mux::attach_dialed` it calls (`lib/src/protocol/mux/mod.rs`) own the
+    /// four on the fresh-dial
+    /// path — backend selection, buffer-pool exhaustion, the new
+    /// connection refusing the stream, and the `L7Proxy::register_socket`
+    /// rollback, which restores its gauges and slab entry but not the
+    /// slot. The split moved no ordering: the claim still precedes all
+    /// six. `Self::untrack_all_cluster_ip` is the only release, and
+    /// session teardown is its only caller — the
+    /// `L7Proxy::remove_session` impls on `HttpProxy` / `HttpsProxy` for
+    /// the mux, `TcpSession::close` for raw TCP.
+    /// An unpaired claim reads like an oversight; it is not one, and
+    /// sozu-proxy/sozu#1521 is where the reasoning was measured rather
+    /// than assumed. Do not pair a release with those exits as part of a
+    /// refactor — it would LOOSEN a connection limit under exactly the
+    /// conditions a client can induce.
+    ///
+    /// What makes the unpaired claim cheap on H1 is that a failed dial
+    /// ENDS the frontend connection, so the slot returns with it:
+    ///
+    /// - `Mux::ready_inner` joins the plan and the dial into a single
+    ///   `Result` with `and_then`, so every post-claim exit from either
+    ///   function reaches the same `BackendConnectionError` arm of its
+    ///   pending-link loop, which answers the stream from the template
+    ///   registry instead of retrying. No arm there returns
+    ///   `SessionResult::Close` of its own.
+    /// - Every built-in template in
+    ///   `lib/src/protocol/kawa_h1/answers.rs` carries
+    ///   `Connection: close`, so `set_default_answer_with_retry_after`
+    ///   (`lib/src/protocol/mux/answers.rs`) clears
+    ///   `HttpContext::keep_alive_frontend`. On H1 that one bit is what
+    ///   closes the connection; H2 does not read it.
+    /// - H1: once the answer flushes, the response-complete branch of
+    ///   `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) takes
+    ///   `ConnectionH1::defer_close_for_tls_flush` instead of the
+    ///   keep-alive reset, so the session closes after that one flush.
+    /// - H2: the answer ends its own stream only (RFC 9113 §8.2.2:
+    ///   `Connection` is not an H2 field, sozu-proxy/sozu#1740). The
+    ///   connection stays open, so the slot is held until the client
+    ///   closes it or it times out.
+    /// - TCP never reaches an answer at all: any error out of
+    ///   `TcpSession::connect_to_backend` (`lib/src/tcp.rs`) becomes
+    ///   `SessionResult::Close` in the same event-loop pass.
+    /// - A registered, `Normal` backend that is down may not fail on the
+    ///   dial at all. The dial — `Mux::dial_backend`
+    ///   (`lib/src/protocol/mux/mod.rs`) for HTTP, `Backend::try_connect`
+    ///   (`lib/src/backends.rs`) for TCP — is non-blocking: a refusal the
+    ///   kernel reports synchronously surfaces as
+    ///   `BackendError::ConnectionFailures`, which the mux re-queues for
+    ///   another backend, while an `EINPROGRESS` connect returns `Ok` and
+    ///   its refusal (or its `connect_timeout`) arrives later as a backend
+    ///   failure, so the stream retries through `EndStreamAction::Reconnect`.
+    ///   The re-track is the no-op above, so one slot — not one per
+    ///   attempt — is held for at most `max_connection_attempts` attempts
+    ///   (sozu-proxy/sozu#1800).
+    ///
+    /// The window IS the connection's whole lifetime in two cases: any
+    /// H2 connection, and an H1 connection answered by an operator
+    /// template that omits `Connection: close` (the opt-out
+    /// `doc/rate-limit-design.md` records for the 429 template). Either
+    /// holds its one slot per (connection, cluster) until the client goes
+    /// away, as a connection whose dial succeeded does.
+    pub fn track_cluster_ip(&mut self, token: Token, cluster_id: ClusterId, ip: IpAddr) {
+        // Snapshot the forward count for this (cluster, ip) before the insert
+        // so we can pair-assert the delta. Ungated `let`: read only inside the
+        // debug_assert! below → optimised out in release (no E0425).
+        let count_before = self
+            .connections_per_cluster_ip
+            .get(&cluster_id)
+            .and_then(|by_ip| by_ip.get(&ip))
+            .copied()
+            .unwrap_or(0);
+        let inserted = self
+            .cluster_ip_tracks
+            .entry(token)
+            .or_default()
+            .entry(cluster_id.clone())
+            .or_default()
+            .insert(ip);
+        if inserted {
+            *self
+                .connections_per_cluster_ip
+                .entry(cluster_id.clone())
+                .or_default()
+                .entry(ip)
+                .or_insert(0) += 1;
+        }
+        // Postconditions: the reverse index now records this (token, cluster,
+        // ip), and the forward count advanced by exactly `inserted as usize`
+        // (idempotent: a repeat call for the same triple is a no-op on both).
+        debug_assert!(
+            self.cluster_ip_tracks
+                .get(&token)
+                .and_then(|by_cluster| by_cluster.get(&cluster_id))
+                .is_some_and(|ips| ips.contains(&ip)),
+            "track must leave the (token, cluster, ip) recorded in the reverse index"
+        );
+        debug_assert_eq!(
+            self.connections_per_cluster_ip
+                .get(&cluster_id)
+                .and_then(|by_ip| by_ip.get(&ip))
+                .copied()
+                .unwrap_or(0),
+            count_before + inserted as usize,
+            "forward count must advance by exactly 1 on first track, 0 on a repeat"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// Account `token`'s active connection against
+    /// `(cluster, subnet_of(ip))`. Mirror of `track_cluster_ip` on the
+    /// subnet counter, with one deliberate difference: it is a NO-OP
+    /// while the resolved subnet limit is `0`.
+    ///
+    /// That conditional is what keeps the default genuinely free. The
+    /// per-IP index is populated unconditionally, so an operator who
+    /// never enables the subnet cap would otherwise pay a second hash,
+    /// a second allocation and a second per-session entry forever for a
+    /// feature they do not use. The cost is that enabling the cap at
+    /// runtime does not retroactively count sessions already in flight;
+    /// the counter converges as those sessions close. The per-IP path
+    /// has the same shape of gap after `clear_cluster_ip_tracking`.
+    pub fn track_cluster_subnet(
+        &mut self,
+        token: Token,
+        cluster_id: ClusterId,
+        ip: IpAddr,
+        override_value: Option<u64>,
+    ) {
+        if self.effective_max_connections_per_subnet(override_value) == 0 {
+            // No assertion that nothing is recorded for this token: that
+            // is NOT an invariant. A cluster override can drop to
+            // `Some(0)` after a session was tracked under a positive
+            // limit — `AddCluster` is an upsert and clears no counters,
+            // and only the global `SetMaxConnectionsPerSubnet(0)` drains
+            // the bookkeeping. The stale slot is harmless (a `0` limit
+            // never refuses) and is released normally on session close.
+            return;
+        }
+        let subnet = self.subnet_key(&ip);
+        // Snapshot before the insert so the delta can be pair-asserted.
+        // Ungated `let`: read only inside the debug_assert! below, so it
+        // is optimised out in release (no E0425).
+        let count_before = self
+            .connections_per_cluster_subnet
+            .get(&cluster_id)
+            .and_then(|by_subnet| by_subnet.get(&subnet))
+            .copied()
+            .unwrap_or(0);
+        let inserted = self
+            .cluster_subnet_tracks
+            .entry(token)
+            .or_default()
+            .entry(cluster_id.clone())
+            .or_default()
+            .insert(subnet);
+        if inserted {
+            *self
+                .connections_per_cluster_subnet
+                .entry(cluster_id.clone())
+                .or_default()
+                .entry(subnet)
+                .or_insert(0) += 1;
+        }
+        debug_assert!(
+            self.cluster_subnet_tracks
+                .get(&token)
+                .and_then(|by_cluster| by_cluster.get(&cluster_id))
+                .is_some_and(|subnets| subnets.contains(&subnet)),
+            "track must leave the (token, cluster, subnet) recorded in the reverse index"
+        );
+        debug_assert_eq!(
+            self.connections_per_cluster_subnet
+                .get(&cluster_id)
+                .and_then(|by_subnet| by_subnet.get(&subnet))
+                .copied()
+                .unwrap_or(0),
+            count_before + inserted as usize,
+            "forward count must advance by exactly 1 on first track, 0 on a repeat"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// Account `token`'s active connection against BOTH counters. The
+    /// companion of `cluster_connection_at_limit`: the two enforcement
+    /// points take the gate and the slot through one call each, so the
+    /// per-IP and per-subnet bookkeeping can never fall out of step
+    /// between the mux and raw TCP.
+    pub fn track_cluster_connection(
+        &mut self,
+        token: Token,
+        cluster_id: ClusterId,
+        ip: IpAddr,
+        subnet_override: Option<u64>,
+    ) {
+        self.track_cluster_ip(token, cluster_id.clone(), ip);
+        self.track_cluster_subnet(token, cluster_id, ip, subnet_override);
+    }
+
+    /// Drain every slot held by `token` — per-IP AND per-subnet — and
+    /// apply the matching decrements. Called on session teardown only —
+    /// there is no per-stream untrack because the limit is
+    /// per-connection, not per-stream. Removes empty inner maps so the
+    /// outer `connections_per_cluster_ip` does not retain
+    /// `(cluster_id, empty_map)` orphans across cluster lifetimes.
+    ///
+    /// The name is historical: this is the SINGLE release point every
+    /// protocol already calls on close (`HttpSession`, `HttpsSession`,
+    /// `TcpSession`), so the subnet counter is drained from here rather
+    /// than from a second call each of those three sites would have to
+    /// remember. A missed release leaks a slot until worker restart,
+    /// which is exactly the failure a second entry point would invite.
+    pub fn untrack_all_cluster_ip(&mut self, token: Token) {
+        self.untrack_all_cluster_subnet(token);
+        let Some(by_cluster) = self.cluster_ip_tracks.remove(&token) else {
+            return;
+        };
+        // The reverse index for this token was just drained by `remove`; no
+        // other code path re-inserts it within this call.
+        debug_assert!(
+            !self.cluster_ip_tracks.contains_key(&token),
+            "untrack_all must evict the token from the reverse index"
+        );
+        for (cluster_id, ips) in by_cluster {
+            let Entry::Occupied(mut outer) = self.connections_per_cluster_ip.entry(cluster_id)
+            else {
+                continue;
+            };
+            for ip in ips {
+                if let Entry::Occupied(mut inner) = outer.get_mut().entry(ip) {
+                    let count = inner.get_mut();
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        inner.remove();
+                    }
+                }
+            }
+            if outer.get().is_empty() {
+                outer.remove();
+            }
+        }
+        // No orphan bookkeeping survives: the forward map must not retain a
+        // cluster with an empty inner ip-map, nor an ip whose count is zero.
+        debug_assert!(
+            self.connections_per_cluster_ip
+                .values()
+                .all(|by_ip| !by_ip.is_empty() && by_ip.values().all(|&c| c > 0)),
+            "untrack_all must not leave empty inner maps or zero-count ips behind"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// Drain every `(cluster, subnet)` slot held by `token`. Mirror of
+    /// the per-IP drain in `untrack_all_cluster_ip`, which is its only
+    /// caller. A no-op when the subnet limiter was never enabled, since
+    /// nothing was tracked in the first place.
+    fn untrack_all_cluster_subnet(&mut self, token: Token) {
+        let Some(by_cluster) = self.cluster_subnet_tracks.remove(&token) else {
+            return;
+        };
+        debug_assert!(
+            !self.cluster_subnet_tracks.contains_key(&token),
+            "untrack_all must evict the token from the subnet reverse index"
+        );
+        for (cluster_id, subnets) in by_cluster {
+            let Entry::Occupied(mut outer) = self.connections_per_cluster_subnet.entry(cluster_id)
+            else {
+                continue;
+            };
+            for subnet in subnets {
+                if let Entry::Occupied(mut inner) = outer.get_mut().entry(subnet) {
+                    let count = inner.get_mut();
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        inner.remove();
+                    }
+                }
+            }
+            if outer.get().is_empty() {
+                outer.remove();
+            }
+        }
+        debug_assert!(
+            self.connections_per_cluster_subnet
+                .values()
+                .all(|by_subnet| !by_subnet.is_empty() && by_subnet.values().all(|&c| c > 0)),
+            "untrack_all must not leave empty inner maps or zero-count subnets behind"
+        );
+    }
+
+    /// Whether both halves of the subnet accounting are empty.
+    ///
+    /// Exists so a test can assert that a DISABLED subnet limiter leaves
+    /// no bookkeeping behind at all — "inert" and "free" are different
+    /// claims, and only the second one is checkable from outside.
+    pub fn subnet_tracking_is_empty(&self) -> bool {
+        self.cluster_subnet_tracks.is_empty() && self.connections_per_cluster_subnet.is_empty()
+    }
+
+    /// Wipe every per-(cluster, source-SUBNET) accounting bucket.
+    /// Called by the runtime `SetMaxConnectionsPerSubnet(0)` path.
+    /// Deliberately does NOT touch the per-IP buckets: the two limiters
+    /// are independent, and disabling one must not silently reset the
+    /// other's live counters.
+    pub fn clear_cluster_subnet_tracking(&mut self) {
+        self.cluster_subnet_tracks.clear();
+        self.connections_per_cluster_subnet.clear();
+        debug_assert!(
+            self.cluster_subnet_tracks.is_empty() && self.connections_per_cluster_subnet.is_empty(),
+            "clear must wipe both the subnet reverse index and the subnet forward count map"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// Wipe every per-(cluster, source-IP) accounting bucket. Called by
+    /// the runtime `SetMaxConnectionsPerIp(0)` path so disabling the
+    /// feature does not leave dead bookkeeping behind that a future
+    /// re-enable would consult.
+    pub fn clear_cluster_ip_tracking(&mut self) {
+        self.cluster_ip_tracks.clear();
+        self.connections_per_cluster_ip.clear();
+        // Both halves of the per-(cluster, ip) accounting are now empty; a
+        // future re-enable starts from a clean slate.
+        debug_assert!(
+            self.cluster_ip_tracks.is_empty() && self.connections_per_cluster_ip.is_empty(),
+            "clear must wipe both the reverse index and the forward count map"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// The slab is considered at capacity if it contains more sessions than twice max_connections
+    pub fn at_capacity(&self) -> bool {
+        self.slab.len() >= self.accept_slab_threshold()
+    }
+
+    /// The slab fill level at which `at_capacity` flips to true and the
+    /// accept queue is flushed. Reported as `slab.accept_threshold` so the
+    /// per-iteration `slab.accept_threshold_percent` gauge in the run loop
+    /// can chart proximity to this gate, distinct from raw slab usage.
+    ///
+    /// The constant `10 + 2 * max_connections` is the historical pre-knob
+    /// budget; configured slab capacity is
+    /// `10 + slab_entries_per_connection * max_connections` (see
+    /// `command/src/config.rs`) and can be larger, so `slab.usage_percent`
+    /// (against `slab.capacity()`) and `slab.accept_threshold_percent`
+    /// (against this gate) are emitted as independent gauges.
+    pub fn accept_slab_threshold(&self) -> usize {
+        let threshold = 10 + 2 * self.max_connections;
+        // The gate must leave headroom above the connection cap so listener /
+        // system slots (Channel, Metrics, Timer, listeners) are never starved
+        // by frontend connections alone.
+        debug_assert!(
+            threshold > self.max_connections,
+            "accept gate must sit strictly above max_connections to reserve system slots"
+        );
+        threshold
+    }
+
+    /// Check the number of connections against max_connections, and the slab capacity.
+    /// Returns false if limits are reached.
+    pub fn check_limits(&mut self) -> bool {
+        // Live-count invariant: the accounted connection count never exceeds
+        // the configured cap (incr() enforces this, decr() never underflows).
+        debug_assert!(
+            self.nb_connections <= self.max_connections,
+            "nb_connections must never exceed max_connections"
+        );
+        if self.nb_connections >= self.max_connections {
+            error!("max number of session connection reached, flushing the accept queue");
+            gauge!(names::accept_queue::BACKPRESSURE, 1);
+            self.can_accept = false;
+            // A negative result must have closed the accept gate.
+            debug_assert!(
+                !self.can_accept,
+                "refusing at the cap must clear can_accept"
+            );
+            return false;
+        }
+
+        if self.at_capacity() {
+            error!("not enough memory to accept another session, flushing the accept queue");
+            error!(
+                "nb_connections: {}, max_connections: {}",
+                self.nb_connections, self.max_connections
+            );
+            gauge!(names::accept_queue::BACKPRESSURE, 1);
+            self.can_accept = false;
+
+            debug_assert!(
+                !self.can_accept,
+                "refusing at slab capacity must clear can_accept"
+            );
+            return false;
+        }
+
+        // A positive result means there is room under both gates.
+        debug_assert!(
+            self.nb_connections < self.max_connections && !self.at_capacity(),
+            "check_limits returned room while a gate was actually saturated"
+        );
+        true
+    }
+
+    pub fn to_session(token: Token) -> SessionToken {
+        SessionToken(token.0)
+    }
+
+    pub fn incr(&mut self) {
+        let before = self.nb_connections;
+        self.nb_connections += 1;
+        assert!(self.nb_connections <= self.max_connections);
+        // The counter advances by exactly one per accepted session.
+        debug_assert_eq!(
+            self.nb_connections,
+            before + 1,
+            "incr must raise nb_connections by exactly one"
+        );
+        // `client.connections_max` and `client.connections_percent` are
+        // emitted from the run loop alongside `process.uptime_seconds` /
+        // `server.live` so all proxy gauges advance in lock-step. Keeping
+        // `client.connections` per-event preserves the high-resolution
+        // signal scrapers expect.
+        gauge!(names::client::CONNECTIONS, self.nb_connections);
+    }
+
+    /// Decrements the number of sessions, start accepting new connections
+    /// if the capacity limit of 90% has not been reached.
+    pub fn decr(&mut self) {
+        assert!(self.nb_connections != 0);
+        let before = self.nb_connections;
+        self.nb_connections -= 1;
+        // Mirror of incr: exactly one connection is released, no underflow.
+        debug_assert_eq!(
+            self.nb_connections,
+            before - 1,
+            "decr must lower nb_connections by exactly one"
+        );
+        gauge!(names::client::CONNECTIONS, self.nb_connections);
+
+        // do not be ready to accept right away, wait until we get back to 10% capacity
+        if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
+            debug!(
+                "nb_connections = {}, max_connections = {}, starting to accept again",
+                self.nb_connections, self.max_connections
+            );
+            gauge!(names::accept_queue::BACKPRESSURE, 0);
+            self.can_accept = true;
+        }
+    }
+
+    /// Full cross-field invariant sweep for the session manager. Called as a
+    /// `debug_assert!`-guarded postcondition from the mutating cluster-IP
+    /// tracking methods. Asserts logic-bug conditions only — every clause
+    /// holds on any well-formed manager regardless of traffic.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        // 1. Live connection count never exceeds the configured cap.
+        debug_assert!(
+            self.nb_connections <= self.max_connections,
+            "nb_connections {} exceeds max_connections {}",
+            self.nb_connections,
+            self.max_connections
+        );
+        // 2. The forward count map never retains an empty inner ip-map or a
+        //    zero count (both are reaped on the last untrack).
+        debug_assert!(
+            self.connections_per_cluster_ip
+                .values()
+                .all(|by_ip| !by_ip.is_empty() && by_ip.values().all(|&c| c > 0)),
+            "connections_per_cluster_ip holds an empty inner map or a zero count"
+        );
+        // 3. Reverse-index → forward-count coherence: every (token, cluster,
+        //    ip) recorded in the reverse index must have a positive forward
+        //    count. The forward count is the sum of contributing tokens, so a
+        //    tracked slot can never point at a missing/zero count.
+        debug_assert!(
+            self.cluster_ip_tracks.values().all(|by_cluster| {
+                by_cluster.iter().all(|(cluster_id, ips)| {
+                    ips.iter().all(|ip| {
+                        self.connections_per_cluster_ip
+                            .get(cluster_id)
+                            .and_then(|by_ip| by_ip.get(ip))
+                            .is_some_and(|&c| c > 0)
+                    })
+                })
+            }),
+            "a tracked (token, cluster, ip) slot has no positive forward count"
+        );
+        // 4. The reverse index never retains an empty inner structure.
+        debug_assert!(
+            self.cluster_ip_tracks.values().all(|by_cluster| {
+                !by_cluster.is_empty() && by_cluster.values().all(|ips| !ips.is_empty())
+            }),
+            "cluster_ip_tracks retains an empty per-token or per-cluster entry"
+        );
+        // 5-7. The same three structural clauses, on the subnet mirror.
+        debug_assert!(
+            self.connections_per_cluster_subnet
+                .values()
+                .all(|by_subnet| !by_subnet.is_empty() && by_subnet.values().all(|&c| c > 0)),
+            "connections_per_cluster_subnet holds an empty inner map or a zero count"
+        );
+        debug_assert!(
+            self.cluster_subnet_tracks.values().all(|by_cluster| {
+                by_cluster.iter().all(|(cluster_id, subnets)| {
+                    subnets.iter().all(|subnet| {
+                        self.connections_per_cluster_subnet
+                            .get(cluster_id)
+                            .and_then(|by_subnet| by_subnet.get(subnet))
+                            .is_some_and(|&c| c > 0)
+                    })
+                })
+            }),
+            "a tracked (token, cluster, subnet) slot has no positive forward count"
+        );
+        debug_assert!(
+            self.cluster_subnet_tracks.values().all(|by_cluster| {
+                !by_cluster.is_empty() && by_cluster.values().all(|subnets| !subnets.is_empty())
+            }),
+            "cluster_subnet_tracks retains an empty per-token or per-cluster entry"
+        );
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ServerError {
+    #[error("could not create event loop with MIO poll: {0}")]
+    CreatePoll(IoError),
+    #[error("could not clone the MIO registry: {0}")]
+    CloneRegistry(IoError),
+    #[error("could not register the channel: {0}")]
+    RegisterChannel(IoError),
+    #[error("{msg}:{scm_err}")]
+    ScmSocket {
+        msg: String,
+        scm_err: ScmSocketError,
+    },
+    #[error("could not read the initial message of the main process: {0}")]
+    ReadInitialMessage(ChannelError),
+    #[error("could not answer the initial message of the main process: {0}")]
+    WriteInitialAnswer(ChannelError),
+}
+
+/// Where the blocking handshake before `Server::run` stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapStage {
+    /// Nothing received: a direct `Status` or the capability query.
+    Start,
+    /// The capability is confirmed: a `Prepare`, or the closing `Status`.
+    Ready,
+    /// A version is staged: its `Commit` or `Abort`.
+    Prepared { cluster: String, version: u64 },
+    /// A version is applied: its `Release` or `Abort`.
+    Committed { cluster: String, version: u64 },
+}
+
+/// What a worker answers to the one request the handshake expects next, and
+/// the stage an exact answer leads to.
+struct BootstrapStep {
+    phase: ProtectedHealthCheckPhase,
+    cluster: String,
+    version: u64,
+    next: BootstrapStage,
+}
+
+impl BootstrapStage {
+    /// The step `request` is, when this stage accepts it. `Status` is not a
+    /// step: `Server::await_initial_status` ends the handshake with it.
+    fn step(&self, request: &RequestType) -> Option<BootstrapStep> {
+        use ProtectedHealthCheckPhase as Phase;
+        match request {
+            RequestType::QueryProtectedHealthCheckSupport(_) if *self == Self::Start => {
+                Some(BootstrapStep {
+                    phase: Phase::ProtectedHealthCheckCapability,
+                    cluster: String::new(),
+                    version: 0,
+                    next: Self::Ready,
+                })
+            }
+            RequestType::ProtectedHealthCheckOrder(order) => {
+                let phase = Phase::try_from(order.phase).ok()?;
+                let (cluster, version) = (order.cluster_id.to_owned(), order.version);
+                let outstanding = match self {
+                    Self::Prepared {
+                        cluster: held,
+                        version: staged,
+                    }
+                    | Self::Committed {
+                        cluster: held,
+                        version: staged,
+                    } => *held == cluster && *staged == version,
+                    _ => false,
+                };
+                let next = match (self, phase) {
+                    (Self::Ready, Phase::ProtectedHealthCheckPrepare) => Self::Prepared {
+                        cluster: cluster.to_owned(),
+                        version,
+                    },
+                    (Self::Prepared { .. }, Phase::ProtectedHealthCheckCommit) if outstanding => {
+                        Self::Committed {
+                            cluster: cluster.to_owned(),
+                            version,
+                        }
+                    }
+                    (Self::Committed { .. }, Phase::ProtectedHealthCheckRelease) if outstanding => {
+                        Self::Ready
+                    }
+                    (
+                        Self::Prepared { .. } | Self::Committed { .. },
+                        Phase::ProtectedHealthCheckAbort,
+                    ) if outstanding => Self::Ready,
+                    _ => return None,
+                };
+                Some(BootstrapStep {
+                    phase,
+                    cluster,
+                    version,
+                    next,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the headerless `Status` may end the handshake: nothing is
+    /// prepared, committed or left to release.
+    fn accepts_status(&self) -> bool {
+        matches!(self, Self::Start | Self::Ready)
+    }
+}
+
+impl BootstrapStep {
+    /// Whether `response` is the positive typed reply to this very step.
+    fn is_answered_by(&self, response: &WorkerResponse) -> bool {
+        response.status == ResponseStatus::Ok as i32
+            && matches!(
+                response
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.content_type.as_ref()),
+                Some(ContentType::ProtectedHealthCheckReply(reply))
+                    if reply.phase == self.phase as i32
+                        && reply.cluster_id == self.cluster
+                        && reply.version == self.version
+            )
+    }
+}
+
+/// `Server` handles the event loop, the listeners, the sessions and
+/// communication with the configuration channel.
+///
+/// A listener wraps a listen socket, the associated proxying protocols
+/// (HTTP, HTTPS and TCP) and the routing configuration for clusters.
+/// Listeners handle creating sessions from accepted sockets.
+///
+/// A session manages a "front" socket for a connected client, and all
+/// of the associated data (back socket, protocol state machine, buffers,
+/// metrics...).
+///
+/// `Server` gets configuration updates from the channel (domIN/path routes,
+/// backend server address...).
+///
+/// Listeners and sessions are all stored in a slab structure to index them
+/// by a [Token], they all have to implement the [ProxySession] trait.
+pub struct Server {
+    accept_queue_timeout: Duration,
+    /// Tuple layout: `(socket, listen token, protocol, accept time, peer
+    /// address)`. The peer is the address `accept(2)` returned with the
+    /// socket: it attributes the `client.connect.per_source.*` counter at
+    /// accept time and is handed to `create_session`, so no one has to read it
+    /// back with `getpeername(2)` (sozu-proxy/sozu#1586). Unlike that lookup,
+    /// which fails once the peer has reset, `accept(2)` always reports it.
+    accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant, SocketAddr)>,
+    /// When the accept queue saturates and `check_limits` refuses, evict the
+    /// oldest non-listener sessions to make room. Default off — see
+    /// `command::config::DEFAULT_EVICT_ON_QUEUE_FULL` for the rationale.
+    evict_on_queue_full: bool,
+    accept_ready: HashSet<ListenToken>,
+    backends: Rc<RefCell<BackendMap>>,
+    base_sessions_count: usize,
+    channel: ProxyChannel,
+    config_state: ConfigState,
+    current_poll_errors: i32,
+    health_checker: HealthChecker,
+    http: Rc<RefCell<http::HttpProxy>>,
+    https: Rc<RefCell<https::HttpsProxy>>,
+    last_sessions_len: usize,
+    last_shutting_down_message: Option<Instant>,
+    last_zombie_check: Instant,
+    loop_start: Instant,
+    /// Wall-clock anchor for the `process.uptime_seconds` gauge. Captured once
+    /// in [`Server::new`]; never reset on hot upgrades (the new worker that
+    /// inherits FDs is a fresh process and starts its own counter).
+    started_at: Instant,
+    /// Last time the 1Hz `accept_queue.saturated_seconds` ticker fired. The
+    /// counter is incremented once per [`ACCEPT_SATURATION_TICK`] while
+    /// `SessionManager::can_accept` is `false`, so dashboards can plot the
+    /// time spent saturated rather than just whether saturation occurred.
+    last_saturation_tick: Instant,
+    max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
+    /// Shared reference to the buffer pool the protocol stacks check buffers
+    /// in and out of. Held here so the run loop can sample
+    /// `buffer.in_use` / `buffer.capacity` / `buffer.usage_percent` once per
+    /// iteration without requiring each protocol module to expose its own
+    /// snapshot.
+    pool: Rc<RefCell<Pool>>,
+    pub poll: Poll,
+    /// Protected health-check headers staged, applied or kept for an abort.
+    protected_health_check: ProtectedWorker,
+    poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
+    scm_listeners: Option<Listeners>,
+    scm: ScmSocket,
+    sessions: Rc<RefCell<SessionManager>>,
+    should_poll_at: Option<Instant>,
+    shutting_down: Option<String>,
+    /// Sessions a `CloseSessions` request ordered to close that are still
+    /// finishing their in-flight HTTP work, keyed by frontend token.
+    ///
+    /// The `Weak` is what makes the token safe to hold: a session that closes
+    /// on its own frees its slab key, which a new session can take, and
+    /// `Server::drive_closing_sessions` only acts on a token whose slab entry
+    /// is still this very session.
+    closing_sessions: Vec<(Token, Weak<RefCell<dyn ProxySession>>)>,
+    tcp: Rc<RefCell<tcp::TcpProxy>>,
+    udp: Rc<RefCell<udp::UdpProxy>>,
+    zombie_check_interval: Duration,
+}
+
+impl Server {
+    pub fn try_new_from_config(
+        worker_to_main_channel: ProxyChannel,
+        worker_to_main_scm: ScmSocket,
+        config: ServerConfig,
+        initial_state: InitialState,
+        expects_initial_status: bool,
+    ) -> Result<Self, ServerError> {
+        let event_loop = Poll::new().map_err(ServerError::CreatePoll)?;
+        // Commit the operator-configured Basic-auth credential cap (or
+        // keep the built-in default) once per worker process. The
+        // `OnceLock` rejects any later attempt to change the value, so
+        // calling here — before any L7 listener has accepted a request
+        // — guarantees the cap is in force the first time `mux::auth`
+        // runs.
+        if let Some(cap) = config.basic_auth_max_credential_bytes {
+            crate::protocol::mux::auth::set_max_decoded_credential_bytes(cap as usize);
+        }
+        // Same set-once-per-worker-boot pattern for the splice kernel-pipe
+        // capacity. The setter no-ops on `0` so an explicit zero in config
+        // does not collapse the pipe to PAGE_SIZE; the kernel still applies
+        // page-rounding and `/proc/sys/fs/pipe-max-size` clamping at
+        // SplicePipe::new time. Cfg-gated because the splice module only
+        // exists on Linux + `splice` feature.
+        #[cfg(all(target_os = "linux", feature = "splice"))]
+        if let Some(cap) = config.splice_pipe_capacity_bytes {
+            crate::splice::set_pipe_capacity(cap as usize);
+        }
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(
+            config.min_buffers as usize,
+            config.max_buffers as usize,
+            config.buffer_size as usize,
+        )));
+        let backends = Rc::new(RefCell::new(BackendMap::new()));
+
+        // Note: slab_capacity uses 4x multiplier (up from 2x) to account for H2
+        // multiplexing where each session can have multiple backend connections.
+        // Newer `optional` proto fields fall through to the
+        // command-lib defaults when an older worker manager omits them.
+        let sessions: Rc<RefCell<SessionManager>> = SessionManager::new(
+            Slab::with_capacity(config.slab_capacity() as usize),
+            config.max_connections as usize,
+            config
+                .max_connections_per_ip
+                .unwrap_or(sozu_command::config::DEFAULT_MAX_CONNECTIONS_PER_IP),
+            config
+                .retry_after
+                .unwrap_or(sozu_command::config::DEFAULT_RETRY_AFTER),
+            config
+                .max_connections_per_subnet
+                .unwrap_or(sozu_command::config::DEFAULT_MAX_CONNECTIONS_PER_SUBNET),
+            config
+                .subnet_ipv4_prefix
+                .unwrap_or(sozu_command::config::DEFAULT_SUBNET_IPV4_PREFIX),
+            config
+                .subnet_ipv6_prefix
+                .unwrap_or(sozu_command::config::DEFAULT_SUBNET_IPV6_PREFIX),
+        );
+        // Newer field, so an older main may omit it. The main validates it at
+        // config load; a value that still breaks the bounds keeps the default
+        // rather than disabling retries or overflowing the attempt counters.
+        sessions.borrow_mut().max_connection_attempts = match config.max_connection_attempts {
+            Some(attempts)
+                if sozu_command::config::validate_max_connection_attempts(attempts).is_ok() =>
+            {
+                attempts
+            }
+            Some(attempts) => {
+                error!(
+                    "max_connection_attempts = {} is out of 1..=255, keeping {}",
+                    attempts,
+                    sozu_command::config::DEFAULT_MAX_CONNECTION_ATTEMPTS
+                );
+                sozu_command::config::DEFAULT_MAX_CONNECTION_ATTEMPTS
+            }
+            None => sozu_command::config::DEFAULT_MAX_CONNECTION_ATTEMPTS,
+        };
+        {
+            let mut s = sessions.borrow_mut();
+            let entry = s.slab.vacant_entry();
+            trace!("taking token {:?} for channel", SessionToken(entry.key()));
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Channel,
+            })));
+        }
+        {
+            let mut s = sessions.borrow_mut();
+            let entry = s.slab.vacant_entry();
+            trace!("taking token {:?} for metrics", SessionToken(entry.key()));
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Timer,
+            })));
+        }
+        {
+            let mut s = sessions.borrow_mut();
+            let entry = s.slab.vacant_entry();
+            trace!("taking token {:?} for metrics", SessionToken(entry.key()));
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Metrics,
+            })));
+        }
+
+        Server::new(
+            event_loop,
+            worker_to_main_channel,
+            worker_to_main_scm,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            config,
+            Some(initial_state),
+            expects_initial_status,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        poll: Poll,
+        mut channel: ProxyChannel,
+        scm: ScmSocket,
+        sessions: Rc<RefCell<SessionManager>>,
+        pool: Rc<RefCell<Pool>>,
+        backends: Rc<RefCell<BackendMap>>,
+        http: Option<http::HttpProxy>,
+        https: Option<https::HttpsProxy>,
+        tcp: Option<tcp::TcpProxy>,
+        server_config: ServerConfig,
+        initial_state: Option<InitialState>,
+        expects_initial_status: bool,
+    ) -> Result<Self, ServerError> {
+        FEATURES.with(|_features| {
+            // initializing feature flags
+        });
+
+        poll.registry()
+            .register(
+                &mut channel,
+                Token(0),
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .map_err(ServerError::RegisterChannel)?;
+
+        METRICS.with(|metrics| {
+            if let Some(sock) = (*metrics.borrow_mut()).socket_mut() {
+                poll.registry()
+                    .register(sock, Token(2), Interest::WRITABLE)
+                    .expect("should register the metrics socket");
+            }
+        });
+
+        let base_sessions_count = sessions.borrow().slab.len();
+
+        let http = Rc::new(RefCell::new(match http {
+            Some(http) => http,
+            None => {
+                let registry = poll
+                    .registry()
+                    .try_clone()
+                    .map_err(ServerError::CloneRegistry)?;
+
+                http::HttpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
+            }
+        }));
+
+        let https = Rc::new(RefCell::new(match https {
+            Some(https) => https,
+            None => {
+                let registry = poll
+                    .registry()
+                    .try_clone()
+                    .map_err(ServerError::CloneRegistry)?;
+
+                https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
+            }
+        }));
+
+        let tcp = Rc::new(RefCell::new(match tcp {
+            Some(tcp) => tcp,
+            None => {
+                let registry = poll
+                    .registry()
+                    .try_clone()
+                    .map_err(ServerError::CloneRegistry)?;
+
+                tcp::TcpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
+            }
+        }));
+
+        // UDP proxy is constructed internally (no constructor parameter) so the
+        // public `Server::new` / `try_new_from_config` signatures stay
+        // unchanged — bin/ is not forced to change for construction.
+        let udp = Rc::new(RefCell::new({
+            let registry = poll
+                .registry()
+                .try_clone()
+                .map_err(ServerError::CloneRegistry)?;
+
+            udp::UdpProxy::new(
+                registry,
+                sessions.clone(),
+                pool.clone(),
+                backends.clone(),
+                server_config.max_connections as usize,
+                server_config.buffer_size as usize,
+            )
+        }));
+
+        let mut server = Server {
+            accept_queue_timeout: Duration::from_secs(u64::from(
+                server_config.accept_queue_timeout,
+            )),
+            accept_queue: VecDeque::new(),
+            evict_on_queue_full: server_config.evict_on_queue_full.unwrap_or(false),
+            accept_ready: HashSet::new(),
+            backends,
+            base_sessions_count,
+            channel,
+            config_state: ConfigState::new(),
+            current_poll_errors: 0,
+            health_checker: HealthChecker::new(),
+            http,
+            https,
+            last_sessions_len: 0, // to be reset on server run
+            last_shutting_down_message: None,
+            last_zombie_check: Instant::now(), // to be reset on server run
+            loop_start: Instant::now(),        // to be reset on server run
+            started_at: Instant::now(),        // captured once, never reset
+            last_saturation_tick: Instant::now(), // 1Hz saturation ticker anchor
+            max_poll_errors: 10000,            // TODO: make it configurable?
+            pool,
+            poll_timeout: Some(Duration::from_millis(1000)), // TODO: make it configurable?
+            poll,
+            scm_listeners: None,
+            scm,
+            sessions,
+            should_poll_at: None,
+            shutting_down: None,
+            closing_sessions: Vec::new(),
+            protected_health_check: ProtectedWorker::default(),
+            tcp,
+            udp,
+            zombie_check_interval: Duration::from_secs(u64::from(
+                server_config.zombie_check_interval,
+            )),
+        };
+
+        // Take the retiring worker's listening sockets BEFORE applying the
+        // initial state, because that state is what adopts them.
+        //
+        // `fork_main_into_worker` (`bin/src/worker.rs`) sends the descriptors
+        // over the SCM socket right after the fork — before the main process
+        // sends the initial `Status` request — and
+        // `ConfigState::produce_initial_state` carries one `ActivateListener`
+        // per active listener. Receiving them afterwards left `scm_listeners`
+        // empty for the whole initial state, so every `ActivateListener` took
+        // the `server_bind` / `udp_bind` branch (which succeeds only because
+        // of `SO_REUSEPORT`), the listener came up `active`, and the inherited
+        // descriptor was then dropped unused by the next, short-circuiting
+        // `activate()` — discarding the accept backlog (TCP/HTTP/HTTPS) and
+        // the receive buffer (UDP) the hand-off exists to preserve (sozu#1342).
+        //
+        // Blocking here is the same blocking read as before, only earlier: the
+        // sole production caller of `fork_main_into_worker`,
+        // `CommandServer::launch_new_worker`, always passes `Some(listeners)`,
+        // so a fresh start receives an empty manifest immediately and every
+        // listener binds its own socket exactly as it always did.
+        info!("will try to receive listeners");
+        server
+            .scm
+            .set_blocking(true)
+            .map_err(|scm_err| ServerError::ScmSocket {
+                msg: "Could not set the scm socket to blocking".to_string(),
+                scm_err,
+            })?;
+        let listeners =
+            server
+                .scm
+                .receive_listeners()
+                .map_err(|scm_err| ServerError::ScmSocket {
+                    msg: "could not receive listeners from the scm socket".to_string(),
+                    scm_err,
+                })?;
+        server
+            .scm
+            .set_blocking(false)
+            .map_err(|scm_err| ServerError::ScmSocket {
+                msg: "Could not set the scm socket to unblocking".to_string(),
+                scm_err,
+            })?;
+        info!("received listeners: {:?}", listeners);
+        server.scm_listeners = Some(listeners);
+
+        // initialize the worker with the state we got from a file
+        if let Some(state) = initial_state {
+            for request in state.requests {
+                trace!("generating initial config request: {:#?}", request);
+                server.notify_proxys(request);
+            }
+
+            // do not send back answers to the initialization messages
+            QUEUE.with(|queue| {
+                (*queue.borrow_mut()).clear();
+            });
+        }
+
+        server.report_unclaimed_inherited_sockets();
+
+        if expects_initial_status {
+            // the main process sends a Status message, so we can notify it
+            // when the initial state is loaded; a protected health check
+            // bootstrap may come first, see `Server::await_initial_status`
+            server.block_channel();
+            server.await_initial_status()?;
+            server.unblock_channel();
+        }
+
+        Ok(server)
+    }
+
+    /// Answer the main process on the blocking channel until its `Status`
+    /// ends the handshake, before `Server::run` can start any probe.
+    ///
+    /// A worker that is sent protected health checks first gets the capability
+    /// query, then any number of prepare, commit and release cycles (or an
+    /// abort), each answered by `ProtectedWorker::handle` straight on the
+    /// channel. `BootstrapStage` admits one request at a time and moves on
+    /// only when the handler returned the exact typed reply; anything else
+    /// gets a static refusal and the loop keeps waiting. There is no timer
+    /// here: the loop ends with a valid `Status` or a channel error, and the
+    /// main process owns the deadline.
+    fn await_initial_status(&mut self) -> Result<(), ServerError> {
+        let mut stage = BootstrapStage::Start;
+        loop {
+            let WorkerRequest { id, mut content } = self
+                .channel
+                .read_message()
+                .map_err(ServerError::ReadInitialMessage)?;
+            // the request is never logged: a prepare order carries clear values
+            debug!("got initial message {}", id);
+
+            let Some(request_type) = content.request_type.as_mut() else {
+                self.answer_initial(worker_response_error(id, REFUSED_INITIAL_REQUEST))?;
+                continue;
+            };
+
+            if matches!(request_type, RequestType::Status(_)) {
+                if !stage.accepts_status() {
+                    self.answer_initial(worker_response_error(id, REFUSED_INITIAL_REQUEST))?;
+                    continue;
+                }
+                self.answer_initial(WorkerResponse::ok(id))?;
+                return Ok(());
+            }
+
+            let Some(step) = stage.step(request_type) else {
+                self.answer_initial(worker_response_error(id, REFUSED_INITIAL_REQUEST))?;
+                continue;
+            };
+            let response = self.protected_health_check.handle(
+                &id,
+                request_type,
+                &mut self.config_state,
+                &mut self.backends.borrow_mut(),
+            );
+            match response {
+                Some(response) if step.is_answered_by(&response) => {
+                    stage = step.next;
+                    self.answer_initial(response)?;
+                }
+                // a refusal of the handler is forwarded as it is
+                Some(response) if response.status != ResponseStatus::Ok as i32 => {
+                    self.answer_initial(response)?;
+                }
+                _ => {
+                    self.answer_initial(worker_response_error(id, REFUSED_INITIAL_REQUEST))?;
+                }
+            }
+        }
+    }
+
+    fn answer_initial(&mut self, response: WorkerResponse) -> Result<(), ServerError> {
+        self.channel
+            .write_message(&response)
+            .map_err(ServerError::WriteInitialAnswer)
+    }
+
+    /// The server runs in a loop until a shutdown is ordered
+    pub fn run(&mut self) {
+        let mut events = Events::with_capacity(1024); // TODO: make event capacity configurable?
+        // The session owning each event's token when `epoll_wait` returned,
+        // by event position; see `Server::ready_if_still_owned`. Reused
+        // across turns so the loop allocates it once.
+        let mut event_owners: Vec<Option<Rc<RefCell<dyn ProxySession>>>> =
+            Vec::with_capacity(events.capacity());
+        self.last_sessions_len = self.sessions.borrow().slab.len();
+
+        self.last_zombie_check = Instant::now();
+        self.loop_start = Instant::now();
+
+        loop {
+            self.check_for_poll_errors();
+
+            let timeout = self.reset_loop_time_and_get_timeout();
+
+            match self.poll.poll(&mut events, timeout) {
+                Ok(_) => self.current_poll_errors = 0,
+                Err(error) => {
+                    error!("Error while polling events: {:?}", error);
+                    self.current_poll_errors += 1;
+                    continue;
+                }
+            }
+
+            let after_epoll = Instant::now();
+            time!(
+                names::event_loop::EPOLL_TIME,
+                (after_epoll - self.loop_start).as_millis()
+            );
+            self.loop_start = after_epoll;
+
+            // Before `send_queue`, so an expiry event leaves on this turn.
+            tick_metric_detail_leases(after_epoll);
+
+            self.send_queue();
+
+            self.snapshot_event_owners(events.iter().map(|event| event.token()), &mut event_owners);
+            for (event, owner) in events.iter().zip(event_owners.drain(..)) {
+                match event.token() {
+                    // this is the command channel
+                    Token(0) => {
+                        if event.is_error() {
+                            error!("error reading from command channel");
+                            continue;
+                        }
+                        if event.is_read_closed() || event.is_write_closed() {
+                            error!("command channel was closed");
+                            return;
+                        }
+                        let ready = Ready::from(event);
+                        self.channel.handle_events(ready);
+
+                        // loop here because iterations has borrow issues
+                        loop {
+                            QUEUE.with(|queue| {
+                                if !(*queue.borrow()).is_empty() {
+                                    self.channel.interest.insert(Ready::WRITABLE);
+                                }
+                            });
+
+                            //trace!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements",
+                            //  line!(), self.channel.readiness, self.channel.interest, self.queue.len());
+                            if self.channel.readiness() == Ready::EMPTY {
+                                break;
+                            }
+
+                            // exit the big loop if the message is HardStop
+                            if self.read_channel_messages_and_notify() {
+                                return;
+                            }
+
+                            QUEUE.with(|queue| {
+                                if !(*queue.borrow()).is_empty() {
+                                    self.channel.interest.insert(Ready::WRITABLE);
+                                }
+                            });
+
+                            self.send_queue();
+                        }
+                    }
+                    // timer tick
+                    Token(1) => {
+                        while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
+                            self.timeout(t);
+                        }
+                    }
+                    // metrics socket is writable
+                    Token(2) => METRICS.with(|metrics| {
+                        (*metrics.borrow_mut()).writable();
+                    }),
+                    // ListenToken: 1 listener <=> 1 token
+                    // ProtocolToken (HTTP/HTTPS/TCP): 1 connection <=> 1 token
+                    token if self.health_checker.owns_token(token) => {
+                        self.health_checker.ready(token);
+                    }
+                    token if self.udp.borrow().health_owns_token(token) => {
+                        self.udp.borrow_mut().health_ready(token);
+                    }
+                    token => self.ready_if_still_owned(token, Ready::from(event), owner),
+                }
+            }
+
+            if let Some(t) = self.should_poll_at.as_ref()
+                && *t <= Instant::now()
+            {
+                while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
+                    //info!("polled for timeout: {:?}", t);
+                    self.timeout(t);
+                }
+            }
+            self.handle_remaining_readiness();
+            self.create_sessions();
+
+            self.should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date());
+
+            self.zombie_check();
+            self.health_checker
+                .poll(&self.backends, self.poll.registry());
+            // Drive the UDP endpoint health prober (TCP-probe + hysteresis +
+            // fail-open). Non-blocking; no-op when no UDP cluster has health
+            // configured.
+            self.udp.borrow_mut().health_poll();
+
+            // Frontend session gauges. `client.connections` keeps the
+            // per-event signal from `SessionManager::incr/decr`; the rest
+            // follow the once-per-iteration batching contract this run loop
+            // uses for `process.uptime_seconds` / `server.live`.
+            //
+            // `slab.usage_percent` charts pure slab utilisation against
+            // `slab.capacity()`. `slab.accept_threshold_percent` charts how
+            // close the slab is to the `at_capacity()` accept gate
+            // (`10 + 2 * max_connections`, see
+            // `SessionManager::accept_slab_threshold`). Configured slab
+            // capacity can be larger than that gate (`slab_entries_per_connection`
+            // > 2), so the two gauges are kept independent on purpose.
+            {
+                let sessions = self.sessions.borrow();
+                let nb_connections = sessions.nb_connections;
+                let max_connections = sessions.max_connections;
+                let slab_len = sessions.slab.len();
+                let slab_capacity = sessions.slab.capacity();
+                let accept_threshold = sessions.accept_slab_threshold();
+
+                gauge!(names::client::CONNECTIONS, nb_connections);
+                gauge!(names::client::CONNECTIONS_MAX, max_connections);
+                if let Some(percent) = (nb_connections * 100).checked_div(max_connections) {
+                    gauge!(names::client::CONNECTIONS_PERCENT, percent);
+                }
+
+                gauge!(names::slab::ENTRIES, slab_len);
+                gauge!(names::slab::CAPACITY, slab_capacity);
+                if let Some(percent) = (slab_len * 100).checked_div(slab_capacity) {
+                    gauge!(names::slab::USAGE_PERCENT, percent);
+                }
+                if let Some(percent) = (slab_len * 100).checked_div(accept_threshold) {
+                    gauge!(names::slab::ACCEPT_THRESHOLD_PERCENT, percent);
+                }
+            }
+            // Buffer pool gauges. `buffer.in_use` replaces the older
+            // `buffer.number` (renamed in `lib/src/pool.rs` for naming
+            // consistency with the surrounding `buffer.*` keys).
+            // `buffer.usage_percent` is computed against the configured
+            // `buffer.capacity` so dashboards can chart pool pressure.
+            {
+                let pool = self.pool.borrow();
+                let used = pool.inner.used();
+                let capacity = pool.inner.capacity();
+                gauge!(names::buffer::IN_USE, used);
+                gauge!(names::buffer::CAPACITY, capacity);
+                if let Some(percent) = (used * 100).checked_div(capacity) {
+                    gauge!(names::buffer::USAGE_PERCENT, percent);
+                }
+            }
+            // 1Hz tick for `accept_queue.saturated_seconds`. Increments once
+            // per `ACCEPT_SATURATION_TICK` while `SessionManager::can_accept`
+            // is `false`. Distinguishes "queue spent N seconds at max" from
+            // "queue briefly hit max" — the binary `accept_queue.backpressure`
+            // gauge collapses that duration. Sampled here rather than via a
+            // dedicated mio timer because the run loop ticks at least once
+            // per `poll_timeout` (1s by default), which is granular enough.
+            let now = Instant::now();
+            if now.duration_since(self.last_saturation_tick) >= ACCEPT_SATURATION_TICK {
+                if !self.sessions.borrow().can_accept {
+                    incr!(names::accept_queue::SATURATED_SECONDS);
+                }
+                self.last_saturation_tick = now;
+            }
+            // Process / runtime gauges sampled once per loop iteration. Same
+            // batch as `client.connections` so dashboards see them update in
+            // lock-step.
+            gauge!(
+                names::process::UPTIME_SECONDS,
+                self.started_at.elapsed().as_secs() as usize
+            );
+            // `server.live` flips to 0 once a graceful shutdown is requested,
+            // matching Envoy's `server.live` semantics. L4 health checks
+            // (HAProxy / cloud LBs) can poll this gauge to drain a worker
+            // before the OS-level termination signal lands.
+            gauge!(
+                names::server::LIVE,
+                if self.shutting_down.is_some() { 0 } else { 1 }
+            );
+            METRICS.with(|metrics| {
+                (*metrics.borrow_mut()).send_data();
+            });
+
+            if self.shutting_down.is_some() && self.shut_down_sessions() {
+                return;
+            }
+            if !self.closing_sessions.is_empty() {
+                self.drive_closing_sessions();
+            }
+        }
+    }
+
+    fn check_for_poll_errors(&mut self) {
+        if self.current_poll_errors >= self.max_poll_errors {
+            error!(
+                "Something is going very wrong. Last {} poll() calls failed, crashing..",
+                self.current_poll_errors
+            );
+            panic!(
+                "poll() calls failed {} times in a row",
+                self.current_poll_errors
+            );
+        }
+    }
+
+    fn reset_loop_time_and_get_timeout(&mut self) -> Option<Duration> {
+        let now = Instant::now();
+        time!(
+            names::event_loop::EVENT_LOOP_TIME,
+            (now - self.loop_start).as_millis()
+        );
+
+        let mut timeout = match self.should_poll_at.as_ref() {
+            None => self.poll_timeout,
+            Some(i) => {
+                if *i <= now {
+                    self.poll_timeout
+                } else {
+                    let dur = *i - now;
+                    match self.poll_timeout {
+                        None => Some(dur),
+                        Some(t) => {
+                            if t < dur {
+                                Some(t)
+                            } else {
+                                Some(dur)
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // A session ordered to close is re-asked every tick, during a soft stop
+        // or after a `CloseSessions` request, because nothing else wakes the
+        // loop when its in-flight work completes.
+        if self.shutting_down.is_some() || !self.closing_sessions.is_empty() {
+            let shutdown_tick = Duration::from_millis(100);
+            timeout = match timeout {
+                None => Some(shutdown_tick),
+                Some(current) => Some(current.min(shutdown_tick)),
+            };
+        }
+
+        self.loop_start = now;
+        timeout
+    }
+
+    /// Returns true if hardstop
+    fn read_channel_messages_and_notify(&mut self) -> bool {
+        if !self.channel.readiness().is_readable() {
+            return false;
+        }
+
+        if let Err(e) = self.channel.readable() {
+            error!("error reading from channel: {:?}", e);
+        }
+
+        loop {
+            let request = self.channel.read_message();
+            debug!("Received request {:?}", request);
+            match request {
+                Ok(request) => match request.content.request_type {
+                    Some(RequestType::HardStop(_)) => {
+                        let req_id = request.id.clone();
+                        self.notify(request);
+                        if let Err(e) = self.channel.write_message(&WorkerResponse::ok(req_id)) {
+                            error!("Could not send ok response to the main process: {}", e);
+                        }
+                        if let Err(e) = self.channel.run() {
+                            error!("Error while running the server channel: {}", e);
+                        }
+                        return true;
+                    }
+                    Some(RequestType::SoftStop(_)) => {
+                        self.shutting_down = Some(request.id.clone());
+                        self.last_sessions_len = self.sessions.borrow().slab.len();
+                        self.notify(request);
+                    }
+                    Some(RequestType::ReturnListenSockets(_)) => {
+                        info!("received ReturnListenSockets order");
+                        match self.return_listen_sockets() {
+                            Ok(_) => push_queue(WorkerResponse::ok(request.id)),
+                            Err(error) => push_queue(worker_response_error(
+                                request.id,
+                                format!("Could not send listeners on scm socket: {error:?}"),
+                            )),
+                        }
+                    }
+                    _ => self.notify(request),
+                },
+                // Not an error per se, occurs when there is nothing to read
+                Err(_) => {
+                    // if the message was too large, we grow the buffer and retry to read if possible
+                    if (self.channel.interest & self.channel.readiness).is_readable() {
+                        if let Err(e) = self.channel.readable() {
+                            error!("error reading from channel: {:?}", e);
+                        }
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        false
+    }
+
+    /// Scans all sessions that have been inactive for longer than the configured interval
+    fn zombie_check(&mut self) {
+        let now = Instant::now();
+        if now - self.last_zombie_check < self.zombie_check_interval {
+            return;
+        }
+        info!("zombie check");
+        // `now` is sampled this iteration and we only get here past the
+        // interval gate, so the check timestamp advances monotonically.
+        debug_assert!(
+            now >= self.last_zombie_check,
+            "zombie-check timestamp must never move backwards"
+        );
+        self.last_zombie_check = now;
+
+        let mut zombie_tokens = HashSet::new();
+
+        // find the zombie sessions
+        for (_index, session) in self
+            .sessions
+            .borrow_mut()
+            .slab
+            .iter_mut()
+            .filter(|(_, c)| now - c.borrow().last_event() > self.zombie_check_interval)
+        {
+            let session_token = session.borrow().frontend_token();
+            if !zombie_tokens.contains(&session_token) {
+                session.borrow().print_session();
+                zombie_tokens.insert(session_token);
+            }
+        }
+
+        // Listen/system sessions report `Instant::now()` as their last event,
+        // so `now - last_event` is ~0 and never exceeds the interval: a
+        // listener can never be collected as a zombie. Assert the set is free
+        // of listen protocols before we reap it.
+        debug_assert!(
+            !self.sessions.borrow().slab.iter().any(|(_, session)| {
+                let s = session.borrow();
+                zombie_tokens.contains(&s.frontend_token())
+                    && matches!(
+                        s.protocol(),
+                        Protocol::HTTPListen | Protocol::HTTPSListen | Protocol::TCPListen
+                    )
+            }),
+            "zombie reaping must never target a listener session"
+        );
+
+        let zombie_count = zombie_tokens.len() as i64;
+        count!(names::misc::ZOMBIES, zombie_count);
+
+        let remaining_count = self.shut_down_sessions_by_frontend_tokens(zombie_tokens);
+        info!(
+            "removing {} zombies ({} remaining entries after close)",
+            zombie_count, remaining_count
+        );
+    }
+
+    /// Calls close on targeted sessions, yields the number of entries in the slab
+    /// that were not properly removed
+    fn shut_down_sessions_by_frontend_tokens(&self, tokens: HashSet<Token>) -> usize {
+        if tokens.is_empty() {
+            return 0;
+        }
+
+        // close the sessions associated with the tokens
+        for token in &tokens {
+            if self.sessions.borrow().slab.contains(token.0) {
+                let slab_before = self.sessions.borrow().slab.len();
+                let session = { self.sessions.borrow_mut().slab.remove(token.0) };
+                session.borrow_mut().close();
+                self.sessions.borrow_mut().decr();
+                // The removed token is truly gone afterwards. The slab may shrink
+                // by MORE than one: `close()` also frees the session's backend
+                // slab slot(s) (the multi-token pattern), so assert it shrank by
+                // at least the frontend slot we just removed, not exactly one.
+                debug_assert!(
+                    !self.sessions.borrow().slab.contains(token.0),
+                    "removed token must be absent from the slab"
+                );
+                debug_assert!(
+                    self.sessions.borrow().slab.len() < slab_before,
+                    "removing a present session must free at least its own slab slot"
+                );
+            }
+        }
+
+        // find the entries of closed sessions in the session manager (they should not be there)
+        let mut dangling_entries = HashSet::new();
+        for (entry_key, session) in &self.sessions.borrow().slab {
+            if tokens.contains(&session.borrow().frontend_token()) {
+                dangling_entries.insert(entry_key);
+            }
+        }
+
+        // remove these from the session manager
+        let mut dangling_entries_count = 0;
+        for entry_key in dangling_entries {
+            let mut sessions = self.sessions.borrow_mut();
+            if sessions.slab.contains(entry_key) {
+                sessions.slab.remove(entry_key);
+                dangling_entries_count += 1;
+            }
+        }
+        // Postcondition: no surviving slab entry still references any of the
+        // closed frontend tokens — both the direct remove and the dangling
+        // sweep together leave the slab clean of these sessions.
+        debug_assert!(
+            !self
+                .sessions
+                .borrow()
+                .slab
+                .iter()
+                .any(|(_, session)| tokens.contains(&session.borrow().frontend_token())),
+            "no slab entry may reference a closed frontend token after teardown"
+        );
+        dangling_entries_count
+    }
+
+    /// Order sessions to shut down, check that they are all down
+    fn shut_down_sessions(&mut self) -> bool {
+        let sessions_count = self.sessions.borrow().slab.len();
+        let mut sessions_to_shut_down = HashSet::new();
+
+        for (_key, session) in &self.sessions.borrow().slab {
+            let mut session = session.borrow_mut();
+            if session.shutting_down() {
+                debug!(
+                    "Server killing session from shutting_down: token={:?}, protocol={:?}",
+                    session.frontend_token(),
+                    session.protocol()
+                );
+                sessions_to_shut_down.insert(Token(session.frontend_token().0));
+            }
+        }
+        let _ = self.shut_down_sessions_by_frontend_tokens(sessions_to_shut_down);
+
+        let new_sessions_count = self.sessions.borrow().slab.len();
+
+        if new_sessions_count < sessions_count {
+            let now = Instant::now();
+            if let Some(last) = self.last_shutting_down_message
+                && (now - last) > Duration::from_secs(5)
+            {
+                info!(
+                    "closed {} sessions, {} sessions left, base_sessions_count = {}",
+                    sessions_count - new_sessions_count,
+                    new_sessions_count,
+                    self.base_sessions_count
+                );
+            }
+            self.last_shutting_down_message = Some(now);
+        }
+
+        if new_sessions_count <= self.base_sessions_count {
+            info!("last session stopped, shutting down!");
+            if let Err(e) = self.channel.run() {
+                error!("Error while running the server channel: {}", e);
+            }
+            // self.block_channel();
+            let id = self
+                .shutting_down
+                .take()
+                .expect("should have shut down correctly"); // panicking here makes sense actually
+
+            debug!("Responding OK to main process for request {}", id);
+
+            let proxy_response = WorkerResponse::ok(id);
+            if let Err(e) = self.channel.write_message(&proxy_response) {
+                error!("Could not write response to the main process: {}", e);
+            }
+            if let Err(e) = self.channel.run() {
+                error!("Error while running the server channel: {}", e);
+            }
+            return true;
+        }
+
+        if new_sessions_count < self.last_sessions_len {
+            info!(
+                "shutting down, {} slab elements remaining (base: {})",
+                new_sessions_count - self.base_sessions_count,
+                self.base_sessions_count
+            );
+            self.last_sessions_len = new_sessions_count;
+        }
+
+        false
+    }
+
+    /// Order every session `target` selects to close, the way a soft stop
+    /// orders all of them: `ProxySession::shutting_down` closes it now when it
+    /// is idle (or TCP, or WebSocket), and otherwise lets it finish its
+    /// in-flight HTTP work, which `Server::drive_closing_sessions` then
+    /// watches.
+    fn close_sessions(&mut self, target: &SessionTarget) -> ClosedSessions {
+        // One slab entry per token: a session appears under its frontend
+        // token and under each backend token, so deduplicate by frontend.
+        let mut targeted: HashMap<Token, Rc<RefCell<dyn ProxySession>>> = HashMap::new();
+        for (_key, session) in &self.sessions.borrow().slab {
+            let borrowed = session.borrow();
+            if borrowed.targets(target) {
+                targeted
+                    .entry(borrowed.frontend_token())
+                    .or_insert_with(|| session.clone());
+            }
+        }
+
+        let mut to_close = HashSet::new();
+        let mut draining = 0u64;
+        for (token, session) in targeted {
+            if session.borrow_mut().shutting_down() {
+                to_close.insert(token);
+            } else {
+                draining += 1;
+                let already_closing = self.closing_sessions.iter().any(|(_, pending)| {
+                    pending.upgrade().is_some_and(|p| Rc::ptr_eq(&p, &session))
+                });
+                if !already_closing {
+                    self.closing_sessions.push((token, Rc::downgrade(&session)));
+                }
+            }
+        }
+        let closed = to_close.len() as u64;
+        self.shut_down_sessions_by_frontend_tokens(to_close);
+
+        // Post: every session left draining is tracked for the next ticks.
+        debug_assert!(
+            self.closing_sessions.len() as u64 >= draining,
+            "every draining session must be watched by drive_closing_sessions"
+        );
+        ClosedSessions { closed, draining }
+    }
+
+    /// Re-ask every session a `CloseSessions` request left draining whether it
+    /// can close now, and close those that can. Run once per loop tick while
+    /// any is left.
+    fn drive_closing_sessions(&mut self) {
+        let pending = std::mem::take(&mut self.closing_sessions);
+        let mut to_close = HashSet::new();
+        for (token, weak) in pending {
+            let Some(session) = weak.upgrade() else {
+                continue;
+            };
+            // The session may have closed on its own and its key been reused.
+            let still_there = self
+                .sessions
+                .borrow()
+                .slab
+                .get(token.0)
+                .is_some_and(|entry| Rc::ptr_eq(entry, &session));
+            if !still_there {
+                continue;
+            }
+            if session.borrow_mut().shutting_down() {
+                to_close.insert(token);
+            } else {
+                self.closing_sessions.push((token, weak));
+            }
+        }
+        // Post: a session is either closed now or still watched, never both.
+        debug_assert!(
+            self.closing_sessions
+                .iter()
+                .all(|(token, _)| !to_close.contains(token)),
+            "a session closed this tick must not stay watched"
+        );
+        self.shut_down_sessions_by_frontend_tokens(to_close);
+    }
+
+    fn kill_session(&self, session: Rc<RefCell<dyn ProxySession>>) {
+        let token = session.borrow().frontend_token();
+        let _ = self.shut_down_sessions_by_frontend_tokens(HashSet::from([token]));
+    }
+
+    fn send_queue(&mut self) {
+        if self.channel.readiness.is_writable() {
+            QUEUE.with(|q| {
+                let mut queue = q.borrow_mut();
+                loop {
+                    if let Some(resp) = queue.pop_front() {
+                        debug!("Sending response {:?}", resp);
+                        if let Err(e) = self.channel.write_message(&resp) {
+                            error!("Could not write message {} on the channel: {}", resp, e);
+                            queue.push_front(resp);
+                        }
+                    }
+
+                    if self.channel.back_buf.available_data() > 0
+                        && let Err(e) = self.channel.writable()
+                    {
+                        error!("error writing to channel: {:?}", e);
+                    }
+
+                    if !self.channel.readiness.is_writable() {
+                        break;
+                    }
+
+                    if self.channel.back_buf.available_data() == 0 && queue.is_empty() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    fn notify(&mut self, message: WorkerRequest) {
+        // Run the lease janitor here too, not only from the run loop: the
+        // same `now` reading is threaded into `lease_apply` below
+        // (`SetMetricDetail` arm) so the whole lease lifecycle for this
+        // `notify` call is anchored to one clock read, and a query never
+        // reports a lease the janitor is already due to retire.
+        let now = std::time::Instant::now();
+        tick_metric_detail_leases(now);
+        match &message.content.request_type {
+            Some(RequestType::ConfigureMetrics(configuration)) => {
+                match MetricsConfiguration::try_from(*configuration) {
+                    Ok(metrics_config) => {
+                        METRICS.with(|metrics| {
+                            (*metrics.borrow_mut()).configure(&metrics_config);
+                            push_queue(WorkerResponse::ok(message.id));
+                        });
+                    }
+                    Err(e) => {
+                        error!("Error configuring metrics: {}", e);
+                        push_queue(WorkerResponse::error(message.id, e));
+                    }
+                }
+                return;
+            }
+            Some(RequestType::QueryMetrics(query_metrics_options)) => {
+                METRICS.with(|metrics| {
+                    match (*metrics.borrow_mut()).query(query_metrics_options) {
+                        Ok(c) => push_queue(WorkerResponse::ok_with_content(message.id, c)),
+                        Err(e) => {
+                            error!("Error querying metrics: {}", e);
+                            push_queue(WorkerResponse::error(message.id, e))
+                        }
+                    }
+                });
+                return;
+            }
+            // Runtime cardinality lease verb — apply, renew, or clear a lease
+            // on this worker's `Aggregator`. The lease bumps `effective` to
+            // `max(configured, max(active leases))`; expiry runs on the polled
+            // janitor, `tick_metric_detail_leases`. Master-side aggregation
+            // into `MetricDetailStatus` lands in a follow-up; for now the
+            // worker acks with a bare OK so the existing `worker_request`
+            // fan-out path can collect.
+            Some(RequestType::SetMetricDetail(req)) => {
+                // Master populates the peer binding from the connecting
+                // `ClientSession` before fan-out (`bin/src/command/
+                // requests.rs::worker_request`). A pre-binding caller or a
+                // platform without `SO_PEERCRED` yields `PeerBinding::default()`
+                // — clears against that lease are accepted from anyone, per
+                // the proto contract on `SetMetricDetail.peer_pid`.
+                let presented_binding = crate::metrics::PeerBinding {
+                    pid: req.peer_pid,
+                    // Master sends Crockford-base32 ULIDs (`Ulid::to_string`);
+                    // accept those, with a fallback hex parse for callers that
+                    // happen to send `0x…` form. A failed parse degrades to
+                    // `None` — the lease store treats that as "binding
+                    // unknown" per the proto contract.
+                    session_ulid: req.peer_session_ulid.as_deref().and_then(|s| {
+                        rusty_ulid::Ulid::from_str(s)
+                            .map(u128::from)
+                            .ok()
+                            .or_else(|| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    }),
+                };
+                if req.clear.unwrap_or(false) {
+                    // Defense-in-depth: the master pre-validates `client_id`
+                    // length at the dispatch site, but worker IPC is not
+                    // master-only — fuzz harnesses, serial_test-flagged
+                    // integration tests, and future internal callers can
+                    // issue an oversized clear directly. Mirror the apply
+                    // path's `ClientIdTooLong` arm so an unbounded HashMap
+                    // lookup is never driven by an operator-supplied string
+                    // here either. The reason string echoes the byte length
+                    // but not the operator bytes themselves (symmetric with
+                    // the audit-column-smuggling guard on the apply path).
+                    if req.client_id.len() > crate::metrics::LEASE_CLIENT_ID_MAX_BYTES {
+                        let msg = format!(
+                            "SetMetricDetail: clear client_id length {} exceeds {} bytes",
+                            req.client_id.len(),
+                            crate::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+                        );
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                        return;
+                    }
+                    // Capture transition fields + post-clear snapshot
+                    // before releasing the borrow so we can emit an
+                    // Event after AND build the WorkerMetricDetailStatus
+                    // payload that the master folds into
+                    // `MetricDetailStatus.workers[<worker_id>]`. Without
+                    // this payload the master used its own view as a
+                    // stand-in for the worker's per-aggregator state.
+                    let (outcome, effective_after, configured_after, lease_count_after) = METRICS
+                        .with(|metrics| {
+                            let mut m = metrics.borrow_mut();
+                            let outcome = m.lease_clear(&req.client_id, presented_binding);
+                            (
+                                outcome,
+                                m.detail_effective(),
+                                m.detail_configured(),
+                                m.lease_count(),
+                            )
+                        });
+                    match outcome {
+                        crate::metrics::LeaseClearOutcome::Cleared { previous_effective } => {
+                            push_metric_detail_transition(
+                                previous_effective,
+                                effective_after,
+                                "lease_clear",
+                                Some(req.client_id.clone()),
+                            );
+                            push_queue(WorkerResponse::ok_with_content(
+                                message.id.clone(),
+                                worker_metric_detail_status_content(
+                                    configured_after,
+                                    effective_after,
+                                    previous_effective,
+                                    lease_count_after,
+                                ),
+                            ));
+                        }
+                        crate::metrics::LeaseClearOutcome::NotFound => {
+                            // Silent no-op: no lease existed for that
+                            // id. The worker's state is unchanged so
+                            // previous_effective == effective.
+                            push_queue(WorkerResponse::ok_with_content(
+                                message.id.clone(),
+                                worker_metric_detail_status_content(
+                                    configured_after,
+                                    effective_after,
+                                    effective_after,
+                                    lease_count_after,
+                                ),
+                            ));
+                        }
+                        crate::metrics::LeaseClearOutcome::Unauthorized => {
+                            // Do NOT echo `req.client_id` here: the operator-
+                            // supplied bytes flow back through the master's
+                            // worker→reason aggregation into the audit line's
+                            // `reason=` column, which is sanitised for control
+                            // bytes only. The dedicated `lease_id=` audit
+                            // column already carries the operator string
+                            // through `sanitize_for_audit_kv`, so re-embedding
+                            // it here would let a value containing `,` or `=`
+                            // forge a sibling KV pair against SIEM consumers
+                            // that split on `, key=value`.
+                            let msg = "SetMetricDetail: clear refused (peer \
+                                 binding does not match the apply-time owner)"
+                                .to_owned();
+                            error!("{}", msg);
+                            push_queue(WorkerResponse::error(message.id.clone(), msg));
+                        }
+                    }
+                    return;
+                }
+                let detail_proto = match req.detail {
+                    Some(d) => d,
+                    None => {
+                        // Operator-supplied `client_id` is intentionally
+                        // omitted from the reason string: the dedicated
+                        // `lease_id=` audit column carries it through the
+                        // strict KV sanitiser. See the matching comment on
+                        // the `Unauthorized` arm above for the column-
+                        // smuggling rationale.
+                        let msg = "SetMetricDetail without `detail` and without `clear`".to_owned();
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                        return;
+                    }
+                };
+                let detail_enum = match MetricDetail::try_from(detail_proto) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let msg =
+                            format!("SetMetricDetail: invalid MetricDetail variant {detail_proto}");
+                        error!("{}: {}", msg, e);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                        return;
+                    }
+                };
+                let level = MetricDetailLevel::from(detail_enum);
+                // Bound the worst case BEFORE we touch the aggregator: the
+                // proto contract on `SetMetricDetail.ttl_seconds` says the
+                // worker rejects values larger than `LEASE_TTL_MAX` so a
+                // stuck operator-side renewer (or a buggy third-party client)
+                // cannot lock the worker into elevated cardinality. The
+                // `Aggregator::lease_apply` clamp is still in place as a
+                // defence-in-depth net for code paths that bypass this
+                // dispatch (proto fuzzing, future internal callers).
+                if let Some(t) = req.ttl_seconds
+                    && u64::from(t) > crate::metrics::LEASE_TTL_MAX.as_secs()
+                {
+                    let msg = format!(
+                        "SetMetricDetail: ttl_seconds={t} exceeds LEASE_TTL_MAX={}",
+                        crate::metrics::LEASE_TTL_MAX.as_secs()
+                    );
+                    error!("{}", msg);
+                    push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    return;
+                }
+                let ttl_seconds = req.ttl_seconds.filter(|&t| t > 0).unwrap_or_else(|| {
+                    // The default fits in a u32 by construction
+                    // (LEASE_TTL_DEFAULT = 60 s); the lossy `as u32` cast
+                    // is replaced with a checked conversion so any
+                    // future tweak past `u32::MAX` seconds (≈ 136 years)
+                    // can't silently truncate. Falls through to 60 s on
+                    // the theoretical overflow path.
+                    u32::try_from(crate::metrics::LEASE_TTL_DEFAULT.as_secs()).unwrap_or(60)
+                });
+                let ttl = std::time::Duration::from_secs(ttl_seconds.into());
+                let (outcome, configured_after, lease_count_after) = METRICS.with(|metrics| {
+                    let mut m = metrics.borrow_mut();
+                    let outcome =
+                        m.lease_apply(req.client_id.clone(), level, ttl, presented_binding, now);
+                    (outcome, m.detail_configured(), m.lease_count())
+                });
+                match outcome {
+                    crate::metrics::LeaseApplyOutcome::Applied {
+                        previous_effective,
+                        new_effective,
+                    } => {
+                        push_metric_detail_transition(
+                            previous_effective,
+                            new_effective,
+                            "lease_apply",
+                            Some(req.client_id.clone()),
+                        );
+                        push_queue(WorkerResponse::ok_with_content(
+                            message.id.clone(),
+                            worker_metric_detail_status_content(
+                                configured_after,
+                                new_effective,
+                                previous_effective,
+                                lease_count_after,
+                            ),
+                        ));
+                    }
+                    crate::metrics::LeaseApplyOutcome::ClientIdTooLong => {
+                        let msg = format!(
+                            "SetMetricDetail: client_id length {} exceeds {} bytes",
+                            req.client_id.len(),
+                            crate::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+                        );
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    }
+                    crate::metrics::LeaseApplyOutcome::TableFull => {
+                        // Same audit-column-smuggling guard as the
+                        // `Unauthorized` and missing-detail arms: the
+                        // operator-supplied `client_id` is already rendered
+                        // safely through the strict KV sanitiser in the
+                        // audit envelope's `lease_id=` column, so we keep
+                        // it out of the reason string.
+                        let msg = format!(
+                            "SetMetricDetail: lease table at capacity ({} entries); reject new \
+                             apply — operators must retry after an active lease expires or is \
+                             cleared",
+                            crate::metrics::LEASE_TABLE_CAP,
+                        );
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    }
+                    crate::metrics::LeaseApplyOutcome::TtlOutOfRange => {
+                        // Unreachable in the normal flow: the dispatch-time
+                        // gate above already rejected ttl > LEASE_TTL_MAX.
+                        // Surface explicitly so any future bypass (proto
+                        // fuzzing, internal callers) fails loud rather
+                        // than silently capping the lessor's intent.
+                        let msg = format!(
+                            "SetMetricDetail: ttl exceeds LEASE_TTL_MAX={} (internal contract \
+                             violation: dispatch gate should have rejected)",
+                            crate::metrics::LEASE_TTL_MAX.as_secs(),
+                        );
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    }
+                    crate::metrics::LeaseApplyOutcome::Unauthorized => {
+                        // A renewal arrived against an existing lease whose
+                        // apply-time peer binding does not match the
+                        // presented one. The `client_id` is intentionally
+                        // omitted from the error string — the audit-log
+                        // row already carries it in the dedicated
+                        // `lease_id` column, and echoing it here would
+                        // route operator-controlled bytes through the
+                        // freeform reason field.
+                        let msg = "SetMetricDetail: renewal refused (peer binding does not \
+                                   match the apply-time owner)"
+                            .to_owned();
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    }
+                }
+                return;
+            }
+            Some(RequestType::Logging(logging_filter)) => {
+                info!(
+                    "{} changing logging filter to {}",
+                    message.id, logging_filter
+                );
+                // there should not be any errors as it was already parsed by the main process
+                let (directives, _errors) = logging::parse_logging_spec(logging_filter);
+                logging::LOGGER.with(|logger| {
+                    logger.borrow_mut().set_directives(directives);
+                });
+                push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
+            Some(RequestType::QueryClustersHashes(_)) => {
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id.clone(),
+                    ContentType::ClusterHashes(ClusterHashes {
+                        map: self
+                            .config_state
+                            .hash_state()
+                            .into_iter()
+                            .map(|(cluster_id, hash)| (cluster_id.to_string(), hash))
+                            .collect(),
+                    })
+                    .into(),
+                ));
+                return;
+            }
+            Some(RequestType::QueryClusterById(cluster_id)) => {
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id.clone(),
+                    ContentType::Clusters(ClusterInformations {
+                        vec: self
+                            .config_state
+                            .cluster_state(cluster_id)
+                            .map_or(vec![], |ci| vec![ci]),
+                    })
+                    .into(),
+                ));
+            }
+            Some(RequestType::SetMaxConnectionsPerIp(limit)) => {
+                let mut sessions = self.sessions.borrow_mut();
+                let previous = sessions.max_connections_per_ip;
+                sessions.max_connections_per_ip = *limit;
+                // Disabling the feature on the fly should not leave
+                // stale `(cluster, ip)` entries behind: drain the
+                // bookkeeping so a re-enable starts from a clean slate
+                // and `cluster_ip_at_limit` does not consult dead state.
+                if *limit == 0 {
+                    sessions.clear_cluster_ip_tracking();
+                }
+                info!(
+                    "{} updated global max_connections_per_ip from {} to {}",
+                    message.id, previous, limit
+                );
+                push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
+            Some(RequestType::QueryMaxConnectionsPerIp(_)) => {
+                let limit = self.sessions.borrow().max_connections_per_ip;
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ContentType::MaxConnectionsPerIpLimit(
+                        sozu_command::proto::command::MaxConnectionsPerIpLimit { limit },
+                    )
+                    .into(),
+                ));
+                return;
+            }
+            Some(RequestType::SetMaxConnectionsPerSubnet(limit)) => {
+                let mut sessions = self.sessions.borrow_mut();
+                let previous = sessions.max_connections_per_subnet;
+                sessions.max_connections_per_subnet = *limit;
+                // Disabling the subnet limiter on the fly should not
+                // leave stale `(cluster, subnet)` entries behind: drain
+                // its bookkeeping so a re-enable starts from a clean
+                // slate. The per-IP buckets are deliberately untouched —
+                // the two limiters are independent.
+                if *limit == 0 {
+                    sessions.clear_cluster_subnet_tracking();
+                }
+                info!(
+                    "{} updated global max_connections_per_subnet from {} to {}",
+                    message.id, previous, limit
+                );
+                push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
+            Some(RequestType::SetMaxConnectionAttempts(attempts)) => {
+                if let Err(reason) =
+                    sozu_command::config::validate_max_connection_attempts(*attempts)
+                {
+                    push_queue(WorkerResponse::error(message.id, reason));
+                    return;
+                }
+                let mut sessions = self.sessions.borrow_mut();
+                let previous = sessions.max_connection_attempts;
+                sessions.max_connection_attempts = *attempts;
+                info!(
+                    "{} updated global max_connection_attempts from {} to {}",
+                    message.id, previous, attempts
+                );
+                push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
+            Some(RequestType::CloseSessions(request)) => {
+                let target = SessionTarget::from(request);
+                let closed = self.close_sessions(&target);
+                info!(
+                    "{} CloseSessions on {:?}: {} sessions closed, {} draining",
+                    message.id, target, closed.closed, closed.draining
+                );
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ContentType::ClosedSessions(closed).into(),
+                ));
+                return;
+            }
+            Some(RequestType::QueryMaxConnectionsPerSubnet(_)) => {
+                let sessions = self.sessions.borrow();
+                let limit = sessions.max_connections_per_subnet;
+                // The prefixes ride along because they are boot-time
+                // only: this reply is the sole runtime surface that can
+                // tell an operator what the live cap is a cap ON.
+                let ipv4_prefix = sessions.subnet_ipv4_prefix;
+                let ipv6_prefix = sessions.subnet_ipv6_prefix;
+                drop(sessions);
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ContentType::MaxConnectionsPerSubnetLimit(
+                        sozu_command::proto::command::MaxConnectionsPerSubnetLimit {
+                            limit,
+                            ipv4_prefix,
+                            ipv6_prefix,
+                        },
+                    )
+                    .into(),
+                ));
+                return;
+            }
+            Some(RequestType::QueryClustersByDomain(domain)) => {
+                let cluster_ids = self
+                    .config_state
+                    .get_cluster_ids_by_domain(domain.hostname.clone(), domain.path.clone());
+                let vec = cluster_ids
+                    .iter()
+                    .filter_map(|cluster_id| self.config_state.cluster_state(cluster_id))
+                    .collect();
+
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id.clone(),
+                    ContentType::Clusters(ClusterInformations { vec }).into(),
+                ));
+                return;
+            }
+            // A filter carrying a fingerprint is answered from this worker's
+            // own `ConfigState` rather than from its resolver. Note that
+            // `get_certificates` tests its domain arm FIRST, so a request
+            // carrying BOTH filters is answered by exact SAN equality on the
+            // domain and the fingerprint is ignored — the one path where
+            // `--domain` is not the trie lookup `query_certificate_for_domain`
+            // and `bin`'s `certificates_serving_domain` both perform
+            // (sozu#1383). `QueryCertificatesFilters` documents that the two
+            // filters do not compound; `doc/configure_cli.md` says to pass one
+            // at a time.
+            Some(RequestType::QueryCertificatesFromWorkers(filters))
+                if filters.fingerprint.is_some() =>
+            {
+                let certs = self.config_state.get_certificates(filters.clone());
+                let response = if !certs.is_empty() {
+                    WorkerResponse::ok_with_content(
+                        message.id.clone(),
+                        ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints {
+                            certs,
+                        })
+                        .into(),
+                    )
+                } else {
+                    worker_response_error(
+                        message.id.clone(),
+                        "Could not find certificate for this fingerprint",
+                    )
+                };
+                push_queue(response);
+                return;
+            }
+            // if all certificates are queried, or filtered by domain name,
+            // the request will be handled by the https proxy
+            _other_request => {}
+        }
+        self.notify_proxys(message);
+    }
+
+    pub fn notify_proxys(&mut self, mut request: WorkerRequest) {
+        // The public protected verb carries the clear values to the main
+        // process only. A worker never applies it as one step: the main
+        // process drives the prepare, commit, abort and release orders below.
+        if matches!(
+            request.content.request_type,
+            Some(RequestType::SetProtectedHealthCheck(_))
+        ) {
+            push_queue(worker_response_error(
+                request.id,
+                "SetProtectedHealthCheck is not a worker order",
+            ));
+            return;
+        }
+        if let Some(request_type) = request.content.request_type.as_mut()
+            && let Some(response) = self.protected_health_check.handle(
+                &request.id,
+                request_type,
+                &mut self.config_state,
+                &mut self.backends.borrow_mut(),
+            )
+        {
+            push_queue(response);
+            return;
+        }
+
+        // A health check `port` and a `unix_path` backend never share a
+        // cluster. The state refuses the pair, but a refusal other than
+        // `ClusterNotFound` does not stop the worker below, so ask first and
+        // leave the state, the `BackendMap` and the `HealthChecker` as they
+        // are.
+        if let Some(reason) = request
+            .content
+            .request_type
+            .as_ref()
+            .and_then(|request_type| {
+                self.config_state
+                    .health_check_port_unix_conflict(request_type)
+            })
+        {
+            push_queue(worker_response_error(request.id, reason));
+            return;
+        }
+
+        // Read before the dispatch below: `ConfigState::remove_cluster`
+        // (`command/src/state.rs`) removes these objects from the state, and
+        // the `RemoveCluster` arm removes them from the proxies.
+        let cluster_objects = match &request.content.request_type {
+            Some(RequestType::RemoveCluster(cluster_id)) => {
+                self.config_state.cluster_removal_requests(cluster_id)
+            }
+            _ => Vec::new(),
+        };
+
+        // Snapshot a compensating request before dispatch: removal requests
+        // carry only an identity selector, while the stored frontend carries
+        // the metadata an exact re-add needs.
+        let rollback_candidate = request
+            .content
+            .request_type
+            .as_ref()
+            .and_then(|request_type| self.config_state.rollback_for(request_type));
+        let mut rollback = None;
+        if let Err(e) = self.config_state.dispatch(&request.content) {
+            if self
+                .config_state
+                .removed_with_its_cluster(&request.content, &e)
+            {
+                // The object went with its cluster (`RemoveCluster` cascades),
+                // for instance when a main process that predates the cascade
+                // follows its `RemoveCluster` with the removal of each object.
+                // There is nothing left to remove: answer ok rather than fail
+                // on a missing route.
+                debug!("{} already removed with its cluster: {}", request.id, e);
+                push_queue(WorkerResponse::ok(request.id));
+                return;
+            }
+            if is_frontend_removal(&request.content)
+                && matches!(e, StateError::NotFound { .. } | StateError::NoChange)
+            {
+                // The state holds no frontend of the named cluster under
+                // this identity: `NotFound` when it holds none of that
+                // cluster at all (or the route key is another cluster's),
+                // `NoChange` when the TCP or UDP frontends it holds for that
+                // cluster do not include this one. The proxies look a
+                // frontend up by address, hostname and path, or by listener,
+                // whatever cluster owns it: applying the removal to them
+                // could evict another cluster's route or listener mapping.
+                // Refuse it without touching them.
+                push_queue(WorkerResponse::error(
+                    request.id,
+                    format!("Could not execute order on config state: {e}"),
+                ));
+                return;
+            }
+            if matches!(e, StateError::ClusterNotFound { .. }) {
+                // A backend belongs to its cluster
+                // (`ConfigState::add_backend`, `command/src/state.rs`): the
+                // state refused one of a cluster it does not hold, never
+                // added or already removed. Refuse it without adding it to
+                // the `BackendMap`, where it would outlive its cluster.
+                push_queue(WorkerResponse::error(
+                    request.id,
+                    format!("Could not execute order on config state: {e}"),
+                ));
+                return;
+            }
+            error!("Could not execute order on config state: {}", e);
+        } else {
+            rollback = rollback_candidate;
+        }
+
+        let req_id = request.id.clone();
+
+        match request.content.request_type {
+            Some(RequestType::AddCluster(ref cluster)) => {
+                // Mirror the master-side ConfigState::add_cluster check so
+                // off-channel paths (TOML reload, SaveState/LoadState, direct
+                // API) that smuggle a malformed `cluster.health_check` cannot
+                // arm the worker's BackendList::set_health_check_config with
+                // a CRLF/NUL/C0 URI or zero thresholds. The SetHealthCheck
+                // handler below already runs the same validation; this is the
+                // AddCluster mirror.
+                if let Some(hc) = cluster.health_check.as_ref()
+                    && let Err(reason) = sozu_command::config::validate_health_check_config(hc)
+                {
+                    push_queue(worker_response_error(req_id, reason));
+                    return;
+                }
+                // Same mirror for the shuffle-sharding knobs (#524): a worker
+                // never arms a shard the master would have refused.
+                if let Err(reason) = sozu_command::config::validate_shuffle_sharding(
+                    cluster.shard_percent,
+                    cluster.shard_min_backends,
+                    cluster.shard_mode,
+                ) {
+                    push_queue(worker_response_error(req_id, reason));
+                    return;
+                }
+                if let Some(Err(reason)) = cluster
+                    .max_connection_attempts
+                    .map(sozu_command::config::validate_max_connection_attempts)
+                {
+                    push_queue(worker_response_error(req_id, reason));
+                    return;
+                }
+                self.protected_health_check
+                    .forget_cluster(&cluster.cluster_id);
+                self.add_cluster(cluster);
+                // An upsert without a health check clears it like
+                // `RemoveHealthCheck`: `add_cluster` already reset the
+                // backends, drop the probes still in flight too (#1811).
+                if cluster.health_check.is_none() {
+                    self.health_checker.remove_cluster(&cluster.cluster_id);
+                }
+                // Re-arm the metric drain tombstone in case this cluster id
+                // was previously removed — without this the drain would
+                // continue dropping every emission for the resurrected
+                // cluster. Idempotent on a fresh id.
+                METRICS.with(|metrics| {
+                    (*metrics.borrow_mut()).add_cluster(&cluster.cluster_id);
+                });
+                //not returning because the message must still be handled by each proxy
+            }
+            Some(RequestType::RemoveCluster(ref cluster_id)) => {
+                self.protected_health_check.forget_cluster(cluster_id);
+                self.remove_cluster_objects(&req_id, cluster_id, cluster_objects);
+                self.remove_health_check_state(cluster_id);
+                METRICS.with(|metrics| {
+                    (*metrics.borrow_mut()).remove_cluster(cluster_id);
+                });
+                //not returning because the message must still be handled by each proxy
+            }
+            Some(RequestType::SetHealthCheck(ref set)) => {
+                if let Err(reason) = sozu_command::config::validate_health_check_config(&set.config)
+                {
+                    push_queue(worker_response_error(req_id, reason));
+                    return;
+                }
+                self.protected_health_check.forget_cluster(&set.cluster_id);
+                self.backends
+                    .borrow_mut()
+                    .set_health_check_config(&set.cluster_id, Some(set.config.to_owned()));
+                push_queue(WorkerResponse::ok(req_id));
+                return;
+            }
+            Some(RequestType::RemoveHealthCheck(ref cluster_id)) => {
+                self.remove_health_check_state(cluster_id);
+                push_queue(WorkerResponse::ok(req_id));
+                return;
+            }
+            Some(RequestType::AddBackend(ref backend))
+            | Some(RequestType::AddUnixBackend(ref backend)) => {
+                push_queue(self.add_backend(&req_id, backend));
+                return;
+            }
+            Some(RequestType::RemoveBackend(ref remove_backend)) => {
+                push_queue(self.remove_backend(&req_id, remove_backend));
+                return;
+            }
+            _ => {}
+        };
+
+        let proxy_destinations = request.content.get_destinations();
+        let mut notify_response = None;
+        if proxy_destinations.to_http_proxy {
+            notify_response = Some(self.http.borrow_mut().notify(request.clone()));
+        }
+        if proxy_destinations.to_https_proxy {
+            let http_proxy_response = self.https.borrow_mut().notify(request.clone());
+            if http_proxy_response.is_failure() || notify_response.is_none() {
+                notify_response = Some(http_proxy_response);
+            }
+        }
+        if proxy_destinations.to_tcp_proxy {
+            let tcp_proxy_response = self.tcp.borrow_mut().notify(request.clone());
+            if tcp_proxy_response.is_failure() || notify_response.is_none() {
+                notify_response = Some(tcp_proxy_response);
+            }
+        }
+        if proxy_destinations.to_udp_proxy {
+            let udp_proxy_response = self.udp.borrow_mut().notify(request.clone());
+            if udp_proxy_response.is_failure() || notify_response.is_none() {
+                notify_response = Some(udp_proxy_response);
+            }
+        }
+        if let Some(response) = notify_response {
+            self.finish_proxy_order(&mut rollback, response);
+        }
+
+        match request.content.request_type {
+            // special case for adding listeners, because we need to register a listener
+            Some(RequestType::AddHttpListener(listener)) => {
+                let response = self.notify_add_http_listener(&req_id, listener);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(
+                RequestType::AddHttpsListener(listener)
+                | RequestType::AddHttpsListenerWithClientAuth(listener),
+            ) => {
+                let response = self.notify_add_https_listener(&req_id, listener);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(RequestType::AddTcpListener(listener)) => {
+                let response = self.notify_add_tcp_listener(&req_id, listener);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(RequestType::AddUdpListener(listener)) => {
+                let response = self.notify_add_udp_listener(&req_id, listener);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(RequestType::UpdateHttpListener(patch)) => {
+                let response = self.notify_update_http_listener(&req_id, patch);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(
+                RequestType::UpdateHttpsListener(patch)
+                | RequestType::UpdateHttpsListenerWithClientAuth(patch),
+            ) => {
+                let response = self.notify_update_https_listener(&req_id, patch);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(RequestType::UpdateTcpListener(patch)) => {
+                let response = self.notify_update_tcp_listener(&req_id, patch);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(RequestType::UpdateUdpListener(patch)) => {
+                let response = self.notify_update_udp_listener(&req_id, patch);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(RequestType::RemoveListener(ref remove)) => {
+                debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
+                // We only remove a listener that was previously added, so the
+                // base count is at least 1 — the subtraction cannot underflow.
+                debug_assert!(
+                    self.base_sessions_count > 0,
+                    "removing a listener with base_sessions_count == 0 would underflow"
+                );
+                self.base_sessions_count -= 1;
+                let listener_type = ListenerType::try_from(remove.proxy);
+                // `RemoveListener` is the sole release point of the slab slot
+                // `AddListener` reserved (see `reserve_listen_token`): no
+                // proxy's `remove_listener` touches the session slab, so
+                // without this the slot leaks one slab key per add/remove
+                // cycle — and `base_sessions_count`, decremented just above,
+                // drifts below the number of reserved slots. Read the token
+                // BEFORE the proxy drops the listener that holds it.
+                let address = remove.listener_key();
+                let listen_token = match listener_type {
+                    Ok(ListenerType::Http) => self.http.borrow().listener_token(&address),
+                    Ok(ListenerType::Https) => self.https.borrow().listener_token(&address),
+                    Ok(ListenerType::Tcp) => self.tcp.borrow().listener_token(&address),
+                    Ok(ListenerType::Udp) => self.udp.borrow().listener_token(&address),
+                    Err(_) => None,
+                };
+                let response = match listener_type {
+                    Ok(ListenerType::Http) => self.http.borrow_mut().notify(request),
+                    Ok(ListenerType::Https) => self.https.borrow_mut().notify(request),
+                    Ok(ListenerType::Tcp) => self.tcp.borrow_mut().notify(request),
+                    Ok(ListenerType::Udp) => self.udp.borrow_mut().notify(request),
+                    Err(_) => WorkerResponse::error(req_id, "Wrong variant ListenerType"),
+                };
+                if let Some(token) = listen_token {
+                    self.sessions.borrow_mut().slab.try_remove(token.0);
+                    // Same rule as the deactivate arms: a listen token with no
+                    // slab slot must not stay queued for a deferred accept.
+                    self.accept_ready.remove(&ListenToken(token.0));
+                    info!("released listen token {:?}", token);
+                }
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(RequestType::ActivateListener(ref activate)) => {
+                let response = self.notify_activate_listener(&req_id, activate);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            Some(RequestType::DeactivateListener(ref deactivate)) => {
+                let response = self.notify_deactivate_listener(&req_id, deactivate);
+                self.finish_proxy_order(&mut rollback, response);
+            }
+            _other_request => {}
+        };
+    }
+
+    /// Queue a proxy response and restore the worker's persisted view when a
+    /// single-plane runtime order was refused after `ConfigState::dispatch`.
+    fn finish_proxy_order(&mut self, rollback: &mut Option<Request>, response: WorkerResponse) {
+        if response.is_failure()
+            && let Some(rollback) = rollback.take()
+        {
+            debug_assert!(
+                rollback.request_type.is_some(),
+                "a ConfigState rollback must carry one request"
+            );
+            if let Err(error) = self.config_state.dispatch(&rollback) {
+                error!(
+                    "Could not roll back worker config state after a proxy refused an order: {}",
+                    error
+                );
+            }
+            debug_assert!(
+                rollback.request_type.is_some(),
+                "dispatching a rollback must not consume its request type"
+            );
+        }
+
+        push_queue(response);
+    }
+
+    fn add_cluster(&mut self, cluster: &Cluster) {
+        let mut backends = self.backends.borrow_mut();
+        backends.set_load_balancing_policy_for_cluster(
+            &cluster.cluster_id,
+            LoadBalancingAlgorithms::try_from(cluster.load_balancing).unwrap_or_default(),
+            cluster
+                .load_metric
+                .and_then(|n| LoadMetric::try_from(n).ok()),
+        );
+        backends.set_shuffle_sharding_for_cluster(
+            &cluster.cluster_id,
+            ShuffleSharding::from_cluster(
+                cluster.shard_percent,
+                cluster.shard_min_backends,
+                cluster.shard_mode,
+            ),
+        );
+        backends.set_health_check_config(&cluster.cluster_id, cluster.health_check.to_owned());
+        backends.set_cluster_http2(&cluster.cluster_id, cluster.http2.unwrap_or(false));
+    }
+
+    fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> WorkerResponse {
+        if let Some(Err(reason)) = add_backend
+            .unix_path
+            .as_deref()
+            .map(sozu_command::config::parse_backend_unix_path)
+        {
+            return WorkerResponse::error(req_id, format!("invalid unix_path: {reason}"));
+        }
+        let new_backend = Backend::new(
+            &add_backend.backend_id,
+            add_backend.address.into(),
+            add_backend.sticky_id.clone(),
+            add_backend.load_balancing_parameters,
+            add_backend.backup,
+        )
+        .with_unix_path(add_backend.unix_path.clone());
+        self.backends
+            .borrow_mut()
+            .add_backend(&add_backend.cluster_id, new_backend);
+
+        WorkerResponse::ok(req_id)
+    }
+
+    /// Remove from the proxies and the `BackendMap` the frontends and backends
+    /// of a cluster being removed, `requests` being the removal orders
+    /// `ConfigState::cluster_removal_requests` (`command/src/state.rs`)
+    /// returned for it. Each object goes through the removal its own order
+    /// takes, so the router, the tags, the TCP and UDP listener to cluster
+    /// mappings and the per-backend metrics are cleaned the same way.
+    ///
+    /// A session already established keeps the backend connection it holds
+    /// and drains on it; only new requests and connections stop routing. A
+    /// failure is logged and does not stop the others: the `RemoveCluster`
+    /// answer stays the single response the main process waits for.
+    fn remove_cluster_objects(&mut self, req_id: &str, cluster_id: &str, requests: Vec<Request>) {
+        for request in requests {
+            let result = match request.request_type {
+                Some(
+                    RequestType::RemoveHttpFrontend(front)
+                    | RequestType::RemoveHttpFrontendWithHeaderPredicates(front),
+                ) => self.http.borrow_mut().remove_http_frontend(front),
+                Some(
+                    RequestType::RemoveHttpsFrontend(front)
+                    | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front),
+                ) => self
+                    .https
+                    .borrow_mut()
+                    .remove_https_frontend(front)
+                    .map(|_| ()),
+                Some(RequestType::RemoveTcpFrontend(front)) => {
+                    self.tcp.borrow_mut().remove_tcp_front(front)
+                }
+                Some(RequestType::RemoveUdpFrontend(front)) => {
+                    self.udp.borrow_mut().remove_udp_front(front)
+                }
+                Some(RequestType::RemoveBackend(backend)) => {
+                    let response = self.remove_backend(req_id, &backend);
+                    debug_assert_eq!(
+                        response.status,
+                        ResponseStatus::Ok as i32,
+                        "Server::remove_backend always answers ok"
+                    );
+                    Ok(())
+                }
+                other => {
+                    debug_assert!(
+                        false,
+                        "cluster_removal_requests only returns frontend and backend removals, got {other:?}"
+                    );
+                    Ok(())
+                }
+            };
+            if let Err(error) = result {
+                warn!(
+                    "{} removing cluster {}: could not remove one of its objects: {}",
+                    req_id, cluster_id, error
+                );
+            }
+        }
+        self.backends.borrow_mut().remove_cluster(cluster_id);
+        debug_assert!(
+            !self.backends.borrow().backends.contains_key(cluster_id),
+            "a removed cluster must leave no backend list behind"
+        );
+    }
+
+    /// Stop health checking `cluster_id`: drop its in-flight probes, then
+    /// forget its configuration and reset every backend it marked DOWN, since
+    /// no probe will ever mark them UP again (#1811). Dropping the probes first
+    /// keeps one already in flight from marking a backend DOWN after the reset.
+    fn remove_health_check_state(&mut self, cluster_id: &str) {
+        self.protected_health_check.forget_cluster(cluster_id);
+        self.health_checker.remove_cluster(cluster_id);
+        self.backends
+            .borrow_mut()
+            .set_health_check_config(cluster_id, None);
+    }
+
+    fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> WorkerResponse {
+        let address = backend.address.into();
+        // Runtime removal keys on `(backend_id, address)`, as `ConfigState`
+        // does: another id at the same address stays (#1821). The metrics
+        // layer is id-keyed, so one row aggregates every entry carrying the
+        // id: it is dropped only once no entry of that id remains at any
+        // address, and is still tidied when the backend was already gone,
+        // clearing any orphan row.
+        let id_still_live = {
+            let mut backends = self.backends.borrow_mut();
+            backends.remove_backend(&backend.cluster_id, &backend.backend_id, &address);
+            backends.has_backend_id(&backend.cluster_id, &backend.backend_id)
+        };
+        if !id_still_live {
+            METRICS.with(|metrics| {
+                (*metrics.borrow_mut()).remove_backend(&backend.cluster_id, &backend.backend_id);
+            });
+        }
+
+        WorkerResponse::ok(req_id)
+    }
+
+    fn notify_add_http_listener(
+        &mut self,
+        req_id: &str,
+        listener: HttpListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} add http listener {:?}", req_id, listener);
+
+        let address: SocketAddr = listener.address.into();
+        let retained_frontends = self
+            .config_state
+            .http_fronts
+            .values()
+            .filter(|frontend| frontend.address == address)
+            .cloned()
+            .map(Into::into)
+            .collect();
+
+        if self.sessions.borrow().at_capacity() {
+            return worker_response_error(req_id, "session list is full, cannot add a listener");
+        }
+
+        let mut session_manager = self.sessions.borrow_mut();
+        // The vacant entry's key is free now and becomes the listener's token.
+        let slab_before = session_manager.slab.len();
+        debug_assert!(
+            !session_manager
+                .slab
+                .contains(session_manager.slab.vacant_key()),
+            "the next vacant slab key must be free before insertion"
+        );
+        let entry = session_manager.slab.vacant_entry();
+        let token = Token(entry.key());
+
+        match self.http.borrow_mut().add_listener_with_retained_frontends(
+            listener,
+            token,
+            retained_frontends,
+        ) {
+            Ok(_token) => {
+                entry.insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::HTTPListen,
+                })));
+                // The listener session occupies exactly the token's slab key,
+                // and the slab grew by exactly one slot.
+                debug_assert!(
+                    session_manager.slab.contains(token.0),
+                    "listener insert must occupy the token's slab key"
+                );
+                debug_assert_eq!(
+                    session_manager.slab.len(),
+                    slab_before + 1,
+                    "adding a listener must occupy exactly one slab slot"
+                );
+                self.base_sessions_count += 1;
+                WorkerResponse::ok(req_id)
+            }
+            Err(e) => worker_response_error(req_id, format!("Could not add HTTP listener: {e}")),
+        }
+    }
+
+    fn notify_add_https_listener(
+        &mut self,
+        req_id: &str,
+        listener: HttpsListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} add https listener {:?}", req_id, listener);
+
+        let wire_address = listener.address;
+        let address: SocketAddr = wire_address.into();
+        let retained_frontends = self
+            .config_state
+            .https_fronts
+            .values()
+            .filter(|frontend| frontend.address == address)
+            .cloned()
+            .map(Into::into)
+            .collect();
+        let retained_certificates = self
+            .config_state
+            .certificate_add_requests_for_address(address);
+
+        if self.sessions.borrow().at_capacity() {
+            return worker_response_error(req_id, "session list is full, cannot add a listener");
+        }
+
+        let mut session_manager = self.sessions.borrow_mut();
+        let slab_before = session_manager.slab.len();
+        debug_assert!(
+            !session_manager
+                .slab
+                .contains(session_manager.slab.vacant_key()),
+            "the next vacant slab key must be free before insertion"
+        );
+        let entry = session_manager.slab.vacant_entry();
+        let token = Token(entry.key());
+
+        match self.https.borrow_mut().add_listener_with_retained_state(
+            listener.clone(),
+            token,
+            retained_frontends,
+            retained_certificates,
+        ) {
+            Ok(_token) => {
+                entry.insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::HTTPSListen,
+                })));
+                debug_assert!(
+                    session_manager.slab.contains(token.0),
+                    "listener insert must occupy the token's slab key"
+                );
+                debug_assert_eq!(
+                    session_manager.slab.len(),
+                    slab_before + 1,
+                    "adding a listener must occupy exactly one slab slot"
+                );
+                self.base_sessions_count += 1;
+                WorkerResponse::ok(req_id)
+            }
+            Err(e) => worker_response_error(req_id, format!("Could not add HTTPS listener: {e}")),
+        }
+    }
+
+    fn notify_add_tcp_listener(
+        &mut self,
+        req_id: &str,
+        listener: CommandTcpListener,
+    ) -> WorkerResponse {
+        debug!("{} add tcp listener {:?}", req_id, listener);
+
+        let address: SocketAddr = listener.address.into();
+        let retained_frontends = self
+            .config_state
+            .tcp_fronts
+            .values()
+            .flatten()
+            .filter(|frontend| frontend.address == address)
+            .cloned()
+            .map(Into::into)
+            .collect();
+
+        if self.sessions.borrow().at_capacity() {
+            return worker_response_error(req_id, "session list is full, cannot add a listener");
+        }
+
+        let mut session_manager = self.sessions.borrow_mut();
+        let slab_before = session_manager.slab.len();
+        debug_assert!(
+            !session_manager
+                .slab
+                .contains(session_manager.slab.vacant_key()),
+            "the next vacant slab key must be free before insertion"
+        );
+        let entry = session_manager.slab.vacant_entry();
+        let token = Token(entry.key());
+
+        match self.tcp.borrow_mut().add_listener_with_retained_frontends(
+            listener,
+            token,
+            retained_frontends,
+        ) {
+            Ok(_token) => {
+                entry.insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::TCPListen,
+                })));
+                debug_assert!(
+                    session_manager.slab.contains(token.0),
+                    "listener insert must occupy the token's slab key"
+                );
+                debug_assert_eq!(
+                    session_manager.slab.len(),
+                    slab_before + 1,
+                    "adding a listener must occupy exactly one slab slot"
+                );
+                self.base_sessions_count += 1;
+                WorkerResponse::ok(req_id)
+            }
+            Err(e) => worker_response_error(req_id, format!("Could not add TCP listener: {e}")),
+        }
+    }
+
+    fn notify_add_udp_listener(
+        &mut self,
+        req_id: &str,
+        listener: CommandUdpListener,
+    ) -> WorkerResponse {
+        debug!("{} add udp listener {:?}", req_id, listener);
+
+        let address: SocketAddr = listener.address.into();
+        let retained_frontends = self
+            .config_state
+            .udp_fronts
+            .values()
+            .flatten()
+            .filter(|frontend| frontend.address == address)
+            .cloned()
+            .map(Into::into)
+            .collect();
+
+        if self.sessions.borrow().at_capacity() {
+            return worker_response_error(req_id, "session list is full, cannot add a listener");
+        }
+
+        let mut session_manager = self.sessions.borrow_mut();
+        let entry = session_manager.slab.vacant_entry();
+        let token = Token(entry.key());
+
+        match self.udp.borrow_mut().add_listener_with_retained_frontends(
+            listener,
+            token,
+            retained_frontends,
+        ) {
+            Ok(_token) => {
+                entry.insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::UDPListen,
+                })));
+                self.base_sessions_count += 1;
+                WorkerResponse::ok(req_id)
+            }
+            Err(e) => worker_response_error(req_id, format!("Could not add UDP listener: {e}")),
+        }
+    }
+
+    fn notify_update_udp_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateUdpListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update udp listener {:?}", req_id, patch.address);
+        match self.udp.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => worker_response_error(req_id, format!("Could not update UDP listener: {e}")),
+        }
+    }
+
+    fn notify_update_http_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateHttpListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update http listener {:?}", req_id, patch.address);
+        match self.http.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => worker_response_error(req_id, format!("Could not update HTTP listener: {e}")),
+        }
+    }
+
+    fn notify_update_https_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateHttpsListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update https listener {:?}", req_id, patch.address);
+        match self.https.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => {
+                worker_response_error(req_id, format!("Could not update HTTPS listener: {e}"))
+            }
+        }
+    }
+
+    fn notify_update_tcp_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateTcpListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update tcp listener {:?}", req_id, patch.address);
+        match self.tcp.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => worker_response_error(req_id, format!("Could not update TCP listener: {e}")),
+        }
+    }
+
+    /// Re-arm a deactivated listener's slab slot with the inert
+    /// [`ListenSession`] placeholder that `AddListener` first installed there.
+    ///
+    /// DESIGN (2026-09-18) — a listener owns exactly one slab slot for its
+    /// whole `AddListener` -> `RemoveListener` lifetime, activated or not.
+    /// The alternative was to stop retaining the token across a deactivate and
+    /// allocate a fresh slab key on every activate; it was rejected because
+    /// the token is the *identity* of a listener in all four proxies — their
+    /// `listeners` maps (plus UDP's `managers`, `cluster_for_listener` and
+    /// `listener_sessions`) are keyed by it, `give_back_listener` hands the
+    /// same token back and `activate()` returns it again — so a fresh key
+    /// would mean rekeying five maps across four proxies on every activate,
+    /// far more machinery than the defect warrants.
+    ///
+    /// Reserving the slot is what makes the retained token honest, and it
+    /// closes both halves of the defect at once:
+    ///
+    /// * the slot is never vacant, so `Server::ready` keeps dispatching the
+    ///   listen token after a deactivate/activate cycle. Freeing it left the
+    ///   socket re-registered under a token with no slab entry — `ready()`
+    ///   silently drops the event, and the reactivated listener was deaf
+    ///   while `ActivateListener` had reported success;
+    /// * the slab can never hand that key to another session, so the UDP
+    ///   activate path can no longer overwrite a live session with its
+    ///   listener session. Mode 2 is gone by construction, not by check.
+    ///
+    /// `RemoveListener` is the sole release point (see `notify_proxys`). No
+    /// proxy's `remove_listener` touches the session slab, so before this
+    /// change the deactivate arms were the ONLY code that ever freed a
+    /// listener's slot — removing a listener that had not been deactivated
+    /// first already stranded its slab key (and, for UDP, the last
+    /// `UdpListenerSession` reference, hence the listener's open `UdpSocket`).
+    /// Reserving the slot here makes that release mandatory rather than
+    /// incidental.
+    fn reserve_listen_token(&mut self, token: Token, protocol: Protocol) {
+        let mut sessions = self.sessions.borrow_mut();
+        match sessions.slab.get_mut(token.0) {
+            Some(slot) => {
+                *slot = Rc::new(RefCell::new(ListenSession { protocol }));
+                info!("reserved listen token {:?} for {:?}", token, protocol);
+            }
+            // Unreachable while the lifetime above holds: `AddListener`
+            // inserted the slot and only `RemoveListener` frees it. Loud
+            // rather than silent, because the listener is deaf if it happens.
+            None => error!(
+                "listen token {:?} ({:?}) has no slab slot to reserve; the listener would not be reachable if reactivated",
+                token, protocol
+            ),
+        }
+    }
+
+    /// Say what the initial state left unclaimed in the SCM table.
+    ///
+    /// A descriptor is kept whenever no listener exists at its address yet,
+    /// because an `AddListener` + `ActivateListener` pair can still arrive and
+    /// adopt it — `UpgradeWorkerTask` (`bin/src/command/upgrade.rs`) scatters
+    /// `generate_activate_requests()` only after `Server::new` has returned, so
+    /// there is no point during startup at which a leftover is provably
+    /// unclaimable. Retention is therefore open-ended, and the one thing this
+    /// worker can do is make it visible.
+    ///
+    /// An address that already has a listener is the expected shape (an initial
+    /// state carrying the listeners inactive, activated straight afterwards) and
+    /// is reported at `info`. An address with no listener at all is the one an
+    /// operator needs to see: nothing in this worker's state mentions it, so the
+    /// descriptor is the retiring worker's listening socket, still bound with
+    /// `SO_REUSEPORT` and registered with no event loop, which is expected to
+    /// keep taking a share of new connections that nothing accepts. (That
+    /// expectation follows from `SO_REUSEPORT` load-balancing semantics; nothing
+    /// here measures it.) That is reported at `warn`.
+    fn report_unclaimed_inherited_sockets(&self) {
+        let Some(scm_listeners) = self.scm_listeners.as_ref() else {
+            return;
+        };
+        let leftovers: [(&str, &Vec<(ListenerKey, RawFd)>); 4] = [
+            ("HTTP", &scm_listeners.http),
+            ("HTTPS", &scm_listeners.tls),
+            ("TCP", &scm_listeners.tcp),
+            ("UDP", &scm_listeners.udp),
+        ];
+        for (label, table) in leftovers {
+            for (address, fd) in table {
+                let has_listener = match label {
+                    "HTTP" => self.http.borrow().listener_token(address).is_some(),
+                    "HTTPS" => self.https.borrow().listener_token(address).is_some(),
+                    "TCP" => self.tcp.borrow().listener_token(address).is_some(),
+                    _ => self.udp.borrow().listener_token(address).is_some(),
+                };
+                if has_listener {
+                    info!(
+                        "inherited {} listening socket for {} (fd {}) is held for an \
+                         ActivateListener this worker has not processed yet",
+                        label, address, fd
+                    );
+                } else {
+                    warn!(
+                        "inherited {} listening socket for {} (fd {}) is held with no listener \
+                         at that address: until an AddListener plus ActivateListener for {} \
+                         adopts it, it is expected to keep taking a share of new connections \
+                         that nothing accepts (inferred from SO_REUSEPORT semantics, not \
+                         measured here)",
+                        label, address, fd, address
+                    );
+                }
+            }
+        }
+    }
+
+    fn notify_activate_listener(
+        &mut self,
+        req_id: &str,
+        activate: &ActivateListener,
+    ) -> WorkerResponse {
+        use crate::InheritedSocketFate;
+
+        debug!(
+            "{} activate {:?} listener {:?}",
+            req_id, activate.proxy, activate
+        );
+
+        let address = activate.listener_key();
+
+        match ListenerType::try_from(activate.proxy) {
+            Ok(ListenerType::Http) => {
+                let listener = match self.http.borrow().inherited_socket_fate(&address) {
+                    InheritedSocketFate::Adopted => self
+                        .scm_listeners
+                        .as_mut()
+                        .and_then(|listeners| listeners.get_http(&address))
+                        // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                        // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                        // `Listeners` table removes it on `get_http`. Ownership transfers to
+                        // the mio wrapper, whose `Drop` closes the descriptor.
+                        .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) }),
+                    InheritedSocketFate::Refused => {
+                        discard_inherited_socket::<MioTcpListener>(
+                            self.scm_listeners
+                                .as_mut()
+                                .and_then(|listeners| listeners.get_http(&address)),
+                            &address,
+                            "HTTP",
+                        );
+                        None
+                    }
+                    // Left in the SCM table on purpose: a later `AddListener` +
+                    // `ActivateListener` for this address can still adopt it.
+                    InheritedSocketFate::Unclaimed => None,
+                };
+
+                let activated_token = self.http.borrow_mut().activate_listener(&address, listener);
+                match activated_token {
+                    Ok(token) => {
+                        self.accept(ListenToken(token.0), Protocol::HTTPListen);
+                        WorkerResponse::ok(req_id)
+                    }
+                    Err(activate_error) => worker_response_error(
+                        req_id,
+                        format!("Could not activate HTTP listener: {activate_error}"),
+                    ),
+                }
+            }
+            Ok(ListenerType::Https) => {
+                let listener = match self.https.borrow().inherited_socket_fate(&address) {
+                    InheritedSocketFate::Adopted => self
+                        .scm_listeners
+                        .as_mut()
+                        .and_then(|listeners| listeners.get_https(&address))
+                        // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                        // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                        // `Listeners` table removes it on `get_https`. Ownership transfers to
+                        // the mio wrapper, whose `Drop` closes the descriptor.
+                        .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) }),
+                    InheritedSocketFate::Refused => {
+                        discard_inherited_socket::<MioTcpListener>(
+                            self.scm_listeners
+                                .as_mut()
+                                .and_then(|listeners| listeners.get_https(&address)),
+                            &address,
+                            "HTTPS",
+                        );
+                        None
+                    }
+                    // Left in the SCM table on purpose: a later `AddListener` +
+                    // `ActivateListener` for this address can still adopt it.
+                    InheritedSocketFate::Unclaimed => None,
+                };
+
+                let activated_token = self
+                    .https
+                    .borrow_mut()
+                    .activate_listener(&address, listener);
+                match activated_token {
+                    Ok(token) => {
+                        self.accept(ListenToken(token.0), Protocol::HTTPSListen);
+                        WorkerResponse::ok(req_id)
+                    }
+                    Err(activate_error) => worker_response_error(
+                        req_id,
+                        format!("Could not activate HTTPS listener: {activate_error}"),
+                    ),
+                }
+            }
+            Ok(ListenerType::Tcp) => {
+                let listener = match self.tcp.borrow().inherited_socket_fate(&address) {
+                    InheritedSocketFate::Adopted => self
+                        .scm_listeners
+                        .as_mut()
+                        .and_then(|listeners| listeners.get_tcp(&address))
+                        // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                        // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                        // `Listeners` table removes it on `get_tcp`. Ownership transfers to
+                        // the mio wrapper, whose `Drop` closes the descriptor.
+                        .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) }),
+                    InheritedSocketFate::Refused => {
+                        discard_inherited_socket::<MioTcpListener>(
+                            self.scm_listeners
+                                .as_mut()
+                                .and_then(|listeners| listeners.get_tcp(&address)),
+                            &address,
+                            "TCP",
+                        );
+                        None
+                    }
+                    // Left in the SCM table on purpose: a later `AddListener` +
+                    // `ActivateListener` for this address can still adopt it.
+                    InheritedSocketFate::Unclaimed => None,
+                };
+
+                let listener_token = self.tcp.borrow_mut().activate_listener(&address, listener);
+                match listener_token {
+                    Ok(token) => {
+                        self.accept(ListenToken(token.0), Protocol::TCPListen);
+                        WorkerResponse::ok(req_id)
+                    }
+                    Err(activate_error) => worker_response_error(
+                        req_id,
+                        format!("Could not activate TCP listener: {activate_error}"),
+                    ),
+                }
+            }
+            Ok(ListenerType::Udp) => {
+                let socket = match self.udp.borrow().inherited_socket_fate(&address) {
+                    InheritedSocketFate::Adopted => self
+                        .scm_listeners
+                        .as_mut()
+                        .and_then(|listeners| listeners.get_udp(&address))
+                        // SAFETY: `fd` was just received from the supervisor via
+                        // SCM_RIGHTS (see `command/src/scm_socket.rs`) and is not
+                        // owned elsewhere — `Listeners::get_udp` removes it from
+                        // the table. Ownership transfers to the mio `UdpSocket`
+                        // wrapper, whose `Drop` closes the descriptor. `O_NONBLOCK`
+                        // + `SO_REUSE*` are file-description flags preserved across
+                        // SCM + exec.
+                        .map(|fd| unsafe { MioUdpSocket::from_raw_fd(fd) }),
+                    InheritedSocketFate::Refused => {
+                        discard_inherited_socket::<MioUdpSocket>(
+                            self.scm_listeners
+                                .as_mut()
+                                .and_then(|listeners| listeners.get_udp(&address)),
+                            &address,
+                            "UDP",
+                        );
+                        None
+                    }
+                    // Left in the SCM table on purpose: a later `AddListener` +
+                    // `ActivateListener` for this address can still adopt it.
+                    InheritedSocketFate::Unclaimed => None,
+                };
+
+                let activated_token = self.udp.borrow_mut().activate_listener(&address, socket);
+                match activated_token {
+                    Ok(token) => {
+                        // UDP never uses accept()/create_session: replace the
+                        // `ListenSession` placeholder at the listener token with
+                        // the real `UdpListenerSession` so the READABLE
+                        // registration drives `Server::ready`'s generic path
+                        // into `UdpListenerSession::update_readiness`.
+                        //
+                        // Install it once per ACTIVATION, not once per request.
+                        // `Ok(token)` does not mean this call activated
+                        // anything: `UdpListener::activate` short-circuits on
+                        // its own `active` flag and answers `Ok(self.token)` for
+                        // a listener that is already up. Nothing upstream
+                        // filters that repeat out either —
+                        // `ConfigState::activate_listener` sets `active = true`
+                        // and answers `Ok(())` however often it is asked, so the
+                        // main process forwards a second
+                        // `sozu listener udp activate`, and
+                        // `ConfigState::generate_requests` re-emits
+                        // `ActivateListener` for every active listener on each
+                        // state replay.
+                        //
+                        // Rebuilding on a repeat would therefore overwrite a
+                        // LIVE session: the proxy keeps the shared `UdpManager`
+                        // and its flow table, but the replacement session starts
+                        // with empty `upstream_sockets` / `upstream_to_flow` /
+                        // `flow_to_upstream`, so every in-flight flow stops
+                        // forwarding and its upstream slab slot can never be
+                        // released (`on_close_flow` reaches it only through
+                        // `flow_to_upstream`). `close()` is a `ProxySession`
+                        // method and not `Drop`, so dropping the displaced
+                        // session runs no teardown on the way out.
+                        //
+                        // `has_listener_session` is the precise "already
+                        // installed" test — `build_session` is its only
+                        // producer, and deactivate / remove / soft+hard stop are
+                        // its only consumers — paired with the reserved slab
+                        // slot still being present, so a slot that vanished
+                        // still falls through to the invariant-break report
+                        // below. It deliberately tracks the INSTALLED session
+                        // and not the listener's `active` flag: the SCM
+                        // hand-off's `give_back_listeners` clears `active` and
+                        // takes the socket without removing the session, and
+                        // skipping the rebuild there is right — the retained
+                        // session reaches the freshly bound socket through the
+                        // shared `Rc<RefCell<UdpListener>>`, so its flows
+                        // survive the re-exec instead of being orphaned. A repeat then answers `ok` having touched
+                        // nothing: the listener is active and its session is in
+                        // the slab, which is exactly what the caller asked for,
+                        // and it matches what the HTTP/HTTPS/TCP arms already
+                        // answer for their own repeats.
+                        let session_installed = self.udp.borrow().has_listener_session(token)
+                            && self.sessions.borrow().slab.contains(token.0);
+                        if !session_installed {
+                            // The slot is reserved for the listener's whole
+                            // lifetime (`reserve_listen_token`), so both failures
+                            // below are invariant breaks; report them instead of
+                            // returning `ok` for a listener whose socket is
+                            // registered under a token `Server::ready` would
+                            // ignore.
+                            let session = match self.udp.borrow_mut().build_session(token) {
+                                Some(session) => session,
+                                None => {
+                                    return worker_response_error(
+                                        req_id,
+                                        format!(
+                                            "Could not build the UDP listener session for {address}"
+                                        ),
+                                    );
+                                }
+                            };
+                            let mut sessions = self.sessions.borrow_mut();
+                            match sessions.slab.get_mut(token.0) {
+                                Some(slot) => *slot = session,
+                                None => {
+                                    return worker_response_error(
+                                        req_id,
+                                        format!(
+                                            "UDP listener {address} has no session slot at {token:?}"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        WorkerResponse::ok(req_id)
+                    }
+                    Err(activate_error) => worker_response_error(
+                        req_id,
+                        format!("Could not activate UDP listener: {activate_error}"),
+                    ),
+                }
+            }
+            Err(_) => worker_response_error(req_id, "Wrong variant for ListenerType on request"),
+        }
+    }
+
+    fn notify_deactivate_listener(
+        &mut self,
+        req_id: &str,
+        deactivate: &DeactivateListener,
+    ) -> WorkerResponse {
+        debug!(
+            "{} deactivate {:?} listener {:?}",
+            req_id, deactivate.proxy, deactivate
+        );
+
+        let address = deactivate.listener_key();
+
+        match ListenerType::try_from(deactivate.proxy) {
+            Ok(ListenerType::Http) => {
+                let (token, mut listener) =
+                    match self.http.borrow_mut().give_back_listener(&address) {
+                        Ok((token, listener)) => (token, listener),
+                        Err(e) => {
+                            return worker_response_error(
+                                req_id,
+                                format!("Couldn't deactivate HTTP listener at {address}: {e}"),
+                            );
+                        }
+                    };
+
+                if let Err(e) = self.poll.registry().deregister(&mut listener) {
+                    error!(
+                        "error deregistering HTTP listen socket({:?}): {:?}",
+                        deactivate, e
+                    );
+                }
+
+                // The slot stays RESERVED for the deactivated listener — see
+                // `reserve_listen_token`. It carries the same inert placeholder
+                // `AddListener` installed, so a later `ActivateListener` finds
+                // its token still valid and no other session can take the key.
+                self.reserve_listen_token(token, Protocol::HTTPListen);
+                // The listen token may still be queued for a deferred accept
+                // (`ready()` enqueues it whenever the listener is readable but
+                // `can_accept` is false). The listener has just given its
+                // socket back, so `handle_remaining_readiness` must not call
+                // `accept()` on it.
+                self.accept_ready.remove(&ListenToken(token.0));
+
+                if deactivate.to_scm {
+                    self.unblock_scm_socket();
+                    let listeners = Listeners {
+                        http: vec![(address.clone(), listener.as_raw_fd())],
+                        tls: vec![],
+                        tcp: vec![],
+                        udp: vec![],
+                    };
+                    info!("sending HTTP listener: {:?}", listeners);
+                    let res = self.scm.send_listeners(&listeners);
+
+                    self.block_scm_socket();
+
+                    info!("sent HTTP listener: {:?}", res);
+                }
+                WorkerResponse::ok(req_id)
+            }
+            Ok(ListenerType::Https) => {
+                let (token, mut listener) =
+                    match self.https.borrow_mut().give_back_listener(&address) {
+                        Ok((token, listener)) => (token, listener),
+                        Err(e) => {
+                            return worker_response_error(
+                                req_id,
+                                format!("Couldn't deactivate HTTPS listener at {address}: {e}",),
+                            );
+                        }
+                    };
+                if let Err(e) = self.poll.registry().deregister(&mut listener) {
+                    error!(
+                        "error deregistering HTTPS listen socket({:?}): {:?}",
+                        deactivate, e
+                    );
+                }
+                // See the HTTP arm: the slot stays reserved, and a
+                // socket-less listener must not stay queued for an accept.
+                self.reserve_listen_token(token, Protocol::HTTPSListen);
+                self.accept_ready.remove(&ListenToken(token.0));
+
+                if deactivate.to_scm {
+                    self.unblock_scm_socket();
+                    let listeners = Listeners {
+                        http: vec![],
+                        tls: vec![(address.clone(), listener.as_raw_fd())],
+                        tcp: vec![],
+                        udp: vec![],
+                    };
+                    info!("sending HTTPS listener: {:?}", listeners);
+                    let res = self.scm.send_listeners(&listeners);
+
+                    self.block_scm_socket();
+
+                    info!("sent HTTPS listener: {:?}", res);
+                }
+                WorkerResponse::ok(req_id)
+            }
+            Ok(ListenerType::Tcp) => {
+                let (token, mut listener) = match self.tcp.borrow_mut().give_back_listener(&address)
+                {
+                    Ok((token, listener)) => (token, listener),
+                    Err(e) => {
+                        return worker_response_error(
+                            req_id,
+                            format!("Could not deactivate TCP listener at {address}: {e}"),
+                        );
+                    }
+                };
+
+                if let Err(e) = self.poll.registry().deregister(&mut listener) {
+                    error!(
+                        "error deregistering TCP listen socket({:?}): {:?}",
+                        deactivate, e
+                    );
+                }
+                // See the HTTP arm: the slot stays reserved, and a
+                // socket-less listener must not stay queued for an accept.
+                self.reserve_listen_token(token, Protocol::TCPListen);
+                self.accept_ready.remove(&ListenToken(token.0));
+
+                if deactivate.to_scm {
+                    self.unblock_scm_socket();
+                    let listeners = Listeners {
+                        http: vec![],
+                        tls: vec![],
+                        tcp: vec![(address.clone(), listener.as_raw_fd())],
+                        udp: vec![],
+                    };
+                    info!("sending TCP listener: {:?}", listeners);
+                    let res = self.scm.send_listeners(&listeners);
+
+                    self.block_scm_socket();
+
+                    info!("sent TCP listener: {:?}", res);
+                }
+                WorkerResponse::ok(req_id)
+            }
+            Ok(ListenerType::Udp) => {
+                let (token, mut listener) = match self.udp.borrow_mut().give_back_listener(&address)
+                {
+                    Ok((token, listener)) => (token, listener),
+                    Err(e) => {
+                        return worker_response_error(
+                            req_id,
+                            format!("Could not deactivate UDP listener at {address}: {e}"),
+                        );
+                    }
+                };
+
+                if let Err(e) = self.poll.registry().deregister(&mut listener) {
+                    error!(
+                        "error deregistering UDP listen socket({:?}): {:?}",
+                        deactivate, e
+                    );
+                }
+                // See the HTTP arm. For UDP this ALSO drops the live
+                // `UdpListenerSession` the activate path installed here,
+                // putting the slot back to the placeholder — the flows it owned
+                // were already torn down by `give_back_listener`.
+                self.reserve_listen_token(token, Protocol::UDPListen);
+                // A UDP listen token never reaches `accept_ready` (`ready()`
+                // only enqueues the three accept-driven listen protocols), but
+                // the removal keeps the rule uniform across the four arms.
+                self.accept_ready.remove(&ListenToken(token.0));
+
+                if deactivate.to_scm {
+                    self.unblock_scm_socket();
+                    let listeners = Listeners {
+                        http: vec![],
+                        tls: vec![],
+                        tcp: vec![],
+                        udp: vec![(address.clone(), listener.as_raw_fd())],
+                    };
+                    info!("sending UDP listener: {:?}", listeners);
+                    let res = self.scm.send_listeners(&listeners);
+
+                    self.block_scm_socket();
+
+                    info!("sent UDP listener: {:?}", res);
+                }
+                WorkerResponse::ok(req_id)
+            }
+            Err(_) => worker_response_error(req_id, "Wrong variant for ListenerType on request"),
+        }
+    }
+
+    /// Send all socket addresses and file descriptors of all proxies, via the scm socket
+    pub fn return_listen_sockets(&mut self) -> Result<(), ScmSocketError> {
+        self.unblock_scm_socket();
+
+        let mut http_listeners = self.http.borrow_mut().give_back_listeners();
+        for &mut (_, ref mut sock) in http_listeners.iter_mut() {
+            if let Err(e) = self.poll.registry().deregister(sock) {
+                error!(
+                    "error deregistering HTTP listen socket({:?}): {:?}",
+                    sock, e
+                );
+            }
+        }
+
+        let mut https_listeners = self.https.borrow_mut().give_back_listeners();
+        for &mut (_, ref mut sock) in https_listeners.iter_mut() {
+            if let Err(e) = self.poll.registry().deregister(sock) {
+                error!(
+                    "error deregistering HTTPS listen socket({:?}): {:?}",
+                    sock, e
+                );
+            }
+        }
+
+        let mut tcp_listeners = self.tcp.borrow_mut().give_back_listeners();
+        for &mut (_, ref mut sock) in tcp_listeners.iter_mut() {
+            if let Err(e) = self.poll.registry().deregister(sock) {
+                error!("error deregistering TCP listen socket({:?}): {:?}", sock, e);
+            }
+        }
+
+        let mut udp_listeners = self.udp.borrow_mut().give_back_listeners();
+        for &mut (_, ref mut sock) in udp_listeners.iter_mut() {
+            if let Err(e) = self.poll.registry().deregister(sock) {
+                error!("error deregistering UDP listen socket({:?}): {:?}", sock, e);
+            }
+        }
+
+        // use as_raw_fd because the listeners should be dropped after sending them
+        let listeners = Listeners {
+            http: http_listeners
+                .iter()
+                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
+                .collect(),
+            tls: https_listeners
+                .iter()
+                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
+                .collect(),
+            tcp: tcp_listeners
+                .iter()
+                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
+                .collect(),
+            udp: udp_listeners
+                .iter()
+                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
+                .collect(),
+        };
+        // Each handed-back listener is collected exactly once: the assembled
+        // fd lists mirror the give_back lists one-to-one (the maps above are
+        // straight `.iter().map().collect()` with no filtering or dedup).
+        debug_assert_eq!(
+            listeners.http.len(),
+            http_listeners.len(),
+            "every HTTP listener must be collected exactly once"
+        );
+        debug_assert_eq!(
+            listeners.tls.len(),
+            https_listeners.len(),
+            "every HTTPS listener must be collected exactly once"
+        );
+        debug_assert_eq!(
+            listeners.tcp.len(),
+            tcp_listeners.len(),
+            "every TCP listener must be collected exactly once"
+        );
+        info!("sending default listeners: {:?}", listeners);
+        let res = self.scm.send_listeners(&listeners);
+
+        self.block_scm_socket();
+
+        info!("sent default listeners: {:?}", res);
+        res
+    }
+
+    fn block_scm_socket(&mut self) {
+        if let Err(e) = self.scm.set_blocking(true) {
+            error!("Could not block scm socket: {}", e);
+        }
+    }
+
+    fn unblock_scm_socket(&mut self) {
+        if let Err(e) = self.scm.set_blocking(false) {
+            error!("Could not unblock scm socket: {}", e);
+        }
+    }
+
+    pub fn to_session(&self, token: Token) -> SessionToken {
+        SessionToken(token.0)
+    }
+
+    pub fn from_session(&self, token: SessionToken) -> Token {
+        Token(token.0)
+    }
+
+    pub fn accept(&mut self, token: ListenToken, protocol: Protocol) {
+        // Per-protocol counter key. Keeping the namespace static (3 keys +
+        // aggregate) is a deliberate cardinality cap: per-listener-address
+        // labelling would require runtime `Box::leak` because `incr!` takes
+        // `&'static str`, and listener addresses can be reconfigured at
+        // runtime by the control plane. Operators wanting per-listener
+        // attribution should correlate with the listener-protocol breakdown
+        // below.
+        //
+        // Non-listen protocols reach this code only on an invariant break
+        // upstream (`ready()` dispatched a non-listen `Protocol` to
+        // `accept()`). Log and return rather than panicking — defense in
+        // depth on the accept path, which is process-fatal if it aborts.
+        let (proto_key, accepted_protocol) = match protocol {
+            Protocol::TCPListen => ("listener.accepted.tcp", Protocol::TCPListen),
+            Protocol::HTTPListen => ("listener.accepted.http", Protocol::HTTPListen),
+            Protocol::HTTPSListen => ("listener.accepted.https", Protocol::HTTPSListen),
+            other => {
+                warn!(
+                    "accept() called with non-listen protocol {:?} on token {:?}; skipping",
+                    other, token
+                );
+                return;
+            }
+        };
+
+        // Past the guard, `accepted_protocol` is one of the three listen
+        // variants — the inner dispatch's `unreachable!` arm relies on this.
+        debug_assert!(
+            matches!(
+                accepted_protocol,
+                Protocol::TCPListen | Protocol::HTTPListen | Protocol::HTTPSListen
+            ),
+            "accept dispatch must run with a listen protocol only"
+        );
+
+        loop {
+            let result = match accepted_protocol {
+                Protocol::TCPListen => self.tcp.borrow_mut().accept(token),
+                Protocol::HTTPListen => self.http.borrow_mut().accept(token),
+                Protocol::HTTPSListen => self.https.borrow_mut().accept(token),
+                // The outer match populates `accepted_protocol` only with the
+                // three listen variants and returns early otherwise — this
+                // arm is structurally unreachable.
+                other => unreachable!(
+                    "accept dispatch reached non-listen protocol {:?} after outer guard",
+                    other
+                ),
+            };
+            match result {
+                Ok((sock, peer)) => {
+                    // `peer` is the address `accept(2)` returned: the counter
+                    // and the session below both use it, and neither costs a
+                    // `getpeername(2)`.
+                    incr!(names::listener::ACCEPTED_TOTAL);
+                    incr!(proto_key);
+                    incr!(per_source_bucket(&peer));
+                    let queue_before = self.accept_queue.len();
+                    self.accept_queue.push_back((
+                        sock,
+                        token,
+                        accepted_protocol,
+                        Instant::now(),
+                        peer,
+                    ));
+                    // One accepted socket enqueues exactly one entry.
+                    debug_assert_eq!(
+                        self.accept_queue.len(),
+                        queue_before + 1,
+                        "each accepted socket must enqueue exactly one entry"
+                    );
+                }
+                Err(AcceptError::WouldBlock) => {
+                    self.accept_ready.remove(&token);
+                    break;
+                }
+                Err(other) => {
+                    error!(
+                        "error accepting {:?} sockets: {:?}",
+                        accepted_protocol, other
+                    );
+                    self.accept_ready.remove(&token);
+                    break;
+                }
+            }
+        }
+
+        gauge!(names::accept_queue::CONNECTIONS, self.accept_queue.len());
+    }
+
+    pub fn create_sessions(&mut self) {
+        while let Some((sock, token, protocol, timestamp, peer)) = self.accept_queue.pop_back() {
+            let wait_time = Instant::now() - timestamp;
+            time!(names::accept_queue::WAIT_TIME, wait_time.as_millis());
+            if wait_time > self.accept_queue_timeout {
+                incr!(names::accept_queue::TIMEOUT);
+                continue;
+            }
+
+            if !self.sessions.borrow_mut().check_limits() {
+                // Every `break` below drops the socket we just popped,
+                // unserved, while the remaining queued sockets wait for the
+                // next pass or time out. `listener.connection_capped` counts
+                // exactly that dropped socket, once, at each `break`: a socket
+                // served after eviction made room is not a refusal.
+                if !self.evict_on_queue_full {
+                    incr!(names::listener::CONNECTION_CAPPED);
+                    break;
+                }
+
+                // Skip eviction during graceful shutdown — defeats the
+                // shutting_down semantics and is wasted work since the
+                // worker is winding down anyway.
+                if self.shutting_down.is_some() {
+                    incr!(names::listener::CONNECTION_CAPPED);
+                    break;
+                }
+
+                // Evict 1% of `max_connections` per iteration. Conservative
+                // ratio: large enough to make meaningful progress clearing
+                // the accept queue, small enough to limit collateral damage
+                // to active sessions. The cap loop re-checks limits after
+                // each eviction round, so multiple rounds can run if the
+                // queue has many pending connections. Decoupled from
+                // `slab_entries_per_connection` (which only sizes the slab,
+                // not `max_connections`).
+                let to_evict = (self.sessions.borrow().max_connections / 100).max(1);
+                let evicted = self.evict_least_active_sessions(to_evict);
+                if evicted == 0 {
+                    // Informational, not an invariant break: the worker may
+                    // be at boot, or every active session is a system
+                    // protocol (Channel/Metrics/Timer/listeners) and is
+                    // ineligible. Stay at warn so operators see it in info-
+                    // level production logs.
+                    warn!("evict_on_queue_full enabled but no candidate sessions to evict");
+                    incr!(names::listener::CONNECTION_CAPPED);
+                    break;
+                }
+
+                count!(names::sessions::EVICTED, evicted as i64);
+                warn!(
+                    "evicted {} least recently active sessions to make room",
+                    evicted
+                );
+
+                if !self.sessions.borrow_mut().check_limits() {
+                    incr!(names::listener::CONNECTION_CAPPED);
+                    break;
+                }
+            }
+
+            //FIXME: check the timestamp
+            //TODO: create_session should return the session and
+            // the server should insert it in the the SessionManager
+            // The accept path only ever enqueues listen protocols, so the
+            // `_ => panic!` arm below is genuinely unreachable. Assert the set
+            // here so a future enqueue regression trips in debug, not prod.
+            debug_assert!(
+                matches!(
+                    protocol,
+                    Protocol::TCPListen | Protocol::HTTPListen | Protocol::HTTPSListen
+                ),
+                "accept queue must only hold listen protocols, got {protocol:?}"
+            );
+            match protocol {
+                Protocol::TCPListen => {
+                    let proxy = self.tcp.clone();
+                    if self
+                        .tcp
+                        .borrow_mut()
+                        .create_session(sock, peer, token, wait_time, proxy)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Protocol::HTTPListen => {
+                    let proxy = self.http.clone();
+                    if self
+                        .http
+                        .borrow_mut()
+                        .create_session(sock, peer, token, wait_time, proxy)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Protocol::HTTPSListen => {
+                    if self
+                        .https
+                        .borrow_mut()
+                        .create_session(sock, peer, token, wait_time, self.https.clone())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
+            };
+            let nb_before = self.sessions.borrow().nb_connections;
+            self.sessions.borrow_mut().incr();
+            // A successfully created session bumps the live count by one.
+            debug_assert_eq!(
+                self.sessions.borrow().nb_connections,
+                nb_before + 1,
+                "create_sessions must account exactly one new connection per created session"
+            );
+        }
+
+        gauge!(names::accept_queue::CONNECTIONS, self.accept_queue.len());
+    }
+
+    /// Record, for each token of one `epoll_wait` result, the session its
+    /// slab slot holds right now, before any of the result is dispatched.
+    fn snapshot_event_owners(
+        &self,
+        tokens: impl Iterator<Item = Token>,
+        owners: &mut Vec<Option<Rc<RefCell<dyn ProxySession>>>>,
+    ) {
+        debug_assert!(
+            owners.is_empty(),
+            "the previous turn must have consumed every event owner"
+        );
+        let sessions = self.sessions.borrow();
+        owners.extend(tokens.map(|token| sessions.slab.get(token.0).cloned()));
+    }
+
+    /// Dispatch `events` through `Server::ready` only if `token` still
+    /// belongs to `owner`, the session `Server::snapshot_event_owners`
+    /// recorded for it when `epoll_wait` returned.
+    ///
+    /// A session that closes while the loop walks one `epoll_wait` result
+    /// frees its slab slots at once, and the slab hands the most recently
+    /// freed key to the next allocation. A session dispatched later in the
+    /// same result can therefore take that key for its new backend
+    /// (`TcpSession::connect_to_backend` in `lib/src/tcp.rs`, or the mux's
+    /// backend dial through `L7Proxy::add_session`, `lib/src/lib.rs`) while the
+    /// result still holds an event, typically a HUP, from the closed
+    /// session's own socket. Delivered under the reused token, that event
+    /// reads as the new backend hanging up, and the new session closes
+    /// (sozu-proxy/sozu#1877). Comparing with the recorded owner drops it.
+    /// The recorded `Rc` stays alive until this call, so no new session can
+    /// sit at its address and pass the comparison by accident.
+    ///
+    /// The guard compares sessions, not sockets: a session that closes one of
+    /// its own backends and dials another in the same result, on a different
+    /// descriptor's event, gets the freed key back under the same `Rc`, and a
+    /// queued event of the old socket still reaches it.
+    fn ready_if_still_owned(
+        &mut self,
+        token: Token,
+        events: Ready,
+        owner: Option<Rc<RefCell<dyn ProxySession>>>,
+    ) {
+        let still_owned = owner.is_some_and(|owner| {
+            self.sessions
+                .borrow()
+                .slab
+                .get(token.0)
+                .is_some_and(|current| Rc::ptr_eq(current, &owner))
+        });
+        if !still_owned {
+            trace!(
+                "PROXY\t{:?} dropping events {:?} from a socket whose session closed earlier in this epoll result",
+                token, events
+            );
+            return;
+        }
+        self.ready(token, events);
+    }
+
+    pub fn ready(&mut self, token: Token, events: Ready) {
+        trace!("PROXY\t{:?} got events: {:?}", token, events);
+
+        let session_token = token.0;
+        if self.sessions.borrow().slab.contains(session_token) {
+            //info!("sessions contains {:?}", session_token);
+            let protocol = self.sessions.borrow().slab[session_token]
+                .borrow()
+                .protocol();
+            // NOTE: `token` is NOT necessarily the session's frontend token. A
+            // session is registered under BOTH its frontend and its backend slab
+            // slots (the multi-token pattern: `connect_to_backend` inserts the
+            // same session Rc under a second vacant key), so `ready()` is also
+            // dispatched with the backend token, where `frontend_token() !=
+            // session_token`. There is therefore no `token == frontend_token`
+            // identity to assert here.
+            //info!("protocol: {:?}", protocol);
+            match protocol {
+                Protocol::HTTPListen | Protocol::HTTPSListen | Protocol::TCPListen => {
+                    //info!("PROTOCOL IS LISTEN");
+                    if events.is_readable() {
+                        self.accept_ready.insert(ListenToken(token.0));
+                        if self.sessions.borrow().can_accept {
+                            self.accept(ListenToken(token.0), protocol);
+                        }
+                        return;
+                    }
+
+                    if events.is_writable() {
+                        error!(
+                            "received writable for listener {:?}, this should not happen",
+                            token
+                        );
+                        return;
+                    }
+
+                    if events.is_hup() {
+                        error!("should not happen: server {:?} closed", token);
+                        return;
+                    }
+
+                    unreachable!();
+                }
+                _ => {}
+            }
+
+            let session = self.sessions.borrow_mut().slab[session_token].clone();
+            session.borrow_mut().update_readiness(token, events);
+            if session.borrow_mut().ready(session.clone()) {
+                debug!(
+                    "Server killing session from ready: token={:?}, protocol={:?}, events={:?}",
+                    token, protocol, events
+                );
+                self.kill_session(session);
+            }
+        }
+    }
+
+    pub fn timeout(&mut self, token: Token) {
+        trace!("PROXY\t{:?} got timeout", token);
+
+        let session_token = token.0;
+        if self.sessions.borrow().slab.contains(session_token) {
+            let session = self.sessions.borrow_mut().slab[session_token].clone();
+            if session.borrow_mut().timeout(token) {
+                debug!(
+                    "Server killing session from timeout: token={:?}, protocol={:?}",
+                    token,
+                    session.borrow().protocol()
+                );
+                self.kill_session(session);
+            } else if session.borrow().needs_ready_pass() {
+                // The timeout left work only `ready` can do, and no socket
+                // event will come to trigger it: a backend whose connect timed
+                // out must be counted as failed and its requests sent to
+                // another backend (sozu-proxy/sozu#1800).
+                if session.borrow_mut().ready(session.clone()) {
+                    debug!(
+                        "Server killing session from ready after timeout: token={:?}, protocol={:?}",
+                        token,
+                        session.borrow().protocol()
+                    );
+                    self.kill_session(session);
+                }
+            }
+        }
+    }
+
+    pub fn handle_remaining_readiness(&mut self) {
+        // try to accept again after handling all session events,
+        // since we might have released a few session slots
+        if self.sessions.borrow().can_accept && !self.accept_ready.is_empty() {
+            while let Some(token) = self
+                .accept_ready
+                .iter()
+                .next()
+                .map(|token| ListenToken(token.0))
+            {
+                // A listen token queued here while `can_accept` was false can
+                // outlive its slab entry. `notify_deactivate_listener` no
+                // longer frees that entry — it RESERVES the slot, re-arming it
+                // with the inert `ListenSession` placeholder (see
+                // `reserve_listen_token`) — so after a deactivate the lookup
+                // below still succeeds and it is the `accept_ready` purge in
+                // those arms that keeps a socket-less listener out of
+                // `accept()`. `RemoveListener` is the sole release point of the
+                // slot (`notify_proxys`), and it purges the token too, so a
+                // token reaching this loop with no slab entry means those
+                // purges were bypassed. Indexing the slab with it panicked the
+                // worker, hence the fallible `get`. Purging it HERE as well as
+                // at those sites is what keeps the loop finite: `accept()`
+                // below only removes the token on `WouldBlock`/error, so a
+                // `continue` without the removal would hand `iter().next()` the
+                // same stale token forever.
+                let protocol = self
+                    .sessions
+                    .borrow()
+                    .slab
+                    .get(token.0)
+                    .map(|session| session.borrow().protocol());
+                let Some(protocol) = protocol else {
+                    error!(
+                        "accept_ready holds listen token {:?}, which no longer has a session; dropping it",
+                        token
+                    );
+                    self.accept_ready.remove(&token);
+                    continue;
+                };
+                self.accept(token, protocol);
+                if !self.sessions.borrow().can_accept || self.accept_ready.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    fn block_channel(&mut self) {
+        if let Err(e) = self.channel.blocking() {
+            error!("Could not block channel: {}", e);
+        }
+    }
+    fn unblock_channel(&mut self) {
+        if let Err(e) = self.channel.nonblocking() {
+            error!("Could not block channel: {}", e);
+        }
+    }
+
+    /// Evict the `count` least-recently-active non-listener sessions and
+    /// return how many tokens were enqueued for shutdown. Used by
+    /// `create_sessions` when the accept queue is saturated and the
+    /// `evict_on_queue_full` knob is set.
+    ///
+    /// Uses `select_nth_unstable_by_key` (introselect, O(n) average) to
+    /// partition the oldest `count` sessions in-place rather than a full
+    /// O(n log n) sort. The candidate `Vec` is unavoidable because of
+    /// `RefCell` borrow rules — the immutable borrow on `self.sessions`
+    /// must drop before `shut_down_sessions_by_frontend_tokens` can take
+    /// its mutable borrow.
+    fn evict_least_active_sessions(&self, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+
+        let tokens = {
+            let sessions = self.sessions.borrow();
+            let mut candidates: Vec<(Token, Instant)> = sessions
+                .slab
+                .iter()
+                .filter(|(_, session)| {
+                    !matches!(
+                        session.borrow().protocol(),
+                        Protocol::HTTPListen
+                            | Protocol::HTTPSListen
+                            | Protocol::TCPListen
+                            | Protocol::UDPListen
+                            | Protocol::Channel
+                            | Protocol::Metrics
+                            | Protocol::Timer
+                    )
+                })
+                .map(|(_, session)| {
+                    let s = session.borrow();
+                    (s.frontend_token(), s.last_event())
+                })
+                .collect();
+
+            // Early return is load-bearing: the `pivot` computation below
+            // does `count.min(len) - 1`, which underflows on empty input.
+            if candidates.is_empty() {
+                return 0;
+            }
+
+            let pivot = count.min(candidates.len()) - 1;
+            candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+            candidates[..=pivot]
+                .iter()
+                .map(|&(token, _)| token)
+                .collect::<HashSet<Token>>()
+        };
+
+        let evicted = tokens.len();
+        self.shut_down_sessions_by_frontend_tokens(tokens);
+        evicted
+    }
+}
+
+/// Close an inherited listening socket this worker is not going to use, and
+/// say so.
+///
+/// Reached only for [`crate::InheritedSocketFate::Refused`]: a listener is
+/// already up at `address` on a socket of its own, so `activate()`
+/// short-circuits and nothing consumes this descriptor. That is a statement
+/// about now, not about the lifetime — `DeactivateListener` then
+/// `ActivateListener` would bring the address back to `Adopted`, and because
+/// `scm_listeners` is filled once and never refilled, closing here means such a
+/// reactivation binds a fresh socket. See [`crate::InheritedSocketFate::Refused`]
+/// for why that trade is taken: a queued backlog decays, whereas an unaccepted
+/// socket in the address's `SO_REUSEPORT` group is expected to go on taking a
+/// share of new connections for as long as it stays open. That expectation
+/// follows from `SO_REUSEPORT` load-balancing semantics; nothing here measures
+/// it.
+///
+/// The close is explicit rather than a dropped wrapper falling out of scope: it
+/// is the same syscall either way, but this one is deliberate, attributable and
+/// logged, which is precisely what sozu#1342 was missing.
+fn discard_inherited_socket<T: FromRawFd>(
+    fd: Option<RawFd>,
+    address: &ListenerKey,
+    protocol: &str,
+) {
+    let Some(fd) = fd else {
+        return;
+    };
+    warn!(
+        "closing the inherited {} listening socket for {}: this worker already has an active \
+         listener there, so nothing will adopt this descriptor unless that listener is \
+         deactivated and reactivated, and until then it is expected to keep taking a share of \
+         new connections that nothing accepts (inferred from SO_REUSEPORT semantics, not \
+         measured here)",
+        protocol, address
+    );
+    // SAFETY: `fd` was just removed from the SCM table by `Listeners::get_*`,
+    // which hands over ownership, so no other owner survives. The wrapper is
+    // built only to be dropped: `Drop` is what performs the close.
+    drop(unsafe { T::from_raw_fd(fd) });
+}
+
+/// The refusal of a request the initial handshake does not admit now.
+const REFUSED_INITIAL_REQUEST: &str = "unexpected request before the initial status";
+
+/// log the error together with the request id
+/// create a WorkerResponse
+fn worker_response_error<S: ToString, T: ToString>(request_id: S, error: T) -> WorkerResponse {
+    error!(
+        "error on request {}, {}",
+        request_id.to_string(),
+        error.to_string()
+    );
+    WorkerResponse::error(request_id, error)
+}
+
+pub struct ListenSession {
+    pub protocol: Protocol,
+}
+
+impl ProxySession for ListenSession {
+    fn last_event(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn print_session(&self) {}
+
+    fn frontend_token(&self) -> Token {
+        Token(0)
+    }
+
+    fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
+    fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+        false
+    }
+
+    fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        false
+    }
+
+    fn update_readiness(&mut self, _token: Token, _events: Ready) {}
+
+    fn close(&mut self) {}
+
+    fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
+        error!(
+            "called ProxySession::timeout(token={:?}, time) on ListenSession {{ protocol: {:?} }}",
+            _token, self.protocol
+        );
+        false
+    }
+}
+
+#[cfg(test)]
+mod accept_telemetry_tests {
+    use super::*;
+
+    /// Two IPv4 addresses sharing the same /24 must hash to the same bucket;
+    /// the masking logic guarantees this regardless of the host octet.
+    #[test]
+    fn per_source_bucket_collapses_ipv4_slash24() {
+        let a: SocketAddr = "203.0.113.5:1234".parse().unwrap();
+        let b: SocketAddr = "203.0.113.250:9999".parse().unwrap();
+        assert_eq!(
+            per_source_bucket(&a),
+            per_source_bucket(&b),
+            "addresses in the same /24 must land in the same bucket"
+        );
+    }
+
+    /// Two IPv6 addresses sharing the same /48 must hash to the same bucket.
+    #[test]
+    fn per_source_bucket_collapses_ipv6_slash48() {
+        let a: SocketAddr = "[2001:db8:1234::1]:443".parse().unwrap();
+        let b: SocketAddr = "[2001:db8:1234:abcd::ffff]:8443".parse().unwrap();
+        assert_eq!(
+            per_source_bucket(&a),
+            per_source_bucket(&b),
+            "addresses in the same /48 must land in the same bucket"
+        );
+    }
+
+    /// Every bucket label must be one of `PER_SOURCE_BUCKETS` precomputed
+    /// statics — the cardinality cap is the load-bearing property.
+    #[test]
+    fn per_source_bucket_keys_are_bounded() {
+        assert_eq!(PER_SOURCE_BUCKET_KEYS.len(), PER_SOURCE_BUCKETS);
+        for (i, key) in PER_SOURCE_BUCKET_KEYS.iter().enumerate() {
+            let expected = format!("client.connect.per_source.bucket_{i:03}");
+            assert_eq!(*key, expected.as_str());
+        }
+    }
+
+    /// A modest sample across distinct /24 prefixes should hit a healthy
+    /// number of distinct buckets — guards against the hash collapsing.
+    #[test]
+    fn per_source_bucket_distributes_distinct_subnets() {
+        let mut hits = std::collections::HashSet::new();
+        for i in 0..200u8 {
+            let addr: SocketAddr = format!("10.0.{i}.42:80").parse().unwrap();
+            hits.insert(per_source_bucket(&addr));
+        }
+        // With 200 distinct /24 prefixes hashed into 256 buckets we expect
+        // many distinct labels — assert a conservative lower bound that
+        // tolerates birthday collisions.
+        assert!(
+            hits.len() >= 100,
+            "expected at least 100 distinct buckets across 200 /24s, got {}",
+            hits.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod state_error_log_tests {
+    use sozu_command::state::StateError;
+
+    #[test]
+    fn worker_state_dispatch_error_sink_bounds_the_reason() {
+        const REASON_SECRET: &str = "WORKER_STATE_ERROR_REASON_SECRET_SENTINEL";
+
+        let reason = format!("{REASON_SECRET}{}", "x".repeat(4096));
+        let reason_len = reason.len();
+        let output = crate::capture_test_logs(move || {
+            let error = StateError::InvalidTcpFrontend {
+                address: "127.0.0.1:443"
+                    .parse()
+                    .expect("test TCP frontend address must parse"),
+                reason,
+            };
+            error!("Could not execute order on config state: {}", error);
+        });
+
+        assert!(
+            !output.contains(REASON_SECRET),
+            "worker state-error sink leaked the reason: {output}"
+        );
+        assert!(
+            output.contains(&format!("reason_bytes={reason_len}")),
+            "worker state-error sink omitted bounded reason metadata: {output}"
+        );
+        assert!(
+            output.len() <= 512,
+            "worker state-error sink is not bounded: {} bytes",
+            output.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    use mio::Token;
+
+    /// `select_nth_unstable_by_key` partitions in O(n) so that the first
+    /// `pivot + 1` entries are the `pivot + 1` smallest by key. This guards
+    /// against a future refactor swapping the comparator orientation.
+    #[test]
+    fn select_nth_finds_oldest_sessions() {
+        let now = Instant::now();
+        let mut candidates = [
+            (Token(1), now - Duration::from_secs(10)), // 10s old
+            (Token(2), now - Duration::from_secs(50)), // 50s old (oldest)
+            (Token(3), now - Duration::from_secs(5)),  // 5s old (newest)
+            (Token(4), now - Duration::from_secs(30)), // 30s old
+            (Token(5), now - Duration::from_secs(20)), // 20s old
+        ];
+
+        let count = 2;
+        let pivot = count.min(candidates.len()) - 1;
+        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+        let selected: HashSet<Token> = candidates[..=pivot]
+            .iter()
+            .map(|&(token, _)| token)
+            .collect();
+
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected.contains(&Token(2)),
+            "should contain 50s-old session"
+        );
+        assert!(
+            selected.contains(&Token(4)),
+            "should contain 30s-old session"
+        );
+    }
+
+    /// When `count` exceeds available candidates, the pivot collapses to
+    /// `len - 1` so we evict everything; this test pins that behaviour
+    /// against a future refactor that might silently truncate.
+    #[test]
+    fn select_nth_with_count_exceeding_candidates() {
+        let now = Instant::now();
+        let mut candidates = [(Token(1), now - Duration::from_secs(10))];
+
+        let count = 5;
+        let pivot = count.min(candidates.len()) - 1;
+        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+        let selected: HashSet<Token> = candidates[..=pivot]
+            .iter()
+            .map(|&(token, _)| token)
+            .collect();
+
+        assert_eq!(selected.len(), 1);
+        assert!(selected.contains(&Token(1)));
+    }
+}
+
+#[cfg(test)]
+mod accept_ready_tests {
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{DeactivateListener, ListenerType, SocketAddress},
+    };
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+    /// A worker holding one activated TCP listener, reachable through the very
+    /// same `Server` surface the event loop drives. The listen token carries a
+    /// `ListenSession` placeholder in the slab, exactly like
+    /// `tcp::testing::start_tcp_worker` installs it.
+    pub(super) fn server_with_tcp_listener() -> (Server, Token, SocketAddress) {
+        let ServerParts {
+            event_loop,
+            registry,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        // `send_scm = true`: `Server::new` makes a BLOCKING
+        // `receive_listeners()` call before it applies the initial state, so
+        // the client side must have queued its (empty) listener set first --
+        // exactly what `tcp::testing::start_tcp_worker` does.
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listener_config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build a TcpListenerConfig for the test");
+
+        let listen_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::TCPListen,
+            })));
+            token
+        };
+
+        let mut tcp_proxy =
+            tcp::TcpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+        tcp_proxy
+            .add_listener(listener_config, listen_token)
+            .expect("could not add the test TCP listener");
+        tcp_proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not activate the test TCP listener");
+
+        let server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            Some(tcp_proxy),
+            server_config,
+            None,
+            false,
+        )
+        .expect("could not build the test server");
+
+        // `_command_channel` is dropped here on purpose: nothing in these
+        // tests reads the worker's side of the channel.
+        (server, listen_token, address)
+    }
+
+    /// `ready()` queues a listen token in `accept_ready` whenever its listener
+    /// is readable but the worker cannot accept (buffer-pool backpressure), and
+    /// only `accept()` — which never runs while `can_accept` is false — takes
+    /// it back out. Deactivating that listener hands its socket back, so
+    /// without this purge the deferred accept pass called `accept()` on a
+    /// socket-less listener (and, before the slot was reserved for the
+    /// listener's whole lifetime, indexed a vacant slab key).
+    ///
+    /// To SEE THIS RED: drop `self.accept_ready.remove(&ListenToken(token.0))`
+    /// from `notify_deactivate_listener`'s TCP arm — the last assertion below
+    /// fails.
+    #[test]
+    fn deactivating_a_listener_drops_its_pending_accept_token() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+
+        // The backpressure state: readable listener, worker at capacity.
+        server.accept_ready.insert(ListenToken(listen_token.0));
+
+        let response = server.notify_deactivate_listener(
+            "test-deactivate",
+            &DeactivateListener {
+                interface: None,
+                address,
+                proxy: ListenerType::Tcp as i32,
+                to_scm: false,
+            },
+        );
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "deactivating an activated TCP listener must succeed: {response:?}"
+        );
+        assert!(
+            server.sessions.borrow().slab.contains(listen_token.0),
+            "deactivating a listener must KEEP its slab slot reserved — see \
+             `reserve_listen_token`; the accept purge below is what stops the \
+             deferred pass from accepting on a socket-less listener"
+        );
+        assert!(
+            !server.accept_ready.contains(&ListenToken(listen_token.0)),
+            "a deactivated listener must not stay queued for a deferred accept"
+        );
+
+        // The pass that used to panic.
+        server.handle_remaining_readiness();
+    }
+
+    /// Structural safety for the deferred-accept pass itself: whatever else
+    /// ever drops a listen token's slab entry, indexing the slab with a token
+    /// that is no longer there must not take the worker down. Dropping the
+    /// stale token is also what keeps THIS branch finite: `accept()` only
+    /// removes a token on `WouldBlock`/error, so re-entering the loop without
+    /// the removal would spin on the same vacant slot forever.
+    ///
+    /// To SEE THIS RED: restore `self.sessions.borrow().slab[token.0]` in
+    /// `handle_remaining_readiness` — this test then panics with
+    /// "invalid key".
+    #[test]
+    fn a_stale_accept_token_is_dropped_instead_of_panicking() {
+        let (mut server, listen_token, _address) = server_with_tcp_listener();
+
+        server.sessions.borrow_mut().slab.remove(listen_token.0);
+        server.accept_ready.insert(ListenToken(listen_token.0));
+
+        server.handle_remaining_readiness();
+
+        assert!(
+            server.accept_ready.is_empty(),
+            "a listen token with no session must be dropped from accept_ready"
+        );
+    }
+}
+/// One `epoll_wait` result can hold events for a session that closes while
+/// the loop walks it, after another session took over one of its slab keys.
+/// `Server::ready_if_still_owned` must deliver such an event to nobody
+/// (sozu-proxy/sozu#1877).
+#[cfg(test)]
+mod event_owner_tests {
+    use super::*;
+
+    /// A session that closes on its first `ready` and frees its backend slot
+    /// from `close`, as `TcpSession::close_backend` (`lib/src/tcp.rs`) does.
+    struct ClosingSession {
+        sessions: Rc<RefCell<SessionManager>>,
+        frontend: Token,
+        backend: Token,
+    }
+
+    impl ProxySession for ClosingSession {
+        fn protocol(&self) -> Protocol {
+            Protocol::TCP
+        }
+        fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+            true
+        }
+        fn shutting_down(&mut self) -> SessionIsToBeClosed {
+            true
+        }
+        fn update_readiness(&mut self, _token: Token, _events: Ready) {}
+        fn close(&mut self) {
+            self.sessions.borrow_mut().slab.try_remove(self.backend.0);
+        }
+        fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
+            false
+        }
+        fn last_event(&self) -> Instant {
+            Instant::now()
+        }
+        fn print_session(&self) {}
+        fn frontend_token(&self) -> Token {
+            self.frontend
+        }
+    }
+
+    /// A session whose first `ready` dials a backend, taking the slab's next
+    /// vacant key as `TcpSession::connect_to_backend` (`lib/src/tcp.rs`) does,
+    /// and that records every token it is handed readiness for.
+    struct DialingSession {
+        sessions: Rc<RefCell<SessionManager>>,
+        frontend: Token,
+        backend: Option<Token>,
+        delivered: Vec<Token>,
+    }
+
+    impl ProxySession for DialingSession {
+        fn protocol(&self) -> Protocol {
+            Protocol::TCP
+        }
+        fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+            if self.backend.is_none() {
+                self.backend = Some(Token(self.sessions.borrow_mut().slab.insert(session)));
+            }
+            false
+        }
+        fn shutting_down(&mut self) -> SessionIsToBeClosed {
+            true
+        }
+        fn update_readiness(&mut self, token: Token, _events: Ready) {
+            self.delivered.push(token);
+        }
+        fn close(&mut self) {}
+        fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
+            false
+        }
+        fn last_event(&self) -> Instant {
+            Instant::now()
+        }
+        fn print_session(&self) {}
+        fn frontend_token(&self) -> Token {
+            self.frontend
+        }
+    }
+
+    /// The batch of sozu-proxy/sozu#1877: the client's FIN on the first
+    /// session's frontend, the first readiness of the second session, then
+    /// the HUP of the first session's backend socket, in that order.
+    ///
+    /// To SEE THIS RED: make `Server::ready_if_still_owned` call
+    /// `self.ready(token, events)` unconditionally — the dialing session then
+    /// receives the closed backend's HUP under its own backend token.
+    #[test]
+    fn an_event_of_a_closed_session_is_not_delivered_to_the_session_reusing_its_token() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+        let sessions = server.sessions.clone();
+
+        let closing = Rc::new(RefCell::new(ClosingSession {
+            sessions: sessions.clone(),
+            frontend: Token(0),
+            backend: Token(0),
+        }));
+        let dialing = Rc::new(RefCell::new(DialingSession {
+            sessions: sessions.clone(),
+            frontend: Token(0),
+            backend: None,
+            delivered: Vec::new(),
+        }));
+        {
+            let mut sessions = sessions.borrow_mut();
+            let closing_session: Rc<RefCell<dyn ProxySession>> = closing.clone();
+            let frontend = Token(sessions.slab.insert(closing_session.clone()));
+            let backend = Token(sessions.slab.insert(closing_session));
+            let mut closing = closing.borrow_mut();
+            closing.frontend = frontend;
+            closing.backend = backend;
+            let dialing_session: Rc<RefCell<dyn ProxySession>> = dialing.clone();
+            dialing.borrow_mut().frontend = Token(sessions.slab.insert(dialing_session));
+            sessions.incr();
+            sessions.incr();
+        }
+        let closed_frontend = closing.borrow().frontend;
+        let closed_backend = closing.borrow().backend;
+        let dialing_frontend = dialing.borrow().frontend;
+
+        let batch = [
+            (closed_frontend, Ready::READABLE | Ready::HUP),
+            (dialing_frontend, Ready::READABLE | Ready::WRITABLE),
+            (
+                closed_backend,
+                Ready::READABLE | Ready::WRITABLE | Ready::HUP,
+            ),
+        ];
+        let mut owners = Vec::new();
+        server.snapshot_event_owners(batch.iter().map(|(token, _)| *token), &mut owners);
+        for ((token, events), owner) in batch.into_iter().zip(owners.drain(..)) {
+            server.ready_if_still_owned(token, events, owner);
+        }
+
+        assert_eq!(
+            dialing.borrow().backend,
+            Some(closed_backend),
+            "precondition: the dial must reuse the key the closed session freed in this batch"
+        );
+        assert!(
+            !sessions.borrow().slab.contains(closed_frontend.0),
+            "the closed session must have left the slab"
+        );
+        assert_eq!(
+            dialing.borrow().delivered,
+            vec![dialing_frontend],
+            "the closed backend's HUP must not reach the session that reused its token"
+        );
+    }
+}
+/// A session a `CloseSessions` request left draining can close on its own
+/// before `Server::drive_closing_sessions` revisits it, and another session
+/// then takes its slab key. The watcher must leave the new tenant alone.
+#[cfg(test)]
+mod closing_sessions_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// A session whose `shutting_down` answer is scripted and whose `close`
+    /// is counted.
+    struct ScriptedSession {
+        frontend: Token,
+        can_close_now: bool,
+        closed: Rc<Cell<bool>>,
+    }
+
+    impl ProxySession for ScriptedSession {
+        fn protocol(&self) -> Protocol {
+            Protocol::HTTP
+        }
+        fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+            false
+        }
+        fn shutting_down(&mut self) -> SessionIsToBeClosed {
+            self.can_close_now
+        }
+        fn update_readiness(&mut self, _token: Token, _events: Ready) {}
+        fn close(&mut self) {
+            self.closed.set(true);
+        }
+        fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
+            false
+        }
+        fn last_event(&self) -> Instant {
+            Instant::now()
+        }
+        fn print_session(&self) {}
+        fn frontend_token(&self) -> Token {
+            self.frontend
+        }
+    }
+
+    fn insert_scripted(
+        server: &Server,
+        can_close_now: bool,
+    ) -> (Token, Rc<RefCell<dyn ProxySession>>, Rc<Cell<bool>>) {
+        let closed = Rc::new(Cell::new(false));
+        let mut sessions = server.sessions.borrow_mut();
+        let entry = sessions.slab.vacant_entry();
+        let token = Token(entry.key());
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(ScriptedSession {
+            frontend: token,
+            can_close_now,
+            closed: closed.clone(),
+        }));
+        entry.insert(session.clone());
+        sessions.incr();
+        (token, session, closed)
+    }
+
+    /// The draining session (closable by now) leaves the slab (its `Rc` is
+    /// still held, so its `Weak` still upgrades) and an unrelated session
+    /// takes the same key. Draining must not close it.
+    ///
+    /// To SEE THIS RED: drop the `still_there` check from
+    /// `Server::drive_closing_sessions`, so a live `Weak` alone selects the
+    /// token -- the unrelated session is then closed and removed.
+    #[test]
+    fn a_draining_sessions_reused_slab_key_is_not_closed() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+
+        let (token, draining, draining_closed) = insert_scripted(&server, true);
+        server
+            .closing_sessions
+            .push((token, Rc::downgrade(&draining)));
+
+        // The draining session closed by itself; an unrelated one reuses its key.
+        server.sessions.borrow_mut().slab.remove(token.0);
+        let (reused, unrelated, unrelated_closed) = insert_scripted(&server, true);
+        assert_eq!(reused, token, "precondition: the slab must reuse the key");
+        assert!(
+            !Rc::ptr_eq(&draining, &unrelated),
+            "precondition: the two sessions are distinct"
+        );
+
+        server.drive_closing_sessions();
+
+        assert!(
+            server.sessions.borrow().slab.contains(token.0),
+            "the unrelated session that reused the key must stay in the slab"
+        );
+        assert!(
+            !unrelated_closed.get() && !draining_closed.get(),
+            "neither session may be closed by the stale watch"
+        );
+        assert!(
+            server.closing_sessions.is_empty(),
+            "the stale watch must be dropped, not kept"
+        );
+    }
+
+    /// Positive twin: the same session still in its slot, once able to close,
+    /// is closed and unwatched.
+    #[test]
+    fn a_draining_session_still_in_its_slot_is_closed_when_ready() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+
+        let (token, session, closed) = insert_scripted(&server, true);
+        server
+            .closing_sessions
+            .push((token, Rc::downgrade(&session)));
+
+        server.drive_closing_sessions();
+
+        assert!(
+            closed.get(),
+            "a still-owned closable session must be closed"
+        );
+        assert!(!server.sessions.borrow().slab.contains(token.0));
+        assert!(server.closing_sessions.is_empty());
+    }
+}
+/// The listener slab slot is reserved for a listener's whole `AddListener` ->
+/// `RemoveListener` lifetime. These tests pin both ends of that lifetime and
+/// the deactivate/reactivate cycle in between; see `reserve_listen_token` for
+/// the design and the alternative it rejects.
+#[cfg(test)]
+mod listener_lifecycle_tests {
+    use std::net::UdpSocket as StdUdpSocket;
+
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{
+            ActivateListener, DeactivateListener, ListenerType, LoadBalancingParams,
+            RemoveListener, RequestUdpFrontend, SocketAddress, filtered_metrics,
+        },
+    };
+
+    use super::accept_ready_tests::server_with_tcp_listener;
+    use super::*;
+    use crate::{
+        metrics::{METRICS, names},
+        testing::{ServerParts, prebuild_server, provide_port},
+    };
+
+    /// A worker with no listener at all, driven through `Server`'s own request
+    /// surface. Same shape as `accept_ready_tests::server_with_tcp_listener`,
+    /// minus the pre-installed listener — `Server::new` builds its own UDP
+    /// proxy, which is the one these tests exercise.
+    pub(super) fn bare_server() -> Server {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            None,
+            false,
+        )
+        .expect("could not build the test server")
+    }
+
+    fn add_udp_listener(server: &mut Server, address: SocketAddress) -> Token {
+        let listener_config = ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+        let response = server.notify_add_udp_listener("test-add-udp", listener_config);
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "adding a UDP listener must succeed: {response:?}"
+        );
+        server
+            .udp
+            .borrow()
+            .listener_token(&address.into())
+            .expect("the added UDP listener must own a token")
+    }
+
+    fn activate(server: &mut Server, address: SocketAddress, proxy: ListenerType) {
+        let response = server.notify_activate_listener(
+            "test-activate",
+            &ActivateListener {
+                interface: None,
+                address,
+                proxy: proxy as i32,
+                from_scm: false,
+            },
+        );
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "activating a {proxy:?} listener must succeed: {response:?}"
+        );
+    }
+
+    fn deactivate(server: &mut Server, address: SocketAddress, proxy: ListenerType) {
+        let response = server.notify_deactivate_listener(
+            "test-deactivate",
+            &DeactivateListener {
+                interface: None,
+                address,
+                proxy: proxy as i32,
+                to_scm: false,
+            },
+        );
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "deactivating a {proxy:?} listener must succeed: {response:?}"
+        );
+    }
+
+    /// The protocol recorded in the slab slot at `token`, and whether that slot
+    /// holds the inert `ListenSession` placeholder. `ListenSession` reports
+    /// `Token(0)` as its frontend token while a real `UdpListenerSession`
+    /// reports its own listen token — the only way to tell the two apart, since
+    /// both answer `Protocol::UDPListen`.
+    fn slot_state(server: &Server, token: Token) -> Option<(Protocol, bool)> {
+        let sessions = server.sessions.borrow();
+        let session = sessions.slab.get(token.0)?;
+        let session = session.borrow();
+        Some((session.protocol(), session.frontend_token() == Token(0)))
+    }
+
+    /// FAILURE MODE 1, the whole point of this change: a deactivated listener
+    /// that is activated again must be reachable from the event loop.
+    ///
+    /// The proxies retain the listener's token across a deactivate
+    /// (`give_back_listener` and `activate()` both hand back the same one), and
+    /// `Server::ready` ignores any token the slab does not contain. Freeing the
+    /// slot on deactivate therefore left `ActivateListener` re-registering the
+    /// socket under a dead token: the request answered `ok` and the listener
+    /// never saw another readiness event.
+    ///
+    /// `can_accept` is forced to `false` so `ready()` parks the token in
+    /// `accept_ready` instead of immediately draining it in `accept()` —
+    /// membership there is the observable proof that the event reached the
+    /// listener's dispatch path at all.
+    ///
+    /// To SEE THIS RED: in `notify_deactivate_listener`'s TCP arm, replace
+    /// `self.reserve_listen_token(token, Protocol::TCPListen);` with
+    /// `self.sessions.borrow_mut().slab.remove(token.0);` — the reactivated
+    /// listener's readiness event is then dropped, and the assertion fails
+    /// with "a reactivated listener must still be dispatched by `ready()`".
+    #[test]
+    fn a_reactivated_tcp_listener_is_reachable_from_the_event_loop() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+
+        deactivate(&mut server, address, ListenerType::Tcp);
+        activate(&mut server, address, ListenerType::Tcp);
+
+        server.sessions.borrow_mut().can_accept = false;
+        server.ready(listen_token, Ready::READABLE);
+
+        assert!(
+            server.accept_ready.contains(&ListenToken(listen_token.0)),
+            "a reactivated listener must still be dispatched by `ready()`"
+        );
+    }
+
+    /// The UDP half of failure mode 1. UDP never accepts, so its activate path
+    /// installs a real `UdpListenerSession` at the listen token instead — which
+    /// it skipped outright when the slot had been freed, leaving the socket
+    /// registered against the placeholder-less token and every datagram
+    /// unread, while the request still answered `ok`.
+    ///
+    /// To SEE THIS RED: in `notify_deactivate_listener`'s UDP arm, replace
+    /// `self.reserve_listen_token(token, Protocol::UDPListen);` with
+    /// `self.sessions.borrow_mut().slab.remove(token.0);` — the activate arm
+    /// then returns an error response ("has no session slot"), so `activate()`
+    /// panics on the status assertion.
+    #[test]
+    fn a_reactivated_udp_listener_gets_its_session_back() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, true)),
+            "an added, not-yet-activated UDP listener holds the placeholder"
+        );
+
+        activate(&mut server, address, ListenerType::Udp);
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, false)),
+            "activating must install the real UdpListenerSession"
+        );
+
+        deactivate(&mut server, address, ListenerType::Udp);
+        activate(&mut server, address, ListenerType::Udp);
+
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, false)),
+            "reactivating must reinstall the real UdpListenerSession"
+        );
+    }
+
+    /// FAILURE MODE 2, now impossible by construction: while the slot was
+    /// freed on deactivate, the slab was free to hand that key to the next
+    /// session, and the UDP activate path — which found `contains` true and
+    /// assigned — overwrote that live session with its listener session.
+    ///
+    /// The reserved slot is never vacant, so `vacant_entry()` can no longer
+    /// return it. This test pins that, and ONLY that: the session created while
+    /// the listener is deactivated must land on a different key and survive the
+    /// reactivate. It says nothing about what the activate arm writes into the
+    /// listener's OWN key, because the reactivate here follows a deactivate and
+    /// so takes the full activation path. The repeat with no deactivate in
+    /// between — where the arm's answer is `Ok(token)` from
+    /// `UdpListener::activate`'s `active` short-circuit and the listener's own
+    /// key holds a LIVE `UdpListenerSession` — is FAILURE MODE 3, pinned by
+    /// `a_duplicate_udp_activate_keeps_the_live_listener_session` and the three
+    /// tests beside it. Naming this one for "a live session" hid that gap: it
+    /// stayed green throughout.
+    ///
+    /// To SEE THIS RED: in `notify_deactivate_listener`'s UDP arm, replace
+    /// `self.reserve_listen_token(token, Protocol::UDPListen);` with
+    /// `self.sessions.borrow_mut().slab.remove(token.0);` — the interloper
+    /// then takes the listener's key and the `assert_ne!` below fails with
+    /// "a deactivated listener's key must not be handed to another session".
+    #[test]
+    fn a_deactivated_udp_listeners_key_is_not_handed_to_another_session() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+        activate(&mut server, address, ListenerType::Udp);
+        deactivate(&mut server, address, ListenerType::Udp);
+
+        // Whatever the worker admits next takes the slab's next vacant key.
+        // `Protocol::Channel` is just a marker no listener ever reports.
+        let interloper = {
+            let mut sessions = server.sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Channel,
+            })));
+            Token(key)
+        };
+        assert_ne!(
+            interloper, listen_token,
+            "a deactivated listener's key must not be handed to another session"
+        );
+
+        activate(&mut server, address, ListenerType::Udp);
+
+        assert_eq!(
+            slot_state(&server, interloper),
+            Some((Protocol::Channel, true)),
+            "reactivating a listener must not overwrite another session's slot"
+        );
+    }
+
+    /// The cluster every UDP data-path test in this module routes through.
+    const UDP_FLOW_CLUSTER: &str = "udp-duplicate-activate";
+
+    /// The session Rc currently occupying `token`. Identity (`Rc::ptr_eq`)
+    /// across an operation is the direct statement that the operation did not
+    /// replace the live session — `UdpListenerSession`'s per-flow maps are
+    /// private to `udp.rs`, so identity plus an end-to-end datagram are what
+    /// this module can observe.
+    fn slab_session(server: &Server, token: Token) -> Rc<RefCell<dyn ProxySession>> {
+        server
+            .sessions
+            .borrow()
+            .slab
+            .get(token.0)
+            .expect("the listener must own a slab slot")
+            .clone()
+    }
+
+    /// The current value of the `udp.active_flows` gauge for this test thread.
+    /// `METRICS` is a `thread_local!` and libtest gives each test its own
+    /// thread, so this reads only what the test itself emitted.
+    fn active_flows_gauge() -> i64 {
+        METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(names::udp::ACTIVE_FLOWS)
+                .and_then(|metric| match metric.inner {
+                    Some(filtered_metrics::Inner::Gauge(value)) => Some(value as i64),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// A worker holding one activated UDP listener, a frontend and one backend,
+    /// plus the real client and backend sockets. The UDP data path is driven for
+    /// real on loopback because the orphaning these tests pin — the shell's
+    /// `upstream_to_flow` / `flow_to_upstream` / `upstream_sockets` maps going
+    /// empty under a live `UdpManager` — is only observable end to end.
+    fn udp_worker_with_backend(
+        server: &mut Server,
+        address: SocketAddress,
+    ) -> (StdUdpSocket, StdUdpSocket) {
+        // A backend belongs to its cluster: add the cluster first.
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: UDP_FLOW_CLUSTER.to_owned(),
+                ..Default::default()
+            })
+            .into(),
+        });
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-front".to_owned(),
+            content: RequestType::AddUdpFrontend(RequestUdpFrontend {
+                cluster_id: UDP_FLOW_CLUSTER.to_owned(),
+                address,
+                tags: Default::default(),
+            })
+            .into(),
+        });
+
+        let backend_socket =
+            StdUdpSocket::bind("127.0.0.1:0").expect("could not bind the test UDP backend");
+        backend_socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("could not set the backend read timeout");
+        let backend_address = backend_socket
+            .local_addr()
+            .expect("the test UDP backend must have a local address");
+
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-backend".to_owned(),
+            content: RequestType::AddBackend(AddBackend {
+                cluster_id: UDP_FLOW_CLUSTER.to_owned(),
+                backend_id: format!("{UDP_FLOW_CLUSTER}-0"),
+                address: backend_address.into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+                unix_path: None,
+            })
+            .into(),
+        });
+
+        let client_socket =
+            StdUdpSocket::bind("127.0.0.1:0").expect("could not bind the test UDP client");
+        (client_socket, backend_socket)
+    }
+
+    /// Send one datagram from `client` to the listener and drive a single
+    /// READABLE event through `Server::ready`, exactly as the event loop does.
+    /// Returns what reached the backend within its read timeout, or `None` when
+    /// nothing was forwarded. Loopback `send_to` has already queued the datagram
+    /// on the listener socket by the time it returns, so one pass is enough.
+    fn forward_one(
+        server: &mut Server,
+        listen_token: Token,
+        listen_address: SocketAddress,
+        client: &StdUdpSocket,
+        backend: &StdUdpSocket,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        let target: std::net::SocketAddr = listen_address.into();
+        client
+            .send_to(payload, target)
+            .expect("the test client must reach the UDP listener");
+        server.ready(listen_token, Ready::READABLE);
+
+        let mut received = [0u8; 64];
+        backend
+            .recv_from(&mut received)
+            .ok()
+            .map(|(len, _)| received[..len].to_vec())
+    }
+
+    /// FAILURE MODE 3, the residual of the listener-slot change: a SECOND
+    /// `ActivateListener` for a listener that is already active must not rebuild
+    /// its session.
+    ///
+    /// `UdpListener::activate` short-circuits on its own `active` flag and
+    /// answers `Ok(self.token)` without doing any work, so `Ok(token)` does not
+    /// mean this call activated anything — and the arm used to run
+    /// `build_session` + `*slot = session` on that answer regardless.
+    ///
+    /// To SEE THIS RED: in `notify_activate_listener`'s UDP arm, drop the
+    /// `if !session_installed` guard so `build_session` and the slab write run
+    /// unconditionally again — the second activate then installs a fresh
+    /// session and the `Rc::ptr_eq` assertion fails with "a repeated
+    /// ActivateListener must not replace the live UDP listener session".
+    #[test]
+    fn a_duplicate_udp_activate_keeps_the_live_listener_session() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+        activate(&mut server, address, ListenerType::Udp);
+
+        let installed = slab_session(&server, listen_token);
+
+        let response = server.notify_activate_listener(
+            "test-activate-twice",
+            &ActivateListener {
+                interface: None,
+                address,
+                proxy: ListenerType::Udp as i32,
+                from_scm: false,
+            },
+        );
+        // The response an already-active listener must get. `ok` and not an
+        // error: `ConfigState::activate_listener` answers `Ok(())` for the same
+        // repeat, `generate_activate_requests` re-emits one per active listener
+        // on every state replay, and the HTTP/HTTPS/TCP arms all answer `ok`
+        // for their own repeats. Erroring here would fail an ordinary replay and
+        // make the worker disagree with the state the main process persisted.
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "a repeated ActivateListener on an active UDP listener must answer ok: {response:?}"
+        );
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, false)),
+            "the real UdpListenerSession must still be the one in the slab"
+        );
+        assert!(
+            Rc::ptr_eq(&installed, &slab_session(&server, listen_token)),
+            "a repeated ActivateListener must not replace the live UDP listener session"
+        );
+    }
+
+    /// The consequence of that rebuild, end to end. The displaced session took
+    /// the whole shell side of every flow with it — `upstream_sockets`,
+    /// `upstream_to_flow`, `flow_to_upstream` — while the proxy kept the shared
+    /// `UdpManager` and its flow table. `close()` is a `ProxySession` method and
+    /// not `Drop`, so nothing tore those flows down; they simply stopped
+    /// forwarding while `udp.active_flows` went on counting them.
+    ///
+    /// To SEE THIS RED: in `notify_activate_listener`'s UDP arm, drop the
+    /// `if !session_installed` guard — the datagram sent after the duplicate
+    /// activate then never reaches the backend and the assertion fails with
+    /// "an in-flight UDP flow must survive a repeated ActivateListener".
+    #[test]
+    fn in_flight_udp_flows_survive_a_duplicate_udp_activate() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+        activate(&mut server, address, ListenerType::Udp);
+        let (client, backend) = udp_worker_with_backend(&mut server, address);
+
+        assert_eq!(
+            forward_one(
+                &mut server,
+                listen_token,
+                address,
+                &client,
+                &backend,
+                b"before"
+            )
+            .as_deref(),
+            Some(&b"before"[..]),
+            "the flow must be established before the duplicate activate"
+        );
+        assert_eq!(
+            active_flows_gauge(),
+            1,
+            "one established flow must be on the gauge"
+        );
+
+        activate(&mut server, address, ListenerType::Udp);
+
+        // The gauge counts what the manager holds, and the manager is retained
+        // across the rebuild — so the gauge alone cannot tell a live flow from
+        // an orphaned one. Assert both together: the flow the gauge claims must
+        // still be a flow the data path can serve.
+        assert_eq!(
+            active_flows_gauge(),
+            1,
+            "a repeated ActivateListener must neither open nor evict a flow"
+        );
+        assert_eq!(
+            forward_one(
+                &mut server,
+                listen_token,
+                address,
+                &client,
+                &backend,
+                b"after"
+            )
+            .as_deref(),
+            Some(&b"after"[..]),
+            "an in-flight UDP flow must survive a repeated ActivateListener"
+        );
+    }
+
+    /// The resource the rebuild strands for good. Every flow holds one extra
+    /// slab slot for its upstream socket, and `on_close_flow` reaches that slot
+    /// only through `flow_to_upstream`. A replacement session's map is empty, so
+    /// the eventual manager-driven teardown frees the flow, balances the gauge —
+    /// and leaves the upstream slot allocated for the worker's whole life.
+    ///
+    /// To SEE THIS RED: in `notify_activate_listener`'s UDP arm, drop the
+    /// `if !session_installed` guard — the deactivate then leaves the upstream
+    /// slot behind and the assertion fails with "tearing the listener down must
+    /// release every per-flow slab slot".
+    #[test]
+    fn a_duplicate_udp_activate_strands_no_upstream_slab_slot() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+        activate(&mut server, address, ListenerType::Udp);
+        let (client, backend) = udp_worker_with_backend(&mut server, address);
+
+        // Baseline AFTER the listener exists: its own reserved slot is part of
+        // `base_sessions_count` and is not what this test measures.
+        let baseline = server.sessions.borrow().slab.len();
+
+        assert!(
+            forward_one(
+                &mut server,
+                listen_token,
+                address,
+                &client,
+                &backend,
+                b"flow"
+            )
+            .is_some(),
+            "the flow must be established before the duplicate activate"
+        );
+        assert_eq!(
+            server.sessions.borrow().slab.len(),
+            baseline + 1,
+            "an established flow owns exactly one upstream slab slot"
+        );
+
+        activate(&mut server, address, ListenerType::Udp);
+        deactivate(&mut server, address, ListenerType::Udp);
+
+        assert_eq!(
+            server.sessions.borrow().slab.len(),
+            baseline,
+            "tearing the listener down must release every per-flow slab slot"
+        );
+        assert_eq!(
+            active_flows_gauge(),
+            0,
+            "tearing the listener down must return the active-flows gauge to zero"
+        );
+    }
+
+    /// The path that reaches this arm without anyone typing a command:
+    /// `load_state` replays the state the main process persisted, and
+    /// `ConfigState::generate_activate_requests` emits one `ActivateListener`
+    /// per ACTIVE listener. For a worker whose listener is already up, that
+    /// replay is a duplicate activate by construction — the ordinary case, not
+    /// an operator mistake, which is why this arm answers `ok` instead of
+    /// surfacing the repeat as an error.
+    ///
+    /// Driven through the real `ConfigState` rather than a hand-written
+    /// `ActivateListener`, so the test breaks if that emission ever changes.
+    ///
+    /// To SEE THIS RED: in `notify_activate_listener`'s UDP arm, drop the
+    /// `if !session_installed` guard — the replay then rebuilds the session and
+    /// the `Rc::ptr_eq` assertion fails with "replaying ActivateListener must
+    /// leave the live UDP listener session in place".
+    #[test]
+    fn replaying_activate_listener_is_a_clean_no_op_for_an_active_udp_listener() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listener_config = ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+
+        // Through `notify_proxys` so the worker's own `ConfigState` records the
+        // listener and its activation, exactly as a live worker's does.
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp".to_owned(),
+            content: RequestType::AddUdpListener(listener_config).into(),
+        });
+        server.notify_proxys(WorkerRequest {
+            id: "test-activate".to_owned(),
+            content: RequestType::ActivateListener(ActivateListener {
+                interface: None,
+                address,
+                proxy: ListenerType::Udp as i32,
+                from_scm: false,
+            })
+            .into(),
+        });
+        let listen_token = server
+            .udp
+            .borrow()
+            .listener_token(&address.into())
+            .expect("the added UDP listener must own a token");
+        let installed = slab_session(&server, listen_token);
+
+        let replayed: Vec<ActivateListener> = server
+            .config_state
+            .generate_activate_requests()
+            .into_iter()
+            .filter_map(|request| match request.request_type {
+                Some(RequestType::ActivateListener(activate)) => Some(activate),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "an active UDP listener must be replayed exactly once: {replayed:?}"
+        );
+
+        for activate in &replayed {
+            let response = server.notify_activate_listener("test-replay", activate);
+            assert_eq!(
+                response.status,
+                ResponseStatus::Ok as i32,
+                "a replayed ActivateListener must answer ok: {response:?}"
+            );
+        }
+
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, false)),
+            "the replay must leave the real UdpListenerSession in the slab"
+        );
+        assert!(
+            Rc::ptr_eq(&installed, &slab_session(&server, listen_token)),
+            "replaying ActivateListener must leave the live UDP listener session in place"
+        );
+    }
+
+    /// The other end of the lifetime. Reserving the slot across a deactivate is
+    /// only sound if something releases it: no proxy's `remove_listener`
+    /// touches the session slab, so `RemoveListener` is the sole release point.
+    /// Without it each add/remove cycle would strand one slab key — and
+    /// `base_sessions_count`, decremented on every `RemoveListener`, would
+    /// drift below the number of occupied slots, so a soft stop would wait for
+    /// sessions that do not exist.
+    ///
+    /// Three full cycles, because a leak is only visible as growth, and every
+    /// other one removes the listener while it is still ACTIVATED: that path
+    /// drops a live `UdpListenerSession` out of the slab — the Rc that, left
+    /// there, also pinned the listener's `UdpSocket` open and kept `ready()`
+    /// dispatching to a removed listener.
+    ///
+    /// To SEE THIS RED: drop the `if let Some(token) = listen_token` block from
+    /// `notify_proxys`'s `RemoveListener` arm — the slab then grows by one slot
+    /// per cycle and the assertion fails with "cycle 0: removing a listener
+    /// must release its reserved slot".
+    #[test]
+    fn removing_a_listener_releases_its_reserved_slab_slot() {
+        let mut server = bare_server();
+        let baseline = server.sessions.borrow().slab.len();
+        let base_sessions_count = server.base_sessions_count;
+
+        for cycle in 0..3 {
+            let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let listen_token = add_udp_listener(&mut server, address);
+            activate(&mut server, address, ListenerType::Udp);
+            if cycle % 2 == 0 {
+                deactivate(&mut server, address, ListenerType::Udp);
+            }
+
+            server.notify_proxys(WorkerRequest {
+                id: "test-remove".to_owned(),
+                content: RequestType::RemoveListener(RemoveListener {
+                    interface: None,
+                    address,
+                    proxy: ListenerType::Udp as i32,
+                })
+                .into(),
+            });
+
+            assert!(
+                !server.sessions.borrow().slab.contains(listen_token.0),
+                "cycle {cycle}: removing a listener must release its reserved slot"
+            );
+            assert_eq!(
+                server.sessions.borrow().slab.len(),
+                baseline,
+                "cycle {cycle}: the slab must return to its baseline occupancy"
+            );
+            assert_eq!(
+                server.base_sessions_count, base_sessions_count,
+                "cycle {cycle}: base_sessions_count must track the reserved slots"
+            );
+        }
+    }
+
+    /// The UDP per-source flow limit is opt-in per cluster: a global
+    /// `max_connections_per_ip` / `max_connections_per_subnet` — here set at
+    /// runtime, as an operator would for HTTP/TCP — never reaches a UDP
+    /// listener, while the cluster's own `max_connections_per_ip` does, and
+    /// sheds a new port of an address that holds its limit.
+    ///
+    /// To SEE THIS RED: in `UdpProxy::cluster_config_for`, replace
+    /// `per_ip.unwrap_or(0)` with
+    /// `per_ip.unwrap_or(self.sessions.borrow().max_connections_per_ip)`, so
+    /// UDP inherits the global default; the first assertion then reads `1`.
+    #[test]
+    fn udp_flow_limits_come_from_the_cluster_not_the_global_defaults() {
+        use std::{net::SocketAddr, time::Instant};
+
+        use crate::protocol::udp::{
+            BackendId, BackendSource, ManagerInput, MetricEvent, Output, UdpManager,
+        };
+
+        struct OneBackend;
+        impl BackendSource for OneBackend {
+            fn select(
+                &mut self,
+                _cluster: &str,
+                _key: Option<u64>,
+                _now: Instant,
+            ) -> Option<(BackendId, SocketAddr)> {
+                Some(("b".to_owned(), SocketAddr::from(([127, 0, 0, 1], 5353))))
+            }
+        }
+        // Feed one datagram from `port` of one address; `true` when it opened
+        // a flow, `false` when it was shed at the per-source limit.
+        fn admit(manager: &RefCell<UdpManager>, port: u16) -> bool {
+            let mut manager = manager.borrow_mut();
+            manager.handle_input(
+                ManagerInput::ClientDatagram {
+                    src: SocketAddr::from(([192, 0, 2, 1], port)),
+                    payload: b"q",
+                    backends: &mut OneBackend,
+                },
+                Instant::now(),
+            );
+            let mut opened = false;
+            let mut shed = false;
+            while let Some(out) = manager.poll_output() {
+                opened |= matches!(out, Output::OpenUpstream { .. });
+                shed |= matches!(out, Output::Metric(MetricEvent::FlowShedSourceLimit));
+            }
+            assert_ne!(opened, shed, "a datagram is either admitted or shed");
+            opened
+        }
+        fn add_cluster(server: &mut Server, max_connections_per_ip: Option<u64>) {
+            server.notify_proxys(WorkerRequest {
+                id: "test-add-cluster".to_owned(),
+                content: RequestType::AddCluster(Cluster {
+                    cluster_id: "udp-limits".to_owned(),
+                    max_connections_per_ip,
+                    ..Default::default()
+                })
+                .into(),
+            });
+        }
+
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = add_udp_listener(&mut server, address);
+        server.notify(WorkerRequest {
+            id: "test-set-per-ip".to_owned(),
+            content: RequestType::SetMaxConnectionsPerIp(1).into(),
+        });
+        server.notify(WorkerRequest {
+            id: "test-set-per-subnet".to_owned(),
+            content: RequestType::SetMaxConnectionsPerSubnet(1).into(),
+        });
+        add_cluster(&mut server, None);
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-front".to_owned(),
+            content: RequestType::AddUdpFrontend(RequestUdpFrontend {
+                cluster_id: "udp-limits".to_owned(),
+                address,
+                tags: Default::default(),
+            })
+            .into(),
+        });
+        let manager = server
+            .udp
+            .borrow()
+            .manager(token)
+            .expect("the UDP listener must own a flow manager");
+
+        {
+            let manager = manager.borrow();
+            let cfg = manager.cluster_config();
+            assert_eq!(
+                cfg.max_flows_per_ip, 0,
+                "the global per-IP default must not apply to UDP"
+            );
+            assert_eq!(
+                cfg.max_flows_per_subnet, 0,
+                "the global per-subnet default must not apply to UDP"
+            );
+        }
+        assert!(admit(&manager, 1000));
+        assert!(
+            admit(&manager, 1001),
+            "a global limit of 1 must not shed a second UDP flow"
+        );
+
+        add_cluster(&mut server, Some(2));
+        assert_eq!(manager.borrow().cluster_config().max_flows_per_ip, 2);
+        assert!(
+            !admit(&manager, 1002),
+            "the cluster's own limit of 2 counts the two open flows and sheds a third"
+        );
+    }
+}
+
+#[cfg(test)]
+mod add_cluster_validation_tests {
+    use sozu_command::proto::command::{LoadBalancingParams, ShardMode};
+
+    use super::listener_lifecycle_tests::bare_server;
+    use super::*;
+    use crate::{backends::ShardOutcome, load_balancing::affinity_key_from_ip};
+
+    const CLUSTER: &str = "sharded";
+    const ADD_CLUSTER_ID: &str = "test-add-invalid-shard";
+
+    /// The worker mirrors `validate_shuffle_sharding` on `AddCluster`
+    /// (#524): an `AddCluster` that reaches the worker without the master's
+    /// check, as a TOML reload or a `LoadState` can, with `shard_percent`
+    /// outside `1..=100` is answered with an error and leaves the cluster
+    /// unsharded.
+    ///
+    /// TO SEE THIS RED: delete the `validate_shuffle_sharding` check from the
+    /// `AddCluster` arm of `Server::notify_proxys`; the worker then answers
+    /// `Ok` and arms a shard of two over the four backends.
+    #[test]
+    fn an_add_cluster_with_an_invalid_shard_percent_is_refused_and_unsharded() {
+        let mut server = bare_server();
+        // The cluster exists unsharded before the refused update: a backend
+        // belongs to its cluster, and one of a cluster the worker does not
+        // hold is refused (`ConfigState::add_backend`).
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-unsharded-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+                ..Default::default()
+            })
+            .into(),
+        });
+        server.notify_proxys(WorkerRequest {
+            id: ADD_CLUSTER_ID.to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+                // The only invalid knob: `shard_min_backends` and
+                // `shard_mode` are valid on their own.
+                shard_percent: Some(0),
+                shard_min_backends: Some(2),
+                shard_mode: Some(ShardMode::Strict as i32),
+                ..Default::default()
+            })
+            .into(),
+        });
+        let response = QUEUE
+            .with(|queue| {
+                queue
+                    .borrow()
+                    .iter()
+                    .find(|response| response.id == ADD_CLUSTER_ID)
+                    .cloned()
+            })
+            .expect("the worker must answer the AddCluster");
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "an invalid shard_percent must be refused: {response:?}"
+        );
+        assert_eq!(response.message, "shard_percent must lie in 1..=100");
+
+        for index in 0..4u16 {
+            server.notify_proxys(WorkerRequest {
+                id: format!("test-add-backend-{index}"),
+                content: RequestType::AddBackend(AddBackend {
+                    cluster_id: CLUSTER.to_owned(),
+                    backend_id: format!("{CLUSTER}-{index}"),
+                    address: SocketAddr::from(([127, 0, 0, 1], 23_000 + index)).into(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    sticky_id: None,
+                    backup: None,
+                    unix_path: None,
+                })
+                .into(),
+            });
+        }
+        let key = affinity_key_from_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut backends = server.backends.borrow_mut();
+        let list = backends
+            .backends
+            .get_mut(CLUSTER)
+            .expect("the backends must have created the cluster's list");
+        assert_eq!(
+            list.select_with_key(Some(key), Instant::now()).1,
+            ShardOutcome::Unsharded,
+            "a refused AddCluster must not arm a shard"
+        );
+    }
+}
+
+/// A health check `port` targets a backend IP and a `unix_path` backend has
+/// none: the worker refuses the pair in either order before its state, its
+/// `BackendMap` or its `HealthChecker` change.
+#[cfg(test)]
+mod health_check_port_unix_tests {
+    use sozu_command::{
+        config::HEALTH_CHECK_PORT_UNIX_REFUSED,
+        proto::command::{HealthCheckConfig, HealthCheckMode, SetHealthCheck, SocketAddress},
+    };
+
+    use super::listener_lifecycle_tests::bare_server;
+    use super::*;
+
+    const CLUSTER: &str = "port-unix-cluster";
+
+    fn probe(port: Option<u32>) -> HealthCheckConfig {
+        HealthCheckConfig {
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Tcp as i32,
+            port,
+            ..Default::default()
+        }
+    }
+
+    fn cluster(health_check: Option<HealthCheckConfig>) -> RequestType {
+        RequestType::AddCluster(Cluster {
+            cluster_id: CLUSTER.to_owned(),
+            health_check,
+            ..Default::default()
+        })
+    }
+
+    fn unix_backend() -> RequestType {
+        RequestType::AddUnixBackend(AddBackend {
+            cluster_id: CLUSTER.to_owned(),
+            backend_id: format!("{CLUSTER}-0"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+            unix_path: Some("/run/app.sock".to_owned()),
+            ..Default::default()
+        })
+    }
+
+    fn send(server: &mut Server, request: RequestType) -> Vec<WorkerResponse> {
+        server.notify_proxys(WorkerRequest {
+            id: "test-request".to_owned(),
+            content: request.into(),
+        });
+        QUEUE.with(|queue| {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|response| response.id != "EVENT")
+                .collect()
+        })
+    }
+
+    /// What the refusal must leave alone: the persisted state, the
+    /// `BackendMap` (backend incarnations by allocation, probe configs) and
+    /// the probes in flight.
+    fn snapshot(server: &Server) -> (String, Vec<*const RefCell<Backend>>, Vec<String>, usize) {
+        let backends = server.backends.borrow();
+        (
+            format!(
+                "{:?}{:?}",
+                server.config_state.clusters, server.config_state.backends
+            ),
+            backends
+                .backends
+                .get(CLUSTER)
+                .map(|list| list.backends.iter().map(Rc::as_ptr).collect())
+                .unwrap_or_default(),
+            backends
+                .health_check_configs
+                .values()
+                .map(|config| format!("{config:?}"))
+                .collect(),
+            server.health_checker.in_flight_len(),
+        )
+    }
+
+    fn assert_refused(server: &mut Server, request: RequestType) {
+        let before = snapshot(server);
+        let responses = send(server, request);
+        assert_eq!(responses.len(), 1, "one answer expected: {responses:?}");
+        assert_eq!(responses[0].status, ResponseStatus::Failure as i32);
+        assert!(
+            responses[0]
+                .message
+                .contains(HEALTH_CHECK_PORT_UNIX_REFUSED),
+            "the answer names the refusal: {responses:?}"
+        );
+        assert_eq!(before, snapshot(server), "a refusal changes nothing");
+    }
+
+    #[test]
+    fn a_probe_port_already_set_refuses_a_unix_backend() {
+        let mut server = bare_server();
+        send(&mut server, cluster(Some(probe(Some(8081)))));
+        assert_refused(&mut server, unix_backend());
+        assert!(snapshot(&server).1.is_empty(), "no backend was added");
+    }
+
+    #[test]
+    fn a_unix_backend_already_there_refuses_a_probe_port() {
+        let mut server = bare_server();
+        send(&mut server, cluster(Some(probe(None))));
+        send(&mut server, unix_backend());
+        assert_eq!(snapshot(&server).1.len(), 1, "test setup: the unix backend");
+
+        assert_refused(
+            &mut server,
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: CLUSTER.to_owned(),
+                config: probe(Some(8081)),
+            }),
+        );
+        assert_refused(&mut server, cluster(Some(probe(Some(8081)))));
+        assert_eq!(
+            server.backends.borrow().health_check_configs[CLUSTER].port,
+            None,
+            "the previous probe config stays"
+        );
+    }
+}
+
+/// Clearing a cluster's health check resets the backends a probe marked DOWN
+/// (#1811): no probe will ever mark them UP again.
+#[cfg(test)]
+mod remove_health_check_tests {
+    use sozu_command::proto::command::{HealthCheckConfig, LoadBalancingParams};
+
+    use super::listener_lifecycle_tests::bare_server;
+    use super::*;
+
+    const CLUSTER: &str = "health-checked";
+
+    fn health_check() -> HealthCheckConfig {
+        HealthCheckConfig {
+            uri: "/livez".to_owned(),
+            interval: 1,
+            timeout: 1,
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
+            ..Default::default()
+        }
+    }
+
+    fn add_cluster(server: &mut Server, health_check: Option<HealthCheckConfig>) {
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                health_check,
+                ..Default::default()
+            })
+            .into(),
+        });
+    }
+
+    /// A server whose cluster carries a health check and one backend a probe
+    /// marked DOWN.
+    fn server_with_down_backend() -> Server {
+        let mut server = bare_server();
+        add_cluster(&mut server, Some(health_check()));
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-backend".to_owned(),
+            content: RequestType::AddBackend(AddBackend {
+                cluster_id: CLUSTER.to_owned(),
+                backend_id: format!("{CLUSTER}-0"),
+                address: SocketAddr::from(([127, 0, 0, 1], 23_100)).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+                unix_path: None,
+            })
+            .into(),
+        });
+        server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow_mut()
+            .health
+            .record_failure(1);
+        assert!(!backend_is_healthy(&server), "test setup: backend DOWN");
+        server
+    }
+
+    fn backend_is_healthy(server: &Server) -> bool {
+        server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .is_healthy()
+    }
+
+    /// TO SEE THIS RED: make `Server::remove_health_check_state` remove the
+    /// cluster from `health_check_configs` directly instead of calling
+    /// `set_health_check_config(cluster_id, None)`; the backend stays DOWN.
+    #[test]
+    fn remove_health_check_resets_a_backend_marked_down() {
+        let mut server = server_with_down_backend();
+        server.notify_proxys(WorkerRequest {
+            id: "test-remove-health-check".to_owned(),
+            content: RequestType::RemoveHealthCheck(CLUSTER.to_owned()).into(),
+        });
+        assert!(
+            !server
+                .backends
+                .borrow()
+                .health_check_configs
+                .contains_key(CLUSTER),
+            "RemoveHealthCheck must forget the cluster's configuration"
+        );
+        assert!(
+            backend_is_healthy(&server),
+            "RemoveHealthCheck must reset a backend a probe marked DOWN"
+        );
+    }
+
+    /// An `AddCluster` upsert without a health check clears it the same way.
+    ///
+    /// TO SEE THIS RED: delete the `set_health_check_config` call from
+    /// `Server::add_cluster`; the backend stays DOWN. The in-flight probes the
+    /// `AddCluster` arm drops are not covered: that needs a live probe socket.
+    #[test]
+    fn add_cluster_without_health_check_resets_a_backend_marked_down() {
+        let mut server = server_with_down_backend();
+        add_cluster(&mut server, None);
+        assert!(
+            !server
+                .backends
+                .borrow()
+                .health_check_configs
+                .contains_key(CLUSTER),
+            "an AddCluster without a health check must forget the configuration"
+        );
+        assert!(
+            backend_is_healthy(&server),
+            "an AddCluster without a health check must reset a backend marked DOWN"
+        );
+    }
+
+    /// An idempotent reload re-sends the same `AddCluster` (health check
+    /// `port` included) and the same `AddBackend`: the DOWN backend and its
+    /// failure counters must survive, only a `None` health check resets them.
+    ///
+    /// TO SEE THIS RED: make `Server::add_cluster` pass `None` to
+    /// `set_health_check_config`; the counters are cleared.
+    #[test]
+    fn an_idempotent_reload_keeps_a_backend_marked_down_and_its_counters() {
+        let ported = HealthCheckConfig {
+            port: Some(8081),
+            ..health_check()
+        };
+        let mut server = bare_server();
+        add_cluster(&mut server, Some(ported.clone()));
+        let add_backend = || WorkerRequest {
+            id: "test-add-backend".to_owned(),
+            content: RequestType::AddBackend(AddBackend {
+                cluster_id: CLUSTER.to_owned(),
+                backend_id: format!("{CLUSTER}-0"),
+                address: SocketAddr::from(([127, 0, 0, 1], 23_100)).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+                unix_path: None,
+            })
+            .into(),
+        };
+        server.notify_proxys(add_backend());
+        {
+            let backends = server.backends.borrow();
+            let mut backend = backends.backends[CLUSTER].backends[0].borrow_mut();
+            // thresholds above the failure count keep the status stable; two
+            // failures leave a nonzero streak, the third marks it DOWN
+            for _ in 0..3 {
+                backend.health.record_failure(3);
+            }
+        }
+        let before = server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .clone();
+        assert!(!before.is_healthy(), "test setup: backend DOWN");
+        assert_eq!(before.consecutive_failures, 3, "test setup: counters");
+
+        // the order a reload sends: the cluster first, then its backend
+        add_cluster(&mut server, Some(ported.clone()));
+        server.notify_proxys(add_backend());
+
+        let after = server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .clone();
+        assert_eq!(after, before, "a reload must not reset the runtime health");
+        assert_eq!(
+            server.backends.borrow().health_check_configs[CLUSTER],
+            ported,
+            "the health check configuration stays"
+        );
+    }
+}
+
+/// The SCM hand-off a worker upgrade performs: the retiring worker's listening
+/// sockets travel to the new worker over the SCM socket, and the new worker
+/// must ADOPT them instead of binding fresh ones.
+/// `RemoveCluster` removes the cluster's frontends and backends from the
+/// worker's proxies, the way `ConfigState::remove_cluster`
+/// (`command/src/state.rs`) removes them from the state.
+#[cfg(test)]
+mod remove_cluster_cascade_tests {
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{
+            LoadBalancingParams, PathRule, RequestHttpFrontend, RequestTcpFrontend,
+            RequestUdpFrontend, RulePosition, SocketAddress,
+        },
+    };
+
+    use super::listener_lifecycle_tests::bare_server;
+    use super::*;
+    use crate::{L7ListenerHandler, protocol::http::parser::Method, testing::provide_port};
+
+    const REMOVED: &str = "cascade_removed";
+    const KEPT: &str = "cascade_kept";
+
+    /// The answers the worker queues for `request`. Events it queues along
+    /// the way (a removed backend's, for instance) are not answers and are
+    /// left out.
+    fn send(server: &mut Server, id: &str, request: RequestType) -> Vec<WorkerResponse> {
+        server.notify_proxys(WorkerRequest {
+            id: id.to_owned(),
+            content: request.into(),
+        });
+        QUEUE.with(|queue| {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|response| response.id != "EVENT")
+                .collect()
+        })
+    }
+
+    fn http_front(cluster_id: Option<&str>, hostname: &str, path: &str) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: cluster_id.map(str::to_owned),
+            hostname: hostname.to_owned(),
+            path: PathRule::prefix(path.to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 0),
+            ..Default::default()
+        }
+    }
+
+    /// A proxy can reject an order after the worker's `ConfigState` accepted
+    /// it. The worker must then restore its state, or `QueryClusterById`
+    /// reports an object the runtime never installed and disagrees with the
+    /// main process after its own rollback.
+    #[test]
+    fn a_proxy_rejection_rolls_back_reversible_worker_state() {
+        let cluster_id = "worker-rollback";
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let http = http_front(Some(cluster_id), "rollback.test", "/");
+
+        let requests = [
+            RequestType::AddHttpFrontend(RequestHttpFrontend {
+                address,
+                ..http.clone()
+            }),
+            RequestType::AddHttpsFrontend(RequestHttpFrontend { address, ..http }),
+            RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: cluster_id.to_owned(),
+                address,
+                ..Default::default()
+            }),
+            RequestType::AddUdpFrontend(RequestUdpFrontend {
+                cluster_id: cluster_id.to_owned(),
+                address,
+                ..Default::default()
+            }),
+        ];
+
+        for (index, request) in requests.into_iter().enumerate() {
+            let mut server = bare_server();
+            for response in send(
+                &mut server,
+                &format!("cluster-{index}"),
+                RequestType::AddCluster(Cluster {
+                    cluster_id: cluster_id.to_owned(),
+                    ..Default::default()
+                }),
+            ) {
+                assert_eq!(response.status, ResponseStatus::Ok as i32);
+            }
+
+            let responses = send(&mut server, &format!("frontend-{index}"), request);
+            assert_eq!(
+                responses
+                    .iter()
+                    .map(|response| response.status)
+                    .collect::<Vec<_>>(),
+                vec![ResponseStatus::Failure as i32],
+                "a frontend with no listener must be refused: {responses:?}"
+            );
+
+            let cluster = server
+                .config_state
+                .cluster_state(cluster_id)
+                .expect("the setup cluster must stay in worker state");
+            assert!(
+                cluster.http_frontends.is_empty()
+                    && cluster.https_frontends.is_empty()
+                    && cluster.tcp_frontends.is_empty()
+                    && cluster.udp_frontends.is_empty(),
+                "a refused frontend must not remain in worker ConfigState: {cluster:?}"
+            );
+        }
+    }
+
+    /// Removing a frontend is keyed by only its routing identity. If the
+    /// runtime refuses the removal after `ConfigState` accepted it, rollback
+    /// must restore the complete stored frontend rather than manufacture an
+    /// `Add` from the removal selector and lose metadata.
+    #[test]
+    fn a_refused_frontend_removal_restores_the_exact_stored_frontend() {
+        let cluster_id = "worker-remove-rollback";
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tags = std::collections::BTreeMap::from([("owner".to_owned(), "preserved".to_owned())]);
+        let mut http = http_front(Some(cluster_id), "remove.test", "/api");
+        http.address = address;
+        http.method = Some("POST".to_owned());
+        http.position = RulePosition::Post.into();
+        http.tags = tags.clone();
+        http.rewrite_host = Some("internal.test".to_owned());
+
+        let mut http_selector = http.clone();
+        http_selector.position = RulePosition::Tree.into();
+        http_selector.tags.clear();
+        http_selector.rewrite_host = None;
+
+        let mut https = http.clone();
+        https.hostname = "secure-remove.test".to_owned();
+        let mut https_selector = https.clone();
+        https_selector.position = RulePosition::Tree.into();
+        https_selector.tags.clear();
+        https_selector.rewrite_host = None;
+
+        let tcp = RequestTcpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address,
+            tags: tags.clone(),
+            sni: Some("REMOVE.TEST".to_owned()),
+            alpn: vec!["http/1.1".to_owned(), "h2".to_owned()],
+        };
+        let tcp_selector = RequestTcpFrontend {
+            tags: Default::default(),
+            sni: Some("remove.test".to_owned()),
+            alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
+            ..tcp.clone()
+        };
+
+        let udp = RequestUdpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address,
+            tags,
+        };
+
+        let cases = [
+            (
+                "http",
+                RequestType::AddHttpFrontend(http),
+                RequestType::RemoveHttpFrontend(http_selector),
+            ),
+            (
+                "https",
+                RequestType::AddHttpsFrontend(https),
+                RequestType::RemoveHttpsFrontend(https_selector),
+            ),
+            (
+                "tcp",
+                RequestType::AddTcpFrontend(tcp),
+                RequestType::RemoveTcpFrontend(tcp_selector),
+            ),
+            (
+                "udp",
+                RequestType::AddUdpFrontend(udp.clone()),
+                RequestType::RemoveUdpFrontend(udp),
+            ),
+        ];
+
+        for (protocol, add, remove) in cases {
+            let mut server = bare_server();
+            server
+                .config_state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: cluster_id.to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("the setup cluster must enter worker state");
+            server
+                .config_state
+                .dispatch(&add.into())
+                .unwrap_or_else(|error| {
+                    panic!("the {protocol} setup frontend must be stored: {error}")
+                });
+            let before = server
+                .config_state
+                .cluster_state(cluster_id)
+                .expect("the setup cluster must expose its frontend");
+
+            let responses = send(&mut server, &format!("remove-{protocol}"), remove);
+            assert_eq!(
+                responses
+                    .iter()
+                    .map(|response| response.status)
+                    .collect::<Vec<_>>(),
+                vec![ResponseStatus::Failure as i32],
+                "a frontend removal with no runtime listener must be refused: {responses:?}"
+            );
+            assert_eq!(
+                server.config_state.cluster_state(cluster_id),
+                Some(before),
+                "a refused {protocol} removal must restore the complete stored frontend"
+            );
+        }
+    }
+
+    /// A request-only inverse is safe only after the corresponding `Add`
+    /// entered `ConfigState`. A duplicate is rejected before mutation; if the
+    /// runtime then refuses it too, applying the inverse would delete the
+    /// frontend that predated the request.
+    #[test]
+    fn a_refused_duplicate_frontend_add_preserves_the_preexisting_frontend() {
+        let cluster_id = "worker-add-rollback";
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tags =
+            std::collections::BTreeMap::from([("owner".to_owned(), "preexisting".to_owned())]);
+        let mut http = http_front(Some(cluster_id), "duplicate.test", "/api");
+        http.address = address;
+        http.method = Some("PATCH".to_owned());
+        http.position = RulePosition::Pre.into();
+        http.tags = tags.clone();
+
+        let mut https = http.clone();
+        https.hostname = "secure-duplicate.test".to_owned();
+        let tcp = RequestTcpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address,
+            tags: tags.clone(),
+            sni: Some("duplicate.test".to_owned()),
+            alpn: vec!["h2".to_owned()],
+        };
+        let udp = RequestUdpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address,
+            tags,
+        };
+
+        let cases = [
+            ("http", RequestType::AddHttpFrontend(http)),
+            ("https", RequestType::AddHttpsFrontend(https)),
+            ("tcp", RequestType::AddTcpFrontend(tcp)),
+            ("udp", RequestType::AddUdpFrontend(udp)),
+        ];
+
+        for (protocol, add) in cases {
+            let mut server = bare_server();
+            server
+                .config_state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: cluster_id.to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("the setup cluster must enter worker state");
+            server
+                .config_state
+                .dispatch(&add.clone().into())
+                .unwrap_or_else(|error| {
+                    panic!("the {protocol} setup frontend must be stored: {error}")
+                });
+            let before = server
+                .config_state
+                .cluster_state(cluster_id)
+                .expect("the setup cluster must expose its frontend");
+
+            let responses = send(&mut server, &format!("duplicate-{protocol}"), add);
+            assert_eq!(
+                responses
+                    .iter()
+                    .map(|response| response.status)
+                    .collect::<Vec<_>>(),
+                vec![ResponseStatus::Failure as i32],
+                "a duplicate frontend with no runtime listener must be refused: {responses:?}"
+            );
+            assert_eq!(
+                server.config_state.cluster_state(cluster_id),
+                Some(before),
+                "a refused duplicate {protocol} add must preserve the preexisting frontend"
+            );
+        }
+    }
+
+    /// Listener adds are request-invertible only on the vacant state path. A
+    /// duplicate state error must leave rollback unarmed when the runtime also
+    /// refuses the order.
+    #[test]
+    fn a_refused_duplicate_listener_add_preserves_the_preexisting_listener() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listener = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("the test HTTP listener configuration must build");
+        let mut server = bare_server();
+        server
+            .config_state
+            .dispatch(&RequestType::AddHttpListener(listener.clone()).into())
+            .expect("the setup listener must enter worker state");
+        let before = server.config_state.http_listeners.clone();
+
+        // Fill the reserved slab headroom so the worker takes the explicit
+        // refusal path before attempting to install a runtime listener.
+        let threshold = server.sessions.borrow().accept_slab_threshold();
+        while server.sessions.borrow().slab.len() < threshold {
+            server
+                .sessions
+                .borrow_mut()
+                .slab
+                .insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::HTTPListen,
+                })));
+        }
+        assert!(server.sessions.borrow().at_capacity());
+
+        let responses = send(
+            &mut server,
+            "duplicate-listener",
+            RequestType::AddHttpListener(listener),
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.status)
+                .collect::<Vec<_>>(),
+            vec![ResponseStatus::Failure as i32],
+            "the full session slab must refuse the duplicate listener: {responses:?}"
+        );
+        assert_eq!(
+            server.config_state.http_listeners, before,
+            "a refused duplicate listener add must preserve the preexisting listener"
+        );
+    }
+
+    fn backend(cluster_id: &str, port: u16) -> AddBackend {
+        AddBackend {
+            cluster_id: cluster_id.to_owned(),
+            backend_id: format!("{cluster_id}-0"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            load_balancing_parameters: Some(LoadBalancingParams::default()),
+            ..Default::default()
+        }
+    }
+
+    /// Admission leases belong to live frontend-session tokens, not to the
+    /// current cluster configuration object. Removing a cluster therefore
+    /// leaves the old session's contribution in both counters; re-adding the
+    /// same id lets a new session contribute alongside it; closing either
+    /// session releases exactly that token's contribution.
+    ///
+    /// To SEE THIS RED: change `untrack_all_cluster_ip`'s per-IP decrement from
+    /// `saturating_sub(1)` to `saturating_sub(0)`. The old lease then remains at
+    /// two and the post-close assertion fails, proving this observes release
+    /// rather than only reconfiguration.
+    #[test]
+    fn remove_then_readd_same_cluster_id_preserves_and_releases_live_admission_leases() {
+        let mut server = bare_server();
+        let cluster_id = ClusterId::from(REMOVED);
+        let source: IpAddr = "203.0.113.9".parse().expect("test address must parse");
+        let subnet = server.sessions.borrow().subnet_key(&source);
+        let old_token = Token(60_001);
+        let new_token = Token(60_002);
+
+        for response in send(
+            &mut server,
+            "add-old-incarnation",
+            RequestType::AddCluster(Cluster {
+                cluster_id: REMOVED.to_owned(),
+                max_connections_per_ip: Some(2),
+                max_connections_per_subnet: Some(2),
+                ..Default::default()
+            }),
+        ) {
+            assert_eq!(response.status, ResponseStatus::Ok as i32);
+        }
+        server.sessions.borrow_mut().track_cluster_connection(
+            old_token,
+            cluster_id.clone(),
+            source,
+            Some(2),
+        );
+
+        for response in send(
+            &mut server,
+            "remove-old-incarnation",
+            RequestType::RemoveCluster(REMOVED.to_owned()),
+        ) {
+            assert_eq!(response.status, ResponseStatus::Ok as i32);
+        }
+        for response in send(
+            &mut server,
+            "add-new-incarnation",
+            RequestType::AddCluster(Cluster {
+                cluster_id: REMOVED.to_owned(),
+                max_connections_per_ip: Some(2),
+                max_connections_per_subnet: Some(2),
+                ..Default::default()
+            }),
+        ) {
+            assert_eq!(response.status, ResponseStatus::Ok as i32);
+        }
+
+        {
+            let mut sessions = server.sessions.borrow_mut();
+            assert_eq!(sessions.connections_per_cluster_ip[REMOVED][&source], 1);
+            assert_eq!(sessions.connections_per_cluster_subnet[REMOVED][&subnet], 1);
+            sessions.track_cluster_connection(new_token, cluster_id, source, Some(2));
+            assert_eq!(sessions.connections_per_cluster_ip[REMOVED][&source], 2);
+            assert_eq!(sessions.connections_per_cluster_subnet[REMOVED][&subnet], 2);
+
+            sessions.untrack_all_cluster_ip(old_token);
+            assert_eq!(sessions.connections_per_cluster_ip[REMOVED][&source], 1);
+            assert_eq!(sessions.connections_per_cluster_subnet[REMOVED][&subnet], 1);
+            assert!(sessions.cluster_ip_tracks.contains_key(&new_token));
+            assert!(sessions.cluster_subnet_tracks.contains_key(&new_token));
+
+            sessions.untrack_all_cluster_ip(new_token);
+            assert!(!sessions.connections_per_cluster_ip.contains_key(REMOVED));
+            assert!(
+                !sessions
+                    .connections_per_cluster_subnet
+                    .contains_key(REMOVED)
+            );
+        }
+    }
+
+    /// The route an HTTP request to `hostname` + `path` resolves to on the
+    /// worker's only HTTP listener, as a cluster id (`Some(None)` for a route
+    /// that names no cluster), or `None` when nothing routes it.
+    fn http_route(
+        server: &Server,
+        address: SocketAddress,
+        hostname: &str,
+        path: &str,
+    ) -> Option<Option<String>> {
+        let http = server.http.borrow();
+        let token = http
+            .listener_token(&SocketAddr::from(address).into())
+            .expect("the test HTTP listener must own a token");
+        let listener = http
+            .get_listener(&token)
+            .expect("the test HTTP listener must exist");
+        listener
+            .borrow()
+            .frontend_from_request(hostname, path, &Method::Get, &crate::router::NoHeaders)
+            .ok()
+            .map(|route| route.cluster_id.map(|id| id.to_string()))
+    }
+
+    /// A removed cluster's HTTP routes and backends are gone from the worker,
+    /// while another cluster's and a route that names no cluster stay. The
+    /// worker answers the `RemoveCluster` once, and a removal of one of the
+    /// cluster's objects sent afterwards (what a main process that predates
+    /// the cascade still sends) answers ok instead of failing on a route the
+    /// cascade already removed.
+    #[test]
+    fn remove_cluster_removes_its_routes_and_backends_from_the_worker() {
+        let mut server = bare_server();
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+
+        let mut removed_front = http_front(Some(REMOVED), "removed.test", "/");
+        removed_front.address = http_address;
+        // A pre-rule: unlike a tree rule, removing it twice is an error in
+        // `Router::remove_pre_rule` (`lib/src/router/mod.rs`).
+        removed_front.position = RulePosition::Pre.into();
+        let mut deny_front = http_front(None, "removed.test", "/deny");
+        deny_front.address = http_address;
+        let mut kept_front = http_front(Some(KEPT), "kept.test", "/");
+        kept_front.address = http_address;
+        let removed_tcp_front = RequestTcpFrontend {
+            cluster_id: REMOVED.to_owned(),
+            address: tcp_address,
+            ..Default::default()
+        };
+
+        let setup = vec![
+            RequestType::AddHttpListener(
+                ListenerBuilder::new_http(http_address)
+                    .to_http(None)
+                    .expect("could not build the test HTTP listener config"),
+            ),
+            RequestType::AddTcpListener(
+                ListenerBuilder::new_tcp(tcp_address)
+                    .to_tcp(None)
+                    .expect("could not build the test TCP listener config"),
+            ),
+            RequestType::AddCluster(Cluster {
+                cluster_id: REMOVED.to_owned(),
+                ..Default::default()
+            }),
+            RequestType::AddCluster(Cluster {
+                cluster_id: KEPT.to_owned(),
+                ..Default::default()
+            }),
+            RequestType::AddHttpFrontend(removed_front.clone()),
+            RequestType::AddHttpFrontend(deny_front),
+            RequestType::AddHttpFrontend(kept_front),
+            RequestType::AddTcpFrontend(removed_tcp_front.clone()),
+            RequestType::AddBackend(backend(REMOVED, 1026)),
+            RequestType::AddBackend(backend(KEPT, 1027)),
+        ];
+        for (index, request) in setup.into_iter().enumerate() {
+            for response in send(&mut server, &format!("setup-{index}"), request) {
+                assert_eq!(
+                    response.status,
+                    ResponseStatus::Ok as i32,
+                    "setup must succeed: {response:?}"
+                );
+            }
+        }
+        assert_eq!(
+            http_route(&server, http_address, "removed.test", "/"),
+            Some(Some(REMOVED.to_owned())),
+            "premise: the removed cluster's hostname routes to it"
+        );
+
+        let responses = send(
+            &mut server,
+            "remove-cluster",
+            RequestType::RemoveCluster(REMOVED.to_owned()),
+        );
+        assert_eq!(
+            responses.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["remove-cluster"],
+            "the worker must answer the RemoveCluster exactly once: {responses:?}"
+        );
+        assert_eq!(
+            responses[0].status,
+            ResponseStatus::Ok as i32,
+            "RemoveCluster must succeed: {responses:?}"
+        );
+
+        assert_eq!(
+            http_route(&server, http_address, "removed.test", "/"),
+            None,
+            "the removed cluster's hostname must no longer route"
+        );
+        assert_eq!(
+            http_route(&server, http_address, "removed.test", "/deny"),
+            Some(None),
+            "a route that names no cluster must survive the removal of a cluster on its hostname"
+        );
+        assert_eq!(
+            http_route(&server, http_address, "kept.test", "/"),
+            Some(Some(KEPT.to_owned())),
+            "another cluster's route must stay"
+        );
+        let backends = server.backends.borrow();
+        assert!(
+            !backends.backends.contains_key(REMOVED),
+            "the removed cluster's backends must be gone from the BackendMap"
+        );
+        assert!(
+            backends.backends.contains_key(KEPT),
+            "another cluster's backends must stay"
+        );
+        drop(backends);
+
+        for (index, request) in [
+            RequestType::RemoveHttpFrontend(removed_front),
+            RequestType::RemoveTcpFrontend(removed_tcp_front),
+            RequestType::RemoveBackend(RemoveBackend {
+                cluster_id: REMOVED.to_owned(),
+                backend_id: format!("{REMOVED}-0"),
+                address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let responses = send(&mut server, &format!("follow-up-{index}"), request);
+            assert!(
+                !responses.is_empty()
+                    && responses
+                        .iter()
+                        .all(|r| r.status == ResponseStatus::Ok as i32),
+                "a removal the cascade already performed must answer ok: {responses:?}"
+            );
+        }
+    }
+
+    /// A backend belongs to its cluster: the worker refuses an `AddBackend`
+    /// for a cluster it does not hold, never added or already removed, and
+    /// never adds it to its `BackendMap`, where it would outlive its cluster.
+    #[test]
+    fn a_backend_of_an_unknown_cluster_is_refused_by_the_worker() {
+        const ORPHAN: &str = "orphan";
+        let mut server = bare_server();
+        let assert_refused = |server: &mut Server, id: &str, port: u16| {
+            let responses = send(server, id, RequestType::AddBackend(backend(ORPHAN, port)));
+            assert!(
+                !responses.is_empty()
+                    && responses
+                        .iter()
+                        .all(|r| r.status == ResponseStatus::Failure as i32),
+                "a backend of an unknown cluster must be refused: {responses:?}"
+            );
+            assert!(
+                !server.backends.borrow().backends.contains_key(ORPHAN),
+                "a refused backend must not reach the BackendMap"
+            );
+        };
+
+        assert_refused(&mut server, "never-added", 1026);
+
+        for (index, request) in [
+            RequestType::AddCluster(Cluster {
+                cluster_id: ORPHAN.to_owned(),
+                ..Default::default()
+            }),
+            RequestType::AddBackend(backend(ORPHAN, 1026)),
+            RequestType::RemoveCluster(ORPHAN.to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for response in send(&mut server, &format!("step-{index}"), request) {
+                assert_eq!(
+                    response.status,
+                    ResponseStatus::Ok as i32,
+                    "step must succeed: {response:?}"
+                );
+            }
+        }
+
+        assert_refused(&mut server, "removed", 1027);
+    }
+
+    /// The route key names no cluster, so cluster B can take the key cluster
+    /// A's frontend used. A removal of A's frontend arriving afterwards must
+    /// leave B's route in the worker's router, whether A is gone (the removal
+    /// answers ok: A's frontend went with A) or still there (refused).
+    #[test]
+    fn a_stale_frontend_removal_never_removes_another_clusters_route() {
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let route = |cluster_id: &str| {
+            let mut front = http_front(Some(cluster_id), "reused.test", "/");
+            front.address = http_address;
+            front
+        };
+        let cluster = |cluster_id: &str| {
+            RequestType::AddCluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                ..Default::default()
+            })
+        };
+        let listener = || {
+            RequestType::AddHttpListener(
+                ListenerBuilder::new_http(http_address)
+                    .to_http(None)
+                    .expect("could not build the test HTTP listener config"),
+            )
+        };
+
+        for (a_is_gone, setup, expected_status) in [
+            (
+                true,
+                vec![
+                    listener(),
+                    cluster("stale_a"),
+                    RequestType::AddHttpFrontend(route("stale_a")),
+                    RequestType::RemoveCluster("stale_a".to_owned()),
+                    cluster("stale_b"),
+                    RequestType::AddHttpFrontend(route("stale_b")),
+                ],
+                ResponseStatus::Ok,
+            ),
+            (
+                false,
+                vec![
+                    listener(),
+                    cluster("stale_a"),
+                    cluster("stale_b"),
+                    RequestType::AddHttpFrontend(route("stale_b")),
+                ],
+                ResponseStatus::Failure,
+            ),
+        ] {
+            let mut server = bare_server();
+            for (index, request) in setup.into_iter().enumerate() {
+                for response in send(&mut server, &format!("setup-{index}"), request) {
+                    assert_eq!(
+                        response.status,
+                        ResponseStatus::Ok as i32,
+                        "setup must succeed: {response:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                http_route(&server, http_address, "reused.test", "/"),
+                Some(Some("stale_b".to_owned())),
+                "premise: cluster B owns the route"
+            );
+
+            let responses = send(
+                &mut server,
+                "stale-removal",
+                RequestType::RemoveHttpFrontend(route("stale_a")),
+            );
+            assert_eq!(
+                responses.iter().map(|r| r.status).collect::<Vec<_>>(),
+                vec![expected_status as i32],
+                "A gone: {a_is_gone}, answers: {responses:?}"
+            );
+            assert_eq!(
+                http_route(&server, http_address, "reused.test", "/"),
+                Some(Some("stale_b".to_owned())),
+                "cluster B's route must survive a stale removal naming cluster A (A gone: {a_is_gone})"
+            );
+        }
+    }
+
+    /// TCP and UDP frontends are removed from their listener by address,
+    /// whatever cluster owns it. Cluster A frees address X, B takes X, and A
+    /// comes back with a frontend on Y. A stale removal of A's frontend on X
+    /// then finds A's frontend list but no match in it (`NoChange`, not
+    /// `NotFound`), and must still leave B's listener on X alone.
+    #[test]
+    fn a_stale_tcp_or_udp_frontend_removal_never_unmaps_another_clusters_listener() {
+        let cluster = |cluster_id: &str| {
+            RequestType::AddCluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                ..Default::default()
+            })
+        };
+        for udp in [false, true] {
+            let x = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let y = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let listener = |address: SocketAddress| {
+                if udp {
+                    RequestType::AddUdpListener(
+                        ListenerBuilder::new_udp(address)
+                            .to_udp(None)
+                            .expect("could not build the test UDP listener config"),
+                    )
+                } else {
+                    RequestType::AddTcpListener(
+                        ListenerBuilder::new_tcp(address)
+                            .to_tcp(None)
+                            .expect("could not build the test TCP listener config"),
+                    )
+                }
+            };
+            let front = |cluster_id: &str, address: SocketAddress| {
+                if udp {
+                    (
+                        RequestType::AddUdpFrontend(RequestUdpFrontend {
+                            cluster_id: cluster_id.to_owned(),
+                            address,
+                            ..Default::default()
+                        }),
+                        RequestType::RemoveUdpFrontend(RequestUdpFrontend {
+                            cluster_id: cluster_id.to_owned(),
+                            address,
+                            ..Default::default()
+                        }),
+                    )
+                } else {
+                    (
+                        RequestType::AddTcpFrontend(RequestTcpFrontend {
+                            cluster_id: cluster_id.to_owned(),
+                            address,
+                            ..Default::default()
+                        }),
+                        RequestType::RemoveTcpFrontend(RequestTcpFrontend {
+                            cluster_id: cluster_id.to_owned(),
+                            address,
+                            ..Default::default()
+                        }),
+                    )
+                }
+            };
+            let owner = |server: &Server| {
+                let key = SocketAddr::from(x).into();
+                if udp {
+                    server.udp.borrow().listener_cluster(&key)
+                } else {
+                    server.tcp.borrow().listener_cluster(&key)
+                }
+                .map(|id| id.to_string())
+            };
+
+            let mut server = bare_server();
+            for (index, request) in [
+                listener(x),
+                listener(y),
+                cluster("stale_a"),
+                front("stale_a", x).0,
+                RequestType::RemoveCluster("stale_a".to_owned()),
+                cluster("stale_b"),
+                front("stale_b", x).0,
+                cluster("stale_a"),
+                front("stale_a", y).0,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for response in send(&mut server, &format!("setup-{index}"), request) {
+                    assert_eq!(
+                        response.status,
+                        ResponseStatus::Ok as i32,
+                        "setup must succeed (udp: {udp}): {response:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                owner(&server).as_deref(),
+                Some("stale_b"),
+                "premise: cluster B owns the listener on X (udp: {udp})"
+            );
+
+            let responses = send(&mut server, "stale-removal", front("stale_a", x).1);
+            assert_eq!(
+                responses.iter().map(|r| r.status).collect::<Vec<_>>(),
+                vec![ResponseStatus::Failure as i32],
+                "the stale removal must be refused (udp: {udp}): {responses:?}"
+            );
+            assert_eq!(
+                owner(&server).as_deref(),
+                Some("stale_b"),
+                "cluster B must keep the listener on X after a stale removal naming A (udp: {udp})"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scm_listener_handoff_tests {
+    use std::{
+        net::{TcpStream as StdTcpStream, UdpSocket as StdUdpSocket},
+        os::fd::{IntoRawFd, RawFd},
+    };
+
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+
+    use super::*;
+    use crate::{
+        ProxyError,
+        socket::{server_bind, udp_bind},
+        testing::{ServerParts, prebuild_server, provide_port},
+    };
+
+    /// A `ConfigState` holding one ACTIVE listener per protocol, i.e. what the
+    /// main process carries into `produce_initial_state` for a worker upgrade.
+    fn state_with_four_active_listeners(
+        http_address: SocketAddress,
+        https_address: SocketAddress,
+        tcp_address: SocketAddress,
+        udp_address: SocketAddress,
+    ) -> ConfigState {
+        let mut state = ConfigState::new();
+        let adds: Vec<(Request, SocketAddress, ListenerType)> = vec![
+            (
+                RequestType::AddHttpListener(
+                    ListenerBuilder::new_http(http_address)
+                        .to_http(None)
+                        .expect("could not build the test HTTP listener config"),
+                )
+                .into(),
+                http_address,
+                ListenerType::Http,
+            ),
+            (
+                RequestType::AddHttpsListener(
+                    ListenerBuilder::new_https(https_address)
+                        .to_tls(None)
+                        .expect("could not build the test HTTPS listener config"),
+                )
+                .into(),
+                https_address,
+                ListenerType::Https,
+            ),
+            (
+                RequestType::AddTcpListener(
+                    ListenerBuilder::new_tcp(tcp_address)
+                        .to_tcp(None)
+                        .expect("could not build the test TCP listener config"),
+                )
+                .into(),
+                tcp_address,
+                ListenerType::Tcp,
+            ),
+            (
+                RequestType::AddUdpListener(
+                    ListenerBuilder::new_udp(udp_address)
+                        .to_udp(None)
+                        .expect("could not build the test UDP listener config"),
+                )
+                .into(),
+                udp_address,
+                ListenerType::Udp,
+            ),
+        ];
+        for (add, address, proxy) in adds {
+            state.dispatch(&add).expect("could not add the listener");
+            state
+                .dispatch(
+                    &RequestType::ActivateListener(ActivateListener {
+                        interface: None,
+                        address,
+                        proxy: proxy.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                )
+                .expect("could not mark the listener active");
+        }
+        state
+    }
+
+    /// The SCM table for `label`, so a test can assert on retention per protocol.
+    fn inherited_table<'a>(server: &'a Server, label: &str) -> &'a Vec<(ListenerKey, RawFd)> {
+        let scm_listeners = server
+            .scm_listeners
+            .as_ref()
+            .expect("scm_listeners must be present");
+        match label {
+            "HTTP" => &scm_listeners.http,
+            "HTTPS" => &scm_listeners.tls,
+            "TCP" => &scm_listeners.tcp,
+            "UDP" => &scm_listeners.udp,
+            other => panic!("unknown protocol label {other}"),
+        }
+    }
+
+    /// Whether `fd` is still the listening socket bound to `port`.
+    ///
+    /// Deliberately identity-aware rather than a bare "is it open" check: the
+    /// test binary runs its tests in parallel, so a descriptor closed here can
+    /// be handed straight back out to an unrelated file opened by another test
+    /// and a liveness-only probe would call that "still open". Every port in
+    /// these tests comes from `provide_port()` and is therefore unique to one
+    /// test, so `getsockname` answering with that exact port is proof the
+    /// descriptor is still the same socket.
+    fn descriptor_is_socket_on_port(fd: RawFd, port: u16) -> bool {
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: `getsockname` writes at most `length` bytes into `storage`
+        // and updates `length`; both outlive the call. A closed, reused or
+        // non-socket descriptor answers -1, which is the answer under test.
+        let result = unsafe {
+            libc::getsockname(
+                fd,
+                (&raw mut storage).cast::<libc::sockaddr>(),
+                &raw mut length,
+            )
+        };
+        if result != 0 || storage.ss_family != libc::AF_INET as libc::sa_family_t {
+            return false;
+        }
+        // SAFETY: the family check above proves the kernel filled a
+        // `sockaddr_in`, which `sockaddr_storage` is aligned and sized for.
+        let inet = unsafe { &*(&raw const storage).cast::<libc::sockaddr_in>() };
+        u16::from_be(inet.sin_port) == port
+    }
+
+    /// The datagram queued on the inherited UDP socket before the hand-off.
+    const QUEUED_DATAGRAM: &[u8] = b"queued-before-the-handoff";
+
+    /// A worker that inherits its predecessor's listening sockets must adopt
+    /// them, not bind its own and leave the inherited descriptors unused.
+    ///
+    /// `fork_main_into_worker` (`bin/src/worker.rs`) sends the retiring
+    /// worker's descriptors over the SCM socket immediately after the fork,
+    /// before the main process sends anything else, and
+    /// `ConfigState::produce_initial_state` carries one `ActivateListener` per
+    /// active listener. `Server::new` must therefore have received those
+    /// descriptors BEFORE it applies the initial state: otherwise every
+    /// `ActivateListener` takes the `server_bind` / `udp_bind` branch — which
+    /// succeeds only because of `SO_REUSEPORT` — and the inherited descriptor
+    /// is dropped unused, discarding the accept backlog (TCP/HTTP/HTTPS) and
+    /// the receive buffer (UDP) the hand-off exists to preserve.
+    ///
+    /// The three TCP-family assertions read `accept_queue`, which
+    /// `notify_activate_listener` fills through `Server::accept` right after a
+    /// successful activation; the UDP assertion reads the listener's own
+    /// socket, since UDP has no accept path.
+    ///
+    /// To SEE THIS RED: in `Server::new`, move the `receive_listeners()` block
+    /// back below the `if let Some(state) = initial_state` block. All four
+    /// assertions fail — each listener binds its own socket, and the queued
+    /// connections and datagram stay on the abandoned descriptors.
+    ///
+    /// The `TCP_NODELAY` assertions guard the backlog drain of
+    /// sozu-proxy/sozu#1586. To SEE THEM RED: delete the
+    /// `self.nodelay_backlog = true;` line from `HttpListener::activate`. The
+    /// listener still gets the flag, but the connection queued before it did
+    /// is accepted without it.
+    #[test]
+    fn inherited_listener_sockets_are_adopted_by_the_initial_activation() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            client_scm_socket,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+
+        // The retiring worker's sockets, bound exactly the way a live worker
+        // binds them.
+        let http_listener = server_bind(http_address.into(), None)
+            .expect("could not bind the inherited HTTP socket");
+        let https_listener = server_bind(https_address.into(), None)
+            .expect("could not bind the inherited HTTPS socket");
+        let tcp_listener =
+            server_bind(tcp_address.into(), None).expect("could not bind the inherited TCP socket");
+        let udp_socket =
+            udp_bind(udp_address.into(), None).expect("could not bind the inherited UDP socket");
+
+        // Queue on each inherited socket exactly what the hand-off exists to
+        // preserve: a completed connection in the accept backlog, and a
+        // datagram in the receive buffer. The clients stay alive for the whole
+        // test so the connections are not closed from under the backlog.
+        let http_client = StdTcpStream::connect::<SocketAddr>(http_address.into())
+            .expect("could not queue a connection on the inherited HTTP socket");
+        let https_client = StdTcpStream::connect::<SocketAddr>(https_address.into())
+            .expect("could not queue a connection on the inherited HTTPS socket");
+        let tcp_client = StdTcpStream::connect::<SocketAddr>(tcp_address.into())
+            .expect("could not queue a connection on the inherited TCP socket");
+        let datagram_sender =
+            StdUdpSocket::bind("127.0.0.1:0").expect("could not bind the test datagram sender");
+        datagram_sender
+            .send_to(QUEUED_DATAGRAM, SocketAddr::from(udp_address))
+            .expect("could not queue a datagram on the inherited UDP socket");
+
+        // The main process's side of the hand-off: send the descriptors, then
+        // close its own copies, exactly as `fork_main_into_worker` does.
+        let listeners = Listeners {
+            http: vec![(http_address.into(), http_listener.into_raw_fd())],
+            tls: vec![(https_address.into(), https_listener.into_raw_fd())],
+            tcp: vec![(tcp_address.into(), tcp_listener.into_raw_fd())],
+            udp: vec![(udp_address.into(), udp_socket.into_raw_fd())],
+        };
+        client_scm_socket
+            .send_listeners(&listeners)
+            .expect("could not send the inherited listeners");
+        listeners.close();
+
+        // The state the main process writes for the new worker. Built through
+        // `ConfigState` and `produce_initial_state` rather than hand-rolled, so
+        // the emission order under test is the real generator's: this breaks if
+        // `generate_requests` ever stops pairing each `AddXxxListener` with the
+        // `ActivateListener` that follows it.
+        let initial_state =
+            state_with_four_active_listeners(http_address, https_address, tcp_address, udp_address)
+                .produce_initial_state();
+        assert_eq!(
+            initial_state.requests.len(),
+            8,
+            "the generator must emit one Add and one Activate per active listener"
+        );
+
+        let server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            Some(initial_state),
+            false,
+        )
+        .expect("could not build the test server");
+
+        let accepted: Vec<Protocol> = server
+            .accept_queue
+            .iter()
+            .map(|(_, _, protocol, _, _)| *protocol)
+            .collect();
+        assert!(
+            accepted.contains(&Protocol::HTTPListen),
+            "the connection queued on the inherited HTTP socket must survive the hand-off, got {accepted:?}"
+        );
+        assert!(
+            accepted.contains(&Protocol::HTTPSListen),
+            "the connection queued on the inherited HTTPS socket must survive the hand-off, got {accepted:?}"
+        );
+        assert!(
+            accepted.contains(&Protocol::TCPListen),
+            "the connection queued on the inherited TCP socket must survive the hand-off, got {accepted:?}"
+        );
+
+        // What those queued connections are handed to the sessions with. They
+        // completed their handshake BEFORE the new worker set `TCP_NODELAY` on
+        // the inherited socket, and a socket inherits the flag when its
+        // handshake completes, not when it is accepted, so the listener alone
+        // cannot have given it to them: the first accept drain after an
+        // activation must. And the peer address queued with each one is the
+        // one `accept(2)` returned, which is the client's own address.
+        for (protocol, client) in [
+            (Protocol::HTTPListen, &http_client),
+            (Protocol::HTTPSListen, &https_client),
+            (Protocol::TCPListen, &tcp_client),
+        ] {
+            let (sock, _, _, _, peer) = server
+                .accept_queue
+                .iter()
+                .find(|(_, _, queued, _, _)| *queued == protocol)
+                .expect("the queued connection was asserted above");
+            assert_eq!(
+                socket2::SockRef::from(sock).tcp_nodelay().ok(),
+                Some(true),
+                "a {protocol:?} connection queued before the hand-off must carry TCP_NODELAY"
+            );
+            assert_eq!(
+                *peer,
+                client.local_addr().expect("the test client has an address"),
+                "the {protocol:?} peer address must be the client's"
+            );
+        }
+
+        let (_, adopted_udp_socket) = server
+            .udp
+            .borrow_mut()
+            .give_back_listeners()
+            .pop()
+            .expect("the UDP listener must hold a socket after activation");
+        let mut buffer = [0u8; 64];
+        let received = adopted_udp_socket.recv_from(&mut buffer);
+        match received {
+            Ok((length, _)) => assert_eq!(
+                &buffer[..length],
+                QUEUED_DATAGRAM,
+                "the datagram queued on the inherited UDP socket must survive the hand-off"
+            ),
+            Err(error) => panic!(
+                "the datagram queued on the inherited UDP socket must survive the hand-off, got {error:?}"
+            ),
+        }
+    }
+
+    /// An `ActivateListener` for a listener that is ALREADY active must dispose
+    /// of the inherited descriptor deliberately, not leave it in the table.
+    ///
+    /// `activate()` short-circuits on `if self.active`, so nothing adopts that
+    /// descriptor while the listener holds the address — a deactivate plus
+    /// reactivate would, which is why `InheritedSocketFate::Refused` documents
+    /// the close as a trade rather than an impossibility. Leaving it in the SCM
+    /// table is not neutral either: it is the retiring worker's listening
+    /// socket, still bound with `SO_REUSEPORT` and registered with no event
+    /// loop, which is expected to keep taking a share of new connections that
+    /// nothing accepts. Nothing here measures that expectation — the assertion
+    /// below checks only that the descriptor is gone from the table and closed.
+    ///
+    /// Receiving the SCM listeners before the initial state means the ordinary
+    /// upgrade no longer reaches this state, so the test constructs it directly.
+    ///
+    /// To SEE THIS RED: make any arm's `InheritedSocketFate::Refused` branch
+    /// return `None` without discarding — that protocol's descriptor stays in the
+    /// table and open, and both assertions below fail. This guards the
+    /// retain-everything regression; the ORIGINAL defect closed the descriptor
+    /// here too, by dropping the wrapper, and is guarded by
+    /// `inherited_listener_sockets_are_adopted_by_the_initial_activation`
+    /// instead.
+    #[test]
+    fn a_repeated_activation_closes_the_descriptor_it_cannot_adopt_now() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+
+        // A worker whose four listeners are up on their OWN sockets: the initial
+        // state activates them and `scm_listeners` is empty, every ordinary start.
+        let initial_state =
+            state_with_four_active_listeners(http_address, https_address, tcp_address, udp_address)
+                .produce_initial_state();
+        let mut server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            Some(initial_state),
+            false,
+        )
+        .expect("could not build the test server");
+
+        // Now hand that already-active worker a descriptor per address.
+        let http_fd = server_bind(http_address.into(), None)
+            .expect("could not bind the spare HTTP socket")
+            .into_raw_fd();
+        let https_fd = server_bind(https_address.into(), None)
+            .expect("could not bind the spare HTTPS socket")
+            .into_raw_fd();
+        let tcp_fd = server_bind(tcp_address.into(), None)
+            .expect("could not bind the spare TCP socket")
+            .into_raw_fd();
+        let udp_fd = udp_bind(udp_address.into(), None)
+            .expect("could not bind the spare UDP socket")
+            .into_raw_fd();
+        {
+            let scm_listeners = server
+                .scm_listeners
+                .as_mut()
+                .expect("Server::new must have populated scm_listeners");
+            scm_listeners.http.push((http_address.into(), http_fd));
+            scm_listeners.tls.push((https_address.into(), https_fd));
+            scm_listeners.tcp.push((tcp_address.into(), tcp_fd));
+            scm_listeners.udp.push((udp_address.into(), udp_fd));
+        }
+
+        for (address, proxy) in [
+            (http_address, ListenerType::Http),
+            (https_address, ListenerType::Https),
+            (tcp_address, ListenerType::Tcp),
+            (udp_address, ListenerType::Udp),
+        ] {
+            let response = server.notify_activate_listener(
+                "test-repeat",
+                &ActivateListener {
+                    interface: None,
+                    address,
+                    proxy: proxy.into(),
+                    from_scm: false,
+                },
+            );
+            assert_eq!(
+                response.status,
+                ResponseStatus::Ok as i32,
+                "a repeated {proxy:?} activation must still answer ok: {response:?}"
+            );
+        }
+
+        let scm_listeners = server
+            .scm_listeners
+            .as_ref()
+            .expect("scm_listeners must still be present");
+        for (label, table, fd, port) in [
+            (
+                "HTTP",
+                &scm_listeners.http,
+                http_fd,
+                http_address.port as u16,
+            ),
+            (
+                "HTTPS",
+                &scm_listeners.tls,
+                https_fd,
+                https_address.port as u16,
+            ),
+            ("TCP", &scm_listeners.tcp, tcp_fd, tcp_address.port as u16),
+            ("UDP", &scm_listeners.udp, udp_fd, udp_address.port as u16),
+        ] {
+            assert!(
+                !table.iter().any(|(_, entry)| *entry == fd),
+                "the inherited {label} descriptor this activation cannot adopt must leave the SCM table"
+            );
+            assert!(
+                !descriptor_is_socket_on_port(fd, port),
+                "the inherited {label} descriptor this activation cannot adopt must be closed, \
+                 not left bound in the address's SO_REUSEPORT group, where it is expected — \
+                 inferred, not measured here — to go on taking a share of new connections"
+            );
+        }
+    }
+
+    /// An inherited descriptor whose address has NO listener yet must stay in
+    /// the SCM table, and a later `AddListener` + `ActivateListener` must adopt
+    /// it — backlog and all.
+    ///
+    /// This is a real upgrade shape, not a hypothetical: `Worker::upgrade`
+    /// (`e2e/src/sozu/worker.rs`) hands the new worker a state whose listeners
+    /// are inactive and sends `generate_activate_requests()` afterwards, and
+    /// `UpgradeWorkerTask` (`bin/src/command/upgrade.rs`) scatters those
+    /// requests only once `Server::new` has returned. Closing leftovers at the
+    /// end of the initial state would destroy exactly this case, which is why
+    /// `InheritedSocketFate::Unclaimed` keeps them.
+    ///
+    /// To SEE THIS RED: make any arm's `InheritedSocketFate::Unclaimed` branch
+    /// take the descriptor out of the table like the other two — the first
+    /// activation consumes and closes it, so the listener added afterwards binds
+    /// its own socket and that protocol's assertions fail.
+    #[test]
+    fn an_inherited_descriptor_with_no_listener_yet_is_adopted_by_a_later_activation() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+
+        let mut server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            None,
+            false,
+        )
+        .expect("could not build the test server");
+
+        // Four inherited descriptors and no listener anywhere. The TCP-family
+        // ones each carry a completed connection so the adoption can be shown to
+        // preserve the backlog, not merely the descriptor.
+        let http_listener = server_bind(http_address.into(), None)
+            .expect("could not bind the inherited HTTP socket");
+        let https_listener = server_bind(https_address.into(), None)
+            .expect("could not bind the inherited HTTPS socket");
+        let tcp_listener =
+            server_bind(tcp_address.into(), None).expect("could not bind the inherited TCP socket");
+        let udp_socket =
+            udp_bind(udp_address.into(), None).expect("could not bind the inherited UDP socket");
+        let _http_client = StdTcpStream::connect::<SocketAddr>(http_address.into())
+            .expect("could not queue a connection on the inherited HTTP socket");
+        let _https_client = StdTcpStream::connect::<SocketAddr>(https_address.into())
+            .expect("could not queue a connection on the inherited HTTPS socket");
+        let _tcp_client = StdTcpStream::connect::<SocketAddr>(tcp_address.into())
+            .expect("could not queue a connection on the inherited TCP socket");
+        let (http_fd, https_fd, tcp_fd, udp_fd) = (
+            http_listener.into_raw_fd(),
+            https_listener.into_raw_fd(),
+            tcp_listener.into_raw_fd(),
+            udp_socket.into_raw_fd(),
+        );
+        {
+            let scm_listeners = server
+                .scm_listeners
+                .as_mut()
+                .expect("Server::new must have populated scm_listeners");
+            scm_listeners.http.push((http_address.into(), http_fd));
+            scm_listeners.tls.push((https_address.into(), https_fd));
+            scm_listeners.tcp.push((tcp_address.into(), tcp_fd));
+            scm_listeners.udp.push((udp_address.into(), udp_fd));
+        }
+
+        let add_requests =
+            state_with_four_active_listeners(http_address, https_address, tcp_address, udp_address);
+        let cases = [
+            ("HTTP", http_address, ListenerType::Http, http_fd),
+            ("HTTPS", https_address, ListenerType::Https, https_fd),
+            ("TCP", tcp_address, ListenerType::Tcp, tcp_fd),
+            ("UDP", udp_address, ListenerType::Udp, udp_fd),
+        ];
+
+        // No listener at any of the addresses: every activation fails, and every
+        // descriptor must survive it untouched.
+        for (label, address, proxy, fd) in cases {
+            let response = server.notify_activate_listener(
+                "test-early",
+                &ActivateListener {
+                    interface: None,
+                    address,
+                    proxy: proxy.into(),
+                    from_scm: false,
+                },
+            );
+            assert_ne!(
+                response.status,
+                ResponseStatus::Ok as i32,
+                "activating {label} with no listener must fail: {response:?}"
+            );
+            assert!(
+                inherited_table(&server, label)
+                    .iter()
+                    .any(|(_, e)| *e == fd),
+                "the {label} descriptor must stay in the SCM table while no listener owns \
+                 its address"
+            );
+            assert!(
+                descriptor_is_socket_on_port(fd, address.port as u16),
+                "the {label} descriptor must stay open while no listener owns its address"
+            );
+        }
+
+        // The listeners arrive, then their activations: every descriptor is
+        // adopted, so nothing is left in the table and nothing was closed unused.
+        for request in add_requests.produce_initial_state().requests {
+            server.notify_proxys(request);
+        }
+        for (label, _address, _proxy, fd) in cases {
+            assert!(
+                !inherited_table(&server, label)
+                    .iter()
+                    .any(|(_, e)| *e == fd),
+                "the retained {label} descriptor must be adopted by the later activation"
+            );
+        }
+        let accepted: Vec<Protocol> = server
+            .accept_queue
+            .iter()
+            .map(|(_, _, protocol, _, _)| *protocol)
+            .collect();
+        for expected in [
+            Protocol::HTTPListen,
+            Protocol::HTTPSListen,
+            Protocol::TCPListen,
+        ] {
+            assert!(
+                accepted.contains(&expected),
+                "the connection queued on the retained {expected:?} descriptor must be served \
+                 by the later activation, got {accepted:?}"
+            );
+        }
+    }
+
+    /// A socket parked by a failed registration must not be mistaken for a
+    /// live, registered one.
+    ///
+    /// Every consumer of the listener's socket field reads its `Some` as
+    /// "registered and live": `give_back_listener` hands it back as an
+    /// activated socket and answers `Ok`, `soft_stop` / `hard_stop` deregister
+    /// it and fold a failure into `ProxyError::SoftStop` / `HardStop`, `accept`
+    /// accepts on it. Parking there made a listener that had simply never come
+    /// up look activated — and, for a registration failure that leaves the
+    /// socket unregistered, made `deregister` answer `ENOENT` and report a
+    /// failed shutdown. The park therefore lives in its own `parked_listener` /
+    /// `parked_socket` field, which nothing but `activate()` reads.
+    ///
+    /// `give_back_listener` is the assertion that falsifies the mutation:
+    /// `ProxyError::UnactivatedListener` keys on the live field being `None`,
+    /// so parking into it turns the answer into `Ok`. The stop assertions ride
+    /// along to pin the shutdown behaviour, but they cannot redden on this
+    /// repro — the EEXIST it uses means the descriptor IS registered (under
+    /// another token), so `deregister` succeeds either way.
+    ///
+    /// To SEE THIS RED: in any `activate()`, replace
+    /// `self.parked_listener = Some(listener)` (or `self.parked_socket = Some(socket)`)
+    /// with `self.listener = Some(listener)` / `self.socket = Some(socket)` —
+    /// that protocol's `give_back_listener` assertion fails.
+    #[test]
+    fn a_socket_parked_by_a_failed_registration_is_not_mistaken_for_a_live_one() {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+
+        let token_for = |protocol: Protocol| {
+            let mut manager = sessions.borrow_mut();
+            let entry = manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession { protocol })));
+            token
+        };
+        // A socket whose descriptor is already registered on the same epoll
+        // instance, so `activate()`'s own `register` answers EEXIST and parks.
+        let pre_registered = |address: SocketAddress| {
+            let mut socket = server_bind(address.into(), None)
+                .expect("could not bind the test listening socket");
+            registry
+                .register(&mut socket, Token(usize::MAX - 2), Interest::READABLE)
+                .expect("could not pre-register the test socket");
+            socket
+        };
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut http_proxy = http::HttpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        http_proxy
+            .add_listener(
+                ListenerBuilder::new_http(http_address)
+                    .to_http(None)
+                    .expect("could not build the test HTTP listener config"),
+                token_for(Protocol::HTTPListen),
+            )
+            .expect("could not add the test HTTP listener");
+        assert!(
+            http_proxy
+                .activate_listener(&http_address.into(), Some(pre_registered(http_address)))
+                .is_err(),
+            "the pre-registered descriptor must make the HTTP registration fail"
+        );
+        assert!(
+            matches!(
+                http_proxy.give_back_listener(&http_address.into()),
+                Err(ProxyError::UnactivatedListener)
+            ),
+            "an HTTP listener holding only a parked socket must not answer as activated"
+        );
+        assert!(
+            http_proxy.soft_stop().is_ok(),
+            "a parked socket must not fail an HTTP soft stop"
+        );
+
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut https_proxy = https::HttpsProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        https_proxy
+            .add_listener(
+                ListenerBuilder::new_https(https_address)
+                    .to_tls(None)
+                    .expect("could not build the test HTTPS listener config"),
+                token_for(Protocol::HTTPSListen),
+            )
+            .expect("could not add the test HTTPS listener");
+        assert!(
+            https_proxy
+                .activate_listener(&https_address.into(), Some(pre_registered(https_address)))
+                .is_err(),
+            "the pre-registered descriptor must make the HTTPS registration fail"
+        );
+        assert!(
+            matches!(
+                https_proxy.give_back_listener(&https_address.into()),
+                Err(ProxyError::UnactivatedListener)
+            ),
+            "an HTTPS listener holding only a parked socket must not answer as activated"
+        );
+        assert!(
+            https_proxy.hard_stop().is_ok(),
+            "a parked socket must not fail an HTTPS hard stop"
+        );
+
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut tcp_proxy = tcp::TcpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        tcp_proxy
+            .add_listener(
+                ListenerBuilder::new_tcp(tcp_address)
+                    .to_tcp(None)
+                    .expect("could not build the test TCP listener config"),
+                token_for(Protocol::TCPListen),
+            )
+            .expect("could not add the test TCP listener");
+        assert!(
+            tcp_proxy
+                .activate_listener(&tcp_address.into(), Some(pre_registered(tcp_address)))
+                .is_err(),
+            "the pre-registered descriptor must make the TCP registration fail"
+        );
+        assert!(
+            matches!(
+                tcp_proxy.give_back_listener(&tcp_address.into()),
+                Err(ProxyError::UnactivatedListener)
+            ),
+            "a TCP listener holding only a parked socket must not answer as activated"
+        );
+
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut udp_proxy = udp::UdpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+            16,
+            16384,
+        );
+        udp_proxy
+            .add_listener(
+                ListenerBuilder::new_udp(udp_address)
+                    .to_udp(None)
+                    .expect("could not build the test UDP listener config"),
+                token_for(Protocol::UDP),
+            )
+            .expect("could not add the test UDP listener");
+        let mut udp_socket =
+            udp_bind(udp_address.into(), None).expect("could not bind the test UDP socket");
+        registry
+            .register(&mut udp_socket, Token(usize::MAX - 2), Interest::READABLE)
+            .expect("could not pre-register the test UDP socket");
+        assert!(
+            udp_proxy
+                .activate_listener(&udp_address.into(), Some(udp_socket))
+                .is_err(),
+            "the pre-registered descriptor must make the UDP registration fail"
+        );
+        assert!(
+            matches!(
+                udp_proxy.give_back_listener(&udp_address.into()),
+                Err(ProxyError::UnactivatedListener)
+            ),
+            "a UDP listener holding only a parked socket must not answer as activated"
+        );
+    }
+
+    /// A failed mio registration must not close the socket it was handed.
+    ///
+    /// `activate()` moves the socket into a local to register it. Propagating a
+    /// registration error straight from that local drops it — and closes a
+    /// descriptor `Listeners::get_*` has already removed from the SCM table,
+    /// which is the sozu#1342 close in a second place. `Registry::register`
+    /// answers `EEXIST` for a descriptor already registered on the same epoll
+    /// instance, which is what the test arranges and what a `deactivate` whose
+    /// `deregister` only logged leaves behind.
+    ///
+    /// To SEE THIS RED: in any `activate()`, go back to
+    /// `registry.register(..).map_err(..)?` followed by `self.listener = Some(listener)`
+    /// — the `?` drops the local and that protocol's assertion fails.
+    #[test]
+    fn a_failed_registration_does_not_close_the_socket_it_was_handed() {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+
+        let token_for = |protocol: Protocol| {
+            let mut manager = sessions.borrow_mut();
+            let entry = manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession { protocol })));
+            token
+        };
+
+        // Hand each proxy a socket whose descriptor is ALREADY registered on the
+        // same epoll instance, so `activate()`'s own `register` answers EEXIST.
+        let handed_out = |address: SocketAddress| {
+            let mut socket = server_bind(address.into(), None)
+                .expect("could not bind the test listening socket");
+            registry
+                .register(&mut socket, Token(usize::MAX - 1), Interest::READABLE)
+                .expect("could not pre-register the test socket");
+            let fd = socket.as_raw_fd();
+            (socket, fd)
+        };
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = token_for(Protocol::HTTPListen);
+        let mut http_proxy = http::HttpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        http_proxy
+            .add_listener(
+                ListenerBuilder::new_http(http_address)
+                    .to_http(None)
+                    .expect("could not build the test HTTP listener config"),
+                token,
+            )
+            .expect("could not add the test HTTP listener");
+        let (socket, http_fd) = handed_out(http_address);
+        let result = http_proxy.activate_listener(&http_address.into(), Some(socket));
+        assert!(
+            result.is_err(),
+            "the pre-registered descriptor must make the HTTP registration fail"
+        );
+        assert!(
+            descriptor_is_socket_on_port(http_fd, http_address.port as u16),
+            "a failed HTTP registration must not close the socket it was handed"
+        );
+
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = token_for(Protocol::TCPListen);
+        let mut tcp_proxy = tcp::TcpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        tcp_proxy
+            .add_listener(
+                ListenerBuilder::new_tcp(tcp_address)
+                    .to_tcp(None)
+                    .expect("could not build the test TCP listener config"),
+                token,
+            )
+            .expect("could not add the test TCP listener");
+        let (socket, tcp_fd) = handed_out(tcp_address);
+        let result = tcp_proxy.activate_listener(&tcp_address.into(), Some(socket));
+        assert!(
+            result.is_err(),
+            "the pre-registered descriptor must make the TCP registration fail"
+        );
+        assert!(
+            descriptor_is_socket_on_port(tcp_fd, tcp_address.port as u16),
+            "a failed TCP registration must not close the socket it was handed"
+        );
+
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = token_for(Protocol::HTTPSListen);
+        let mut https_proxy = https::HttpsProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        https_proxy
+            .add_listener(
+                ListenerBuilder::new_https(https_address)
+                    .to_tls(None)
+                    .expect("could not build the test HTTPS listener config"),
+                token,
+            )
+            .expect("could not add the test HTTPS listener");
+        let (socket, https_fd) = handed_out(https_address);
+        let result = https_proxy.activate_listener(&https_address.into(), Some(socket));
+        assert!(
+            result.is_err(),
+            "the pre-registered descriptor must make the HTTPS registration fail"
+        );
+        assert!(
+            descriptor_is_socket_on_port(https_fd, https_address.port as u16),
+            "a failed HTTPS registration must not close the socket it was handed"
+        );
+
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = token_for(Protocol::UDP);
+        let mut udp_proxy = udp::UdpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+            16,
+            16384,
+        );
+        udp_proxy
+            .add_listener(
+                ListenerBuilder::new_udp(udp_address)
+                    .to_udp(None)
+                    .expect("could not build the test UDP listener config"),
+                token,
+            )
+            .expect("could not add the test UDP listener");
+        let mut socket =
+            udp_bind(udp_address.into(), None).expect("could not bind the test UDP socket");
+        registry
+            .register(&mut socket, Token(usize::MAX - 1), Interest::READABLE)
+            .expect("could not pre-register the test UDP socket");
+        let udp_fd = socket.as_raw_fd();
+        let result = udp_proxy.activate_listener(&udp_address.into(), Some(socket));
+        assert!(
+            result.is_err(),
+            "the pre-registered descriptor must make the UDP registration fail"
+        );
+        assert!(
+            descriptor_is_socket_on_port(udp_fd, udp_address.port as u16),
+            "a failed UDP registration must not close the socket it was handed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClusterId, SessionManager, mask_ipv4, mask_ipv6, subnet_key};
+    use mio::Token;
+    use slab::Slab;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// A cluster override can drop to `Some(0)` AFTER a session was
+    /// tracked under a positive limit: `AddCluster` is an upsert and
+    /// clears no counters, and only the GLOBAL `SetMaxConnectionsPerSubnet(0)`
+    /// drains the bookkeeping. The next track for that still-open session
+    /// then takes the disabled-limiter early return with its slot already
+    /// recorded, which must be an ordinary no-op rather than a panic.
+    #[test]
+    fn a_cluster_override_dropping_to_zero_after_a_track_is_a_no_op() {
+        let manager = SessionManager::new(Slab::with_capacity(8), 8, 0, 0, 0, 24, 56);
+        let token = Token(1);
+        let cluster = ClusterId::from("api");
+        let ip: IpAddr = "203.0.113.9".parse().expect("test address must parse");
+
+        // Tracked under a positive per-cluster override.
+        manager
+            .borrow_mut()
+            .track_cluster_subnet(token, cluster.clone(), ip, Some(5));
+        assert!(
+            !manager.borrow().subnet_tracking_is_empty(),
+            "premise: the positive override must have recorded a slot"
+        );
+
+        // The operator upserts the cluster with the cap disabled. The same
+        // session opens another stream: the early return must not trip on
+        // the slot it legitimately left behind.
+        manager
+            .borrow_mut()
+            .track_cluster_subnet(token, cluster.clone(), ip, Some(0));
+
+        // And the stale slot is still released normally on close.
+        manager.borrow_mut().untrack_all_cluster_ip(token);
+        assert!(
+            manager.borrow().subnet_tracking_is_empty(),
+            "teardown must drain the slot even though the cap was disabled in between"
+        );
+    }
+
+    /// The two ends of the prefix range are the ones that break: a
+    /// full-width prefix would shift by the whole word, and a zero prefix
+    /// would shift by it from the other side. Both are handled by an
+    /// explicit branch, and this pins that neither reaches the shift.
+    #[test]
+    fn masking_handles_both_shift_overflowing_prefix_bounds() {
+        let v4: Ipv4Addr = "203.0.113.45".parse().expect("test address must parse");
+        assert_eq!(
+            mask_ipv4(v4, 32),
+            v4,
+            "a /32 must be the address itself, not a wrapped-shift artefact"
+        );
+        assert_eq!(
+            mask_ipv4(v4, 0),
+            Ipv4Addr::UNSPECIFIED,
+            "a /0 must mask every bit away"
+        );
+
+        let v6: Ipv6Addr = "2001:db8:dead:beef::1"
+            .parse()
+            .expect("test address must parse");
+        assert_eq!(
+            mask_ipv6(v6, 128),
+            v6,
+            "a /128 must be the address itself, not a wrapped-shift artefact"
+        );
+        assert_eq!(
+            mask_ipv6(v6, 0),
+            Ipv6Addr::UNSPECIFIED,
+            "a /0 must mask every bit away"
+        );
+
+        // Out-of-range prefixes cannot reach the shift either. Config load
+        // rejects them, but the hot path does not rely on that having run.
+        assert_eq!(
+            mask_ipv4(v4, 33),
+            v4,
+            "an over-wide IPv4 prefix must clamp to the address, not panic or wrap"
+        );
+        assert_eq!(
+            mask_ipv6(v6, 129),
+            v6,
+            "an over-wide IPv6 prefix must clamp to the address, not panic or wrap"
+        );
+    }
+
+    /// The recommended prefixes from sozu-proxy/sozu#1270 — /24 and /56 —
+    /// must group the addresses an operator expects them to.
+    #[test]
+    fn masking_groups_addresses_at_the_recommended_prefixes() {
+        let parse_v4 = |s: &str| -> Ipv4Addr { s.parse().expect("test address must parse") };
+        assert_eq!(
+            mask_ipv4(parse_v4("203.0.113.1"), 24),
+            mask_ipv4(parse_v4("203.0.113.254"), 24),
+            "two hosts in one /24 must share a subnet key"
+        );
+        assert_ne!(
+            mask_ipv4(parse_v4("203.0.113.1"), 24),
+            mask_ipv4(parse_v4("203.0.114.1"), 24),
+            "hosts in different /24s must NOT share a subnet key"
+        );
+
+        let parse_v6 = |s: &str| -> Ipv6Addr { s.parse().expect("test address must parse") };
+        assert_eq!(
+            mask_ipv6(parse_v6("2001:db8:abcd:0000::1"), 56),
+            mask_ipv6(parse_v6("2001:db8:abcd:00ff::9999"), 56),
+            "two addresses in one /56 must share a subnet key"
+        );
+        assert_ne!(
+            mask_ipv6(parse_v6("2001:db8:abcd:0000::1"), 56),
+            mask_ipv6(parse_v6("2001:db8:abcd:0100::1"), 56),
+            "addresses in different /56s must NOT share a subnet key"
+        );
+
+        // The issue's own scenario: a /64 holder taking a fresh address
+        // per connection lands in one bucket at /56.
+        assert_eq!(
+            mask_ipv6(parse_v6("2001:db8:abcd:1234::1"), 56),
+            mask_ipv6(parse_v6("2001:db8:abcd:1234:ffff:ffff:ffff:ffff"), 56),
+            "every address a /64 holder can mint must collapse to one /56 key — that \
+             collapse IS the mitigation for sozu-proxy/sozu#1270"
+        );
+    }
+
+    /// A dual-stack `[::]` listener hands IPv4 clients back as
+    /// `::ffff:a.b.c.d`. Masking those with an IPv6 prefix would collapse
+    /// the entire IPv4 internet into one `::/56` bucket, so the mapped
+    /// form is canonicalised to IPv4 and charged to the IPv4 prefix.
+    #[test]
+    fn an_ipv4_mapped_source_is_charged_to_the_ipv4_prefix() {
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().expect("must parse");
+        let native: IpAddr = "203.0.113.7".parse().expect("must parse");
+        assert_eq!(
+            subnet_key(&mapped, 24, 56),
+            subnet_key(&native, 24, 56),
+            "a mapped IPv4 source must key identically to the same address arriving natively"
+        );
+        assert!(
+            subnet_key(&mapped, 24, 56).is_ipv4(),
+            "the key for a mapped source must be an IPv4 key"
+        );
+
+        // Negative space: two mapped addresses from DIFFERENT /24s must
+        // not collide. Under the bug this guards against, both would mask
+        // to `::/56` and share one counter.
+        let other: IpAddr = "::ffff:198.51.100.7".parse().expect("must parse");
+        assert_ne!(
+            subnet_key(&mapped, 24, 56),
+            subnet_key(&other, 24, 56),
+            "mapped sources from different IPv4 /24s must NOT share a subnet key — if they \
+             do, every IPv4 client on a dual-stack listener shares one bucket"
+        );
+
+        // A genuine IPv6 source is still keyed as IPv6.
+        let genuine: IpAddr = "2001:db8::1".parse().expect("must parse");
+        assert!(
+            subnet_key(&genuine, 24, 56).is_ipv6(),
+            "a genuine IPv6 source must keep an IPv6 subnet key"
+        );
+    }
+}
+
+#[cfg(test)]
+mod initial_protected_bootstrap_tests {
+    use std::thread;
+
+    use sozu_command::{
+        channel::Channel,
+        proto::command::{
+            CountRequests, HealthCheckConfig, HealthCheckHeader, HealthCheckHeaderValue,
+            InitialState, ProtectedHealthCheckOrder, ProtectedHealthCheckPhase,
+            QueryProtectedHealthCheckSupport, SetProtectedHealthCheck, Status,
+        },
+        secret::{FingerprintKey, ProtectedHeader, SecretValue, Zeroizing},
+    };
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server};
+
+    const CLUSTER: &str = "bootstrap-cluster";
+    const HEADER: &str = "X-Synthetic-Bootstrap";
+    const SECRET: &[u8] = b"synthetic-bootstrap-secret";
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    type Phase = ProtectedHealthCheckPhase;
+
+    fn request(id: &str, request_type: RequestType) -> WorkerRequest {
+        WorkerRequest {
+            id: id.to_owned(),
+            content: request_type.into(),
+        }
+    }
+
+    fn capability(id: &str) -> WorkerRequest {
+        request(
+            id,
+            RequestType::QueryProtectedHealthCheckSupport(QueryProtectedHealthCheckSupport {}),
+        )
+    }
+
+    fn status(id: &str) -> WorkerRequest {
+        request(id, RequestType::Status(Status {}))
+    }
+
+    fn foreign(id: &str) -> WorkerRequest {
+        request(id, RequestType::CountRequests(CountRequests {}))
+    }
+
+    fn payload(cluster: &str) -> SetProtectedHealthCheck {
+        let key = FingerprintKey::from_parts(Zeroizing::new([7u8; 32]), [9u8; 16]);
+        let mut carrier = HealthCheckHeaderValue {
+            name: HEADER.to_owned(),
+            value: SECRET.to_vec(),
+        };
+        let secret = SecretValue::take_from_ingress(&mut carrier).expect("a valid value");
+        let header = ProtectedHeader::new(&key, HEADER.to_owned(), secret);
+        SetProtectedHealthCheck {
+            cluster_id: cluster.to_owned(),
+            config: HealthCheckConfig {
+                uri: "/".to_owned(),
+                interval: 10,
+                timeout: 5,
+                healthy_threshold: 3,
+                unhealthy_threshold: 3,
+                headers: vec![HealthCheckHeader {
+                    name: HEADER.to_owned(),
+                    fingerprint: header.fingerprint().to_string(),
+                }],
+                ..Default::default()
+            },
+            values: vec![HealthCheckHeaderValue {
+                name: HEADER.to_owned(),
+                value: SECRET.to_vec(),
+            }],
+        }
+    }
+
+    fn order(id: &str, phase: Phase, cluster: &str, version: u64) -> WorkerRequest {
+        let prepare = (phase == Phase::ProtectedHealthCheckPrepare).then(|| payload(cluster));
+        request(
+            id,
+            RequestType::ProtectedHealthCheckOrder(ProtectedHealthCheckOrder {
+                phase: phase as i32,
+                cluster_id: cluster.to_owned(),
+                version,
+                prepare,
+            }),
+        )
+    }
+
+    fn prepare(id: &str, version: u64) -> WorkerRequest {
+        order(id, Phase::ProtectedHealthCheckPrepare, CLUSTER, version)
+    }
+
+    fn commit(id: &str, version: u64) -> WorkerRequest {
+        order(id, Phase::ProtectedHealthCheckCommit, CLUSTER, version)
+    }
+
+    fn release(id: &str, version: u64) -> WorkerRequest {
+        order(id, Phase::ProtectedHealthCheckRelease, CLUSTER, version)
+    }
+
+    fn abort(id: &str, version: u64) -> WorkerRequest {
+        order(id, Phase::ProtectedHealthCheckAbort, CLUSTER, version)
+    }
+
+    fn assert_reply(response: &WorkerResponse, phase: Phase, cluster: &str, version: u64) {
+        assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+        let Some(ContentType::ProtectedHealthCheckReply(reply)) = response
+            .content
+            .as_ref()
+            .and_then(|content| content.content_type.as_ref())
+        else {
+            panic!("the answer must be a typed protected reply: {response:?}");
+        };
+        assert_eq!(reply.phase, phase as i32);
+        assert_eq!(reply.cluster_id, cluster);
+        assert_eq!(reply.version, version);
+    }
+
+    fn assert_refused(response: &WorkerResponse, id: &str) {
+        assert_eq!(response.id, id);
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "{response:?}"
+        );
+        assert!(response.content.is_none(), "{response:?}");
+    }
+
+    fn assert_no_secret(responses: &[WorkerResponse]) {
+        let shown = format!("{responses:?}");
+        assert!(!shown.contains(HEADER), "{shown}");
+        assert!(!shown.contains("synthetic-bootstrap-secret"), "{shown}");
+    }
+
+    /// Run `Server::new` on this thread against a blocking peer that plays
+    /// `script`, one request at a time, and returns every answer. The script
+    /// ends with a valid `Status`, the only message that may release the
+    /// constructor; a constructor that returned earlier leaves the peer
+    /// unanswered and the read deadline reports it.
+    fn bootstrap(
+        script: Vec<WorkerRequest>,
+    ) -> (Server, Rc<RefCell<BackendMap>>, Vec<WorkerResponse>) {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (mut peer, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+        let initial_state = InitialState {
+            requests: vec![request(
+                "initial",
+                RequestType::AddCluster(Cluster {
+                    cluster_id: CLUSTER.to_owned(),
+                    ..Default::default()
+                }),
+            )],
+        };
+
+        let driver = thread::spawn(move || {
+            let mut answers = Vec::with_capacity(script.len());
+            for message in script {
+                peer.write_message(&message)
+                    .map_err(|error| format!("peer write: {error}"))?;
+                answers.push(
+                    peer.read_message_blocking_timeout(Some(DEADLINE))
+                        .map_err(|error| format!("peer read: {error}"))?,
+                );
+            }
+            Ok::<_, String>(answers)
+        });
+
+        let held = backends.to_owned();
+        let server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            Some(initial_state),
+            true,
+        )
+        .expect("the constructor must return once the Status arrives");
+        let answers = driver
+            .join()
+            .expect("the peer must not panic")
+            .expect("every request must be answered");
+        (server, held, answers)
+    }
+
+    fn assert_holds_the_values(backends: &Rc<RefCell<BackendMap>>) {
+        let backends = backends.borrow();
+        let config = backends
+            .health_check_configs
+            .get(CLUSTER)
+            .expect("the commit must have installed the metadata");
+        assert_eq!(config.headers.len(), 1);
+        assert_eq!(config.headers[0].name, HEADER);
+        let set = backends
+            .protected_health_check_headers
+            .get(CLUSTER)
+            .expect("the commit must have installed the values");
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.headers()[0].name(), HEADER);
+        assert_eq!(set.headers()[0].value().expose_secret_bytes(), SECRET);
+    }
+
+    fn assert_holds_nothing(backends: &Rc<RefCell<BackendMap>>) {
+        let backends = backends.borrow();
+        assert!(
+            !backends
+                .protected_health_check_headers
+                .contains_key(CLUSTER)
+        );
+        assert!(!backends.health_check_configs.contains_key(CLUSTER));
+    }
+
+    /// The valid cycle that closes every scenario below.
+    fn finish(mut script: Vec<WorkerRequest>, version: u64) -> Vec<WorkerRequest> {
+        script.extend([
+            prepare("p", version),
+            commit("c", version),
+            release("r", version),
+            status("s"),
+        ]);
+        script
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_installs_the_values_before_the_constructor_returns() {
+        let (_server, backends, answers) = bootstrap(vec![
+            capability("cap"),
+            prepare("prep", 1),
+            commit("com", 1),
+            release("rel", 1),
+            status("st"),
+        ]);
+        assert_reply(&answers[0], Phase::ProtectedHealthCheckCapability, "", 0);
+        assert_reply(&answers[1], Phase::ProtectedHealthCheckPrepare, CLUSTER, 1);
+        assert_reply(&answers[2], Phase::ProtectedHealthCheckCommit, CLUSTER, 1);
+        assert_reply(&answers[3], Phase::ProtectedHealthCheckRelease, CLUSTER, 1);
+        assert_eq!(answers[4], WorkerResponse::ok("st"));
+        assert_eq!(answers.len(), 5);
+        assert_holds_the_values(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_still_accepts_a_direct_status() {
+        let (_server, backends, answers) = bootstrap(vec![status("st")]);
+        assert_eq!(answers, vec![WorkerResponse::ok("st")]);
+        assert_holds_nothing(&backends);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_refuses_every_out_of_order_request() {
+        // each script holds exactly one request named `bad`, which must be
+        // refused, and ends with a valid cycle and `Status`
+        let cases: Vec<(&str, Vec<WorkerRequest>)> = vec![
+            (
+                "prepare before the capability",
+                finish(vec![prepare("bad", 1), capability("cap")], 1),
+            ),
+            (
+                "commit before the capability",
+                finish(vec![commit("bad", 1), capability("cap")], 1),
+            ),
+            (
+                "commit before prepare",
+                finish(vec![capability("cap"), commit("bad", 1)], 1),
+            ),
+            (
+                "release before commit",
+                finish(vec![capability("cap"), release("bad", 1)], 1),
+            ),
+            (
+                "foreign request after the capability",
+                finish(vec![capability("cap"), foreign("bad")], 1),
+            ),
+            (
+                "foreign request before the capability",
+                finish(vec![foreign("bad"), capability("cap")], 1),
+            ),
+            (
+                "repeated capability",
+                finish(vec![capability("cap"), capability("bad")], 1),
+            ),
+            (
+                "abort without a started cycle",
+                finish(vec![capability("cap"), abort("bad", 1)], 1),
+            ),
+            ("commit of the wrong version", {
+                let mut script = vec![capability("cap"), prepare("prep", 1)];
+                script.push(commit("bad", 2));
+                script.extend([commit("com", 1), release("rel", 1), status("st")]);
+                script
+            }),
+            ("commit of the wrong cluster", {
+                let mut script = vec![capability("cap"), prepare("prep", 1)];
+                script.push(order(
+                    "bad",
+                    Phase::ProtectedHealthCheckCommit,
+                    "other-cluster",
+                    1,
+                ));
+                script.extend([commit("com", 1), release("rel", 1), status("st")]);
+                script
+            }),
+            ("second prepare while one is staged", {
+                let mut script = vec![capability("cap"), prepare("prep", 1)];
+                script.push(prepare("bad", 2));
+                script.extend([commit("com", 1), release("rel", 1), status("st")]);
+                script
+            }),
+            ("repeated commit", {
+                let mut script = vec![capability("cap"), prepare("prep", 1), commit("com", 1)];
+                script.push(commit("bad", 1));
+                script.extend([release("rel", 1), status("st")]);
+                script
+            }),
+            ("release of the wrong version", {
+                let mut script = vec![capability("cap"), prepare("prep", 1), commit("com", 1)];
+                script.push(release("bad", 2));
+                script.extend([release("rel", 1), status("st")]);
+                script
+            }),
+            ("status while a prepare is outstanding", {
+                let mut script = vec![capability("cap"), prepare("prep", 1)];
+                script.push(status("bad"));
+                script.extend([commit("com", 1), release("rel", 1), status("st")]);
+                script
+            }),
+            ("status while a commit is outstanding", {
+                let mut script = vec![capability("cap"), prepare("prep", 1), commit("com", 1)];
+                script.push(status("bad"));
+                script.extend([release("rel", 1), status("st")]);
+                script
+            }),
+            ("stale prepare after a released cycle", {
+                let mut script = vec![
+                    capability("cap"),
+                    prepare("prep", 2),
+                    commit("com", 2),
+                    release("rel", 2),
+                ];
+                script.push(prepare("bad", 1));
+                script.push(status("st"));
+                script
+            }),
+        ];
+        for (name, script) in cases {
+            let refused: Vec<usize> = script
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.id == "bad")
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(refused.len(), 1, "{name}: exactly one refused request");
+            let (_server, backends, answers) = bootstrap(script);
+            assert_refused(&answers[refused[0]], "bad");
+            assert!(
+                answers
+                    .iter()
+                    .enumerate()
+                    .all(|(index, answer)| index == refused[0]
+                        || answer.status == ResponseStatus::Ok as i32),
+                "{name}: only the refused request fails: {answers:?}"
+            );
+            assert_holds_the_values(&backends);
+            assert_no_secret(&answers);
+        }
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_forwards_a_handler_refusal_and_stays_blocked() {
+        let unknown = order(
+            "bad",
+            Phase::ProtectedHealthCheckPrepare,
+            "unknown-cluster",
+            1,
+        );
+        let (_server, backends, answers) = bootstrap(finish(vec![capability("cap"), unknown], 1));
+        assert_refused(&answers[1], "bad");
+        assert_eq!(
+            answers[1].message,
+            "the cluster is not known to this worker"
+        );
+        assert_holds_the_values(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_abort_drops_the_staged_change() {
+        let (_server, backends, answers) = bootstrap(vec![
+            capability("cap"),
+            prepare("prep", 1),
+            abort("abort", 1),
+            status("st"),
+        ]);
+        assert_reply(&answers[2], Phase::ProtectedHealthCheckAbort, CLUSTER, 1);
+        assert_eq!(answers[3], WorkerResponse::ok("st"));
+        assert_holds_nothing(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_abort_restores_an_applied_change() {
+        let (_server, backends, answers) = bootstrap(vec![
+            capability("cap"),
+            prepare("prep", 1),
+            commit("com", 1),
+            abort("abort", 1),
+            status("st"),
+        ]);
+        assert_reply(&answers[3], Phase::ProtectedHealthCheckAbort, CLUSTER, 1);
+        assert_holds_nothing(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_refuses_a_mismatched_abort_then_completes() {
+        let mut script = vec![capability("cap"), prepare("prep", 1)];
+        script.push(abort("bad", 9));
+        script.extend([abort("abort", 1), prepare("again", 2)]);
+        script.extend([commit("com", 2), release("rel", 2), status("st")]);
+        let (_server, backends, answers) = bootstrap(script);
+        assert_refused(&answers[2], "bad");
+        assert_reply(&answers[3], Phase::ProtectedHealthCheckAbort, CLUSTER, 1);
+        assert_reply(&answers[6], Phase::ProtectedHealthCheckRelease, CLUSTER, 2);
+        assert_holds_the_values(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_returns_an_error_when_the_channel_closes() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (peer, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+        drop(peer);
+        let result = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            None,
+            true,
+        );
+        let Err(error) = result else {
+            panic!("a closed channel must not release the constructor");
+        };
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn initial_status_ack_failure_fails_the_constructor() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (mut peer, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+        // the Status is queued, then the peer goes away: the worker reads it
+        // but can no longer deliver the ACK
+        peer.write_message(&status("st"))
+            .expect("the peer must queue the Status");
+        drop(peer);
+        let result = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            None,
+            true,
+        );
+        let Err(error) = result else {
+            panic!("a lost final ACK must not release the constructor");
+        };
+        assert!(
+            matches!(error, ServerError::WriteInitialAnswer(_)),
+            "{error:?}"
+        );
+    }
+}

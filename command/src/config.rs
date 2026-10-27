@@ -1,0 +1,10297 @@
+//! # Sōzu's configuration
+//!
+//! This module is responsible for parsing the `config.toml` provided by the flag `--config`
+//! when starting Sōzu.
+//!
+//! Here is the workflow for generating a working config:
+//!
+//! ```text
+//!     config.toml   ->   FileConfig    ->  ConfigBuilder   ->  Config
+//! ```
+//!
+//! `config.toml` is parsed to `FileConfig`, a structure that itself contains a lot of substructures
+//! whose names start with `File-` and end with `-Config`, like `FileHttpFrontendConfig` for instance.
+//!
+//! The instance of `FileConfig` is then passed to a `ConfigBuilder` that populates a final `Config`
+//! with listeners and clusters.
+//!
+//! To illustrate:
+//!
+//! ```no_run
+//! use sozu_command_lib::config::{FileConfig, ConfigBuilder};
+//!
+//! let file_config = FileConfig::load_from_path("../config.toml")
+//!     .expect("Could not load config.toml");
+//!
+//! let config = ConfigBuilder::new(file_config, "../assets/config.toml")
+//!     .into_config()
+//!     .expect("Could not build config");
+//! ```
+//!
+//! Note that the path to `config.toml` is used twice: the first time, to parse the file,
+//! the second time, to keep the path in the config for later use.
+//!
+//! However, there is a simpler way that combines all this:
+//!
+//! ```no_run
+//! use sozu_command_lib::config::Config;
+//!
+//! let config = Config::load_from_path("../assets/config.toml")
+//!     .expect("Could not build config from the path");
+//! ```
+//!
+//! ## How values are chosen
+//!
+//! Values are chosen in this order of priority:
+//!
+//! 1. values defined in a section of the TOML file, for instance, timeouts for a specific listener
+//! 2. values defined globally in the TOML file, like timeouts or buffer size
+//! 3. if a variable has not been set in the TOML file, it will be set to a default defined here
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    env, fmt,
+    fs::{File, create_dir_all, metadata},
+    io::{ErrorKind, Read},
+    net::{SocketAddr, ToSocketAddrs},
+    ops::Range,
+    path::PathBuf,
+};
+
+use crate::{
+    ObjectKind,
+    certificate::split_certificate_chain,
+    listener_key::{InterfaceError, ListenerKey, validate_listener_interface},
+    logging::AccessLogFormat,
+    proto::command::{
+        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, ClientAuthMode, Cluster,
+        CustomHttpAnswers, ForwardedHeaders, Header, HeaderMatchKind, HeaderPosition,
+        HeaderPredicate, HealthCheckConfig, HealthCheckHeader, HealthCheckHeaderValue,
+        HealthCheckMode, HstsConfig, HttpListenerConfig, HttpStatusRange, HttpsListenerConfig,
+        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
+        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig,
+        RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend, RequestTcpFrontend,
+        RequestUdpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, ShardMode,
+        SocketAddress, TcpListenerConfig, TlsVersion, UdpAffinityKey, UdpClusterConfig,
+        UdpHealthConfig, UdpHealthMode, UdpListenerConfig, WorkerRequest, request::RequestType,
+    },
+};
+
+/// Authoritative list of default cipher suites for all rustls-based TLS providers.
+///
+/// These use rustls naming conventions and are supported by all three crypto providers
+/// (ring, aws-lc-rs, rustls-openssl). Order follows ANSSI recommendations: AES-256
+/// preferred over AES-128, ECDSA preferred over RSA, TLS 1.3 preferred over TLS 1.2.
+///
+/// See the [documentation](https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html)
+pub const DEFAULT_CIPHER_LIST: [&str; 9] = [
+    // TLS 1.3 cipher suites
+    "TLS13_AES_256_GCM_SHA384",
+    "TLS13_AES_128_GCM_SHA256",
+    "TLS13_CHACHA20_POLY1305_SHA256",
+    // TLS 1.2 cipher suites
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+];
+
+pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
+    "ECDSA+SHA256",
+    "ECDSA+SHA384",
+    "ECDSA+SHA512",
+    "RSA+SHA256",
+    "RSA+SHA384",
+    "RSA+SHA512",
+    "RSA-PSS+SHA256",
+    "RSA-PSS+SHA384",
+    "RSA-PSS+SHA512",
+];
+
+pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["X25519MLKEM768", "x25519", "P-256", "P-384"];
+
+/// Default ALPN protocols advertised by HTTPS listeners.
+/// Both HTTP/2 and HTTP/1.1 are enabled, allowing clients to negotiate either.
+pub const DEFAULT_ALPN_PROTOCOLS: [&str; 2] = ["h2", "http/1.1"];
+
+/// maximum time of inactivity for a frontend socket (60 seconds)
+pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;
+
+/// permission bits given to the unix command socket when `command_socket_mode`
+/// is absent: owner read/write only, the mode Sōzu has always used
+pub const DEFAULT_COMMAND_SOCKET_MODE: u32 = 0o600;
+
+/// every permission bit `command_socket_mode` may set. setuid, setgid and the
+/// sticky bit mean nothing on a socket and are refused.
+pub const MAX_COMMAND_SOCKET_MODE: u32 = 0o777;
+
+/// maximum time of inactivity for a backend socket (30 seconds)
+pub const DEFAULT_BACK_TIMEOUT: u32 = 30;
+
+/// maximum time to connect to a backend server (3 seconds)
+pub const DEFAULT_CONNECT_TIMEOUT: u32 = 3;
+
+/// maximum time allowed to receive enough bytes of the TLS ClientHello to
+/// read the SNI extension on a TCP listener (5 seconds). Only relevant when
+/// at least one SNI-scoped `TcpFrontendConfig` targets the listener. Must
+/// match the proto default on `TcpListenerConfig.sni_preread_timeout`.
+pub const DEFAULT_SNI_PREREAD_TIMEOUT: u32 = 5;
+
+/// maximum number of bytes buffered while prereading the TLS ClientHello
+/// looking for the SNI extension on a TCP listener (16 KB — matches the
+/// H2 frame ceiling used elsewhere in this file). Only relevant when at
+/// least one SNI-scoped `TcpFrontendConfig` targets the listener; clamped by
+/// the global `buffer_size` (see `ConfigError::SniPrereadMaxBytesExceedsBufferSize`).
+/// Must match the proto default on
+/// `TcpListenerConfig.sni_preread_max_bytes`.
+pub const DEFAULT_SNI_PREREAD_MAX_BYTES: u32 = 16384;
+
+/// minimum allowed `sni_preread_max_bytes` on a TCP listener targeted by an
+/// SNI frontend (5 bytes — a full TLS record header: 1-byte `ContentType` +
+/// 2-byte `ProtocolVersion` + 2-byte length, RFC 8446 §5.1). `0` (and every
+/// value below this floor) makes the preread shell issue reads that can
+/// never accumulate enough bytes to parse even the outer record framing,
+/// spinning until the event-loop iteration guard (`MAX_LOOP_ITERATIONS`)
+/// trips instead of ever reaching a routing decision. See
+/// `ConfigError::SniPrereadMaxBytesTooSmall`.
+pub const MIN_SNI_PREREAD_MAX_BYTES: u32 = 5;
+
+/// maximum time to receive a request since the connection started (10 seconds)
+pub const DEFAULT_REQUEST_TIMEOUT: u32 = 10;
+
+/// client/upstream flow idle timeout for a UDP listener (30 seconds)
+pub const DEFAULT_UDP_FRONT_TIMEOUT: u32 = 30;
+
+/// upstream flow idle timeout for a UDP listener (30 seconds)
+pub const DEFAULT_UDP_BACK_TIMEOUT: u32 = 30;
+
+/// maximum received datagram size for a UDP listener, in bytes (1500 = a
+/// typical Ethernet MTU). Capped at the effective `buffer_size` at runtime.
+pub const DEFAULT_UDP_MAX_RX_DATAGRAM_SIZE: u32 = 1500;
+
+/// maximum number of concurrent UDP flows per listener. `0` selects the
+/// runtime auto policy (~70% of the soft `RLIMIT_NOFILE`).
+pub const DEFAULT_UDP_MAX_FLOWS: u32 = 0;
+
+/// maximum time to wait for a worker to respond, until it is deemed NotAnswering (10 seconds)
+pub const DEFAULT_WORKER_TIMEOUT: u32 = 10;
+
+/// a name applied to sticky sessions ("SOZUBALANCEID")
+pub const DEFAULT_STICKY_NAME: &str = "SOZUBALANCEID";
+
+/// Interval between checking for zombie sessions, (30 minutes)
+pub const DEFAULT_ZOMBIE_CHECK_INTERVAL: u32 = 1_800;
+
+/// timeout to accept connection events in the accept queue (60 seconds)
+pub const DEFAULT_ACCEPT_QUEUE_TIMEOUT: u32 = 60;
+
+/// Default `Strict-Transport-Security: max-age` value (1 year, 31_536_000
+/// seconds) substituted at config-load when an `[hsts]` block sets
+/// `enabled = true` but omits `max_age`. Matches the HSTS preload list
+/// minimum (<https://hstspreload.org/>) and the Caddy / Nginx community
+/// recommendation. Operators can override with any `u32`; `max_age = 0`
+/// is the RFC 6797 §11.4 kill switch and is allowed silently.
+pub const DEFAULT_HSTS_MAX_AGE: u32 = 31_536_000;
+
+/// whether to evict least-recently-active sessions when the accept queue is
+/// saturated (false). Defaults to false because during a DDoS the existing
+/// connections are more likely to be legitimate clients than the queued ones;
+/// evicting them would serve the attacker. Enable when overload is dominated
+/// by normal traffic spikes rather than attacks.
+pub const DEFAULT_EVICT_ON_QUEUE_FULL: bool = false;
+
+/// number of workers, i.e. Sōzu processes that scale horizontally (2)
+pub const DEFAULT_WORKER_COUNT: u16 = 2;
+
+/// wether a worker is automatically restarted when it crashes (true)
+pub const DEFAULT_WORKER_AUTOMATIC_RESTART: bool = true;
+
+/// wether to save the state automatically (false)
+pub const DEFAULT_AUTOMATIC_STATE_SAVE: bool = false;
+
+/// minimum number of buffers (1)
+pub const DEFAULT_MIN_BUFFERS: u64 = 1;
+
+/// maximum number of buffers (1 000)
+pub const DEFAULT_MAX_BUFFERS: u64 = 1_000;
+
+/// size of the buffers, in bytes (16 KB)
+pub const DEFAULT_BUFFER_SIZE: u64 = 16_393;
+
+/// minimum buffer size required when any HTTPS listener advertises H2 ALPN.
+///
+/// RFC 9113 §6.5.2 caps `SETTINGS_MAX_FRAME_SIZE` at 16 384 bytes by default;
+/// the on-wire H2 frame header is a fixed 9 bytes (§4.1), so the kawa storage
+/// must be able to hold 16 384 + 9 = 16 393 bytes before forwarding. A smaller
+/// `buffer_size` causes the H2 mux to deadlock on full-size frames (no panic,
+/// no obvious log) until the session timeout fires. Validated at config-load
+/// time in `ConfigBuilder::into_config` so a typo in TOML is rejected at boot,
+/// not discovered under traffic.
+pub const H2_MIN_BUFFER_SIZE: u64 = 16_393;
+
+/// maximum number of simultaneous connections (10 000)
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
+/// size of the buffer for the channels, in bytes. Must be bigger than the size of the data received. (1 MB)
+pub const DEFAULT_COMMAND_BUFFER_SIZE: u64 = 1_000_000;
+
+/// maximum size of the buffer for the channels, in bytes. (2 MB)
+pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: u64 = 2_000_000;
+
+/// wether to avoid register cluster metrics in the local drain
+pub const DEFAULT_DISABLE_CLUSTER_METRICS: bool = false;
+
+pub const MAX_LOOP_ITERATIONS: usize = 100000;
+
+/// Number of TLS 1.3 tickets to send to a client when establishing a connection.
+/// The tickets allow the client to resume a session. This protects the client
+/// agains session tracking. Increases the number of getrandom syscalls,
+/// with little influence on performance. Defaults to 4.
+pub const DEFAULT_SEND_TLS_13_TICKETS: u64 = 4;
+
+/// for both logs and access logs
+pub const DEFAULT_LOG_TARGET: &str = "stdout";
+
+/// Default per-(cluster, source-IP) connection limit. `0` means unlimited.
+/// Counts are kept per `(cluster_id, source_ip)` so two clusters never
+/// share a counter even from the same IP. Per-cluster overrides on the
+/// `Cluster` message take precedence.
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: u64 = 0;
+
+/// Default `Retry-After` header value (seconds) on HTTP 429 responses
+/// emitted when a per-(cluster, source-IP) connection limit is hit. `0`
+/// omits the header — `Retry-After: 0` invites an immediate retry that
+/// defeats the limit. TCP rejections do not emit this value (no HTTP
+/// envelope), but the field is accepted for symmetry.
+pub const DEFAULT_RETRY_AFTER: u32 = 60;
+
+/// Default per-(cluster, source-SUBNET) connection limit. `0` means
+/// unlimited, which disables the subnet limiter entirely and leaves the
+/// pre-existing per-IP behaviour strictly unchanged. This is a SECOND,
+/// independent counter beside [`DEFAULT_MAX_CONNECTIONS_PER_IP`], not a
+/// replacement: the per-IP cap serves the API-gateway case, the
+/// per-subnet cap the denial-of-service case where an attacker holding a
+/// routed prefix takes a fresh address per connection
+/// (sozu-proxy/sozu#1270). Both gates are consulted and both must admit.
+pub const DEFAULT_MAX_CONNECTIONS_PER_SUBNET: u64 = 0;
+
+/// Default backend connection attempt budget of a request: how many backend
+/// connections it may try, the first included, before it is answered `503`
+/// (HTTP) or closed (TCP). Every failed connection counts — refused, timed
+/// out on `connect_timeout`, or reporting a socket error. Replaces the
+/// hard-coded `CONN_RETRIES = 3` of `sozu-lib`; the default rose to 5 with
+/// sozu-proxy/sozu#1800, so a request survives more dead backends in a row.
+pub const DEFAULT_MAX_CONNECTION_ATTEMPTS: u32 = 5;
+
+/// Inclusive upper bound of `max_connection_attempts`, global or per
+/// cluster: the attempt counters are `u8`.
+pub const MAX_CONNECTION_ATTEMPTS_UPPER_BOUND: u32 = u8::MAX as u32;
+
+/// Validate a `max_connection_attempts` value, global or per cluster: at least
+/// one attempt, at most [`MAX_CONNECTION_ATTEMPTS_UPPER_BOUND`]. Called at
+/// config load, on every `AddCluster` and on `SetMaxConnectionAttempts`.
+pub fn validate_max_connection_attempts(attempts: u32) -> Result<(), &'static str> {
+    if (1..=MAX_CONNECTION_ATTEMPTS_UPPER_BOUND).contains(&attempts) {
+        Ok(())
+    } else {
+        Err("max_connection_attempts must lie in 1..=255")
+    }
+}
+
+/// Why a cluster whose health-check header values live in files yields no
+/// order: the protected activation that reads them does not exist yet.
+pub const HEALTH_CHECK_VALUE_FILE_UNSUPPORTED: &str = "health check header value_file references cannot be applied yet: the protected activation of their values is not available";
+
+/// Why a health check `port` and a backend with a `unix_path` never meet in
+/// one cluster: `port` names a TCP port on a backend IP, which a UNIX socket
+/// does not have, so the probe endpoint would be ambiguous.
+pub const HEALTH_CHECK_PORT_UNIX_REFUSED: &str = "health_check.port targets a backend IP address and cannot be combined with a unix_path backend; unset the probe port or the unix_path";
+
+/// Parse a backend's `unix_path` into the socket address sozu dials: an
+/// absolute filesystem path, or `@name` for a Linux abstract-namespace
+/// socket. Called at config load, on every `AddBackend` the main process
+/// accepts and on every `AddBackend` a worker applies, so all three refuse
+/// the same values.
+pub fn parse_backend_unix_path(
+    unix_path: &str,
+) -> Result<std::os::unix::net::SocketAddr, &'static str> {
+    const TOO_LONG: &str = "unix_path does not fit a sockaddr_un (107 bytes at most)";
+    if unix_path.as_bytes().contains(&0) {
+        return Err("unix_path must not contain a NUL byte");
+    }
+    let address = if let Some(name) = unix_path.strip_prefix('@') {
+        if name.is_empty() {
+            return Err("an abstract unix_path needs a name after '@'");
+        }
+        parse_abstract_unix_name(name.as_bytes())
+            .map_err(|unsupported| unsupported.unwrap_or(TOO_LONG))?
+    } else if unix_path.starts_with('/') {
+        std::os::unix::net::SocketAddr::from_pathname(unix_path).map_err(|_| TOO_LONG)?
+    } else {
+        return Err("unix_path must be an absolute path or an @abstract name");
+    };
+    // POST: a pathname parses to a pathname address and `@name` to an
+    // abstract one, never the unnamed address that dials nothing.
+    debug_assert!(
+        !address.is_unnamed(),
+        "a parsed unix_path never yields an unnamed address"
+    );
+    debug_assert_eq!(
+        address.as_pathname().is_some(),
+        !unix_path.starts_with('@'),
+        "only a path without '@' parses to a pathname address"
+    );
+    Ok(address)
+}
+
+/// `Err(None)` when `name` is too long, `Err(Some(reason))` when the platform
+/// has no abstract namespace.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parse_abstract_unix_name(
+    name: &[u8],
+) -> Result<std::os::unix::net::SocketAddr, Option<&'static str>> {
+    #[cfg(target_os = "android")]
+    use std::os::android::net::SocketAddrExt;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt;
+    std::os::unix::net::SocketAddr::from_abstract_name(name).map_err(|_| None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn parse_abstract_unix_name(
+    _name: &[u8],
+) -> Result<std::os::unix::net::SocketAddr, Option<&'static str>> {
+    Err(Some("an @abstract unix_path needs Linux"))
+}
+
+/// Default IPv4 prefix length (bits) used to derive the subnet key. 32
+/// masks nothing, so enabling only `max_connections_per_subnet` yields a
+/// per-address counter rather than a surprising aggregation. `/24` is the
+/// recommended starting point; see `doc/configure.md`.
+pub const DEFAULT_SUBNET_IPV4_PREFIX: u32 = 32;
+
+/// Default IPv6 prefix length (bits) used to derive the subnet key. 128
+/// masks nothing. `/56` is the recommended starting point; see
+/// `doc/configure.md`.
+pub const DEFAULT_SUBNET_IPV6_PREFIX: u32 = 128;
+
+/// Inclusive upper bound for [`DEFAULT_SUBNET_IPV4_PREFIX`] and the
+/// `subnet_ipv4_prefix` config key. A value above this is a config error,
+/// never silently clamped.
+pub const MAX_SUBNET_IPV4_PREFIX: u32 = 32;
+
+/// Inclusive upper bound for [`DEFAULT_SUBNET_IPV6_PREFIX`] and the
+/// `subnet_ipv6_prefix` config key. A value above this is a config error,
+/// never silently clamped.
+pub const MAX_SUBNET_IPV6_PREFIX: u32 = 128;
+
+#[derive(Debug)]
+pub enum IncompatibilityKind {
+    PublicAddress,
+    ProxyProtocol,
+}
+
+#[derive(Debug)]
+pub enum MissingKind {
+    Field(String),
+    Protocol,
+    SavedState,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ConfigError {
+    #[error("env path not found: {0}")]
+    Env(String),
+    #[error("Could not open file {path_to_open}: {io_error}")]
+    FileOpen {
+        path_to_open: String,
+        io_error: std::io::Error,
+    },
+    #[error("Could not read file {path_to_read}: {io_error}")]
+    FileRead {
+        path_to_read: String,
+        io_error: std::io::Error,
+    },
+    #[error(
+        "the field {kind:?} of {object:?} with id or address {id} is incompatible with the rest of the options"
+    )]
+    Incompatible {
+        kind: IncompatibilityKind,
+        object: ObjectKind,
+        id: String,
+    },
+    #[error("Invalid '{0}' field for a TCP frontend")]
+    InvalidFrontendConfig(String),
+    #[error("invalid path {0:?}")]
+    InvalidPath(PathBuf),
+    #[error("listening address {0:?} is already used in the configuration")]
+    ListenerAddressAlreadyInUse(SocketAddr),
+    #[error("listener {0} is already declared in the configuration")]
+    ListenerAlreadyDeclared(ListenerKey),
+    #[error(
+        "listeners sharing the address {0} on different interfaces must all use the same protocol"
+    )]
+    ListenerProtocolMismatchOnAddress(SocketAddr),
+    #[error("listener {address}: {error}")]
+    ListenerInterface {
+        address: SocketAddr,
+        error: InterfaceError,
+    },
+    #[error("missing {0:?}")]
+    Missing(MissingKind),
+    #[error("could not get parent directory for file {0}")]
+    NoFileParent(String),
+    #[error("Could not get the path of the saved state")]
+    SaveStatePath(String),
+    #[error("Can not determine path to sozu socket: {0}")]
+    SocketPathError(String),
+    #[error("toml decoding error: {0}")]
+    DeserializeToml(String),
+    #[error("Can not set this frontend on a {0:?} listener")]
+    WrongFrontendProtocol(ListenerProtocol),
+    #[error("Can not build a {expected:?} listener from a {found:?} config")]
+    WrongListenerProtocol {
+        expected: ListenerProtocol,
+        found: Option<ListenerProtocol>,
+    },
+    #[error("Invalid ALPN protocol '{0}'. Valid values: \"h2\", \"http/1.1\"")]
+    InvalidAlpnProtocol(String),
+    /// A cluster's `affinity_header` / `affinity_cookie` breaks
+    /// [`validate_affinity_key`], or is set on a TCP cluster.
+    #[error("cluster {cluster_id}: {reason}")]
+    InvalidAffinityKey {
+        cluster_id: String,
+        reason: &'static str,
+    },
+    /// A cluster's shuffle-sharding knobs break [`validate_shuffle_sharding`].
+    #[error("cluster {cluster_id}: {reason}")]
+    InvalidShuffleSharding {
+        cluster_id: String,
+        reason: &'static str,
+    },
+    /// A `max_connection_attempts`, global (`cluster_id` is `None`) or of a
+    /// cluster, breaks [`validate_max_connection_attempts`].
+    #[error("max_connection_attempts = {value}{}: {reason}", cluster_id.as_deref().map(|id| format!(" in cluster {id}")).unwrap_or_default())]
+    InvalidMaxConnectionAttempts {
+        cluster_id: Option<String>,
+        value: u32,
+        reason: &'static str,
+    },
+    /// A backend's `unix_path` breaks [`parse_backend_unix_path`], shares its
+    /// identity `address` with another backend of the cluster, or sits in a
+    /// UDP cluster.
+    #[error("cluster {cluster_id}, backend {address}: {reason}")]
+    InvalidBackendUnixPath {
+        cluster_id: String,
+        address: SocketAddr,
+        reason: &'static str,
+    },
+    /// A cluster's `health_check` block has an unparsable `accepted_statuses`
+    /// entry or breaks [`validate_health_check_config`].
+    #[error("cluster {cluster_id}: {reason}")]
+    InvalidHealthCheck {
+        cluster_id: String,
+        reason: &'static str,
+    },
+    /// `subnet_ipv4_prefix` / `subnet_ipv6_prefix` is outside the bit
+    /// width of its address family. Rejected rather than clamped: a
+    /// silently narrowed mask would enforce a different policy than the
+    /// one written in the file, and the operator would have no way to
+    /// tell from the config which one is in force.
+    #[error(
+        "{key} = {value} is out of range: a {family} prefix length must be between 0 and \
+         {maximum} bits inclusive."
+    )]
+    InvalidSubnetPrefix {
+        key: &'static str,
+        family: &'static str,
+        value: u32,
+        maximum: u32,
+    },
+    /// `command_socket_mode` is not an octal permission string within
+    /// [`MAX_COMMAND_SOCKET_MODE`]. See [`parse_command_socket_mode`].
+    #[error("command_socket_mode = {value:?} is invalid: {reason}")]
+    InvalidCommandSocketMode { value: String, reason: &'static str },
+    /// `disable_http11 = true` and `alpn_protocols` containing `"http/1.1"`
+    /// are mutually exclusive: the proxy advertises `http/1.1` to peers,
+    /// then refuses every connection that negotiates
+    /// it. The combination is a self-DoS at handshake time. Either drop
+    /// `http/1.1` from `alpn_protocols` or unset `disable_http11`.
+    #[error(
+        "disable_http11 = true is incompatible with alpn_protocols containing \"http/1.1\" \
+         on listener {address}. The proxy would advertise http/1.1 then refuse every \
+         connection that negotiates it. Drop \"http/1.1\" from alpn_protocols or unset \
+         disable_http11."
+    )]
+    DisableHttp11WithHttp11Alpn { address: String },
+    /// `buffer_size` is below the H2 minimum (16 393 bytes) but at least one
+    /// HTTPS listener advertises `h2` in its ALPN list. The H2 mux requires
+    /// 16 384-byte frame payload + 9-byte header to fit in a single kawa
+    /// buffer; smaller values deadlock streams that carry full-size frames.
+    /// Either raise `buffer_size` to ≥ 16 393 or remove `h2` from the
+    /// affected listeners' `alpn_protocols`.
+    #[error(
+        "buffer_size = {buffer_size} is below the H2 minimum of {minimum} but \
+         {listeners} HTTPS listener(s) advertise H2 ALPN. The H2 mux deadlocks \
+         on full-size frames with smaller buffers. Raise buffer_size to >= {minimum} \
+         or remove \"h2\" from those listeners' alpn_protocols."
+    )]
+    BufferSizeTooSmallForH2 {
+        buffer_size: u64,
+        minimum: u64,
+        listeners: usize,
+    },
+    /// `command_buffer_size` is greater than `max_command_buffer_size`. The command
+    /// channel (`command/src/channel.rs`) allocates its initial buffer at
+    /// `command_buffer_size` and must never let it exceed `max_command_buffer_size` —
+    /// every growth/shrink path on that channel reasons against that ceiling. Rejected
+    /// at load rather than silently clamped, so the operator sees which of the two
+    /// keys to fix instead of the mistake being rewritten out from under them
+    /// (sozu-proxy/sozu#1416).
+    #[error(
+        "command_buffer_size = {command_buffer_size} exceeds max_command_buffer_size = \
+         {max_command_buffer_size}: lower command_buffer_size to <= {max_command_buffer_size} \
+         or raise max_command_buffer_size to >= {command_buffer_size}"
+    )]
+    CommandBufferSizeExceedsMax {
+        command_buffer_size: u64,
+        max_command_buffer_size: u64,
+    },
+    /// An H2 listener knob was set below the minimum the runtime can honour.
+    /// Every flood-detection threshold needs `>= 1`: `check_flood`
+    /// (`lib/src/protocol/mux/h2_flood_detector.rs`) compares
+    /// `count > threshold`, so `0` does not disable the check, it makes the
+    /// first event the counter sees a violation. `h2_stream_shrink_ratio`
+    /// needs `>= 2` for the same reason its runtime `.max(2)` exists.
+    ///
+    /// What that costs depends on which counter the key guards, and the error
+    /// text says so rather than promising the worst case for all of them:
+    ///
+    /// - `h2_max_header_list_size` and `h2_max_header_fields` are *also* the
+    ///   HPACK decode budget `lib/src/protocol/mux/pkawa.rs`'s
+    ///   `decode_headers_with_budget` enforces. At `0` the first header field
+    ///   of every block already exceeds it (name + value + the 32-octet RFC
+    ///   9113 §6.5.2 overhead), so every request on the listener is refused
+    ///   with `ENHANCE_YOUR_CALM`. Immediate and universal. The frame it
+    ///   arrives in depends on the request: a header block that fits one
+    ///   HEADERS frame is refused per stream (`pkawa.rs`'s
+    ///   `Err((EnhanceYourCalm, false))` → `reset_stream`), while one that
+    ///   spans CONTINUATION frames takes the whole connection down —
+    ///   `record_continuation_frame` lifts `accumulated_header_size` above the
+    ///   zero threshold and `check_flood_or_return!`
+    ///   (`lib/src/protocol/mux/h2.rs`) escalates to
+    ///   `GOAWAY(ENHANCE_YOUR_CALM)` before the explicit size test below it.
+    ///   `h2_max_header_table_size` is NOT in this class: `0` only zeroes the
+    ///   HPACK encoder's dynamic table.
+    /// - The per-window and lifetime frame counters only move when a client
+    ///   sends the frame they count. `h2_max_rst_stream_per_window = 0` is
+    ///   harmless to a connection that never sends RST_STREAM — `0 > 0` is
+    ///   false — and fatal to the first one that does.
+    /// - `h2_max_concurrent_streams` and `h2_stream_shrink_ratio` are not
+    ///   flood counters at all: `H2ConnectionConfig::new`
+    ///   (`lib/src/protocol/mux/h2.rs`) promotes an out-of-range value to the
+    ///   floor behind a `warn!`, which is the silent rewrite this error
+    ///   exists to replace.
+    ///
+    /// Rejected at config load rather than silently clamped, so the operator
+    /// sees which key to fix instead of the mistake being rewritten out from
+    /// under them. `UpdateHttp(s)Listener` already refuses the same values via
+    /// `validate_h2_flood_knobs_http`/`_https` (`command/src/state.rs`); this
+    /// is the matching gate on the config-file / `sozu ctl add listener` path
+    /// (sozu-proxy/sozu#1418).
+    #[error(
+        "listener {address}: {key} = {value} is below the minimum of {minimum} the runtime can \
+         honour. Below the minimum the value does not relax the limit, it breaks it: the H2 flood \
+         detector compares count > threshold, so 0 is already exceeded the first time the counter \
+         it guards leaves zero. How far that reaches depends on the key — \
+         h2_max_header_list_size and h2_max_header_fields are also the HPACK decode budget, so 0 \
+         refuses every request on this listener with ENHANCE_YOUR_CALM (as a stream reset, or as \
+         a connection GOAWAY once a header block spans CONTINUATION frames), while a per-window \
+         or lifetime frame counter only trips once a client sends the frame it counts, and \
+         h2_max_concurrent_streams / h2_stream_shrink_ratio are instead promoted to their floor \
+         behind a warning. Raise {key} to >= {minimum}, or remove it to keep the default."
+    )]
+    H2ThresholdBelowMinimum {
+        address: String,
+        key: &'static str,
+        value: u64,
+        minimum: u64,
+    },
+    /// `redirect = "<value>"` on a frontend used a value the parser doesn't
+    /// recognise. Accepted values are `forward`, `permanent`, `unauthorized`,
+    /// `silent_close` (case-insensitive).
+    #[error(
+        "invalid redirect policy '{0}'. Valid values: \"forward\", \"permanent\", \"unauthorized\", \"silent_close\""
+    )]
+    InvalidRedirectPolicy(String),
+    /// `redirect_scheme = "<value>"` on a frontend used a value the parser
+    /// doesn't recognise. Accepted values are `use-same`, `use-http`,
+    /// `use-https` (case-insensitive).
+    #[error(
+        "invalid redirect scheme '{0}'. Valid values: \"use-same\", \"use-http\", \"use-https\""
+    )]
+    InvalidRedirectScheme(String),
+    /// A `[[clusters.<id>.frontends.headers]]` entry carried an unknown
+    /// `position` value. Accepted values are `request`, `response`, `both`
+    /// (case-insensitive).
+    #[error(
+        "invalid header position '{position}' at headers[{index}]. Valid values: \"request\", \"response\", \"both\""
+    )]
+    InvalidHeaderPosition { index: usize, position: String },
+    /// A `[[clusters.<id>.frontends.headers]]` entry contains a forbidden
+    /// byte (NUL, CR, LF, or another C0 control) in its key or value.
+    /// Accepting these would produce HTTP request/response splitting on
+    /// the wire (CWE-113) — the worker's H2 emission path filters them
+    /// at runtime, but the H1 path serialises raw, so we reject at
+    /// config-load time as a defense in depth.
+    #[error(
+        "invalid header bytes in {field} at headers[{index}]: control characters \
+         (NUL / CR / LF / other C0) are forbidden in header keys and values"
+    )]
+    InvalidHeaderBytes { index: usize, field: &'static str },
+    /// A `header_predicates` entry on a frontend is not a usable routing
+    /// condition (sozu-proxy/sozu#1253); `reason` names what is wrong. The
+    /// regex grammar of a `regex` predicate is checked later, by the
+    /// router, exactly as a `path_type = "regex"` path is.
+    #[error("invalid header predicate at header_predicates[{index}]: {reason}")]
+    InvalidHeaderPredicate { index: usize, reason: &'static str },
+    /// An `[hsts]` block populated `max_age`, `include_subdomains`, or
+    /// `preload` but did not set `enabled`. The TOML representation requires
+    /// `enabled` to be present whenever the block is — that single field
+    /// disambiguates "preserve current" / "explicit disable" / "enable" on
+    /// hot-reconfig partial updates.
+    #[error("invalid HSTS config at {0}: `enabled` is required when an [hsts] block is present")]
+    HstsEnabledRequired(String),
+    /// An `[hsts]` block on an HTTP-only listener or frontend. RFC 6797
+    /// §7.2 forbids emitting `Strict-Transport-Security` over plaintext
+    /// HTTP; sozu rejects the configuration at load time so the
+    /// non-conformant policy never ships to a worker.
+    #[error(
+        "invalid HSTS config at {0}: HSTS is only valid on HTTPS listeners and frontends \
+         (RFC 6797 §7.2 forbids the header over plaintext HTTP)"
+    )]
+    HstsOnPlainHttp(String),
+    /// A client-certificate-authentication (mTLS) field was set on a non-HTTPS
+    /// listener. Client auth is a TLS-termination control; HTTP/TCP/UDP
+    /// listeners discard it, so sozu rejects it at load time rather than
+    /// silently starting an unauthenticated listener.
+    #[error(
+        "invalid client auth config at {0}: client_auth / client_ca_certificates / \
+         client_ca_crls are only valid on HTTPS listeners"
+    )]
+    ClientAuthOnNonHttps(String),
+    /// An HTTPS listener names client CA or CRL files but no `client_auth`
+    /// mode. The mode defaults to `none`, which ignores those files, so the
+    /// listener would start without the client authentication they suggest.
+    #[error(
+        "invalid client auth config at {0}: client_ca_certificates / client_ca_crls are set \
+         but client_auth is not; set client_auth to \"optional\" or \"required\", or to \
+         \"none\" to keep them unused"
+    )]
+    ClientAuthModeMissing(String),
+    /// A TCP frontend's `hostname` (mapped to the wire `sni` field) is
+    /// neither an exact hostname nor a single leading `*.` wildcard label
+    /// (sozu-proxy/sozu#1279). Rejects `*.*.example.com`, an embedded `*`
+    /// anywhere but the leading label, an empty label, and any `/` — never
+    /// valid in a hostname, and a leftmost `/.../` label would otherwise be
+    /// inserted into the `pattern_trie` route table as a REGEX segment.
+    #[error(
+        "invalid SNI pattern '{sni}' for a TCP frontend: expected an exact hostname or a \
+         single leading \"*.\" wildcard label (e.g. \"example.com\" or \"*.example.com\"); \
+         '/' and non-leading '*' are rejected"
+    )]
+    InvalidSniPattern { sni: String },
+    /// A TCP frontend's SNI pattern contains non-ASCII characters. On-wire
+    /// SNI is always an ASCII A-label (RFC 6066 §3 / IDNA), so a Unicode
+    /// U-label in the config would load fine but never match any
+    /// ClientHello — a silent routing failure. Rejected loudly until IDNA
+    /// normalization is supported at config-load; the operator must write
+    /// the punycode A-label form instead.
+    #[error(
+        "non-ASCII SNI pattern '{sni}' for a TCP frontend: on-wire SNI is always an ASCII \
+         A-label (RFC 6066), so this pattern would never match a ClientHello. Write the \
+         punycode A-label form instead (e.g. \"xn--mnchen-3ya.example\" for \
+         \"münchen.example\")"
+    )]
+    NonAsciiSniPattern { sni: String },
+    /// A TCP frontend set `alpn` but left `hostname` (mapped to the wire
+    /// `sni` field) unset. An ALPN matcher only ever gets consulted from
+    /// within the SNI-scoped preread route table; a frontend with no `sni`
+    /// installs the worker's raw no-SNI catch-all path instead
+    /// (`TcpListener::cluster_id`), which never looks at `alpn` at all --
+    /// the configured protocol list would silently never be enforced.
+    /// Reject at config-load rather than mis-routing every connection
+    /// through unconditionally.
+    #[error(
+        "TCP frontend {address} sets alpn but no hostname (sni): alpn only matches within an \
+         SNI-scoped preread, so a frontend without hostname would silently ignore its alpn list. \
+         Set hostname or drop alpn."
+    )]
+    AlpnWithoutSni { address: SocketAddr },
+    /// Two TCP frontends on the same `(address, sni)` advertise an
+    /// overlapping ALPN protocol. Routing on a listener must be
+    /// deterministic: if both frontends could match the same ClientHello,
+    /// which cluster receives the connection would depend on iteration
+    /// order rather than configuration.
+    #[error(
+        "TCP frontends on {address} with sni {sni:?} both match ALPN protocol '{protocol}': \
+         ALPN matchers for the same (address, sni) must not overlap"
+    )]
+    TcpFrontendAlpnOverlap {
+        address: SocketAddr,
+        sni: Option<String>,
+        protocol: String,
+    },
+    /// More than one TCP frontend on the same `(address, sni)` left `alpn`
+    /// empty. An empty `alpn` is the catch-all match for that `sni`; two
+    /// catch-alls on the same `(address, sni)` are as ambiguous as two
+    /// frontends sharing an explicit protocol.
+    #[error(
+        "more than one TCP frontend on {address} with sni {sni:?} leaves alpn empty (the \
+         catch-all match): at most one frontend per (address, sni) may omit alpn"
+    )]
+    TcpFrontendMultipleAlpnCatchAll {
+        address: SocketAddr,
+        sni: Option<String>,
+    },
+    /// A TCP listener address is targeted by both a no-SNI frontend and at
+    /// least one SNI-scoped frontend. An SNI-enabled listener prereads the
+    /// ClientHello before choosing a backend; a raw-TCP fallback frontend
+    /// with no SNI to match against would be unreachable for any client
+    /// that doesn't send SNI, and ambiguous for any that does, so the two
+    /// shapes cannot share a listener.
+    #[error(
+        "TCP listener {address} is targeted by both a no-SNI frontend and at least one \
+         SNI-scoped frontend: an SNI-enabled listener must not also have a raw-TCP fallback \
+         frontend on the same address"
+    )]
+    TcpListenerMixesSniAndNoSni { address: SocketAddr },
+    /// `sni_preread_timeout` on a TCP listener exceeds that listener's
+    /// `front_timeout`. The preread phase is bounded by the frontend's own
+    /// inactivity timeout, so a preread budget longer than the timeout that
+    /// would kill the connection anyway can never fully elapse — it is
+    /// either a config mistake or silently dead configuration.
+    #[error(
+        "sni_preread_timeout = {sni_preread_timeout}s on TCP listener {address} exceeds its \
+         front_timeout = {front_timeout}s: the preread phase cannot outlive the frontend \
+         inactivity timeout that would already have closed the connection"
+    )]
+    SniPrereadTimeoutExceedsFrontTimeout {
+        address: SocketAddr,
+        sni_preread_timeout: u32,
+        front_timeout: u32,
+    },
+    /// `sni_preread_max_bytes` on a TCP listener targeted by at least one
+    /// SNI frontend exceeds the global `buffer_size`. The preread buffer is
+    /// carved out of the same per-session buffer the proxy uses for
+    /// relaying, so a preread ceiling above `buffer_size` can never be
+    /// reached in practice and signals a misconfiguration.
+    #[error(
+        "sni_preread_max_bytes = {sni_preread_max_bytes} on TCP listener {address} exceeds \
+         buffer_size = {buffer_size}: raise buffer_size to >= {sni_preread_max_bytes} or lower \
+         sni_preread_max_bytes"
+    )]
+    SniPrereadMaxBytesExceedsBufferSize {
+        address: SocketAddr,
+        sni_preread_max_bytes: u32,
+        buffer_size: u64,
+    },
+    /// `sni_preread_max_bytes` on a TCP listener targeted by at least one
+    /// SNI frontend is below [`MIN_SNI_PREREAD_MAX_BYTES`]. `0` in
+    /// particular makes the preread shell issue zero-length reads that can
+    /// never make progress -- the session spins until the event-loop
+    /// iteration guard (`MAX_LOOP_ITERATIONS`) trips instead of ever
+    /// completing a preread decision. The floor is a full TLS record
+    /// header (1-byte `ContentType` + 2-byte `ProtocolVersion` + 2-byte
+    /// length, RFC 8446 §5.1): below that, the shell cannot even learn how
+    /// many more bytes to wait for.
+    #[error(
+        "sni_preread_max_bytes = {sni_preread_max_bytes} on TCP listener {address} is below the \
+         minimum of {minimum} bytes (a full TLS record header): the preread shell could never \
+         read enough bytes to make progress. Raise sni_preread_max_bytes to >= {minimum}"
+    )]
+    SniPrereadMaxBytesTooSmall {
+        address: SocketAddr,
+        sni_preread_max_bytes: u32,
+        minimum: u32,
+    },
+    /// A backend `address` of the configuration file is neither a socket
+    /// address nor a `host:port` that resolves to at least one address
+    /// (sozu-proxy/sozu#347). Names are resolved once, when the file is
+    /// loaded at startup or by `sozu reload --file`.
+    #[error(
+        "cluster {cluster_id}: cannot resolve backend address {address:?}: {reason}. \
+         Expected an IP:port socket address or a resolvable host:port"
+    )]
+    BackendAddressResolution {
+        cluster_id: String,
+        address: String,
+        reason: String,
+    },
+}
+
+/// Config-facing mutual-TLS (client certificate authentication) mode, parsed
+/// from the `client_auth` key of an HTTPS listener's TOML section. Serializes as
+/// lowercase (`"none"` / `"optional"` / `"required"`) so operators write the
+/// documented values rather than the protobuf enum's `SCREAMING_SNAKE_CASE`.
+/// Maps to the wire [`ClientAuthMode`] in [`ListenerBuilder::to_tls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientAuthConfig {
+    #[default]
+    None,
+    Optional,
+    Required,
+}
+
+impl From<ClientAuthConfig> for ClientAuthMode {
+    fn from(value: ClientAuthConfig) -> Self {
+        match value {
+            ClientAuthConfig::None => ClientAuthMode::ClientAuthNone,
+            ClientAuthConfig::Optional => ClientAuthMode::ClientAuthOptional,
+            ClientAuthConfig::Required => ClientAuthMode::ClientAuthRequired,
+        }
+    }
+}
+
+/// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerBuilder {
+    pub address: SocketAddr,
+    /// Network interface the listening socket is bound to with
+    /// `SO_BINDTODEVICE` (e.g. `"wg0"`), for an address that is not known
+    /// ahead. Linux only: refused at config load on any other platform. Part
+    /// of the listener identity, so two listeners may share an `address` on
+    /// different interfaces.
+    pub interface: Option<String>,
+    pub protocol: Option<ListenerProtocol>,
+    pub public_address: Option<SocketAddr>,
+    pub answer_301: Option<String>,
+    pub answer_400: Option<String>,
+    pub answer_401: Option<String>,
+    pub answer_404: Option<String>,
+    pub answer_408: Option<String>,
+    pub answer_413: Option<String>,
+    /// RFC 9110 §15.5.20 — returned when the request's `:authority` / `Host`
+    /// host does not match the TLS SNI negotiated for this connection.
+    pub answer_421: Option<String>,
+    pub answer_502: Option<String>,
+    pub answer_503: Option<String>,
+    pub answer_504: Option<String>,
+    pub answer_507: Option<String>,
+    /// RFC 6585 §4 — emitted when a request would have reached a backend
+    /// but the per-(cluster, source-IP) connection limit is full. Honoured
+    /// like the other deprecated `answer_NNN` fields: copies into the
+    /// listener-level `answers` map at the matching status.
+    pub answer_429: Option<String>,
+    pub tls_versions: Option<Vec<TlsVersion>>,
+    pub cipher_list: Option<Vec<String>>,
+    pub cipher_suites: Option<Vec<String>>,
+    pub groups_list: Option<Vec<String>>,
+    pub expect_proxy: Option<bool>,
+    #[serde(default = "default_sticky_name")]
+    pub sticky_name: String,
+    pub certificate: Option<String>,
+    pub certificate_chain: Option<String>,
+    pub key: Option<String>,
+    /// maximum time of inactivity for a frontend socket
+    pub front_timeout: Option<u32>,
+    /// maximum time of inactivity for a backend socket
+    pub back_timeout: Option<u32>,
+    /// maximum time to connect to a backend server
+    pub connect_timeout: Option<u32>,
+    /// maximum time to receive a request since the connection started
+    pub request_timeout: Option<u32>,
+    /// A [Config] to pull defaults from
+    pub config: Option<Config>,
+    /// Number of TLS 1.3 tickets to send to a client when establishing a connection.
+    /// The ticket allow the client to resume a session. This protects the client
+    /// agains session tracking. Defaults to 4.
+    pub send_tls13_tickets: Option<u64>,
+    /// ALPN protocols to advertise during TLS handshake, in order of preference.
+    /// Valid values: "h2", "http/1.1". Defaults to ["h2", "http/1.1"].
+    pub alpn_protocols: Option<Vec<String>>,
+    /// H2 flood detection: max RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    pub h2_max_rst_stream_per_window: Option<u32>,
+    /// H2 flood detection: max PING frames per second window (CVE-2019-9512)
+    pub h2_max_ping_per_window: Option<u32>,
+    /// H2 flood detection: max SETTINGS frames per second window (CVE-2019-9515)
+    pub h2_max_settings_per_window: Option<u32>,
+    /// H2 flood detection: max empty DATA frames per second window (CVE-2019-9518)
+    pub h2_max_empty_data_per_window: Option<u32>,
+    /// H2 flood detection: max unsolicited connection-level (stream 0)
+    /// WINDOW_UPDATE frames per sliding window — each DATA frame the proxy
+    /// sends entitles the peer to two that are not counted. Caps non-zero
+    /// stream-0 WINDOW_UPDATE floods that would otherwise stay under the
+    /// generic glitch counter. Default: 2000.
+    pub h2_max_window_update_stream0_per_window: Option<u32>,
+    /// Name of the correlation header Sozu injects into every request and
+    /// response. Default: `Sozu-Id`. Operators can rebrand (e.g. `X-Edge-Id`)
+    /// without touching code.
+    pub sozu_id_header: Option<String>,
+    /// H2 flood detection: max CONTINUATION frames per header block (CVE-2024-27316)
+    pub h2_max_continuation_frames: Option<u32>,
+    /// H2 flood detection: max accumulated protocol anomalies before
+    /// ENHANCE_YOUR_CALM. Default: 2000.
+    pub h2_max_glitch_count: Option<u32>,
+    /// H2 connection-level receive window size in bytes (RFC 9113 §6.9.2). Default: 16777216 (16 MiB).
+    pub h2_initial_connection_window: Option<u32>,
+    /// Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS). Default: 100.
+    pub h2_max_concurrent_streams: Option<u32>,
+    /// Shrink threshold ratio for recycled stream slots. Default: 2.
+    pub h2_stream_shrink_ratio: Option<u32>,
+    /// H2 flood detection: floor of the connection-lifetime cap on RST_STREAM
+    /// frames received (CVE-2023-44487); trips once the count exceeds this
+    /// value and the resets received after a response started or on a closed
+    /// stream exceed the streams a backend answered. Default: 200000.
+    pub h2_max_rst_stream_lifetime: Option<u64>,
+    /// H2 flood detection: floor of the cap on "abusive" (pre-response-start)
+    /// RST_STREAM frames (Rapid Reset signature, CVE-2023-44487); trips once
+    /// the count exceeds this value and more than half of the
+    /// backend-routed streams were reset before their response.
+    /// Default: 1000.
+    pub h2_max_rst_stream_abusive_lifetime: Option<u64>,
+    /// H2 flood detection: floor of the cap on **server-emitted** RST_STREAM
+    /// frames the peer provoked (CVE-2025-8671 "MadeYouReset"); trips once the
+    /// count exceeds this value and more than half of the
+    /// backend-routed streams were reset before their response. Resets
+    /// Sōzu decides on its own and `NoError` resets are not counted.
+    /// Default: 10000.
+    pub h2_max_rst_stream_emitted_lifetime: Option<u64>,
+    /// H2 flood detection: maximum accumulated HPACK-decoded header list
+    /// size per request (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
+    /// Default: 65536.
+    pub h2_max_header_list_size: Option<u32>,
+    /// Maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE) accepted
+    /// from the peer. Caps the value the peer advertises in SETTINGS frames to
+    /// prevent unbounded HPACK encoder memory growth. Default: 65536.
+    pub h2_max_header_table_size: Option<u32>,
+    /// Maximum number of materialized header fields per request — HPACK fields
+    /// plus expanded cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK
+    /// indexed-reference header bomb. Default: 128.
+    pub h2_max_header_fields: Option<u32>,
+    /// H2 flood detection: share, in percent, of the pre-response RST_STREAM
+    /// cap's floor (`h2_max_rst_stream_abusive_lifetime`) at which a
+    /// connection refuses new client streams with `REFUSED_STREAM`
+    /// (retryable, RFC 9113 §8.7) and keeps serving its open streams. `0`
+    /// disables it; `100` or more never engages it before the cap.
+    /// Default: 50.
+    pub h2_stream_refusal_percent: Option<u32>,
+    /// Per-stream idle timeout, in seconds. An open H2 stream that makes no
+    /// forward progress for this duration is cancelled (RST_STREAM / CANCEL)
+    /// to defend against slow-multiplex Slowloris. Unset, it inherits
+    /// `back_timeout`, floored at 30 (so 30 with the default `back_timeout`);
+    /// an explicit value wins, `0` meaning 1.
+    pub h2_stream_idle_timeout_seconds: Option<u32>,
+    /// Maximum wall-clock seconds to wait for in-flight H2 streams after
+    /// `GOAWAY(NO_ERROR)` has been sent during soft-stop. Once the deadline
+    /// elapses the connection is forcibly closed with a final GOAWAY. Set to
+    /// `0` to wait for streams to finish (no forced close). Default: 5.
+    pub h2_graceful_shutdown_deadline_seconds: Option<u32>,
+    /// When true, every HTTP request served on this listener must have its
+    /// `:authority` / `Host` host exact-match the TLS SNI negotiated at
+    /// handshake (CWE-346 / CWE-444). Applies to HTTPS listeners only;
+    /// plaintext HTTP listeners never have an SNI to compare against.
+    /// Default: true.
+    pub strict_sni_binding: Option<bool>,
+    /// When true, this HTTPS listener only accepts HTTP/2 connections;
+    /// clients that do not negotiate `h2` via TLS ALPN (including those
+    /// that omit ALPN entirely) are dropped at handshake instead of
+    /// silently downgrading to HTTP/1.1. Default: false.
+    pub disable_http11: Option<bool>,
+    /// When true, any client-supplied `X-Real-IP` header is stripped from
+    /// requests before forwarding (anti-spoofing). Independently combinable
+    /// with `send_x_real_ip`. Default: false.
+    pub elide_x_real_ip: Option<bool>,
+    /// When true, a proxy-generated `X-Real-IP` header carrying the
+    /// connection peer IP (post-PROXY-v2 unwrap, i.e. the original client
+    /// IP) is appended to every forwarded request. Independently combinable
+    /// with `elide_x_real_ip`. Default: false.
+    pub send_x_real_ip: Option<bool>,
+    /// Which forwarding header family this listener adds to every forwarded
+    /// request (see [`ForwardedHeadersMode`]). Independent of
+    /// `elide_x_real_ip` and `send_x_real_ip`. Default: `both`.
+    pub forwarded_headers: Option<ForwardedHeadersMode>,
+    /// Per-status HTTP answer templates at listener scope — the **global
+    /// default** that fires whenever no cluster-level override matches.
+    /// Map key is the HTTP status code (e.g. `"503"`); map value is
+    /// either a filesystem path or an `inline:<body>` literal, see
+    /// [`resolve_answer_source`]. Loaded into
+    /// [`HttpListenerConfig::answers`] / [`HttpsListenerConfig::answers`]
+    /// at build time via [`load_answers`].
+    ///
+    /// Cluster-level [`FileClusterConfig::answers`] entries override the
+    /// matching status here for requests routed to that cluster.
+    ///
+    /// The deprecated per-status `answer_NNN` fields are still honoured
+    /// for backwards compatibility but are equivalent to a one-line entry
+    /// in this map; new configs should prefer `[listeners.answers]`.
+    pub answers: Option<BTreeMap<String, String>>,
+    /// Listener-default HSTS (RFC 6797) policy. When set, every HTTPS
+    /// frontend on this listener that does not declare its own `[hsts]`
+    /// block inherits this value. Per RFC 6797 §7.2 HSTS is rejected on
+    /// HTTP listeners at config-load time; this field is only meaningful
+    /// for HTTPS listeners. Defaults to `None` (no HSTS).
+    pub hsts: Option<FileHstsConfig>,
+    /// UDP listener only: maximum received datagram size, in bytes. Capped
+    /// at the effective `buffer_size` at config-load (clamp + warn when
+    /// larger). Defaults to [`DEFAULT_UDP_MAX_RX_DATAGRAM_SIZE`].
+    pub max_rx_datagram_size: Option<u32>,
+    /// UDP listener only: maximum number of concurrent flows. `0` (the
+    /// default) selects the runtime auto policy (~70% soft RLIMIT_NOFILE);
+    /// a warning is emitted at config-load when an explicit value exceeds
+    /// that bound.
+    pub max_flows: Option<u32>,
+    /// TCP listener only: time allowed to receive enough bytes of the TLS
+    /// ClientHello to read the SNI extension, in seconds. Only meaningful
+    /// when at least one SNI-scoped frontend targets this listener.
+    /// Defaults to [`DEFAULT_SNI_PREREAD_TIMEOUT`].
+    pub sni_preread_timeout: Option<u32>,
+    /// TCP listener only: maximum number of bytes buffered while prereading
+    /// the TLS ClientHello looking for the SNI extension. Only meaningful
+    /// when at least one SNI-scoped frontend targets this listener; must
+    /// not exceed the global `buffer_size` (validated at config-load).
+    /// Defaults to [`DEFAULT_SNI_PREREAD_MAX_BYTES`].
+    pub sni_preread_max_bytes: Option<u32>,
+    /// HTTPS listener only: mutual TLS (client certificate authentication)
+    /// mode (`none` / `optional` / `required`). Absent and `none` both keep the
+    /// historical no-client-auth behavior.
+    pub client_auth: Option<ClientAuthConfig>,
+    /// HTTPS listener only: filesystem paths to PEM-encoded trusted CA
+    /// certificates a client certificate must chain to. Loaded at
+    /// config-materialization time (like `certificate`/`key`) and inlined as
+    /// PEM into the resulting [`HttpsListenerConfig`].
+    pub client_ca_certificates: Option<Vec<String>>,
+    /// HTTPS listener only: filesystem paths to PEM-encoded CRLs used to
+    /// reject revoked client certificates. Loaded alongside
+    /// `client_ca_certificates`.
+    pub client_ca_crls: Option<Vec<String>>,
+}
+
+pub fn default_sticky_name() -> String {
+    DEFAULT_STICKY_NAME.to_string()
+}
+
+impl ListenerBuilder {
+    /// starts building an HTTP Listener with config values for timeouts,
+    /// or defaults if no config is provided
+    pub fn new_http(address: SocketAddress) -> ListenerBuilder {
+        Self::new(address, ListenerProtocol::Http)
+    }
+
+    /// starts building an HTTPS Listener with config values for timeouts,
+    /// or defaults if no config is provided
+    pub fn new_tcp(address: SocketAddress) -> ListenerBuilder {
+        Self::new(address, ListenerProtocol::Tcp)
+    }
+
+    /// starts building a TCP Listener with config values for timeouts,
+    /// or defaults if no config is provided
+    pub fn new_https(address: SocketAddress) -> ListenerBuilder {
+        Self::new(address, ListenerProtocol::Https)
+    }
+
+    /// starts building a UDP Listener with config values for timeouts,
+    /// or defaults if no config is provided
+    pub fn new_udp(address: SocketAddress) -> ListenerBuilder {
+        Self::new(address, ListenerProtocol::Udp)
+    }
+
+    /// starts building a Listener
+    fn new(address: SocketAddress, protocol: ListenerProtocol) -> ListenerBuilder {
+        ListenerBuilder {
+            address: address.into(),
+            interface: None,
+            answer_301: None,
+            answer_401: None,
+            answer_400: None,
+            answer_404: None,
+            answer_408: None,
+            answer_413: None,
+            answer_421: None,
+            answer_502: None,
+            answer_503: None,
+            answer_504: None,
+            answer_507: None,
+            answer_429: None,
+            back_timeout: None,
+            certificate_chain: None,
+            certificate: None,
+            cipher_list: None,
+            cipher_suites: None,
+            groups_list: None,
+            config: None,
+            connect_timeout: None,
+            expect_proxy: None,
+            front_timeout: None,
+            key: None,
+            protocol: Some(protocol),
+            public_address: None,
+            request_timeout: None,
+            send_tls13_tickets: None,
+            sticky_name: DEFAULT_STICKY_NAME.to_string(),
+            tls_versions: None,
+            alpn_protocols: None,
+            h2_max_rst_stream_per_window: None,
+            h2_max_ping_per_window: None,
+            h2_max_settings_per_window: None,
+            h2_max_empty_data_per_window: None,
+            h2_max_window_update_stream0_per_window: None,
+            sozu_id_header: None,
+            h2_max_continuation_frames: None,
+            h2_max_glitch_count: None,
+            h2_initial_connection_window: None,
+            h2_max_concurrent_streams: None,
+            h2_stream_shrink_ratio: None,
+            h2_max_rst_stream_lifetime: None,
+            h2_max_rst_stream_abusive_lifetime: None,
+            h2_max_rst_stream_emitted_lifetime: None,
+            h2_max_header_list_size: None,
+            h2_max_header_table_size: None,
+            h2_max_header_fields: None,
+            h2_stream_refusal_percent: None,
+            h2_stream_idle_timeout_seconds: None,
+            h2_graceful_shutdown_deadline_seconds: None,
+            strict_sni_binding: None,
+            disable_http11: None,
+            elide_x_real_ip: None,
+            send_x_real_ip: None,
+            forwarded_headers: None,
+            answers: None,
+            hsts: None,
+            max_rx_datagram_size: None,
+            max_flows: None,
+            sni_preread_timeout: None,
+            sni_preread_max_bytes: None,
+            client_auth: None,
+            client_ca_certificates: None,
+            client_ca_crls: None,
+        }
+    }
+
+    /// Set the network interface the listener binds to; `None` clears it.
+    pub fn with_interface<S>(&mut self, interface: Option<S>) -> &mut Self
+    where
+        S: ToString,
+    {
+        self.interface = interface.map(|interface| interface.to_string());
+        self
+    }
+
+    /// The validated `interface`: a valid interface name, on a platform that
+    /// can bind a socket to an interface.
+    fn validated_interface(&self) -> Result<Option<String>, ConfigError> {
+        if let Some(interface) = &self.interface {
+            validate_listener_interface(interface).map_err(|error| {
+                ConfigError::ListenerInterface {
+                    address: self.address,
+                    error,
+                }
+            })?;
+        }
+        Ok(self.interface.clone())
+    }
+
+    pub fn with_public_address(&mut self, public_address: Option<SocketAddr>) -> &mut Self {
+        if let Some(address) = public_address {
+            self.public_address = Some(address);
+        }
+        self
+    }
+
+    pub fn with_answer_404_path<S>(&mut self, answer_404_path: Option<S>) -> &mut Self
+    where
+        S: ToString,
+    {
+        if let Some(path) = answer_404_path {
+            self.answer_404 = Some(path.to_string());
+        }
+        self
+    }
+
+    pub fn with_answer_503_path<S>(&mut self, answer_503_path: Option<S>) -> &mut Self
+    where
+        S: ToString,
+    {
+        if let Some(path) = answer_503_path {
+            self.answer_503 = Some(path.to_string());
+        }
+        self
+    }
+
+    pub fn with_tls_versions(&mut self, tls_versions: Vec<TlsVersion>) -> &mut Self {
+        self.tls_versions = Some(tls_versions);
+        self
+    }
+
+    pub fn with_cipher_list(&mut self, cipher_list: Option<Vec<String>>) -> &mut Self {
+        self.cipher_list = cipher_list;
+        self
+    }
+
+    pub fn with_cipher_suites(&mut self, cipher_suites: Option<Vec<String>>) -> &mut Self {
+        self.cipher_suites = cipher_suites;
+        self
+    }
+
+    pub fn with_alpn_protocols(&mut self, alpn_protocols: Option<Vec<String>>) -> &mut Self {
+        self.alpn_protocols = alpn_protocols;
+        self
+    }
+
+    /// When true, strip any client-supplied `X-Real-IP` header from
+    /// forwarded requests (anti-spoofing). Default: false.
+    pub fn with_elide_x_real_ip(&mut self, elide_x_real_ip: bool) -> &mut Self {
+        self.elide_x_real_ip = Some(elide_x_real_ip);
+        self
+    }
+
+    /// When true, append a proxy-generated `X-Real-IP` header carrying the
+    /// connection peer IP (post-PROXY-v2 unwrap) to every forwarded request.
+    /// Default: false.
+    pub fn with_send_x_real_ip(&mut self, send_x_real_ip: bool) -> &mut Self {
+        self.send_x_real_ip = Some(send_x_real_ip);
+        self
+    }
+
+    /// Which forwarding header family this listener adds to every forwarded
+    /// request. Default: [`ForwardedHeadersMode::Both`].
+    pub fn with_forwarded_headers(&mut self, forwarded_headers: ForwardedHeadersMode) -> &mut Self {
+        self.forwarded_headers = Some(forwarded_headers);
+        self
+    }
+
+    pub fn with_expect_proxy(&mut self, expect_proxy: bool) -> &mut Self {
+        self.expect_proxy = Some(expect_proxy);
+        self
+    }
+
+    pub fn with_sticky_name<S>(&mut self, sticky_name: Option<S>) -> &mut Self
+    where
+        S: ToString,
+    {
+        if let Some(name) = sticky_name {
+            self.sticky_name = name.to_string();
+        }
+        self
+    }
+
+    pub fn with_certificate<S>(&mut self, certificate: S) -> &mut Self
+    where
+        S: ToString,
+    {
+        self.certificate = Some(certificate.to_string());
+        self
+    }
+
+    pub fn with_certificate_chain(&mut self, certificate_chain: String) -> &mut Self {
+        self.certificate = Some(certificate_chain);
+        self
+    }
+
+    pub fn with_key<S>(&mut self, key: String) -> &mut Self
+    where
+        S: ToString,
+    {
+        self.key = Some(key);
+        self
+    }
+
+    pub fn with_front_timeout(&mut self, front_timeout: Option<u32>) -> &mut Self {
+        self.front_timeout = front_timeout;
+        self
+    }
+
+    pub fn with_back_timeout(&mut self, back_timeout: Option<u32>) -> &mut Self {
+        self.back_timeout = back_timeout;
+        self
+    }
+
+    pub fn with_connect_timeout(&mut self, connect_timeout: Option<u32>) -> &mut Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    pub fn with_request_timeout(&mut self, request_timeout: Option<u32>) -> &mut Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Register a single per-status answer template file path on this
+    /// listener. The path is read off disk into the resulting listener's
+    /// `answers` map at build time via [`load_answers`]. Repeated calls
+    /// with the same status code overwrite the prior entry.
+    pub fn with_answer<S, P>(&mut self, code: S, path: P) -> &mut Self
+    where
+        S: ToString,
+        P: ToString,
+    {
+        self.answers
+            .get_or_insert_with(BTreeMap::new)
+            .insert(code.to_string(), path.to_string());
+        self
+    }
+
+    /// Replace the listener-scope answer-template path map. See
+    /// [`Self::with_answer`].
+    pub fn with_answers(&mut self, answers: BTreeMap<String, String>) -> &mut Self {
+        self.answers = Some(answers);
+        self
+    }
+
+    /// Get the custom HTTP answers from the file system using the provided paths
+    fn get_http_answers(&self) -> Result<Option<CustomHttpAnswers>, ConfigError> {
+        let http_answers = CustomHttpAnswers {
+            answer_301: read_http_answer_file(&self.answer_301)?,
+            answer_400: read_http_answer_file(&self.answer_400)?,
+            answer_401: read_http_answer_file(&self.answer_401)?,
+            answer_404: read_http_answer_file(&self.answer_404)?,
+            answer_408: read_http_answer_file(&self.answer_408)?,
+            answer_413: read_http_answer_file(&self.answer_413)?,
+            answer_421: read_http_answer_file(&self.answer_421)?,
+            answer_502: read_http_answer_file(&self.answer_502)?,
+            answer_503: read_http_answer_file(&self.answer_503)?,
+            answer_504: read_http_answer_file(&self.answer_504)?,
+            answer_507: read_http_answer_file(&self.answer_507)?,
+            answer_429: read_http_answer_file(&self.answer_429)?,
+        };
+        Ok(Some(http_answers))
+    }
+
+    /// Build the proto-side `answers` map for this listener.
+    ///
+    /// Merges, in order:
+    /// 1. legacy per-status `answer_NNN` fields (if set), so legacy state
+    ///    files round-trip into the new shape;
+    /// 2. the explicit `[listeners.answers]` map (loaded via [`load_answers`]),
+    ///    so new entries take precedence over legacy ones.
+    fn get_listener_answers(&self) -> Result<BTreeMap<String, String>, ConfigError> {
+        let mut out = BTreeMap::new();
+
+        // Pull bodies from the legacy per-status fields first so the new map
+        // takes precedence on collision. Empty bodies are skipped to keep the
+        // proto map minimal.
+        macro_rules! merge_legacy {
+            ($code:literal, $field:ident) => {
+                if let Some(body) = read_http_answer_file(&self.$field)? {
+                    out.insert($code.to_owned(), body);
+                }
+            };
+        }
+        merge_legacy!("301", answer_301);
+        merge_legacy!("400", answer_400);
+        merge_legacy!("401", answer_401);
+        merge_legacy!("404", answer_404);
+        merge_legacy!("408", answer_408);
+        merge_legacy!("413", answer_413);
+        merge_legacy!("421", answer_421);
+        merge_legacy!("502", answer_502);
+        merge_legacy!("503", answer_503);
+        merge_legacy!("504", answer_504);
+        merge_legacy!("507", answer_507);
+        merge_legacy!("429", answer_429);
+
+        if let Some(map) = &self.answers {
+            let loaded = load_answers(map)?;
+            out.extend(loaded);
+        }
+        Ok(out)
+    }
+
+    /// Assign the timeouts of the config to this listener, only if timeouts did not exist
+    fn assign_config_timeouts(&mut self, config: &Config) {
+        self.front_timeout = Some(self.front_timeout.unwrap_or(config.front_timeout));
+        self.back_timeout = Some(self.back_timeout.unwrap_or(config.back_timeout));
+        self.connect_timeout = Some(self.connect_timeout.unwrap_or(config.connect_timeout));
+        self.request_timeout = Some(self.request_timeout.unwrap_or(config.request_timeout));
+    }
+
+    /// Reject an H2 knob the runtime cannot honour, before it reaches a
+    /// listener config (sozu-proxy/sozu#1418).
+    ///
+    /// `UpdateHttp(s)Listener` has refused these values since the knobs
+    /// existed (`validate_h2_flood_knobs_http`/`_https`, `command/src/state.rs`)
+    /// — the config file and `sozu ctl add listener` did not, so the same `0`
+    /// an operator could not patch in, they could boot with. It reached
+    /// `HttpListenerConfig` untouched, and `lib/src/http.rs::get_h2_flood_config`
+    /// handed it to the flood detector, whose `check_flood` compares
+    /// `count > threshold`: the first event the counter saw was already a
+    /// violation. For `h2_max_header_list_size`/`h2_max_header_fields`, which
+    /// double as the HPACK decode budget, that is every request on the
+    /// listener; for the per-window and lifetime frame counters it is the
+    /// first client that sends the frame they count. Rejecting here rather
+    /// than clamping at use keeps the operator's mistake visible — the error
+    /// names the key, the value and the minimum.
+    ///
+    /// The field set and the minimums are deliberately the same as
+    /// `validate_h2_flood_knobs_http`'s: a value one door refuses must not get
+    /// in through the other. `h2_graceful_shutdown_deadline_seconds = 0` stays
+    /// allowed there and here — it means "wait forever".
+    fn validate_h2_thresholds(&self) -> Result<(), ConfigError> {
+        macro_rules! require_at_least {
+            ($builder:ident, $field:ident, $minimum:literal) => {
+                if let Some(value) = $builder.$field
+                    && u64::from(value) < $minimum
+                {
+                    return Err(ConfigError::H2ThresholdBelowMinimum {
+                        address: $builder.address.to_string(),
+                        key: stringify!($field),
+                        value: u64::from(value),
+                        minimum: $minimum,
+                    });
+                }
+            };
+        }
+        crate::for_each_h2_knob_floor!(require_at_least, self);
+        Ok(())
+    }
+
+    /// Reject mTLS fields on a non-HTTPS listener. Client auth is an
+    /// HTTPS-termination control; the HTTP/TCP/UDP conversions have no field to
+    /// carry it, so an operator who sets it there must get a typed error rather
+    /// than a silently unauthenticated listener.
+    fn reject_client_auth_fields(&self, listener_kind: &str) -> Result<(), ConfigError> {
+        let has_mtls = self
+            .client_auth
+            .is_some_and(|m| m != ClientAuthConfig::None)
+            || self
+                .client_ca_certificates
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+            || self.client_ca_crls.as_ref().is_some_and(|v| !v.is_empty());
+        if has_mtls {
+            return Err(ConfigError::ClientAuthOnNonHttps(format!(
+                "{} listener {}",
+                listener_kind, self.address
+            )));
+        }
+        Ok(())
+    }
+
+    /// build an HTTP listener with config timeouts, using defaults if no config is provided
+    pub fn to_http(&mut self, config: Option<&Config>) -> Result<HttpListenerConfig, ConfigError> {
+        if self.protocol != Some(ListenerProtocol::Http) {
+            return Err(ConfigError::WrongListenerProtocol {
+                expected: ListenerProtocol::Http,
+                found: self.protocol.to_owned(),
+            });
+        }
+        self.reject_client_auth_fields("HTTP")?;
+
+        self.validate_h2_thresholds()?;
+
+        // RFC 6797 §7.2: `Strict-Transport-Security` MUST NOT appear on
+        // plaintext-HTTP responses. Reject an `[hsts]` block on an HTTP
+        // listener at config-load — `HttpListenerConfig` has no `hsts`
+        // field, so silently dropping the operator's intent would be a
+        // worse failure mode than a typed error here.
+        if self.hsts.is_some() {
+            return Err(ConfigError::HstsOnPlainHttp(format!(
+                "HTTP listener {}",
+                self.address
+            )));
+        }
+
+        if let Some(config) = config {
+            self.assign_config_timeouts(config);
+        }
+
+        let http_answers = self.get_http_answers()?;
+        let answers = self.get_listener_answers()?;
+
+        let interface = self.validated_interface()?;
+        let configuration = HttpListenerConfig {
+            address: self.address.into(),
+            interface,
+            public_address: self.public_address.map(|a| a.into()),
+            expect_proxy: self.expect_proxy.unwrap_or(false),
+            sticky_name: self.sticky_name.clone(),
+            front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+            http_answers,
+            answers,
+            h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
+            h2_max_ping_per_window: self.h2_max_ping_per_window,
+            h2_max_settings_per_window: self.h2_max_settings_per_window,
+            h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_window_update_stream0_per_window: self.h2_max_window_update_stream0_per_window,
+            h2_max_continuation_frames: self.h2_max_continuation_frames,
+            h2_max_glitch_count: self.h2_max_glitch_count,
+            h2_initial_connection_window: self.h2_initial_connection_window,
+            h2_max_concurrent_streams: self.h2_max_concurrent_streams,
+            h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
+            h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
+            h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
+            h2_max_rst_stream_emitted_lifetime: self.h2_max_rst_stream_emitted_lifetime,
+            h2_max_header_list_size: self.h2_max_header_list_size,
+            h2_max_header_table_size: self.h2_max_header_table_size,
+            h2_max_header_fields: self.h2_max_header_fields,
+            h2_stream_refusal_percent: self.h2_stream_refusal_percent,
+            h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
+            h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
+            sozu_id_header: self.sozu_id_header.clone(),
+            elide_x_real_ip: Some(self.elide_x_real_ip.unwrap_or(false)),
+            send_x_real_ip: Some(self.send_x_real_ip.unwrap_or(false)),
+            forwarded_headers: Some(ForwardedHeaders::from(
+                self.forwarded_headers.unwrap_or_default(),
+            ) as i32),
+            ..Default::default()
+        };
+
+        // POST: the built listener binds exactly the address that was
+        // requested — a listener whose address drifted here would bind the
+        // wrong socket. (We reached this point only because the protocol guard
+        // at entry confirmed this is an HTTP listener.)
+        debug_assert_eq!(
+            configuration.address,
+            self.address.into(),
+            "HTTP listener must bind the requested address"
+        );
+        Ok(configuration)
+    }
+
+    /// build an HTTPS listener using defaults if no config or values were provided upstream
+    pub fn to_tls(&mut self, config: Option<&Config>) -> Result<HttpsListenerConfig, ConfigError> {
+        if self.protocol != Some(ListenerProtocol::Https) {
+            return Err(ConfigError::WrongListenerProtocol {
+                expected: ListenerProtocol::Https,
+                found: self.protocol.to_owned(),
+            });
+        }
+
+        self.validate_h2_thresholds()?;
+
+        let default_cipher_list = DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect();
+
+        let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
+
+        let cipher_suites = self
+            .cipher_suites
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect());
+
+        let signature_algorithms: Vec<String> = DEFAULT_SIGNATURE_ALGORITHMS
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let groups_list = self
+            .groups_list
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect());
+
+        let alpn_protocols: Vec<String> = match &self.alpn_protocols {
+            Some(protos) if !protos.is_empty() => {
+                for proto in protos {
+                    match proto.as_str() {
+                        "h2" | "http/1.1" => {}
+                        other => return Err(ConfigError::InvalidAlpnProtocol(other.to_owned())),
+                    }
+                }
+                // disable_http11 + http/1.1 ALPN is a self-DoS — every
+                // connection negotiates http/1.1 then is
+                // immediately refused at `https.rs::upgrade_handshake`.
+                // Reject the combination at config load.
+                if self.disable_http11.unwrap_or(false) && protos.iter().any(|p| p == "http/1.1") {
+                    return Err(ConfigError::DisableHttp11WithHttp11Alpn {
+                        address: self.address.to_string(),
+                    });
+                }
+                if !protos.iter().any(|p| p == "http/1.1") {
+                    warn!(
+                        "ALPN protocols do not include 'http/1.1'. Clients without H2 support will fail TLS negotiation."
+                    );
+                }
+                // Deduplicate while preserving order
+                let mut seen = std::collections::HashSet::new();
+                protos
+                    .iter()
+                    .filter(|p| seen.insert(p.as_str()))
+                    .cloned()
+                    .collect()
+            }
+            _ => {
+                // Same self-DoS check on the default ALPN list (which
+                // contains "http/1.1") — `disable_http11 = true` with the
+                // implicit default ALPN must also be rejected.
+                if self.disable_http11.unwrap_or(false)
+                    && DEFAULT_ALPN_PROTOCOLS.contains(&"http/1.1")
+                {
+                    return Err(ConfigError::DisableHttp11WithHttp11Alpn {
+                        address: self.address.to_string(),
+                    });
+                }
+                DEFAULT_ALPN_PROTOCOLS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+        };
+
+        let versions = match self.tls_versions {
+            None => vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
+            Some(ref v) => v.iter().map(|v| *v as i32).collect(),
+        };
+
+        let key = self.key.as_ref().and_then(|path| {
+            Config::load_file(path)
+                .map_err(|e| {
+                    error!("cannot load key at path '{}': {:?}", path, e);
+                    e
+                })
+                .ok()
+        });
+        let certificate = self.certificate.as_ref().and_then(|path| {
+            Config::load_file(path)
+                .map_err(|e| {
+                    error!("cannot load certificate at path '{}': {:?}", path, e);
+                    e
+                })
+                .ok()
+        });
+        let certificate_chain = self
+            .certificate_chain
+            .as_ref()
+            .and_then(|path| {
+                Config::load_file(path)
+                    .map_err(|e| {
+                        error!("cannot load certificate chain at path '{}': {:?}", path, e);
+                        e
+                    })
+                    .ok()
+            })
+            .map(split_certificate_chain)
+            .unwrap_or_default();
+
+        // mTLS: load the trusted-CA and CRL PEM bundles from disk, inlining
+        // their contents (like `certificate`/`key` above). Any unreadable path
+        // aborts materialization: a dropped CA would weaken trust, and a
+        // dropped CRL would silently disable revocation for certificates the
+        // operator meant to reject. Failing closed keeps client auth honest.
+        //
+        // Files are read only for OPTIONAL/REQUIRED. In NONE the runtime
+        // ignores CA/CRL data, so a stale path left in the config must not
+        // block the whole configuration from loading. That tolerance needs an
+        // explicit `client_auth = "none"`: CA or CRL files with no mode at all
+        // most likely mean the operator expected client authentication, and
+        // the default would start the listener without it.
+        let has_client_auth_files = self
+            .client_ca_certificates
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+            || self
+                .client_ca_crls
+                .as_ref()
+                .is_some_and(|paths| !paths.is_empty());
+        match self.client_auth {
+            None if has_client_auth_files => {
+                return Err(ConfigError::ClientAuthModeMissing(format!(
+                    "HTTPS listener {}",
+                    self.address
+                )));
+            }
+            Some(ClientAuthConfig::None) if has_client_auth_files => {
+                warn!(
+                    "HTTPS listener {}: client_auth is \"none\", so its client_ca_certificates \
+                     and client_ca_crls are ignored and clients are not authenticated",
+                    self.address
+                );
+            }
+            _ => {}
+        }
+        let mode = self.client_auth.unwrap_or_default();
+        let client_auth = self
+            .client_auth
+            .map(|mode| ClientAuthMode::from(mode) as i32);
+        let load_pem_paths = |paths: &Option<Vec<String>>| -> Result<Vec<String>, ConfigError> {
+            if mode == ClientAuthConfig::None {
+                return Ok(Vec::new());
+            }
+            paths
+                .as_ref()
+                .map(|list| list.iter().map(|path| Config::load_file(path)).collect())
+                .unwrap_or_else(|| Ok(Vec::new()))
+        };
+        let client_ca_certificates = load_pem_paths(&self.client_ca_certificates)?;
+        let client_ca_crls = load_pem_paths(&self.client_ca_crls)?;
+
+        let http_answers = self.get_http_answers()?;
+        let answers = self.get_listener_answers()?;
+
+        if let Some(config) = config {
+            self.assign_config_timeouts(config);
+        }
+
+        let https_listener_config = HttpsListenerConfig {
+            interface: self.validated_interface()?,
+            address: self.address.into(),
+            sticky_name: self.sticky_name.clone(),
+            public_address: self.public_address.map(|a| a.into()),
+            cipher_list,
+            versions,
+            expect_proxy: self.expect_proxy.unwrap_or(false),
+            key,
+            certificate,
+            certificate_chain,
+            front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+            cipher_suites,
+            signature_algorithms,
+            groups_list,
+            active: false,
+            send_tls13_tickets: self
+                .send_tls13_tickets
+                .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
+            http_answers,
+            answers,
+            alpn_protocols,
+            h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
+            h2_max_ping_per_window: self.h2_max_ping_per_window,
+            h2_max_settings_per_window: self.h2_max_settings_per_window,
+            h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_window_update_stream0_per_window: self.h2_max_window_update_stream0_per_window,
+            h2_max_continuation_frames: self.h2_max_continuation_frames,
+            h2_max_glitch_count: self.h2_max_glitch_count,
+            h2_initial_connection_window: self.h2_initial_connection_window,
+            h2_max_concurrent_streams: self.h2_max_concurrent_streams,
+            h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
+            h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
+            h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
+            h2_max_rst_stream_emitted_lifetime: self.h2_max_rst_stream_emitted_lifetime,
+            h2_max_header_list_size: self.h2_max_header_list_size,
+            h2_max_header_table_size: self.h2_max_header_table_size,
+            h2_max_header_fields: self.h2_max_header_fields,
+            h2_stream_refusal_percent: self.h2_stream_refusal_percent,
+            strict_sni_binding: self.strict_sni_binding,
+            disable_http11: self.disable_http11,
+            h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
+            h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
+            sozu_id_header: self.sozu_id_header.clone(),
+            elide_x_real_ip: Some(self.elide_x_real_ip.unwrap_or(false)),
+            send_x_real_ip: Some(self.send_x_real_ip.unwrap_or(false)),
+            forwarded_headers: Some(ForwardedHeaders::from(
+                self.forwarded_headers.unwrap_or_default(),
+            ) as i32),
+            hsts: match self.hsts.as_ref() {
+                Some(h) => Some(h.to_proto("listener")?),
+                None => None,
+            },
+            client_auth,
+            client_ca_certificates,
+            client_ca_crls,
+        };
+
+        // POST: the built listener binds the requested address and starts
+        // inactive (the protocol guard at entry confirmed this is an HTTPS
+        // listener).
+        debug_assert_eq!(
+            https_listener_config.address,
+            self.address.into(),
+            "HTTPS listener must bind the requested address"
+        );
+        debug_assert!(
+            !https_listener_config.active,
+            "a freshly built HTTPS listener must start inactive"
+        );
+        // POST: the resolved ALPN list is non-empty, contains only the two
+        // protocols Sōzu speaks, and is duplicate-free — the validation/dedup
+        // branches above are the sole producers, so a malformed list here would
+        // mean an unvalidated path slipped through.
+        debug_assert!(
+            !https_listener_config.alpn_protocols.is_empty(),
+            "resolved ALPN list must not be empty"
+        );
+        debug_assert!(
+            https_listener_config
+                .alpn_protocols
+                .iter()
+                .all(|p| p == "h2" || p == "http/1.1"),
+            "resolved ALPN list must contain only h2 and http/1.1"
+        );
+        debug_assert!(
+            {
+                let mut seen = std::collections::HashSet::new();
+                https_listener_config
+                    .alpn_protocols
+                    .iter()
+                    .all(|p| seen.insert(p))
+            },
+            "resolved ALPN list must be duplicate-free"
+        );
+        // POST: disable_http11 + http/1.1 in ALPN is a self-DoS that the
+        // validation above rejects — an Ok return must never carry that combo.
+        debug_assert!(
+            !(self.disable_http11.unwrap_or(false)
+                && https_listener_config
+                    .alpn_protocols
+                    .iter()
+                    .any(|p| p == "http/1.1")),
+            "disable_http11 with http/1.1 in ALPN must have been rejected"
+        );
+        Ok(https_listener_config)
+    }
+
+    /// build an HTTPS listener using defaults if no config or values were provided upstream
+    pub fn to_tcp(&mut self, config: Option<&Config>) -> Result<TcpListenerConfig, ConfigError> {
+        if self.protocol != Some(ListenerProtocol::Tcp) {
+            return Err(ConfigError::WrongListenerProtocol {
+                expected: ListenerProtocol::Tcp,
+                found: self.protocol.to_owned(),
+            });
+        }
+        self.reject_client_auth_fields("TCP")?;
+
+        if let Some(config) = config {
+            self.assign_config_timeouts(config);
+        }
+
+        let tcp_listener_config = TcpListenerConfig {
+            interface: self.validated_interface()?,
+            address: self.address.into(),
+            public_address: self.public_address.map(|a| a.into()),
+            expect_proxy: self.expect_proxy.unwrap_or(false),
+            front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            active: false,
+            sni_preread_timeout: Some(
+                self.sni_preread_timeout
+                    .unwrap_or(DEFAULT_SNI_PREREAD_TIMEOUT),
+            ),
+            sni_preread_max_bytes: Some(
+                self.sni_preread_max_bytes
+                    .unwrap_or(DEFAULT_SNI_PREREAD_MAX_BYTES),
+            ),
+        };
+
+        // POST: the built listener binds exactly the requested address and is
+        // created inactive (activation is a later, explicit step).
+        debug_assert_eq!(
+            tcp_listener_config.address,
+            self.address.into(),
+            "TCP listener must bind the requested address"
+        );
+        debug_assert!(
+            !tcp_listener_config.active,
+            "a freshly built TCP listener must start inactive"
+        );
+        Ok(tcp_listener_config)
+    }
+
+    /// build a UDP listener. UDP has no `expect_proxy` / `connect_timeout`;
+    /// flows are keyed by 4-tuple and torn down on idle.
+    ///
+    /// Timeouts: an unset `front_timeout` / `back_timeout` falls back to the
+    /// UDP-specific defaults ([`DEFAULT_UDP_FRONT_TIMEOUT`] /
+    /// [`DEFAULT_UDP_BACK_TIMEOUT`], both 30 s) — *not* the global HTTP/TCP
+    /// `front_timeout` (60 s) / `back_timeout`. This keeps the effective
+    /// default in lock-step with the CLI help and the proto
+    /// `UdpListenerConfig` defaults (both 30 s). The global config is consulted
+    /// only for `buffer_size` (the `max_rx_datagram_size` cap).
+    ///
+    /// Validation:
+    /// * `max_rx_datagram_size` is clamped to the effective `buffer_size`
+    ///   (with a warning) so a datagram can never exceed the pool buffer.
+    /// * an explicit non-zero `max_flows` that exceeds ~70% of the soft
+    ///   `RLIMIT_NOFILE` emits a warning (the per-flow connected sockets
+    ///   would otherwise risk EMFILE).
+    pub fn to_udp(&mut self, config: Option<&Config>) -> Result<UdpListenerConfig, ConfigError> {
+        if self.protocol != Some(ListenerProtocol::Udp) {
+            return Err(ConfigError::WrongListenerProtocol {
+                expected: ListenerProtocol::Udp,
+                found: self.protocol.to_owned(),
+            });
+        }
+        self.reject_client_auth_fields("UDP")?;
+
+        let mut max_rx_datagram_size = self
+            .max_rx_datagram_size
+            .unwrap_or(DEFAULT_UDP_MAX_RX_DATAGRAM_SIZE);
+        let buffer_size = config.map(|c| c.buffer_size).unwrap_or(DEFAULT_BUFFER_SIZE);
+        if u64::from(max_rx_datagram_size) > buffer_size {
+            warn!(
+                "UDP listener {}: max_rx_datagram_size = {} exceeds buffer_size = {}, clamping to buffer_size",
+                self.address, max_rx_datagram_size, buffer_size
+            );
+            max_rx_datagram_size = buffer_size as u32;
+        }
+
+        let max_flows = self.max_flows.unwrap_or(DEFAULT_UDP_MAX_FLOWS);
+        if max_flows > 0
+            && let Some(soft_limit) = soft_rlimit_nofile()
+        {
+            let advisory = soft_limit.saturating_mul(7) / 10;
+            if u64::from(max_flows) > advisory {
+                warn!(
+                    "UDP listener {}: max_flows = {} exceeds ~70% of the soft RLIMIT_NOFILE ({}); \
+                         per-flow connected sockets may hit EMFILE",
+                    self.address, max_flows, advisory
+                );
+            }
+        }
+
+        Ok(UdpListenerConfig {
+            interface: self.validated_interface()?,
+            address: self.address.into(),
+            public_address: self.public_address.map(|a| a.into()),
+            front_timeout: self.front_timeout.unwrap_or(DEFAULT_UDP_FRONT_TIMEOUT),
+            back_timeout: self.back_timeout.unwrap_or(DEFAULT_UDP_BACK_TIMEOUT),
+            max_rx_datagram_size,
+            max_flows,
+            active: false,
+        })
+    }
+}
+
+/// Read the soft `RLIMIT_NOFILE` (max open file descriptors). Used as an
+/// advisory ceiling for `max_flows` on UDP listeners. Returns `None` when
+/// the limit cannot be read so callers skip the advisory check rather than
+/// failing config-load.
+fn soft_rlimit_nofile() -> Option<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes into the provided `rlimit` out-parameter and
+    // does not retain the pointer. A non-zero return means failure, in which
+    // case we ignore the (uninitialised-by-contract) value and return None.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if rc == 0 {
+        // `rlim_cur` is `rlim_t`, which is `u64` on the Tier-1 targets sozu
+        // builds for, so it already matches the `Option<u64>` return type.
+        Some(limit.rlim_cur)
+    } else {
+        None
+    }
+}
+
+/// read a custom HTTP answer from a file
+fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, ConfigError> {
+    match path {
+        Some(path) => {
+            let mut content = String::new();
+            let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
+                path_to_open: path.to_owned(),
+                io_error,
+            })?;
+
+            file.read_to_string(&mut content)
+                .map_err(|io_error| ConfigError::FileRead {
+                    path_to_read: path.to_owned(),
+                    io_error,
+                })?;
+
+            Ok(Some(content))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Resolve a single `answers` map entry into the literal template body
+/// the proto layer expects.
+///
+/// The same resolution rule applies to entries at every layer:
+/// * **Listener-level** `[listeners.<id>.answers]` — the global default
+///   that fires whenever no more specific override matches.
+/// * **Cluster-level** `[clusters.<id>.answers]` — overrides the
+///   listener-level default for the matching status code on requests
+///   routed to that cluster.
+///
+/// Two source forms are accepted:
+/// * **Filesystem path** — the value starts with the `file://` URI
+///   scheme. Everything after the prefix is treated as a path; the
+///   path is opened and read into a string. Mirrors the on-disk
+///   loading the per-status `read_http_answer_file` helper performs
+///   for the deprecated `answer_301`..`answer_507` fields.
+/// * **Inline literal** (default) — anything else. The value is taken
+///   verbatim as the template body, including an empty string (a
+///   0-byte response payload, typical with `Connection: close` and no
+///   headers). The bare-string default keeps the common case — a
+///   short canned response — typing-light; operators who need a file
+///   say so explicitly with `file://`.
+pub fn resolve_answer_source(value: &str) -> Result<String, ConfigError> {
+    if let Some(path) = value.strip_prefix("file://") {
+        let mut content = String::new();
+        let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
+            path_to_open: path.to_owned(),
+            io_error,
+        })?;
+        file.read_to_string(&mut content)
+            .map_err(|io_error| ConfigError::FileRead {
+                path_to_read: path.to_owned(),
+                io_error,
+            })?;
+        return Ok(content);
+    }
+    Ok(value.to_owned())
+}
+
+/// Load every per-status template referenced by `answers`.
+///
+/// `answers` maps an HTTP status code (e.g. `"503"`) to either a
+/// filesystem path or an `inline:<body>` literal — see
+/// [`resolve_answer_source`] for the resolution rules. Each entry is
+/// resolved into a body string and inserted into the returned map
+/// under the same key, ready to be assigned to the proto-level
+/// `answers` field on a [`HttpListenerConfig`] / [`HttpsListenerConfig`]
+/// / [`Cluster`]. Empty values are skipped (treated as "preserve
+/// current") so the caller can use them as a no-op stub in example
+/// configs.
+///
+/// Errors map to the existing `ConfigError::FileOpen` /
+/// `ConfigError::FileRead` variants so the operator gets the same
+/// diagnostics whether the path comes from this map or from the
+/// deprecated per-status `answer_301`..`answer_507` fields.
+pub fn load_answers(
+    answers: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    let mut out = BTreeMap::new();
+    for (code, value) in answers {
+        if value.is_empty() {
+            continue;
+        }
+        out.insert(code.to_owned(), resolve_answer_source(value)?);
+    }
+    // POST: the loaded map never invents a status code (every output key is an
+    // input key) and never grows past the input — empty-valued entries are
+    // skipped, so |out| <= |answers|.
+    debug_assert!(
+        out.len() <= answers.len(),
+        "load_answers must not synthesize entries"
+    );
+    debug_assert!(
+        out.keys().all(|k| answers.contains_key(k)),
+        "every loaded status code must come from the input map"
+    );
+    Ok(out)
+}
+
+/// Cardinality knob for metrics labels in the StatsD network drain.
+///
+/// Mirrors HAProxy's `process|frontend|backend|server` extra-counters opt-in.
+/// Operators choose the lowest level that satisfies their dashboards so that
+/// the keyspace stays bounded. Each level is a SUPERSET of the previous one:
+///
+/// - `process` — proxy-only counters (no listener, cluster, or backend label).
+/// - `frontend` — adds per-listener (frontend) breakdown.
+/// - `cluster` — adds per-cluster aggregation. **Default** (preserves the
+///   pre-knob behaviour).
+/// - `backend` — adds per-backend aggregation (cluster + backend, highest
+///   cardinality).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum MetricDetailLevel {
+    Process,
+    Frontend,
+    #[default]
+    Cluster,
+    Backend,
+}
+
+impl From<MetricDetailLevel> for MetricDetail {
+    fn from(level: MetricDetailLevel) -> Self {
+        match level {
+            MetricDetailLevel::Process => MetricDetail::DetailProcess,
+            MetricDetailLevel::Frontend => MetricDetail::DetailFrontend,
+            MetricDetailLevel::Cluster => MetricDetail::DetailCluster,
+            MetricDetailLevel::Backend => MetricDetail::DetailBackend,
+        }
+    }
+}
+
+impl From<MetricDetail> for MetricDetailLevel {
+    /// Reverse of [`From<MetricDetailLevel> for MetricDetail`] — used by the
+    /// worker side to convert the protobuf wire enum back into the
+    /// configuration enum before passing it to `sozu_lib::metrics::setup`.
+    fn from(detail: MetricDetail) -> Self {
+        match detail {
+            MetricDetail::DetailProcess => MetricDetailLevel::Process,
+            MetricDetail::DetailFrontend => MetricDetailLevel::Frontend,
+            MetricDetail::DetailCluster => MetricDetailLevel::Cluster,
+            MetricDetail::DetailBackend => MetricDetailLevel::Backend,
+        }
+    }
+}
+
+/// The forwarding header family an HTTP or HTTPS listener adds to every
+/// forwarded request, as spelled in the TOML configuration
+/// (`forwarded_headers = "both"`). The wire form is [`ForwardedHeaders`].
+///
+/// - `both` — **default**, the historical behaviour: `X-Forwarded-For`,
+///   `X-Forwarded-Proto`, `X-Forwarded-Port` and RFC 7239 `Forwarded`, a
+///   client-supplied chain extended with this hop.
+/// - `x_forwarded` — only the `X-Forwarded-*` family, handled as in `both`;
+///   a client-supplied `Forwarded` passes through untouched.
+/// - `rfc7239` — only `Forwarded` (RFC 7239 §4), a client-supplied chain
+///   extended with this hop; a client-supplied `X-Forwarded-For`,
+///   `X-Forwarded-Proto`, `X-Forwarded-Port` or `X-Forwarded-Host` is removed.
+/// - `none` — no forwarding header is added and client-supplied ones pass
+///   through untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardedHeadersMode {
+    #[default]
+    Both,
+    XForwarded,
+    Rfc7239,
+    None,
+}
+
+impl From<ForwardedHeadersMode> for ForwardedHeaders {
+    fn from(mode: ForwardedHeadersMode) -> Self {
+        match mode {
+            ForwardedHeadersMode::Both => ForwardedHeaders::Both,
+            ForwardedHeadersMode::XForwarded => ForwardedHeaders::XForwarded,
+            ForwardedHeadersMode::Rfc7239 => ForwardedHeaders::Rfc7239,
+            ForwardedHeadersMode::None => ForwardedHeaders::None,
+        }
+    }
+}
+
+impl From<ForwardedHeaders> for ForwardedHeadersMode {
+    fn from(headers: ForwardedHeaders) -> Self {
+        match headers {
+            ForwardedHeaders::Both => ForwardedHeadersMode::Both,
+            ForwardedHeaders::XForwarded => ForwardedHeadersMode::XForwarded,
+            ForwardedHeaders::Rfc7239 => ForwardedHeadersMode::Rfc7239,
+            ForwardedHeaders::None => ForwardedHeadersMode::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    pub address: SocketAddr,
+    #[serde(default)]
+    pub tagged_metrics: bool,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Cardinality knob for label-aware metrics. Defaults to `cluster` to
+    /// preserve historical behaviour. See [`MetricDetailLevel`].
+    #[serde(default)]
+    pub detail: MetricDetailLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(deny_unknown_fields)]
+pub enum PathRuleType {
+    Prefix,
+    Regex,
+    Equals,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileClusterFrontendConfig {
+    pub address: SocketAddr,
+    pub hostname: Option<String>,
+    /// TCP frontend only (sozu-proxy/sozu#1279): ALPN protocol names to
+    /// match, read from the TLS ClientHello during the same preread that
+    /// resolves `hostname` (mapped to the wire `sni` field for TCP
+    /// frontends). Empty (the default) is the catch-all for this
+    /// frontend's `hostname`/SNI on its listener. Rejected on HTTP/HTTPS
+    /// frontends — ALPN there is negotiated by the listener's
+    /// `alpn_protocols`, not per-frontend.
+    #[serde(default)]
+    pub alpn: Vec<String>,
+    /// creates a path routing rule where the request URL path has to match this
+    pub path: Option<String>,
+    /// declares whether the path rule is Prefix (default), Regex, or Equals
+    pub path_type: Option<PathRuleType>,
+    pub method: Option<String>,
+    pub certificate: Option<String>,
+    pub key: Option<String>,
+    pub certificate_chain: Option<String>,
+    #[serde(default)]
+    pub tls_versions: Vec<TlsVersion>,
+    #[serde(default)]
+    pub position: RulePosition,
+    pub tags: Option<BTreeMap<String, String>>,
+    /// Frontend-level redirect policy. Accepted values are `forward`
+    /// (default — route to the backend), `permanent` (return 301 with the
+    /// computed `Location`), or `unauthorized` (return 401 with
+    /// `WWW-Authenticate: Basic realm=…`). Case-insensitive.
+    pub redirect: Option<String>,
+    /// Scheme used when emitting a permanent redirect's `Location`. Accepted
+    /// values are `use-same` (default — preserve request scheme), `use-http`,
+    /// `use-https`. Case-insensitive.
+    pub redirect_scheme: Option<String>,
+    /// Optional template applied to the emitted permanent-redirect response
+    /// body. Supports the `%REDIRECT_LOCATION` and other variables
+    /// documented in `doc/configure.md`.
+    pub redirect_template: Option<String>,
+    /// Rewrite host template. Supports `$HOST[n]` / `$PATH[n]` placeholders
+    /// populated from regex captures collected during routing.
+    pub rewrite_host: Option<String>,
+    /// Rewrite path template. Same grammar as `rewrite_host`.
+    pub rewrite_path: Option<String>,
+    /// Optional literal port override on the rewritten URL.
+    pub rewrite_port: Option<u32>,
+    /// When true, requests routed through this frontend must carry a valid
+    /// `Authorization: Basic <user:pass>` header whose hash matches one of
+    /// the cluster's `authorized_hashes`. Default: false.
+    pub required_auth: Option<bool>,
+    /// Header mutations applied to requests and/or responses passing through
+    /// this frontend. See [`HeaderEditConfig`] for the empty-value-deletes
+    /// semantics (HAProxy `del-header` parity).
+    pub headers: Option<Vec<HeaderEditConfig>>,
+    /// Per-frontend HSTS (RFC 6797) policy. When set, overrides any
+    /// listener-default HSTS for this frontend. Set `enabled = false`
+    /// to suppress an inherited listener default. Per RFC 6797 §7.2,
+    /// HSTS is rejected on plain-HTTP frontends at config-load time.
+    pub hsts: Option<FileHstsConfig>,
+    /// Header predicates the request must all satisfy for this frontend to
+    /// match (sozu-proxy/sozu#1253). See [`HeaderPredicateConfig`].
+    pub header_predicates: Option<Vec<HeaderPredicateConfig>>,
+}
+
+/// A routing condition on one request header, as serialised under
+/// `clusters.<id>.frontends.header_predicates` (sozu-proxy/sozu#1253).
+/// Maps to the proto [`HeaderPredicate`] at request-build time.
+///
+/// `match` accepts `exact`, `regex`, or `present` (case-insensitive).
+/// `value` is required for `exact` and `regex` and forbidden for
+/// `present`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderPredicateConfig {
+    pub name: String,
+    #[serde(rename = "match")]
+    pub kind: String,
+    pub value: Option<String>,
+}
+
+/// A single header mutation as serialised under
+/// `[[clusters.<id>.frontends.headers]]`. Maps to the proto [`Header`]
+/// message at request-build time.
+///
+/// `position` accepts `request`, `response`, or `both` (case-insensitive).
+/// An empty `value` deletes the header by name (HAProxy `del-header` parity).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderEditConfig {
+    pub position: String,
+    pub key: String,
+    pub value: String,
+}
+
+/// HSTS (HTTP Strict Transport Security, RFC 6797) policy as serialised
+/// under `[https.listeners.default.hsts]` (listener default) or
+/// `[clusters.<id>.frontends.hsts]` (per-frontend override).
+///
+/// `enabled` is REQUIRED whenever the block is present — its presence vs
+/// absence disambiguates "preserve current" / "explicit disable" / "enable"
+/// on hot-reconfig partial updates.
+///
+/// When `enabled = true` and `max_age` is omitted, sozu substitutes
+/// [`DEFAULT_HSTS_MAX_AGE`] (1 year) at config-load time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHstsConfig {
+    /// REQUIRED. `true` enables HSTS for this scope; `false` suppresses
+    /// any inherited listener default (explicit-disable signal).
+    pub enabled: Option<bool>,
+    /// `Strict-Transport-Security: max-age=<seconds>`. Optional —
+    /// defaults to [`DEFAULT_HSTS_MAX_AGE`] when `enabled = true`.
+    /// `max_age = 0` is the RFC 6797 §11.4 kill switch and is allowed
+    /// silently; `0 < max_age < 86400` warns at config-load.
+    pub max_age: Option<u32>,
+    /// Append `; includeSubDomains` to the rendered header.
+    pub include_subdomains: Option<bool>,
+    /// Append `; preload` to the rendered header. Opt-in only — see RFC
+    /// 6797 §14.2 and <https://hstspreload.org/>.
+    pub preload: Option<bool>,
+    /// Operator opt-in to override any backend-supplied
+    /// `Strict-Transport-Security` header. RFC 6797 §6.1 default
+    /// behaviour is to PRESERVE the backend's value (sozu's edit uses
+    /// `HeaderEditMode::SetIfAbsent`). Set this to `true` to harden a
+    /// stale or weak upstream HSTS policy centrally — the materialiser
+    /// then uses `HeaderEditMode::Set`, replacing any backend STS with
+    /// sozu's rendered value.
+    pub force_replace_backend: Option<bool>,
+}
+
+impl FileHstsConfig {
+    /// Validate and convert the file-level [`FileHstsConfig`] into the
+    /// proto [`HstsConfig`]. `scope` is a human-readable string (e.g.
+    /// "listener" or "frontend api/example.com") surfaced into errors
+    /// and warnings so the operator can pinpoint the offending block.
+    ///
+    /// Validation:
+    /// - `enabled` is required when any other field is set
+    ///   (`HstsEnabledRequired`); the parser returns the typed error so
+    ///   callers can fail fast.
+    /// - `enabled = true && max_age = None` substitutes
+    ///   [`DEFAULT_HSTS_MAX_AGE`].
+    /// - `0 < max_age < 86400` warns (likely misconfig — sub-day max-age
+    ///   is useful only for testing).
+    /// - `preload = true` with `max_age < DEFAULT_HSTS_MAX_AGE` or
+    ///   `include_subdomains != Some(true)` warns (the Chrome HSTS
+    ///   preload list will reject the host).
+    /// - `max_age = 0` is allowed silently (RFC 6797 §11.4 kill switch).
+    pub fn to_proto(&self, scope: &str) -> Result<HstsConfig, ConfigError> {
+        let enabled = match self.enabled {
+            Some(v) => v,
+            None => return Err(ConfigError::HstsEnabledRequired(scope.to_owned())),
+        };
+
+        let max_age = match (enabled, self.max_age) {
+            (true, None) => Some(DEFAULT_HSTS_MAX_AGE),
+            (_, m) => m,
+        };
+
+        if let Some(value) = max_age
+            && value > 0
+            && value < 86_400
+        {
+            warn!(
+                "HSTS max_age = {}s on {} is below 1 day — this is almost certainly a \
+                 misconfiguration. RFC 6797 §11.4 reserves max_age = 0 as the explicit kill \
+                 switch.",
+                value, scope
+            );
+        }
+
+        let include_subdomains = self.include_subdomains;
+        let preload = self.preload;
+
+        if matches!(preload, Some(true)) {
+            let max_age_value = max_age.unwrap_or(0);
+            if max_age_value < DEFAULT_HSTS_MAX_AGE {
+                warn!(
+                    "HSTS preload = true on {} with max_age = {}s; the Chrome HSTS preload \
+                     list requires max_age >= {} (https://hstspreload.org/).",
+                    scope, max_age_value, DEFAULT_HSTS_MAX_AGE
+                );
+            }
+            if include_subdomains != Some(true) {
+                warn!(
+                    "HSTS preload = true on {} without include_subdomains = true; the Chrome \
+                     HSTS preload list requires includeSubDomains \
+                     (https://hstspreload.org/).",
+                    scope
+                );
+            }
+        }
+
+        let config = HstsConfig {
+            enabled: Some(enabled),
+            max_age,
+            include_subdomains,
+            preload,
+            force_replace_backend: self.force_replace_backend,
+        };
+
+        // POST: a built HstsConfig always records an explicit `enabled` flag
+        // (the `None` case errored above), and an enabled policy always carries
+        // a max_age — defaulted to DEFAULT_HSTS_MAX_AGE when the operator left
+        // it unset, so the worker never emits an `max-age`-less STS header.
+        debug_assert_eq!(
+            config.enabled,
+            Some(enabled),
+            "built HSTS config must record the resolved enabled flag"
+        );
+        debug_assert!(
+            !enabled || config.max_age.is_some(),
+            "an enabled HSTS policy must carry a max_age"
+        );
+        Ok(config)
+    }
+}
+
+impl FileClusterFrontendConfig {
+    pub fn to_tcp_front(&self) -> Result<TcpFrontendConfig, ConfigError> {
+        if self.path.is_some() {
+            return Err(ConfigError::InvalidFrontendConfig(
+                "path_prefix".to_string(),
+            ));
+        }
+        if self.certificate.is_some() {
+            return Err(ConfigError::InvalidFrontendConfig(
+                "certificate".to_string(),
+            ));
+        }
+        if self.certificate_chain.is_some() {
+            return Err(ConfigError::InvalidFrontendConfig(
+                "certificate_chain".to_string(),
+            ));
+        }
+
+        if self.header_predicates.is_some() {
+            return Err(ConfigError::InvalidFrontendConfig(
+                "header_predicates".to_string(),
+            ));
+        }
+
+        // `hostname` maps to the TCP frontend's `sni` (sozu-proxy/sozu#1279):
+        // an SNI-scoped frontend reads the same TOML key HTTP frontends use
+        // for their routing hostname, validated for the TCP-specific
+        // exact-or-single-wildcard shape.
+        let sni = match &self.hostname {
+            Some(hostname) => Some(validate_sni_pattern(hostname)?),
+            None => None,
+        };
+
+        // `alpn` only ever gets consulted from within the SNI-scoped
+        // preread route table (sozu-proxy/sozu#1279 hardening): a frontend
+        // with no `hostname`/`sni` installs the worker's raw no-SNI
+        // catch-all path instead, which never looks at `alpn` at all. Left
+        // unchecked, this would load fine and then silently never enforce
+        // the configured protocol list.
+        if sni.is_none() && !self.alpn.is_empty() {
+            return Err(ConfigError::AlpnWithoutSni {
+                address: self.address,
+            });
+        }
+
+        let tcp_front = TcpFrontendConfig {
+            address: self.address,
+            tags: self.tags.clone(),
+            sni,
+            alpn: self.alpn.clone(),
+            // Resolved against `known_addresses` in `populate_clusters`; a
+            // bare `to_tcp_front` (no listener context) defaults to TCP.
+            udp: false,
+        };
+        // POST: a TCP frontend binds exactly the requested address and carries
+        // no HTTP-only attributes — the guards above reject path / certificate,
+        // so an Ok return is a witness that none leaked through (an L7
+        // attribute on an L4 frontend is a config-shape violation). `hostname`
+        // is intentionally excluded from this witness: it is consumed above
+        // into `sni`, not rejected.
+        debug_assert_eq!(
+            tcp_front.address, self.address,
+            "TCP frontend must bind the requested address"
+        );
+        debug_assert!(
+            self.path.is_none() && self.certificate.is_none() && self.certificate_chain.is_none(),
+            "a built TCP frontend must carry no HTTP-only attributes"
+        );
+        debug_assert!(
+            tcp_front.sni.is_some() || tcp_front.alpn.is_empty(),
+            "a built TCP frontend without sni must never carry a non-empty alpn"
+        );
+        Ok(tcp_front)
+    }
+
+    pub fn to_http_front(&self, _cluster_id: &str) -> Result<HttpFrontendConfig, ConfigError> {
+        if !self.alpn.is_empty() {
+            return Err(ConfigError::InvalidFrontendConfig("alpn".to_string()));
+        }
+
+        let hostname = match &self.hostname {
+            Some(hostname) => hostname.to_owned(),
+            None => {
+                return Err(ConfigError::Missing(MissingKind::Field(
+                    "hostname".to_string(),
+                )));
+            }
+        };
+
+        let key_opt = match self.key.as_ref() {
+            None => None,
+            Some(path) => {
+                let key = Config::load_file(path)?;
+                Some(key)
+            }
+        };
+
+        let certificate_opt = match self.certificate.as_ref() {
+            None => None,
+            Some(path) => {
+                let certificate = Config::load_file(path)?;
+                Some(certificate)
+            }
+        };
+
+        let certificate_chain = match self.certificate_chain.as_ref() {
+            None => None,
+            Some(path) => {
+                let certificate_chain = Config::load_file(path)?;
+                Some(split_certificate_chain(certificate_chain))
+            }
+        };
+
+        let path = match (self.path.as_ref(), self.path_type.as_ref()) {
+            (None, _) => PathRule::prefix("".to_string()),
+            (Some(s), Some(PathRuleType::Prefix)) => PathRule::prefix(s.to_string()),
+            (Some(s), Some(PathRuleType::Regex)) => PathRule::regex(s.to_string()),
+            (Some(s), Some(PathRuleType::Equals)) => PathRule::equals(s.to_string()),
+            (Some(s), None) => PathRule::prefix(s.clone()),
+        };
+
+        let redirect = match self.redirect.as_deref() {
+            Some(v) => Some(parse_redirect_policy(v)?),
+            None => None,
+        };
+        let redirect_scheme = match self.redirect_scheme.as_deref() {
+            Some(v) => Some(parse_redirect_scheme(v)?),
+            None => None,
+        };
+
+        let headers = match self.headers.as_ref() {
+            Some(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for (index, entry) in entries.iter().enumerate() {
+                    out.push(parse_header_edit(index, entry)?);
+                }
+                out
+            }
+            None => Vec::new(),
+        };
+
+        // RFC 6797 §7.2: `Strict-Transport-Security` MUST NOT appear on
+        // plaintext-HTTP responses. A frontend without a key+certificate
+        // pair generates `RequestType::AddHttpFrontend` in
+        // `HttpFrontendConfig::generate_requests`, so HSTS configured
+        // there would silently target an HTTP frontend. Reject at
+        // config-load before the cert-presence branch can consume it.
+        let header_predicates = match self.header_predicates.as_ref() {
+            Some(entries) => entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| parse_header_predicate(index, entry))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
+
+        let frontend_serves_https = key_opt.is_some() && certificate_opt.is_some();
+        let hsts = match self.hsts.as_ref() {
+            Some(h) => {
+                if !frontend_serves_https {
+                    return Err(ConfigError::HstsOnPlainHttp(format!(
+                        "frontend {_cluster_id}/{hostname}"
+                    )));
+                }
+                Some(h.to_proto(&format!("frontend {_cluster_id}/{hostname}"))?)
+            }
+            None => None,
+        };
+
+        Ok(HttpFrontendConfig {
+            address: self.address,
+            hostname,
+            certificate: certificate_opt,
+            key: key_opt,
+            certificate_chain,
+            tls_versions: self.tls_versions.clone(),
+            position: self.position,
+            path,
+            method: self.method.clone(),
+            tags: self.tags.clone(),
+            redirect,
+            redirect_scheme,
+            redirect_template: self.redirect_template.clone(),
+            rewrite_host: self.rewrite_host.clone(),
+            rewrite_path: self.rewrite_path.clone(),
+            rewrite_port: self.rewrite_port,
+            required_auth: self.required_auth,
+            headers,
+            hsts,
+            header_predicates,
+        })
+    }
+}
+
+/// Validates and normalizes a TCP frontend's SNI pattern
+/// (sozu-proxy/sozu#1279): either an exact hostname or a single leading
+/// `*.` wildcard label. Rejects an embedded `*` anywhere else (so
+/// `*.*.example.com` and `foo.*.com` are both invalid), a bare `*`, any
+/// empty label (leading/trailing/consecutive dots), and any non-ASCII
+/// character ([`ConfigError::NonAsciiSniPattern`]) — on-wire SNI is always
+/// an ASCII A-label (RFC 6066 §3 / IDNA), so a Unicode U-label would load
+/// fine but never match at runtime, a silent routing failure. Full IDNA/
+/// punycode transformation at config-load is intentionally out of scope
+/// (no `idna` dependency in this crate); operators write the A-label form
+/// directly, consistent with what the HTTP router produces via
+/// `idna::domain_to_ascii` in `lib/src/router/mod.rs`. ASCII-lowercases
+/// the accepted pattern for case-insensitive comparison.
+///
+/// Public: this is the SINGLE SNI shape validator shared by TOML config
+/// load (this module) and the worker's request boundary
+/// (`TcpListener::validate_new_tcp_front` in `lib/src/tcp.rs`), which an
+/// `AddTcpFrontend` sent directly over the command socket, or a
+/// `LoadState` replay, can reach without ever going through config-load —
+/// both call sites must reject the identical set of malformed shapes.
+pub fn validate_sni_pattern(sni: &str) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::InvalidSniPattern {
+        sni: sni.to_string(),
+    };
+
+    if sni.is_empty() {
+        return Err(invalid());
+    }
+
+    if !sni.is_ascii() {
+        return Err(ConfigError::NonAsciiSniPattern {
+            sni: sni.to_string(),
+        });
+    }
+
+    // Only a single leading "*." wildcard label is accepted; strip it (if
+    // present) before checking the remainder is otherwise plain and
+    // non-empty.
+    let remainder = sni.strip_prefix("*.").unwrap_or(sni);
+
+    // `/` is never valid in a hostname — and the SNI route table is a
+    // `pattern_trie::TrieNode`, whose insert treats a leftmost label wrapped
+    // in `/.../` as a REGEX segment; letting one through would silently
+    // widen routing beyond the documented "exact host or one leading `*.`"
+    // contract. Checking `remainder` covers the whole pattern: the only
+    // stripped prefix is the literal `*.`, which cannot contain `/`.
+    if remainder.is_empty() || remainder.contains('*') || remainder.contains('/') {
+        return Err(invalid());
+    }
+    if remainder.split('.').any(|label| label.is_empty()) {
+        return Err(invalid());
+    }
+
+    let normalized = sni.to_ascii_lowercase();
+    // POST: the normalized pattern carries exactly one '*' (the leading
+    // wildcard marker) or none at all — never more, since the checks above
+    // reject any '*' in the remainder — and is pure ASCII, since non-ASCII
+    // input was rejected before normalization (a non-ASCII pattern can
+    // never match the ASCII A-label SNI on the wire).
+    debug_assert!(
+        normalized.matches('*').count() <= 1,
+        "a validated SNI pattern must carry at most one wildcard marker"
+    );
+    debug_assert!(
+        normalized.is_ascii(),
+        "a validated SNI pattern must be pure ASCII"
+    );
+    Ok(normalized)
+}
+
+/// Parse a `redirect` TOML value (case-insensitive) into the proto enum.
+pub(crate) fn parse_redirect_policy(value: &str) -> Result<RedirectPolicy, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "forward" => Ok(RedirectPolicy::Forward),
+        "permanent" => Ok(RedirectPolicy::Permanent),
+        "unauthorized" => Ok(RedirectPolicy::Unauthorized),
+        "silent_close" => Ok(RedirectPolicy::SilentClose),
+        _ => Err(ConfigError::InvalidRedirectPolicy(value.to_owned())),
+    }
+}
+
+/// Parse a `redirect_scheme` TOML value (case-insensitive) into the proto enum.
+pub(crate) fn parse_redirect_scheme(value: &str) -> Result<RedirectScheme, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "use-same" | "use_same" => Ok(RedirectScheme::UseSame),
+        "use-http" | "use_http" => Ok(RedirectScheme::UseHttp),
+        "use-https" | "use_https" => Ok(RedirectScheme::UseHttps),
+        _ => Err(ConfigError::InvalidRedirectScheme(value.to_owned())),
+    }
+}
+
+/// Parse a `[[clusters.<id>.frontends.headers]]` entry into the proto
+/// [`Header`] message. `index` is the zero-based position of `entry` in
+/// the source array — surfaced into the error so a multi-entry config
+/// pinpoints the bad row instead of just naming the unknown position.
+/// An empty `value` is the HAProxy `del-header` parity (deletes the
+/// header by name); the proto carries the empty string verbatim.
+pub(crate) fn parse_header_edit(
+    index: usize,
+    entry: &HeaderEditConfig,
+) -> Result<Header, ConfigError> {
+    let position = match entry.position.to_ascii_lowercase().as_str() {
+        "request" => HeaderPosition::Request,
+        "response" => HeaderPosition::Response,
+        "both" => HeaderPosition::Both,
+        _ => {
+            return Err(ConfigError::InvalidHeaderPosition {
+                index,
+                position: entry.position.clone(),
+            });
+        }
+    };
+    if !header_name_is_valid_token(entry.key.as_bytes()) {
+        return Err(ConfigError::InvalidHeaderBytes {
+            index,
+            field: "key",
+        });
+    }
+    if header_value_contains_forbidden_controls(entry.value.as_bytes()) {
+        return Err(ConfigError::InvalidHeaderBytes {
+            index,
+            field: "value",
+        });
+    }
+    let header = Header {
+        position: position as i32,
+        key: entry.key.clone(),
+        val: entry.value.clone(),
+    };
+    // POST: a Header that escapes this function carries a key that is a valid
+    // RFC 9110 token and a value free of the forbidden control bytes — the two
+    // guards above are the sole gate, so an emitted Header can never inject a
+    // CRLF or a bad token onto the H1 wire (mirrors the runtime filter in
+    // mux/converter.rs).
+    debug_assert!(
+        header_name_is_valid_token(header.key.as_bytes()),
+        "an emitted header key must be a valid token"
+    );
+    debug_assert!(
+        !header_value_contains_forbidden_controls(header.val.as_bytes()),
+        "an emitted header value must be free of forbidden control bytes"
+    );
+    Ok(header)
+}
+
+/// Parse one `header_predicates` entry of a frontend into the proto
+/// [`HeaderPredicate`] (sozu-proxy/sozu#1253), then hold it to
+/// [`validate_header_predicate`].
+pub(crate) fn parse_header_predicate(
+    index: usize,
+    entry: &HeaderPredicateConfig,
+) -> Result<HeaderPredicate, ConfigError> {
+    let kind = match entry.kind.to_ascii_lowercase().as_str() {
+        "exact" => HeaderMatchKind::Exact,
+        "regex" => HeaderMatchKind::Regex,
+        "present" => HeaderMatchKind::Present,
+        _ => {
+            return Err(ConfigError::InvalidHeaderPredicate {
+                index,
+                reason: "match must be \"exact\", \"regex\" or \"present\"",
+            });
+        }
+    };
+    let predicate = HeaderPredicate {
+        name: entry.name.to_owned(),
+        kind: kind as i32,
+        value: entry.value.to_owned(),
+    };
+    validate_header_predicate(&predicate)
+        .map_err(|reason| ConfigError::InvalidHeaderPredicate { index, reason })?;
+    Ok(predicate)
+}
+
+/// Validate one frontend header predicate (sozu-proxy/sozu#1253).
+///
+/// The name must be an RFC 9110 `token`, and neither `Host` nor `Cookie`:
+/// like an `affinity_header` ([`validate_affinity_key`]), a predicate on
+/// either could never find its header among the request's — H1 folds `Host`
+/// into the request authority (H2 sends `:authority`) and both parsers move
+/// cookies into a jar — so it would silently never match. `exact` and `regex`
+/// need a `value`, `present` refuses one, and an `exact` value carrying a
+/// control byte no parsed header value can hold is refused rather than left
+/// to never match. A `regex` value's grammar is the router's to check, where
+/// it is compiled.
+///
+/// Called at config load and by the worker's router on every frontend
+/// addition, which the main process also runs before accepting one
+/// (`validate_frontend_request` in `bin/src/command/requests.rs`), so a TOML
+/// load, a saved state and a direct API request are held to the same rule.
+pub fn validate_header_predicate(predicate: &HeaderPredicate) -> Result<(), &'static str> {
+    let name = predicate.name.as_str();
+    if !header_name_is_valid_token(name.as_bytes()) {
+        return Err("name must be a non-empty RFC 9110 token (a header field name)");
+    }
+    if name.eq_ignore_ascii_case("host") {
+        return Err(
+            "name cannot be Host: the request authority is not a header Sōzu keeps \
+             (H1 folds Host into it, H2 sends :authority); route on the hostname instead",
+        );
+    }
+    if name.eq_ignore_ascii_case("cookie") {
+        return Err("name cannot be Cookie: cookies are parsed into a jar, not kept as a header");
+    }
+    match (
+        HeaderMatchKind::try_from(predicate.kind),
+        predicate.value.as_deref(),
+    ) {
+        (Err(_), _) => Err("unknown match kind"),
+        (Ok(HeaderMatchKind::Present), Some(_)) => Err("a present predicate takes no value"),
+        (Ok(HeaderMatchKind::Present), None) => Ok(()),
+        (Ok(HeaderMatchKind::Exact | HeaderMatchKind::Regex), None) => {
+            Err("an exact or regex predicate requires a value")
+        }
+        (Ok(HeaderMatchKind::Exact), Some(value))
+            if header_value_contains_forbidden_controls(value.as_bytes()) =>
+        {
+            Err("an exact value cannot carry a control character no header value can hold")
+        }
+        (Ok(HeaderMatchKind::Exact | HeaderMatchKind::Regex), Some(_)) => Ok(()),
+    }
+}
+
+/// Field names follow the RFC 9110 §5.1 `token` grammar: non-empty,
+/// composed of `tchar` bytes (alphanumeric plus a closed punctuation
+/// list). HTAB and SP are NOT tchar — they belong to field-value
+/// grammar and must be rejected in the name. Reusing the more
+/// permissive value-side filter would let `Host\t` slip through and
+/// produce an invalid header line on the H1 wire (security review
+/// LISA-002 follow-up).
+pub(crate) fn header_name_is_valid_token(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    bytes.iter().all(|&b| is_tchar(b))
+}
+
+/// `tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+/// "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA` per RFC 9110 §5.6.2.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Reject any byte that would let a header injection escape the value
+/// block on the wire (RFC 9110 §5.5 / RFC 9113 §8.2.1):
+/// `\0..=\x08`, `\x0A..=\x1F`, and `\x7F` — the entire C0 control set
+/// minus horizontal tab `\x09`, which RFC 9110 explicitly permits in
+/// field values. Mirrors the runtime filter at
+/// `lib/src/protocol/mux/converter.rs::call` so config-load and runtime
+/// agree on which header values may travel.
+pub(crate) fn header_value_contains_forbidden_controls(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "lowercase")]
+pub enum ListenerProtocol {
+    Http,
+    Https,
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "lowercase")]
+pub enum FileClusterProtocolConfig {
+    Http,
+    Tcp,
+}
+
+fn default_health_check_interval() -> u32 {
+    10
+}
+fn default_health_check_timeout() -> u32 {
+    5
+}
+fn default_health_check_threshold() -> u32 {
+    3
+}
+fn default_health_check_uri() -> String {
+    "/".to_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHealthCheckConfig {
+    /// Request target of the HTTP probe. Defaults to `/`; ignored in `TCP`
+    /// mode.
+    #[serde(default = "default_health_check_uri")]
+    pub uri: String,
+    #[serde(default = "default_health_check_interval")]
+    pub interval: u32,
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub healthy_threshold: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub unhealthy_threshold: u32,
+    #[serde(default)]
+    pub expected_status: u32,
+    /// Probe mode, parsed in SCREAMING_SNAKE_CASE: `"HTTP"` (the default)
+    /// or `"TCP"`.
+    #[serde(default)]
+    pub mode: Option<HealthCheckMode>,
+    /// HTTP mode: statuses that count as healthy, each one of `"200"`,
+    /// `"200-399"`, `"2xx"` or `"any"` (see [`parse_http_status_range`]).
+    #[serde(default)]
+    pub accepted_statuses: Vec<String>,
+    /// Port the probe dials on the backend's IP address, in `1..=65535`.
+    /// Unset probes the backend's data port.
+    #[serde(default)]
+    pub port: Option<u32>,
+    /// Extra request header fields of the HTTP probe, as an ordered array of
+    /// `{ name, value_file }` tables. A value is never written in the
+    /// configuration: `value_file` names the file the value is read from when
+    /// the probe is set up, and parsing never opens it.
+    #[serde(default)]
+    pub headers: Vec<FileHealthCheckHeader>,
+}
+
+/// One `[[clusters.<id>.health_check.headers]]` entry: a header name and the
+/// file holding its value. Also the reference kept by [`HttpClusterConfig`]
+/// and [`TcpClusterConfig`], so a path is stored exactly as written; resolving
+/// a relative one is left to the code that reads the file.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHealthCheckHeader {
+    pub name: String,
+    pub value_file: String,
+}
+
+impl std::fmt::Debug for FileHealthCheckHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileHealthCheckHeader")
+            .field("name_len", &self.name.len())
+            .field("value_file", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileHealthCheckConfig {
+    /// Build the proto config, parsing `accepted_statuses` and running
+    /// [`validate_health_check_config`] so a bad block is refused at load
+    /// time with the cluster it belongs to.
+    pub fn to_proto(&self) -> Result<HealthCheckConfig, &'static str> {
+        // A proto config names its headers without a value, so a probe built
+        // from it alone could never fill them in: keep the references too, via
+        // [`Self::to_parts`].
+        if !self.headers.is_empty() {
+            return Err(
+                "health check headers from the configuration file are not available yet: their values need the protected channel",
+            );
+        }
+        self.to_parts().map(|(config, _)| config)
+    }
+
+    /// The health check as metadata plus the ordered `value_file` references
+    /// of its headers. The metadata names the headers and leaves every
+    /// fingerprint empty; names are validated, the files are not touched.
+    pub fn to_parts(
+        &self,
+    ) -> Result<(HealthCheckConfig, Vec<FileHealthCheckHeader>), &'static str> {
+        let accepted_statuses = self
+            .accepted_statuses
+            .iter()
+            .map(|spec| parse_http_status_range(spec))
+            .collect::<Result<Vec<_>, _>>()?;
+        let proto = HealthCheckConfig {
+            uri: self.uri.to_owned(),
+            interval: self.interval,
+            timeout: self.timeout,
+            healthy_threshold: self.healthy_threshold,
+            unhealthy_threshold: self.unhealthy_threshold,
+            expected_status: self.expected_status,
+            mode: self.mode.unwrap_or(HealthCheckMode::Http) as i32,
+            accepted_statuses,
+            port: self.port,
+            headers: self
+                .headers
+                .iter()
+                .map(|header| HealthCheckHeader {
+                    name: header.name.to_owned(),
+                    fingerprint: String::new(),
+                })
+                .collect(),
+        };
+        // POST: the proto mirrors the file config exactly — the URI and all
+        // timing knobs are carried through verbatim (no clamping or defaulting
+        // happens at this layer; defaults are applied by serde at parse time).
+        debug_assert_eq!(proto.uri, self.uri, "proto URI must mirror the file config");
+        debug_assert!(
+            proto.interval == self.interval
+                && proto.timeout == self.timeout
+                && proto.healthy_threshold == self.healthy_threshold
+                && proto.unhealthy_threshold == self.unhealthy_threshold,
+            "proto timing knobs must mirror the file config"
+        );
+        debug_assert_eq!(
+            proto.port, self.port,
+            "proto probe port must mirror the file config"
+        );
+        debug_assert_eq!(
+            proto.accepted_statuses.len(),
+            self.accepted_statuses.len(),
+            "every accepted status spec must map to exactly one range"
+        );
+        debug_assert_eq!(
+            proto.headers.len(),
+            self.headers.len(),
+            "every configured header must map to exactly one proto header"
+        );
+        validate_health_check_config(&proto)?;
+        Ok((proto, self.headers.clone()))
+    }
+}
+
+/// Lowest and highest valid HTTP status codes: RFC 9110 §15 calls values
+/// outside `100..=599` invalid.
+pub const HTTP_STATUS_MIN: u32 = 100;
+pub const HTTP_STATUS_MAX: u32 = 599;
+
+/// Parse one `accepted_statuses` entry of the TOML file or the CLI:
+///
+/// - `"any"`: every valid status, `100-599` — any well-formed HTTP response;
+/// - `"Nxx"` with `N` in `1..=5`: the class `N00-N99`;
+/// - `"A-B"`: the inclusive range `A..=B`;
+/// - `"A"`: the single status `A`.
+///
+/// Bounds must lie in `100..=599` and `A <= B`.
+pub fn parse_http_status_range(spec: &str) -> Result<HttpStatusRange, &'static str> {
+    const INVALID: &str = "health check accepted status must be a code (\"404\"), a range \
+                           (\"200-399\"), a class (\"2xx\") or \"any\"";
+    let spec = spec.trim();
+    let range = if spec.eq_ignore_ascii_case("any") {
+        HttpStatusRange {
+            start: HTTP_STATUS_MIN,
+            end: HTTP_STATUS_MAX,
+        }
+    } else if let [class @ b'1'..=b'5', x1, x2] = spec.as_bytes()
+        && x1.eq_ignore_ascii_case(&b'x')
+        && x2.eq_ignore_ascii_case(&b'x')
+    {
+        let start = u32::from(class - b'0') * 100;
+        HttpStatusRange {
+            start,
+            end: start + 99,
+        }
+    } else if let Some((start, end)) = spec.split_once('-') {
+        HttpStatusRange {
+            start: parse_status_code(start).ok_or(INVALID)?,
+            end: parse_status_code(end).ok_or(INVALID)?,
+        }
+    } else {
+        let code = parse_status_code(spec).ok_or(INVALID)?;
+        HttpStatusRange {
+            start: code,
+            end: code,
+        }
+    };
+    validate_http_status_range(&range)?;
+    Ok(range)
+}
+
+/// A status code is ASCII digits only: `u32::from_str` alone would also take
+/// a leading `+`.
+fn parse_status_code(code: &str) -> Option<u32> {
+    let code = code.trim();
+    if code.is_empty() || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    code.parse().ok()
+}
+
+fn validate_http_status_range(range: &HttpStatusRange) -> Result<(), &'static str> {
+    if range.start < HTTP_STATUS_MIN || range.end > HTTP_STATUS_MAX {
+        return Err("health check accepted statuses must lie within 100-599");
+    }
+    if range.start > range.end {
+        return Err("health check accepted status range must not end before it starts");
+    }
+    debug_assert!(
+        (HTTP_STATUS_MIN..=HTTP_STATUS_MAX).contains(&range.start)
+            && (HTTP_STATUS_MIN..=HTTP_STATUS_MAX).contains(&range.end),
+        "a validated range must lie within the valid status codes"
+    );
+    Ok(())
+}
+
+/// Validate a cluster's client affinity key source, `affinity_header` or
+/// `affinity_cookie`.
+///
+/// At most one of the two may be set, and the one that is must be an RFC 9110
+/// `token` (a cookie name is a `token` too, RFC 6265 §4.1.1): a name no
+/// request can carry would silently key every request on its source IP.
+///
+/// Two header names are refused although they are tokens, because the key
+/// lookup can never find them among the request's headers: `Host`, which the
+/// H1 parser folds into the request authority and elides (H2 carries it as
+/// `:authority`), and `Cookie`, whose crumbs both parsers move into the cookie
+/// jar — key on one cookie with `affinity_cookie` instead. Names compare
+/// case-insensitively, as header names do.
+///
+/// Called on every `AddCluster`, so a TOML load, a reload, a saved state and
+/// a direct API request are held to the same rule as `sozu cluster add`.
+pub fn validate_affinity_key(
+    affinity_header: Option<&str>,
+    affinity_cookie: Option<&str>,
+) -> Result<(), &'static str> {
+    match (affinity_header, affinity_cookie) {
+        (Some(_), Some(_)) => {
+            Err("affinity_header and affinity_cookie are mutually exclusive: set at most one")
+        }
+        (Some(name), None) if !header_name_is_valid_token(name.as_bytes()) => {
+            Err("affinity_header must be a non-empty RFC 9110 token (a header field name)")
+        }
+        (Some(name), None) if name.eq_ignore_ascii_case("host") => Err(
+            "affinity_header cannot be Host: the request authority is not a header Sōzu keeps \
+             (H1 folds Host into it, H2 sends :authority)",
+        ),
+        (Some(name), None) if name.eq_ignore_ascii_case("cookie") => Err(
+            "affinity_header cannot be Cookie: cookies are parsed into a jar; key on one with \
+             affinity_cookie instead",
+        ),
+        (None, Some(name)) if !header_name_is_valid_token(name.as_bytes()) => {
+            Err("affinity_cookie must be a non-empty RFC 6265 cookie name (an RFC 9110 token)")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Default `shard_min_backends`: the reference fleet of *Workload isolation
+/// using shuffle sharding* (Colm MacCárthaigh, Amazon Builders' Library,
+/// 2019), eight workers in shards of two. Below it the combinations are too
+/// few to isolate anything: with four backends in shards of two, six shards
+/// exist and nearly every pair of clients overlaps.
+pub const DEFAULT_SHARD_MIN_BACKENDS: u32 = 8;
+
+/// Validate a cluster's shuffle-sharding knobs (sozu-proxy/sozu#524).
+///
+/// `shard_percent` turns sharding on and must lie in `1..=100`;
+/// `shard_min_backends` must be at least 2, the smallest shard; and
+/// `shard_min_backends` or `shard_mode` without `shard_percent` is refused
+/// rather than silently inert. Called at config load and on every
+/// `AddCluster`.
+pub fn validate_shuffle_sharding(
+    shard_percent: Option<u32>,
+    shard_min_backends: Option<u32>,
+    shard_mode: Option<i32>,
+) -> Result<(), &'static str> {
+    let Some(percent) = shard_percent else {
+        if shard_min_backends.is_some() || shard_mode.is_some() {
+            return Err("shard_min_backends and shard_mode require shard_percent");
+        }
+        return Ok(());
+    };
+    if !(1..=100).contains(&percent) {
+        return Err("shard_percent must lie in 1..=100");
+    }
+    if shard_min_backends.is_some_and(|minimum| minimum < 2) {
+        return Err("shard_min_backends must be at least 2, the smallest shard");
+    }
+    if shard_mode.is_some_and(|mode| ShardMode::try_from(mode).is_err()) {
+        return Err("shard_mode must be FALLBACK or STRICT");
+    }
+    Ok(())
+}
+
+/// Most custom request headers a health check may carry.
+pub const HEALTH_CHECK_MAX_HEADERS: usize = 32;
+/// Most `name + value + 4` bytes (the `: ` and CRLF an HTTP/1.1 line adds)
+/// the custom headers of a health check may sum to.
+pub const HEALTH_CHECK_MAX_HEADER_BYTES: usize = 8192;
+/// Largest HPACK block the h2c probe may send: one HEADERS frame, which the
+/// probe never splits, whose payload stays within the default
+/// `SETTINGS_MAX_FRAME_SIZE` of 16384 bytes (RFC 9113 §6.5.2).
+pub const HEALTH_CHECK_MAX_HPACK_BLOCK: usize = 16384;
+/// Longest `:authority` the h2c probe can name: a [`std::net::SocketAddr`]
+/// `Display` is at most `[` + 39 IPv6 digits + `%4294967295` + `]` + `:65535`.
+pub const HEALTH_CHECK_MAX_AUTHORITY_LEN: usize = 1 + 39 + 11 + 1 + 6;
+
+/// Header names the probe owns or that would change the connection framing.
+const HEALTH_CHECK_FORBIDDEN_HEADERS: [&str; 10] = [
+    "host",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "content-length",
+    "te",
+    "trailer",
+    "upgrade",
+    "expect",
+];
+
+/// Bytes of an HPACK integer with a 7-bit prefix (RFC 7541 §5.1).
+fn hpack_string_length_bytes(length: usize) -> usize {
+    if length < 127 {
+        return 1;
+    }
+    let mut rest = length - 127;
+    let mut bytes = 1;
+    loop {
+        bytes += 1;
+        rest >>= 7;
+        if rest == 0 {
+            return bytes;
+        }
+    }
+}
+
+/// Upper bound of the HPACK block the h2c probe encodes for `cfg`: the
+/// four pseudo-headers with the longest possible `:authority`, then every
+/// custom field as a literal with a new name (flag byte, the two string
+/// lengths, name, value), none Huffman coded.
+pub fn health_check_hpack_upper_bound(cfg: &HealthCheckConfig, value_lens: &[usize]) -> usize {
+    // `:method GET` and `:scheme http` are static-table entries, one byte each.
+    let mut bound = 2;
+    // `:path`: an indexed name, or the whole `/` entry, plus the literal URI.
+    bound += 1 + hpack_string_length_bytes(cfg.uri.len()) + cfg.uri.len();
+    // `:authority`: an indexed name plus the literal address.
+    bound += 1
+        + hpack_string_length_bytes(HEALTH_CHECK_MAX_AUTHORITY_LEN)
+        + HEALTH_CHECK_MAX_AUTHORITY_LEN;
+    for (header, value_len) in cfg.headers.iter().zip(value_lens) {
+        bound += 1
+            + hpack_string_length_bytes(header.name.len())
+            + header.name.len()
+            + hpack_string_length_bytes(*value_len)
+            + value_len;
+    }
+    bound
+}
+
+/// The per-value rules of a health-check header: no forbidden control byte,
+/// and no leading or trailing SP or HTAB. Single source for
+/// [`validate_health_check_headers`] and for the protected ingress value
+/// (`crate::secret::SecretValue`); the diagnostics are static, they never
+/// echo the value.
+pub(crate) fn check_health_check_header_value(value: &str) -> Result<(), &'static str> {
+    if header_value_contains_forbidden_controls(value.as_bytes()) {
+        return Err("health check header value must not contain control bytes");
+    }
+    // RFC 9113 §8.2.1: a field value must not begin or end with SP or HTAB
+    // (an HTTP/2 peer treats such a request as malformed). Protobuf and TOML
+    // values keep their exact bytes, so they are refused instead of being
+    // silently rewritten.
+    if value.starts_with([' ', '\t']) || value.ends_with([' ', '\t']) {
+        return Err("health check header value must not begin or end with a space or a tab");
+    }
+    Ok(())
+}
+
+/// Validate the names of the custom `headers` of a health check, which is all
+/// a configuration holds of them. Diagnostics are static: they never echo a
+/// configured name.
+fn validate_health_check_headers(
+    cfg: &HealthCheckConfig,
+    mode: HealthCheckMode,
+) -> Result<(), &'static str> {
+    if cfg.headers.is_empty() {
+        return Ok(());
+    }
+    if mode == HealthCheckMode::Tcp {
+        return Err("health check headers apply to HTTP mode only: leave them unset with mode TCP");
+    }
+    if cfg.headers.len() > HEALTH_CHECK_MAX_HEADERS {
+        return Err("health check carries more than 32 headers");
+    }
+    for (index, header) in cfg.headers.iter().enumerate() {
+        if header.name.starts_with(':')
+            || HEALTH_CHECK_FORBIDDEN_HEADERS
+                .iter()
+                .any(|forbidden| header.name.eq_ignore_ascii_case(forbidden))
+        {
+            return Err("health check header name is reserved for the probe or its framing");
+        }
+        if !header_name_is_valid_token(header.name.as_bytes()) {
+            return Err("health check header name must be a non-empty RFC 9110 token");
+        }
+        if cfg.headers[..index]
+            .iter()
+            .any(|earlier| earlier.name.eq_ignore_ascii_case(&header.name))
+        {
+            return Err("health check header names must be unique, compared case-insensitively");
+        }
+        // Empty is an operator order the main process has yet to fingerprint;
+        // anything else must be a fingerprint, or it is not metadata at all.
+        if !header.fingerprint.is_empty()
+            && header
+                .fingerprint
+                .parse::<crate::secret::HeaderFingerprint>()
+                .is_err()
+        {
+            return Err("health check header fingerprint is malformed");
+        }
+    }
+    Ok(())
+}
+
+/// Validate the clear `values` of the custom headers of `cfg`, whose names
+/// [`validate_health_check_config`] validates: one value per header in the
+/// same order and under the same name, each meeting the per-value rules,
+/// within the 8192-byte wire sum and the one-frame HTTP/2 block. Diagnostics
+/// are static: they never echo a name or a value, nor any length of a value.
+pub fn validate_health_check_header_values(
+    cfg: &HealthCheckConfig,
+    values: &[HealthCheckHeaderValue],
+) -> Result<(), &'static str> {
+    if values.len() != cfg.headers.len() {
+        return Err("health check carries a header value count different from its header count");
+    }
+    let mut wire_bytes = 0usize;
+    for (header, carrier) in cfg.headers.iter().zip(values) {
+        if header.name != carrier.name {
+            return Err(
+                "health check header values must follow the order and names of the headers",
+            );
+        }
+        let text = std::str::from_utf8(&carrier.value)
+            .map_err(|_| "health check header value must be valid UTF-8")?;
+        check_health_check_header_value(text)?;
+        wire_bytes = wire_bytes
+            .saturating_add(header.name.len())
+            .saturating_add(carrier.value.len())
+            .saturating_add(4);
+    }
+    if wire_bytes > HEALTH_CHECK_MAX_HEADER_BYTES {
+        return Err("health check headers exceed 8192 bytes (name + value + 4 per header)");
+    }
+    let value_lens: Vec<usize> = values.iter().map(|carrier| carrier.value.len()).collect();
+    if health_check_hpack_upper_bound(cfg, &value_lens) > HEALTH_CHECK_MAX_HPACK_BLOCK {
+        return Err("health check URI and headers may exceed the 16384-byte HTTP/2 probe block");
+    }
+    Ok(())
+}
+
+/// Validate a [`HealthCheckConfig`] for the rules every layer relies on:
+/// a known probe mode, strict positive thresholds, a URI that cannot
+/// smuggle a second HTTP message on the wire (RFC 9110 §5.1 —
+/// request-target; the leading `/` is only required in HTTP mode, the
+/// only one that sends it), accepted status ranges within `100..=599`,
+/// at most one of `expected_status` / `accepted_statuses`, neither in
+/// TCP mode, which judges no status, and a probe `port`, when set, within
+/// `1..=65535`. Used by
+/// the CLI request builder and the worker `SetHealthCheck` handler so
+/// off-channel inputs (TOML reload, third-party clients) are
+/// constrained the same way as `sozu cluster health-check set`.
+///
+/// The function is intentionally [`Result<(), &'static str>`] rather
+/// than carrying a structured error: the diagnostics only flow into
+/// CLI output / worker error responses where the message is the value.
+pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'static str> {
+    let Ok(mode) = HealthCheckMode::try_from(cfg.mode) else {
+        return Err("health check mode must be HTTP or TCP");
+    };
+    if cfg.interval == 0 {
+        return Err("health check interval must be > 0");
+    }
+    if cfg.timeout == 0 {
+        return Err("health check timeout must be > 0");
+    }
+    if cfg.healthy_threshold == 0 {
+        return Err("health check healthy_threshold must be > 0");
+    }
+    if cfg.unhealthy_threshold == 0 {
+        return Err("health check unhealthy_threshold must be > 0");
+    }
+    // The URI only reaches the wire in HTTP mode; TCP mode ignores it and
+    // may leave it empty. The control-byte check below still applies, so a
+    // stored config never carries a URI that would smuggle a second message
+    // if displayed or later reused.
+    if mode == HealthCheckMode::Http && !cfg.uri.starts_with('/') {
+        return Err("health check URI must start with '/'");
+    }
+    if cfg
+        .uri
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0 || (b < 0x20 && b != b'\t'))
+    {
+        return Err("health check URI must not contain CR, LF, NUL, or other C0 control bytes");
+    }
+    for range in &cfg.accepted_statuses {
+        validate_http_status_range(range)?;
+    }
+    if cfg.expected_status != 0 && !cfg.accepted_statuses.is_empty() {
+        return Err(
+            "health check expected_status and accepted_statuses are mutually exclusive: \
+             set at most one",
+        );
+    }
+    // A TCP probe judges no status: a status field set beside it would read
+    // as a constraint the probe silently does not apply.
+    if mode == HealthCheckMode::Tcp
+        && (cfg.expected_status != 0 || !cfg.accepted_statuses.is_empty())
+    {
+        return Err(
+            "health check expected_status and accepted_statuses apply to HTTP mode only: \
+             leave them unset with mode TCP",
+        );
+    }
+    // The probe dials `ip:port`: 0 names no port, and a TCP port is 16 bits.
+    if cfg
+        .port
+        .is_some_and(|port| !(1..=u32::from(u16::MAX)).contains(&port))
+    {
+        return Err("health check port must lie in 1..=65535");
+    }
+    validate_health_check_headers(cfg, mode)?;
+    // POST: a validated config has strictly-positive timing knobs (a zero
+    // interval/timeout/threshold would make the health-check loop spin or
+    // never converge) and a request-target the worker can splice into an HTTP
+    // probe without smuggling a second message. Every Ok return is a witness
+    // for all of these.
+    debug_assert!(
+        cfg.interval > 0
+            && cfg.timeout > 0
+            && cfg.healthy_threshold > 0
+            && cfg.unhealthy_threshold > 0,
+        "validated health-check thresholds must all be strictly positive"
+    );
+    debug_assert!(
+        mode == HealthCheckMode::Tcp || cfg.uri.starts_with('/'),
+        "a validated HTTP health-check URI must be an absolute path"
+    );
+    debug_assert!(
+        cfg.expected_status == 0 || cfg.accepted_statuses.is_empty(),
+        "a validated health check sets at most one of expected_status and accepted_statuses"
+    );
+    debug_assert!(
+        mode == HealthCheckMode::Http
+            || (cfg.expected_status == 0 && cfg.accepted_statuses.is_empty()),
+        "a validated TCP health check sets no status field"
+    );
+    debug_assert!(
+        cfg.port
+            .is_none_or(|port| port != 0 && u16::try_from(port).is_ok()),
+        "a validated health-check probe port is a non-zero 16-bit port"
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileClusterConfig {
+    pub frontends: Vec<FileClusterFrontendConfig>,
+    pub backends: Vec<FileBackendConfig>,
+    pub protocol: FileClusterProtocolConfig,
+    pub sticky_session: Option<bool>,
+    pub https_redirect: Option<bool>,
+    #[serde(default)]
+    pub send_proxy: Option<bool>,
+    #[serde(default)]
+    pub load_balancing: LoadBalancingAlgorithms,
+    pub answer_503: Option<String>,
+    #[serde(default)]
+    pub load_metric: Option<LoadMetric>,
+    /// Backend-capability hint: `true` when the backend speaks HTTP/2 (h2c or h2+TLS once #1218 lands).
+    /// Does NOT gate H2 at the frontend — frontend H2 is ALPN-negotiated independently (see `alpn_protocols`).
+    pub http2: Option<bool>,
+    /// Per-cluster HTTP answer template overrides keyed by HTTP status
+    /// code (e.g. `"503"`). Each value is either a filesystem path or an
+    /// `inline:<body>` literal — see [`resolve_answer_source`]. Loaded
+    /// into [`Cluster::answers`] at build time via [`load_answers`].
+    ///
+    /// Layering: an entry here overrides the listener-level
+    /// `[listeners.<id>.answers]` default for the matching status on
+    /// requests routed to this cluster. The listener-level map is the
+    /// global default; the cluster-level map is the per-cluster
+    /// override.
+    pub answers: Option<BTreeMap<String, String>>,
+    /// Optional explicit port to use when building the `Location` header
+    /// for an `https_redirect`. When unset, the listener's effective HTTPS
+    /// port is used. Lets operators front a non-standard HTTPS port (e.g.
+    /// 8443) on the redirect target while keeping `https_redirect = true`.
+    pub https_redirect_port: Option<u32>,
+    /// Authorized credentials for HTTP basic authentication, formatted as
+    /// `username:hex(sha256(password))` (lower-case hex). Empty list
+    /// disables auth even when a frontend sets `required_auth = true` —
+    /// such requests are rejected with 401.
+    pub authorized_hashes: Option<Vec<String>>,
+    /// Realm string emitted in `WWW-Authenticate: Basic realm="…"` when
+    /// an unauthenticated request is rejected. Treated as an opaque
+    /// value (no template substitution).
+    pub www_authenticate: Option<String>,
+    /// Override the global per-(cluster, source-IP) connection limit for
+    /// this cluster. `None` (field absent) inherits the global default
+    /// `max_connections_per_ip`. `Some(0)` is explicit "unlimited for
+    /// this cluster". `Some(n > 0)` overrides with the cluster-specific
+    /// limit. The source IP is taken from the parsed proxy-protocol
+    /// header when present, else `peer_addr`. On a UDP cluster it limits
+    /// concurrent flows per datagram source address; UDP never inherits the
+    /// global default.
+    pub max_connections_per_ip: Option<u64>,
+    /// Override the global per-(cluster, source-SUBNET) connection limit
+    /// for this cluster. Same three-state semantics as
+    /// [`FileClusterConfig::max_connections_per_ip`]: `None` inherits,
+    /// `Some(0)` is explicit unlimited, `Some(n > 0)` overrides. This is
+    /// an independent counter — a connection must satisfy BOTH caps.
+    /// The mask itself is global and boot-time only (`subnet_ipv4_prefix`
+    /// / `subnet_ipv6_prefix`), not overridable per cluster.
+    pub max_connections_per_subnet: Option<u64>,
+    /// Override the global `Retry-After` header value (seconds) emitted
+    /// on HTTP 429 responses for this cluster. `None` inherits the global
+    /// default. `Some(0)` omits the header. TCP clusters carry this
+    /// field for shape uniformity but never emit the header (no HTTP
+    /// envelope).
+    pub retry_after: Option<u32>,
+    /// Optional HTTP health-check configuration. The probe wire format
+    /// follows `cluster.http2`: HTTP/1.1 when false, HTTP/2 prior-knowledge
+    /// (h2c) when true.
+    #[serde(default)]
+    pub health_check: Option<FileHealthCheckConfig>,
+    /// Optional UDP-specific cluster configuration, parsed from a
+    /// `[clusters.<id>.udp]` block. Additive: clusters without a `udp`
+    /// block produce `udp: None` on the resulting [`Cluster`].
+    #[serde(default)]
+    pub udp: Option<FileUdpClusterConfig>,
+    /// Key an HTTP/HTTPS cluster's `HRW`/`MAGLEV` selection on the value of
+    /// this request header instead of the client's source IP. A request
+    /// without the header falls back to its source IP. Mutually exclusive
+    /// with `affinity_cookie`; refused on a TCP cluster, which has no request
+    /// headers and always keys on the source IP.
+    #[serde(default)]
+    pub affinity_header: Option<String>,
+    /// Same as `affinity_header`, on the value of this request cookie.
+    #[serde(default)]
+    pub affinity_cookie: Option<String>,
+    /// Shuffle sharding: restrict each client to a shard of
+    /// `max(2, ceil(shard_percent × N / 100))` of the cluster's N primary
+    /// backends, the top of the rendezvous ranking of its affinity key.
+    /// Off when unset. See [`validate_shuffle_sharding`].
+    #[serde(default)]
+    pub shard_percent: Option<u32>,
+    /// Sharding applies only from this many primary backends; defaults to
+    /// [`DEFAULT_SHARD_MIN_BACKENDS`].
+    #[serde(default)]
+    pub shard_min_backends: Option<u32>,
+    /// `FALLBACK` (default) spills an exhausted shard over to the rest of the
+    /// cluster; `STRICT` refuses.
+    #[serde(default)]
+    pub shard_mode: Option<ShardMode>,
+    /// Override the global `max_connection_attempts` for this cluster: how
+    /// many backend connections a request may try, the first included,
+    /// before it is answered `503` (HTTP) or closed (TCP). `None` inherits
+    /// the global value. See [`validate_max_connection_attempts`].
+    #[serde(default)]
+    pub max_connection_attempts: Option<u32>,
+}
+
+/// UDP backend health-check configuration, parsed from
+/// `[clusters.<id>.udp.health]`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileUdpHealthConfig {
+    /// probe mode, parsed in SCREAMING_SNAKE_CASE: `"HEALTH_OFF"`,
+    /// `"TCP_PROBE"`, or `"UDP_PROBE"`. Defaults to `TCP_PROBE` when a
+    /// `udp.health` block is present.
+    pub mode: Option<UdpHealthMode>,
+    pub tcp_port: Option<u32>,
+    pub rise: Option<u32>,
+    pub fall: Option<u32>,
+    pub fail_open: Option<bool>,
+    /// hex-free literal payload sent for a UDP probe.
+    pub udp_probe_payload: Option<String>,
+    pub probe_interval_seconds: Option<u32>,
+    pub probe_timeout_seconds: Option<u32>,
+}
+
+impl FileUdpHealthConfig {
+    pub fn to_proto(&self) -> UdpHealthConfig {
+        UdpHealthConfig {
+            mode: self.mode.map(|m| m as i32),
+            tcp_port: self.tcp_port,
+            rise: self.rise,
+            fall: self.fall,
+            fail_open: self.fail_open,
+            udp_probe_payload: self
+                .udp_probe_payload
+                .as_ref()
+                .map(|p| p.as_bytes().to_owned()),
+            probe_interval_seconds: self.probe_interval_seconds,
+            probe_timeout_seconds: self.probe_timeout_seconds,
+        }
+    }
+}
+
+/// UDP-specific cluster knobs, parsed from a `[clusters.<id>.udp]` block.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileUdpClusterConfig {
+    /// flow affinity key, parsed in SCREAMING_SNAKE_CASE: `"SOURCE_IP"`
+    /// (default) or `"SOURCE_IP_PORT"`.
+    pub affinity_key: Option<UdpAffinityKey>,
+    /// expected replies per flow; 0 = unlimited.
+    pub responses: Option<u32>,
+    /// max client datagrams per flow; 0 = unlimited.
+    pub requests: Option<u32>,
+    /// send a PROXY protocol v2 header to the backend.
+    pub send_proxy_protocol: Option<bool>,
+    /// prepend PPv2 to every datagram; false = first-datagram only.
+    pub proxy_protocol_every_datagram: Option<bool>,
+    /// optional backend health-check configuration.
+    pub health: Option<FileUdpHealthConfig>,
+}
+
+impl FileUdpClusterConfig {
+    pub fn to_proto(&self) -> UdpClusterConfig {
+        UdpClusterConfig {
+            affinity_key: self.affinity_key.map(|k| k as i32),
+            responses: self.responses,
+            requests: self.requests,
+            send_proxy_protocol: self.send_proxy_protocol,
+            proxy_protocol_every_datagram: self.proxy_protocol_every_datagram,
+            health: self.health.as_ref().map(|h| h.to_proto()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendConfig {
+    pub address: SocketAddr,
+    pub weight: Option<u8>,
+    pub sticky_id: Option<String>,
+    pub backup: Option<bool>,
+    pub backend_id: Option<String>,
+    /// Dial this UNIX domain socket (absolute path, or `@name` for the Linux
+    /// abstract namespace) instead of `address`, which then only identifies
+    /// the backend within its cluster and must be unique there.
+    pub unix_path: Option<String>,
+}
+
+/// Check the `unix_path` of a cluster's backends: each parses, and each unix
+/// backend's identity `address` is used by no other backend of the cluster,
+/// since sozu tells backends apart by address.
+fn validate_backend_unix_paths(
+    cluster_id: &str,
+    backends: &[BackendConfig],
+) -> Result<(), ConfigError> {
+    for (index, backend) in backends.iter().enumerate() {
+        let Some(unix_path) = backend.unix_path.as_deref() else {
+            continue;
+        };
+        let invalid = |reason| ConfigError::InvalidBackendUnixPath {
+            cluster_id: cluster_id.to_owned(),
+            address: backend.address,
+            reason,
+        };
+        parse_backend_unix_path(unix_path).map_err(invalid)?;
+        if backends
+            .iter()
+            .enumerate()
+            .any(|(other, b)| other != index && b.address == backend.address)
+        {
+            return Err(invalid(
+                "a unix backend's address is its identity and must be unique in the cluster",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Turns a `host:port` string into socket addresses.
+pub type BackendResolver<'a> = dyn Fn(&str) -> std::io::Result<Vec<SocketAddr>> + 'a;
+
+/// The system resolver (`std::net::ToSocketAddrs`).
+pub fn system_resolver(address: &str) -> std::io::Result<Vec<SocketAddr>> {
+    address.to_socket_addrs().map(Iterator::collect)
+}
+
+/// A backend as written in the configuration file. `address` is either a
+/// socket address (`"127.0.0.1:8080"`, `"[::1]:8080"`) or a `host:port`
+/// (`"ingress:8080"`) that [`FileBackendConfig::resolve`] turns into one
+/// [`BackendConfig`] per resolved address when the file is loaded
+/// (sozu-proxy/sozu#347). Workers only ever receive socket addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileBackendConfig {
+    pub address: String,
+    pub weight: Option<u8>,
+    pub sticky_id: Option<String>,
+    pub backup: Option<bool>,
+    pub backend_id: Option<String>,
+    /// Carried unchanged onto every backend this entry resolves to; see
+    /// [`BackendConfig::unix_path`].
+    pub unix_path: Option<String>,
+}
+
+/// Whether `host` is spelled like a legacy `inet_aton` address: every
+/// dot-separated component is non-empty and either all decimal/octal digits
+/// or `0x`/`0X` followed by ASCII hex digits. Ordinary names (`dead.beef`,
+/// `123.example.com`) have a non-numeric component and do not match.
+fn is_legacy_numeric_host(host: &str) -> bool {
+    host.split('.').all(|component| {
+        !component.is_empty()
+            && match component
+                .strip_prefix("0x")
+                .or_else(|| component.strip_prefix("0X"))
+            {
+                Some(hex) => hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                None => component.bytes().all(|byte| byte.is_ascii_digit()),
+            }
+    })
+}
+
+impl FileBackendConfig {
+    /// Resolves this entry into backends, once, through `resolver`
+    /// ([`system_resolver`] outside tests).
+    ///
+    /// A socket-address literal never reaches the resolver and keeps its
+    /// configured `backend_id`, or the positional default id
+    /// `<cluster_id>-<index>-<address>`, where `index` is the entry's position
+    /// in the file's `backends` list, so it does not move when a name before
+    /// it resolves to more or fewer addresses. A `host:port`
+    /// yields one backend per distinct resolved address, sorted so the
+    /// result does not depend on the resolver's answer order, each with a
+    /// deterministic id: `<backend_id>-<address>` when `backend_id` is set,
+    /// `<cluster_id>-<host:port>-<address>` otherwise. When the name
+    /// resolves, a configured `sticky_id` is suffixed with `-<address>` too,
+    /// so it stays unique in the cluster and does not change when the answer
+    /// grows or shrinks.
+    ///
+    /// A host made only of dot-separated decimal, octal or `0x` hexadecimal
+    /// components that is not a valid IP literal (`010.0.0.1`, `1.2.3`,
+    /// `0x7f.1`) is refused before the resolver: getaddrinfo reads such
+    /// strings as legacy `inet_aton` shorthand (`8.0.0.1`, `1.2.0.3`,
+    /// `127.0.0.1`), which the socket-address parser always rejected. An
+    /// unbracketed IPv6 literal (`::1:8080`) is refused the same way:
+    /// getaddrinfo would split it on the last colon.
+    pub fn resolve(
+        &self,
+        cluster_id: &str,
+        index: usize,
+        resolver: &BackendResolver<'_>,
+    ) -> Result<Vec<BackendConfig>, ConfigError> {
+        if let Ok(address) = self.address.parse::<SocketAddr>() {
+            return Ok(vec![BackendConfig {
+                address,
+                weight: self.weight,
+                sticky_id: self.sticky_id.clone(),
+                backup: self.backup,
+                backend_id: Some(
+                    self.backend_id
+                        .to_owned()
+                        .unwrap_or_else(|| format!("{cluster_id}-{index}-{address}")),
+                ),
+                unix_path: self.unix_path.clone(),
+            }]);
+        }
+
+        let error = |reason: String| ConfigError::BackendAddressResolution {
+            cluster_id: cluster_id.to_owned(),
+            address: self.address.clone(),
+            reason,
+        };
+        if let Some((host, _port)) = self.address.rsplit_once(':') {
+            if host.contains(':') {
+                return Err(error(format!(
+                    "{host:?} is an unbracketed IPv6 literal, IPv6 literals must use [address]:port"
+                )));
+            }
+            if !host.is_empty() && is_legacy_numeric_host(host) {
+                return Err(error(format!(
+                    "{host:?} is not a valid IP address literal and numeric shorthand is not accepted"
+                )));
+            }
+        }
+        let addresses = resolver(&self.address).map_err(|io_error| error(io_error.to_string()))?;
+        self.expand(cluster_id, addresses)
+    }
+
+    /// Turns the addresses a `host:port` entry resolved to into backends:
+    /// the naming half of [`FileBackendConfig::resolve`], kept apart from
+    /// the resolver so it can be exercised with any set of addresses.
+    fn expand(
+        &self,
+        cluster_id: &str,
+        mut addresses: Vec<SocketAddr>,
+    ) -> Result<Vec<BackendConfig>, ConfigError> {
+        addresses.sort_unstable();
+        addresses.dedup();
+        if addresses.is_empty() {
+            return Err(ConfigError::BackendAddressResolution {
+                cluster_id: cluster_id.to_owned(),
+                address: self.address.clone(),
+                reason: "the name resolved to no address".to_owned(),
+            });
+        }
+
+        let backends: Vec<BackendConfig> = addresses
+            .iter()
+            .map(|address| BackendConfig {
+                address: *address,
+                weight: self.weight,
+                sticky_id: self
+                    .sticky_id
+                    .as_ref()
+                    .map(|sticky_id| format!("{sticky_id}-{address}")),
+                backup: self.backup,
+                backend_id: Some(match &self.backend_id {
+                    Some(backend_id) => format!("{backend_id}-{address}"),
+                    None => format!("{cluster_id}-{}-{address}", self.address),
+                }),
+                unix_path: self.unix_path.clone(),
+            })
+            .collect();
+
+        // POST: one backend per distinct resolved address, every one carrying
+        // a distinct id. Downstream state keys backends by `(backend_id,
+        // address)`, so the address alone already keeps them apart; the
+        // address-suffixed id keeps logs, metrics and removals unambiguous.
+        debug_assert_eq!(backends.len(), addresses.len());
+        debug_assert!(
+            backends
+                .iter()
+                .map(|backend| backend.backend_id.as_deref())
+                .collect::<HashSet<_>>()
+                .len()
+                == backends.len(),
+            "resolved backends must carry distinct ids"
+        );
+        Ok(backends)
+    }
+}
+
+impl FileClusterConfig {
+    pub fn to_cluster_config(
+        self,
+        cluster_id: &str,
+        expect_proxy: &HashSet<SocketAddr>,
+    ) -> Result<ClusterConfig, ConfigError> {
+        self.to_cluster_config_with(cluster_id, expect_proxy, Some(&system_resolver))
+    }
+
+    /// [`FileClusterConfig::to_cluster_config`] with the backend resolver
+    /// chosen by the caller. `None` leaves every `host:port` entry out and
+    /// keeps only socket-address literals: a control command reads the
+    /// configuration for its scalar settings and must not depend on DNS.
+    pub fn to_cluster_config_with(
+        self,
+        cluster_id: &str,
+        expect_proxy: &HashSet<SocketAddr>,
+        resolver: Option<&BackendResolver<'_>>,
+    ) -> Result<ClusterConfig, ConfigError> {
+        // PRE: every frontend that converts cleanly must survive into the built
+        // cluster — no frontend is silently dropped during conversion.
+        let requested_frontend_count = self.frontends.len();
+        validate_affinity_key(
+            self.affinity_header.as_deref(),
+            self.affinity_cookie.as_deref(),
+        )
+        .map_err(|reason| ConfigError::InvalidAffinityKey {
+            cluster_id: cluster_id.to_owned(),
+            reason,
+        })?;
+        validate_shuffle_sharding(
+            self.shard_percent,
+            self.shard_min_backends,
+            self.shard_mode.map(|mode| mode as i32),
+        )
+        .map_err(|reason| ConfigError::InvalidShuffleSharding {
+            cluster_id: cluster_id.to_owned(),
+            reason,
+        })?;
+        if let Some(attempts) = self.max_connection_attempts {
+            validate_max_connection_attempts(attempts).map_err(|reason| {
+                ConfigError::InvalidMaxConnectionAttempts {
+                    cluster_id: Some(cluster_id.to_owned()),
+                    value: attempts,
+                    reason,
+                }
+            })?;
+        }
+        let mut backends = Vec::with_capacity(self.backends.len());
+        for (index, backend) in self.backends.iter().enumerate() {
+            match resolver {
+                Some(resolver) => backends.extend(backend.resolve(cluster_id, index, resolver)?),
+                None if backend.address.parse::<SocketAddr>().is_ok() => {
+                    backends.extend(backend.resolve(cluster_id, index, &system_resolver)?)
+                }
+                None => {}
+            }
+        }
+        // POST: every file entry yields at least one backend when resolving.
+        debug_assert!(resolver.is_none() || backends.len() >= self.backends.len());
+        let (health_check, health_check_header_files) = match self
+            .health_check
+            .as_ref()
+            .map(FileHealthCheckConfig::to_parts)
+            .transpose()
+            .map_err(|reason| ConfigError::InvalidHealthCheck {
+                cluster_id: cluster_id.to_owned(),
+                reason,
+            })? {
+            Some((config, files)) => (Some(config), files),
+            None => (None, Vec::new()),
+        };
+        validate_backend_unix_paths(cluster_id, &backends)?;
+        // The file entries, not only the expanded backends: an entry DNS did
+        // not expand (no resolver) still names a `unix_path`.
+        if health_check.as_ref().is_some_and(|hc| hc.port.is_some())
+            && self.backends.iter().any(|b| b.unix_path.is_some())
+        {
+            return Err(ConfigError::InvalidHealthCheck {
+                cluster_id: cluster_id.to_owned(),
+                reason: HEALTH_CHECK_PORT_UNIX_REFUSED,
+            });
+        }
+        match self.protocol {
+            FileClusterProtocolConfig::Tcp => {
+                // A TCP cluster has no request to read a header or a cookie
+                // from: it always keys on the source IP. Refused rather than
+                // ignored, so the file never claims a key the proxy does not use.
+                if self.affinity_header.is_some() || self.affinity_cookie.is_some() {
+                    return Err(ConfigError::InvalidAffinityKey {
+                        cluster_id: cluster_id.to_owned(),
+                        reason: "a TCP cluster always keys on the client source IP: \
+                                 affinity_header and affinity_cookie apply to HTTP clusters only",
+                    });
+                }
+                let mut has_expect_proxy = None;
+                let mut frontends = Vec::new();
+                for f in self.frontends {
+                    if expect_proxy.contains(&f.address) {
+                        match has_expect_proxy {
+                            Some(true) => {}
+                            Some(false) => {
+                                return Err(ConfigError::Incompatible {
+                                    object: ObjectKind::Cluster,
+                                    id: cluster_id.to_owned(),
+                                    kind: IncompatibilityKind::ProxyProtocol,
+                                });
+                            }
+                            None => has_expect_proxy = Some(true),
+                        }
+                    } else {
+                        match has_expect_proxy {
+                            Some(false) => {}
+                            Some(true) => {
+                                return Err(ConfigError::Incompatible {
+                                    object: ObjectKind::Cluster,
+                                    id: cluster_id.to_owned(),
+                                    kind: IncompatibilityKind::ProxyProtocol,
+                                });
+                            }
+                            None => has_expect_proxy = Some(false),
+                        }
+                    }
+                    let tcp_frontend = f.to_tcp_front()?;
+                    frontends.push(tcp_frontend);
+                }
+
+                let send_proxy = self.send_proxy.unwrap_or(false);
+                let expect_proxy = has_expect_proxy.unwrap_or(false);
+                let proxy_protocol = match (send_proxy, expect_proxy) {
+                    (true, true) => Some(ProxyProtocolConfig::RelayHeader),
+                    (true, false) => Some(ProxyProtocolConfig::SendHeader),
+                    (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
+                    _ => None,
+                };
+
+                let answers = match self.answers.as_ref() {
+                    Some(map) => load_answers(map)?,
+                    None => BTreeMap::new(),
+                };
+
+                let udp = self.udp.as_ref().map(|u| u.to_proto());
+                // POST: every requested frontend converted (none dropped), and
+                // the resolved proxy-protocol mode is the documented function of
+                // the (send, expect) pair — expect-only must never resolve to a
+                // send-header mode and vice versa, which would corrupt the wire
+                // framing.
+                debug_assert_eq!(
+                    frontends.len(),
+                    requested_frontend_count,
+                    "every TCP frontend must survive conversion"
+                );
+                debug_assert_eq!(
+                    proxy_protocol,
+                    match (send_proxy, expect_proxy) {
+                        (true, true) => Some(ProxyProtocolConfig::RelayHeader),
+                        (true, false) => Some(ProxyProtocolConfig::SendHeader),
+                        (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
+                        (false, false) => None,
+                    },
+                    "proxy_protocol must be the (send, expect) function"
+                );
+
+                Ok(ClusterConfig::Tcp(TcpClusterConfig {
+                    cluster_id: cluster_id.to_string(),
+                    frontends,
+                    backends,
+                    proxy_protocol,
+                    load_balancing: self.load_balancing,
+                    load_metric: self.load_metric,
+                    answers,
+                    https_redirect_port: self.https_redirect_port,
+                    authorized_hashes: self.authorized_hashes.unwrap_or_default(),
+                    www_authenticate: self.www_authenticate,
+                    max_connections_per_ip: self.max_connections_per_ip,
+                    max_connections_per_subnet: self.max_connections_per_subnet,
+                    retry_after: self.retry_after,
+                    health_check,
+                    health_check_header_files,
+                    udp,
+                    shard_percent: self.shard_percent,
+                    shard_min_backends: self.shard_min_backends,
+                    shard_mode: self.shard_mode,
+                    max_connection_attempts: self.max_connection_attempts,
+                }))
+            }
+            FileClusterProtocolConfig::Http => {
+                let mut frontends = Vec::new();
+                for frontend in self.frontends {
+                    let http_frontend = frontend.to_http_front(cluster_id)?;
+                    frontends.push(http_frontend);
+                }
+
+                let answer_503 = self.answer_503.as_ref().and_then(|path| {
+                    Config::load_file(path)
+                        .map_err(|e| {
+                            error!("cannot load 503 error page at path '{}': {:?}", path, e);
+                            e
+                        })
+                        .ok()
+                });
+
+                let answers = match self.answers.as_ref() {
+                    Some(map) => load_answers(map)?,
+                    None => BTreeMap::new(),
+                };
+
+                let udp = self.udp.as_ref().map(|u| u.to_proto());
+                // POST: every requested HTTP frontend converted — none dropped
+                // (a dropped frontend would silently stop routing a hostname).
+                debug_assert_eq!(
+                    frontends.len(),
+                    requested_frontend_count,
+                    "every HTTP frontend must survive conversion"
+                );
+
+                Ok(ClusterConfig::Http(HttpClusterConfig {
+                    cluster_id: cluster_id.to_string(),
+                    frontends,
+                    backends,
+                    sticky_session: self.sticky_session.unwrap_or(false),
+                    https_redirect: self.https_redirect.unwrap_or(false),
+                    load_balancing: self.load_balancing,
+                    load_metric: self.load_metric,
+                    answer_503,
+                    http2: self.http2,
+                    answers,
+                    https_redirect_port: self.https_redirect_port,
+                    authorized_hashes: self.authorized_hashes.unwrap_or_default(),
+                    www_authenticate: self.www_authenticate,
+                    max_connections_per_ip: self.max_connections_per_ip,
+                    max_connections_per_subnet: self.max_connections_per_subnet,
+                    retry_after: self.retry_after,
+                    health_check,
+                    health_check_header_files,
+                    udp,
+                    affinity_header: self.affinity_header,
+                    affinity_cookie: self.affinity_cookie,
+                    shard_percent: self.shard_percent,
+                    shard_min_backends: self.shard_min_backends,
+                    shard_mode: self.shard_mode,
+                    max_connection_attempts: self.max_connection_attempts,
+                }))
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpFrontendConfig {
+    pub address: SocketAddr,
+    pub hostname: String,
+    pub path: PathRule,
+    pub method: Option<String>,
+    pub certificate: Option<String>,
+    pub key: Option<String>,
+    pub certificate_chain: Option<Vec<String>>,
+    #[serde(default)]
+    pub tls_versions: Vec<TlsVersion>,
+    #[serde(default)]
+    pub position: RulePosition,
+    pub tags: Option<BTreeMap<String, String>>,
+    /// Resolved redirect policy. `None` keeps the proto-default `FORWARD`.
+    #[serde(default)]
+    pub redirect: Option<RedirectPolicy>,
+    /// Resolved redirect scheme. `None` keeps the proto-default `USE_SAME`.
+    #[serde(default)]
+    pub redirect_scheme: Option<RedirectScheme>,
+    #[serde(default)]
+    pub redirect_template: Option<String>,
+    #[serde(default)]
+    pub rewrite_host: Option<String>,
+    #[serde(default)]
+    pub rewrite_path: Option<String>,
+    #[serde(default)]
+    pub rewrite_port: Option<u32>,
+    #[serde(default)]
+    pub required_auth: Option<bool>,
+    /// Header mutations applied to requests and/or responses passing through
+    /// this frontend. Empty by default.
+    #[serde(default)]
+    pub headers: Vec<Header>,
+    /// Resolved per-frontend HSTS (RFC 6797) policy. `None` means inherit
+    /// the listener default at frontend-add time in the worker.
+    #[serde(default)]
+    pub hsts: Option<HstsConfig>,
+    /// Header predicates the request must all satisfy for this frontend to
+    /// match (sozu-proxy/sozu#1253). Empty by default.
+    #[serde(default)]
+    pub header_predicates: Vec<HeaderPredicate>,
+}
+
+impl fmt::Debug for HttpFrontendConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let certificate = self.certificate.as_ref().map(|_| "[redacted]");
+        let certificate_len = self.certificate.as_ref().map(String::len);
+        let key = self.key.as_ref().map(|_| "[redacted]");
+        let key_len = self.key.as_ref().map(String::len);
+        let certificate_chain = self.certificate_chain.as_ref().map(|_| "[redacted]");
+        let certificate_chain_count = self.certificate_chain.as_ref().map(Vec::len);
+        let certificate_chain_len = self.certificate_chain.as_ref().map(|chain| {
+            chain
+                .iter()
+                .map(String::len)
+                .fold(0usize, usize::saturating_add)
+        });
+        let method_len = self.method.as_ref().map(String::len);
+        let redirect_template_len = self.redirect_template.as_ref().map(String::len);
+        let rewrite_host_len = self.rewrite_host.as_ref().map(String::len);
+        let rewrite_path_len = self.rewrite_path.as_ref().map(String::len);
+
+        f.debug_struct("HttpFrontendConfig")
+            .field("address", &self.address)
+            .field("hostname_len", &self.hostname.len())
+            .field("path_kind", &self.path.kind)
+            .field("path_len", &self.path.value.len())
+            .field("method_len", &method_len)
+            .field("certificate", &certificate)
+            .field("certificate_len", &certificate_len)
+            .field("key", &key)
+            .field("key_len", &key_len)
+            .field("certificate_chain", &certificate_chain)
+            .field("certificate_chain_count", &certificate_chain_count)
+            .field("certificate_chain_len", &certificate_chain_len)
+            .field("tls_versions_count", &self.tls_versions.len())
+            .field("position", &self.position)
+            .field(
+                "tags_count",
+                &self.tags.as_ref().map(BTreeMap::len).unwrap_or_default(),
+            )
+            .field("redirect", &self.redirect)
+            .field("redirect_scheme", &self.redirect_scheme)
+            .field("redirect_template_len", &redirect_template_len)
+            .field("rewrite_host_len", &rewrite_host_len)
+            .field("rewrite_path_len", &rewrite_path_len)
+            .field("rewrite_port", &self.rewrite_port)
+            .field("required_auth", &self.required_auth)
+            .field("headers_count", &self.headers.len())
+            .field("hsts", &self.hsts)
+            .field("header_predicates_count", &self.header_predicates.len())
+            .finish()
+    }
+}
+
+impl HttpFrontendConfig {
+    pub fn generate_requests(&self, cluster_id: &str) -> Vec<Request> {
+        let mut v = Vec::new();
+
+        let tags = self.tags.clone().unwrap_or_default();
+
+        if self.key.is_some() && self.certificate.is_some() {
+            v.push(
+                RequestType::AddCertificate(AddCertificate {
+                    address: self.address.into(),
+                    certificate: CertificateAndKey {
+                        key: self.key.clone().unwrap(),
+                        certificate: self.certificate.clone().unwrap(),
+                        certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
+                        versions: self.tls_versions.iter().map(|v| *v as i32).collect(),
+                        // This field is used to override the certificate subject and san, we should not set it when
+                        // loading the configuration, as we may provide a wildcard certificate for a specific domain.
+                        // As a result, we will reject legit traffic for others domains as the certificate resolver will
+                        // not load twice the same certificate and then do not register the certificate for others domains.
+                        names: vec![],
+                    },
+                    expired_at: None,
+                })
+                .into(),
+            );
+
+            v.push(
+                RequestType::add_https_frontend(RequestHttpFrontend {
+                    cluster_id: Some(cluster_id.to_string()),
+                    address: self.address.into(),
+                    hostname: self.hostname.clone(),
+                    path: self.path.clone(),
+                    method: self.method.clone(),
+                    position: self.position.into(),
+                    tags,
+                    redirect: self.redirect.map(|r| r as i32),
+                    required_auth: self.required_auth,
+                    redirect_scheme: self.redirect_scheme.map(|s| s as i32),
+                    redirect_template: self.redirect_template.clone(),
+                    rewrite_host: self.rewrite_host.clone(),
+                    rewrite_path: self.rewrite_path.clone(),
+                    rewrite_port: self.rewrite_port,
+                    headers: self.headers.clone(),
+                    hsts: self.hsts,
+                    header_predicates: self.header_predicates.clone(),
+                })
+                .into(),
+            );
+        } else {
+            //create the front both for HTTP and HTTPS if possible
+            v.push(
+                RequestType::add_http_frontend(RequestHttpFrontend {
+                    cluster_id: Some(cluster_id.to_string()),
+                    address: self.address.into(),
+                    hostname: self.hostname.clone(),
+                    path: self.path.clone(),
+                    method: self.method.clone(),
+                    position: self.position.into(),
+                    tags,
+                    redirect: self.redirect.map(|r| r as i32),
+                    required_auth: self.required_auth,
+                    redirect_scheme: self.redirect_scheme.map(|s| s as i32),
+                    redirect_template: self.redirect_template.clone(),
+                    rewrite_host: self.rewrite_host.clone(),
+                    rewrite_path: self.rewrite_path.clone(),
+                    rewrite_port: self.rewrite_port,
+                    headers: self.headers.clone(),
+                    hsts: self.hsts,
+                    header_predicates: self.header_predicates.clone(),
+                })
+                .into(),
+            );
+        }
+
+        v
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpClusterConfig {
+    pub cluster_id: String,
+    pub frontends: Vec<HttpFrontendConfig>,
+    pub backends: Vec<BackendConfig>,
+    pub sticky_session: bool,
+    pub https_redirect: bool,
+    pub load_balancing: LoadBalancingAlgorithms,
+    pub load_metric: Option<LoadMetric>,
+    pub answer_503: Option<String>,
+    pub http2: Option<bool>,
+    /// Per-status template body map (already loaded from disk). Maps to
+    /// the proto [`Cluster::answers`] field.
+    #[serde(default)]
+    pub answers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub https_redirect_port: Option<u32>,
+    #[serde(default)]
+    pub authorized_hashes: Vec<String>,
+    #[serde(default)]
+    pub www_authenticate: Option<String>,
+    /// Per-cluster override of the global `max_connections_per_ip`. See
+    /// [`FileClusterConfig::max_connections_per_ip`] for semantics.
+    #[serde(default)]
+    pub max_connections_per_ip: Option<u64>,
+    /// Per-cluster override of the global `max_connections_per_subnet`.
+    /// See [`FileClusterConfig::max_connections_per_subnet`] for
+    /// semantics: an independent second cap, not a replacement for the
+    /// per-IP one.
+    #[serde(default)]
+    pub max_connections_per_subnet: Option<u64>,
+    /// Per-cluster override of the global `retry_after` HTTP-429 header
+    /// value (seconds). See [`FileClusterConfig::retry_after`].
+    #[serde(default)]
+    pub retry_after: Option<u32>,
+    /// Optional HTTP health-check configuration. The probe wire format
+    /// follows `cluster.http2`: HTTP/1.1 when false, HTTP/2 prior-knowledge
+    /// (h2c) when true.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
+    /// Where each header named by `health_check` reads its value from, in the
+    /// same order. References, never values: they are kept for the protected
+    /// activation and never copied into an `AddCluster` order.
+    #[serde(default)]
+    pub health_check_header_files: Vec<FileHealthCheckHeader>,
+    /// Optional UDP-specific cluster configuration. Always `None` for HTTP
+    /// clusters; carried for shape uniformity with the proto [`Cluster`].
+    #[serde(default)]
+    pub udp: Option<UdpClusterConfig>,
+    /// Request header keying `HRW`/`MAGLEV` selection. See
+    /// [`FileClusterConfig::affinity_header`].
+    #[serde(default)]
+    pub affinity_header: Option<String>,
+    /// Request cookie keying `HRW`/`MAGLEV` selection. See
+    /// [`FileClusterConfig::affinity_cookie`].
+    #[serde(default)]
+    pub affinity_cookie: Option<String>,
+    /// Shuffle-sharding share of the backends. See
+    /// [`FileClusterConfig::shard_percent`].
+    #[serde(default)]
+    pub shard_percent: Option<u32>,
+    /// See [`FileClusterConfig::shard_min_backends`].
+    #[serde(default)]
+    pub shard_min_backends: Option<u32>,
+    /// See [`FileClusterConfig::shard_mode`].
+    #[serde(default)]
+    pub shard_mode: Option<ShardMode>,
+    /// See [`FileClusterConfig::max_connection_attempts`].
+    #[serde(default)]
+    pub max_connection_attempts: Option<u32>,
+}
+
+impl HttpClusterConfig {
+    pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
+        // A header name without its value must not reach a worker, and the
+        // value-file references do not either: until the protected activation
+        // exists, refuse before any order is built.
+        if !self.health_check_header_files.is_empty() {
+            return Err(ConfigError::InvalidHealthCheck {
+                cluster_id: self.cluster_id.clone(),
+                reason: HEALTH_CHECK_VALUE_FILE_UNSUPPORTED,
+            });
+        }
+        let mut v: Vec<Request> = vec![
+            RequestType::AddCluster(Cluster {
+                cluster_id: self.cluster_id.clone(),
+                sticky_session: self.sticky_session,
+                https_redirect: self.https_redirect,
+                proxy_protocol: None,
+                load_balancing: self.load_balancing as i32,
+                answer_503: self.answer_503.clone(),
+                load_metric: self.load_metric.map(|s| s as i32),
+                http2: self.http2,
+                answers: self.answers.clone(),
+                https_redirect_port: self.https_redirect_port,
+                authorized_hashes: self.authorized_hashes.clone(),
+                www_authenticate: self.www_authenticate.clone(),
+                max_connections_per_ip: self.max_connections_per_ip,
+                max_connections_per_subnet: self.max_connections_per_subnet,
+                retry_after: self.retry_after,
+                health_check: self.health_check.clone(),
+                udp: self.udp.clone(),
+                affinity_header: self.affinity_header.clone(),
+                affinity_cookie: self.affinity_cookie.clone(),
+                shard_percent: self.shard_percent,
+                shard_min_backends: self.shard_min_backends,
+                shard_mode: self.shard_mode.map(|mode| mode as i32),
+                max_connection_attempts: self.max_connection_attempts,
+            })
+            .into(),
+        ];
+
+        for frontend in &self.frontends {
+            let mut orders = frontend.generate_requests(&self.cluster_id);
+            v.append(&mut orders);
+        }
+
+        for (backend_count, backend) in self.backends.iter().enumerate() {
+            let load_balancing_parameters = Some(LoadBalancingParams {
+                weight: backend.weight.unwrap_or(100) as i32,
+            });
+
+            v.push(
+                RequestType::add_backend(AddBackend {
+                    cluster_id: self.cluster_id.clone(),
+                    backend_id: backend.backend_id.clone().unwrap_or_else(|| {
+                        format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
+                    }),
+                    address: backend.address.into(),
+                    load_balancing_parameters,
+                    sticky_id: backend.sticky_id.clone(),
+                    backup: backend.backup,
+                    unix_path: backend.unix_path.clone(),
+                })
+                .into(),
+            );
+        }
+
+        // POST: the order stream begins with exactly one AddCluster and emits
+        // exactly one AddBackend per configured backend — a missing AddCluster
+        // would orphan every backend, and a miscounted backend set would
+        // silently drop or duplicate a backend registration.
+        debug_assert!(
+            matches!(
+                v.first().and_then(|r| r.request_type.as_ref()),
+                Some(RequestType::AddCluster(_))
+            ),
+            "HTTP cluster orders must lead with an AddCluster"
+        );
+        debug_assert_eq!(
+            v.iter()
+                .filter(|r| matches!(
+                    r.request_type,
+                    Some(RequestType::AddBackend(_)) | Some(RequestType::AddUnixBackend(_))
+                ))
+                .count(),
+            self.backends.len(),
+            "one AddBackend order per configured backend"
+        );
+        Ok(v)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TcpFrontendConfig {
+    pub address: SocketAddr,
+    pub tags: Option<BTreeMap<String, String>>,
+    /// `true` when this frontend's address resolves to a `protocol = "udp"`
+    /// listener. Resolved at config-load in `ConfigBuilder::populate_clusters`
+    /// from `known_addresses`; selects `AddUdpFrontend` over `AddTcpFrontend`
+    /// in [`TcpClusterConfig::generate_requests`]. A UDP cluster is declared as
+    /// a `protocol = "tcp"` cluster whose frontends point at UDP listeners and
+    /// whose datagram knobs live under `[clusters.<id>.udp]`.
+    #[serde(default)]
+    pub udp: bool,
+    /// SNI hostname this frontend matches, validated and normalized by
+    /// [`FileClusterFrontendConfig::to_tcp_front`] (sozu-proxy/sozu#1279).
+    /// `None` matches regardless of SNI (a raw-TCP fallback).
+    #[serde(default)]
+    pub sni: Option<String>,
+    /// ALPN protocol names this frontend matches; empty is the catch-all
+    /// for its `sni` on this listener.
+    #[serde(default)]
+    pub alpn: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TcpClusterConfig {
+    pub cluster_id: String,
+    pub frontends: Vec<TcpFrontendConfig>,
+    pub backends: Vec<BackendConfig>,
+    #[serde(default)]
+    pub proxy_protocol: Option<ProxyProtocolConfig>,
+    pub load_balancing: LoadBalancingAlgorithms,
+    pub load_metric: Option<LoadMetric>,
+    /// Per-status template body map (already loaded from disk). Even
+    /// though TCP clusters do not emit HTTP responses, the field is
+    /// carried for shape uniformity with [`HttpClusterConfig`].
+    #[serde(default)]
+    pub answers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub https_redirect_port: Option<u32>,
+    #[serde(default)]
+    pub authorized_hashes: Vec<String>,
+    #[serde(default)]
+    pub www_authenticate: Option<String>,
+    /// Per-cluster override of the global `max_connections_per_ip`. See
+    /// [`FileClusterConfig::max_connections_per_ip`] for semantics.
+    #[serde(default)]
+    pub max_connections_per_ip: Option<u64>,
+    /// Per-cluster override of the global `max_connections_per_subnet`.
+    /// See [`FileClusterConfig::max_connections_per_subnet`] for
+    /// semantics: an independent second cap, not a replacement for the
+    /// per-IP one.
+    #[serde(default)]
+    pub max_connections_per_subnet: Option<u64>,
+    /// Per-cluster override of the global `retry_after`. TCP listeners
+    /// never emit `Retry-After`; the field is carried for shape
+    /// uniformity with [`HttpClusterConfig`].
+    #[serde(default)]
+    pub retry_after: Option<u32>,
+    /// Optional HTTP health-check configuration. TCP clusters carry this
+    /// field for shape uniformity with [`HttpClusterConfig`]; probes are
+    /// HTTP/1.1 only and TCP-only backends should leave this absent.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
+    /// Where each header named by `health_check` reads its value from, in the
+    /// same order. References, never values: they are kept for the protected
+    /// activation and never copied into an `AddCluster` order.
+    #[serde(default)]
+    pub health_check_header_files: Vec<FileHealthCheckHeader>,
+    /// Optional UDP-specific cluster configuration, parsed from a
+    /// `[clusters.<id>.udp]` block on this cluster.
+    #[serde(default)]
+    pub udp: Option<UdpClusterConfig>,
+    /// Shuffle-sharding share of the backends. See
+    /// [`FileClusterConfig::shard_percent`].
+    #[serde(default)]
+    pub shard_percent: Option<u32>,
+    /// See [`FileClusterConfig::shard_min_backends`].
+    #[serde(default)]
+    pub shard_min_backends: Option<u32>,
+    /// See [`FileClusterConfig::shard_mode`].
+    #[serde(default)]
+    pub shard_mode: Option<ShardMode>,
+    /// See [`FileClusterConfig::max_connection_attempts`].
+    #[serde(default)]
+    pub max_connection_attempts: Option<u32>,
+}
+
+impl TcpClusterConfig {
+    pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
+        // A header name without its value must not reach a worker, and the
+        // value-file references do not either: until the protected activation
+        // exists, refuse before any order is built.
+        if !self.health_check_header_files.is_empty() {
+            return Err(ConfigError::InvalidHealthCheck {
+                cluster_id: self.cluster_id.clone(),
+                reason: HEALTH_CHECK_VALUE_FILE_UNSUPPORTED,
+            });
+        }
+        let mut v: Vec<Request> = vec![
+            RequestType::AddCluster(Cluster {
+                cluster_id: self.cluster_id.clone(),
+                sticky_session: false,
+                https_redirect: false,
+                proxy_protocol: self.proxy_protocol.map(|s| s as i32),
+                load_balancing: self.load_balancing as i32,
+                load_metric: self.load_metric.map(|s| s as i32),
+                answer_503: None,
+                http2: None,
+                answers: self.answers.clone(),
+                https_redirect_port: self.https_redirect_port,
+                authorized_hashes: self.authorized_hashes.clone(),
+                www_authenticate: self.www_authenticate.clone(),
+                max_connections_per_ip: self.max_connections_per_ip,
+                max_connections_per_subnet: self.max_connections_per_subnet,
+                retry_after: self.retry_after,
+                health_check: self.health_check.clone(),
+                udp: self.udp.clone(),
+                // A TCP cluster always keys on the source IP.
+                affinity_header: None,
+                affinity_cookie: None,
+                shard_percent: self.shard_percent,
+                shard_min_backends: self.shard_min_backends,
+                shard_mode: self.shard_mode.map(|mode| mode as i32),
+                max_connection_attempts: self.max_connection_attempts,
+            })
+            .into(),
+        ];
+
+        for frontend in &self.frontends {
+            // A frontend whose address resolves to a `protocol = "udp"`
+            // listener (flagged in `populate_clusters`) is added as a UDP
+            // frontend; all others stay TCP. Mixed TCP/UDP frontends on the
+            // same cluster are supported.
+            if frontend.udp {
+                v.push(
+                    RequestType::AddUdpFrontend(RequestUdpFrontend {
+                        cluster_id: self.cluster_id.clone(),
+                        address: frontend.address.into(),
+                        tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
+                    })
+                    .into(),
+                );
+            } else {
+                v.push(
+                    RequestType::AddTcpFrontend(RequestTcpFrontend {
+                        cluster_id: self.cluster_id.clone(),
+                        address: frontend.address.into(),
+                        tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
+                        sni: frontend.sni.clone(),
+                        alpn: frontend.alpn.clone(),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for (backend_count, backend) in self.backends.iter().enumerate() {
+            let load_balancing_parameters = Some(LoadBalancingParams {
+                weight: backend.weight.unwrap_or(100) as i32,
+            });
+
+            v.push(
+                RequestType::add_backend(AddBackend {
+                    cluster_id: self.cluster_id.clone(),
+                    backend_id: backend.backend_id.clone().unwrap_or_else(|| {
+                        format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
+                    }),
+                    address: backend.address.into(),
+                    load_balancing_parameters,
+                    sticky_id: backend.sticky_id.clone(),
+                    backup: backend.backup,
+                    unix_path: backend.unix_path.clone(),
+                })
+                .into(),
+            );
+        }
+
+        // POST: the order stream leads with one AddCluster and emits exactly
+        // one AddTcpFrontend per frontend and one AddBackend per backend — the
+        // worker reconstructs the cluster topology solely from these counts.
+        debug_assert!(
+            matches!(
+                v.first().and_then(|r| r.request_type.as_ref()),
+                Some(RequestType::AddCluster(_))
+            ),
+            "TCP cluster orders must lead with an AddCluster"
+        );
+        debug_assert_eq!(
+            v.iter()
+                .filter(|r| matches!(
+                    r.request_type,
+                    Some(RequestType::AddTcpFrontend(_)) | Some(RequestType::AddUdpFrontend(_))
+                ))
+                .count(),
+            self.frontends.len(),
+            "one AddTcpFrontend or AddUdpFrontend order per configured frontend"
+        );
+        debug_assert_eq!(
+            v.iter()
+                .filter(|r| matches!(
+                    r.request_type,
+                    Some(RequestType::AddBackend(_)) | Some(RequestType::AddUnixBackend(_))
+                ))
+                .count(),
+            self.backends.len(),
+            "one AddBackend order per configured backend"
+        );
+        Ok(v)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClusterConfig {
+    Http(HttpClusterConfig),
+    Tcp(TcpClusterConfig),
+}
+
+impl ClusterConfig {
+    pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
+        match *self {
+            ClusterConfig::Http(ref http) => http.generate_requests(),
+            ClusterConfig::Tcp(ref tcp) => tcp.generate_requests(),
+        }
+    }
+}
+
+/// Parsed from the TOML config provided by the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
+pub struct FileConfig {
+    pub command_socket: Option<String>,
+    /// Permission bits of the unix command socket, as an octal string such
+    /// as `"0660"` or `"660"`. `None` keeps [`DEFAULT_COMMAND_SOCKET_MODE`].
+    /// Parsed by [`parse_command_socket_mode`] when the config is built.
+    #[serde(default)]
+    pub command_socket_mode: Option<String>,
+    pub command_buffer_size: Option<u64>,
+    pub max_command_buffer_size: Option<u64>,
+    pub max_connections: Option<usize>,
+    pub min_buffers: Option<u64>,
+    pub max_buffers: Option<u64>,
+    pub buffer_size: Option<u64>,
+    /// Slab-entries-per-connection multiplier. `None` keeps the compile-time
+    /// default of 4. Operator-visible escape hatch for fan-out topologies
+    /// that exceed 4 backends per session — clamped to [2, 32] at load.
+    #[serde(default)]
+    pub slab_entries_per_connection: Option<u64>,
+    /// Maximum length, in bytes, of a base64-decoded `Authorization: Basic`
+    /// payload accepted by the worker's `mux::auth` module. Caps the
+    /// per-failed-auth allocation so a hostile peer cannot force the worker
+    /// to decode arbitrarily large tokens. RFC 7617 imposes no upper bound
+    /// — defaults to 4096, which is well above the realistic
+    /// `username:password` shape. Operators running hardened tenants can
+    /// lower this to e.g. 256 or 512 to bound the allocation tighter.
+    /// Values >= `buffer_size / 3` emit a warning at config-load time
+    /// (the credential cap shouldn't dominate the per-frontend buffer).
+    #[serde(default)]
+    pub basic_auth_max_credential_bytes: Option<u64>,
+    /// Default per-(cluster, source-IP) connection limit. `None` keeps
+    /// `0` (unlimited). Each cluster may override via its own
+    /// `max_connections_per_ip`. The source IP is taken from the parsed
+    /// proxy-protocol header when present, else `peer_addr`. When the
+    /// limit is reached, HTTP requests are answered with `429 Too Many
+    /// Requests` (with optional `Retry-After`) and TCP sessions are
+    /// closed gracefully without dialing the backend.
+    #[serde(default)]
+    pub max_connections_per_ip: Option<u64>,
+    /// Default per-(cluster, source-SUBNET) connection limit. `None`
+    /// keeps `0` (unlimited), which leaves this limiter inert and the
+    /// per-IP behaviour strictly unchanged. It is a SECOND, independent
+    /// counter beside `max_connections_per_ip`: the per-IP cap serves
+    /// the API-gateway case, the per-subnet cap the denial-of-service
+    /// case where an attacker holding a routed prefix takes a fresh
+    /// address per connection (sozu-proxy/sozu#1270). Both gates are
+    /// consulted and both must admit, so "10 per IP AND 100 per /64" is
+    /// expressible. Each cluster may override via its own
+    /// `max_connections_per_subnet`.
+    #[serde(default)]
+    pub max_connections_per_subnet: Option<u64>,
+    /// IPv4 prefix length (bits, 0-32) used to derive the subnet key.
+    /// `None` keeps 32, which masks nothing. `/24` is the recommended
+    /// starting point. Out-of-range values are rejected at config-load
+    /// time rather than clamped.
+    #[serde(default)]
+    pub subnet_ipv4_prefix: Option<u32>,
+    /// IPv6 prefix length (bits, 0-128) used to derive the subnet key.
+    /// `None` keeps 128, which masks nothing. `/56` is the recommended
+    /// starting point. An IPv4-mapped IPv6 source is canonicalised to
+    /// IPv4 first and masked with `subnet_ipv4_prefix` instead.
+    #[serde(default)]
+    pub subnet_ipv6_prefix: Option<u32>,
+    /// Default `Retry-After` header value (seconds) sent on HTTP 429
+    /// responses. `Some(0)` or `None` keeping the default `0` omits the
+    /// header (rendering `Retry-After: 0` invites an immediate retry that
+    /// defeats the limit). Per-cluster overrides apply for HTTP listeners
+    /// only. TCP listeners ignore this value (no HTTP envelope).
+    #[serde(default)]
+    pub retry_after: Option<u32>,
+    /// Backend connection attempt budget of every request: how many backend
+    /// connections a request may try, the first included, before it is
+    /// answered `503` (HTTP) or closed (TCP). `None` keeps
+    /// [`DEFAULT_MAX_CONNECTION_ATTEMPTS`]. Each cluster may override it with
+    /// its own `max_connection_attempts`. Out-of-range values (see
+    /// [`validate_max_connection_attempts`]) are rejected at config load.
+    #[serde(default)]
+    pub max_connection_attempts: Option<u32>,
+    /// Requested kernel-pipe capacity, in bytes, for each `splice(2)`
+    /// zero-copy direction (Linux only, `splice` feature). `None` keeps
+    /// the kernel default (64 KiB). Applied via `fcntl(F_SETPIPE_SZ)`;
+    /// the kernel rounds up to a page boundary and clamps at
+    /// `/proc/sys/fs/pipe-max-size` (default 1 MiB unprivileged). The
+    /// realised capacity is read back via `fcntl(F_GETPIPE_SZ)` and
+    /// drives the per-call `len` for `splice_in`. Ignored on non-Linux
+    /// targets and on builds without the `splice` feature.
+    #[serde(default)]
+    pub splice_pipe_capacity_bytes: Option<u64>,
+    /// Optional UID allowlist for command-socket requests. `None` (default)
+    /// preserves historical behaviour: any same-UID local process can
+    /// invoke any verb. When set, requests whose `SO_PEERCRED` UID is not
+    /// in the list are rejected. Use to restrict mutating verbs to a
+    /// specific operator UID even when other same-UID daemons coexist
+    /// (CI runners, monitoring).
+    #[serde(default)]
+    pub command_allowed_uids: Option<Vec<u32>>,
+    pub saved_state: Option<String>,
+    #[serde(default)]
+    pub automatic_state_save: Option<bool>,
+    pub log_level: Option<String>,
+    pub log_target: Option<String>,
+    #[serde(default)]
+    pub log_colored: bool,
+    /// Dedicated file path for the control-plane audit log. When set, every
+    /// emitted `[AUDIT]` / `Command(...)` line is also appended to this file
+    /// opened `O_APPEND | O_CREAT` with mode `0o640` (owner read+write,
+    /// group read, world nothing) so operators can separate the audit trail
+    /// from the main log stream and protect it with group-scoped ACLs /
+    /// logrotate. Independent of the standard `log_target`. `None` keeps
+    /// audit lines routed only through the standard logger.
+    #[serde(default)]
+    pub audit_logs_target: Option<String>,
+    /// Dedicated file path for a JSON-encoded mirror of the audit log.
+    /// One JSON object per line so SIEM pipelines (Wazuh, Elastic, Loki)
+    /// ingest without bespoke parsers. Same `O_APPEND | O_CREAT | 0o640`
+    /// as `audit_logs_target`. `None` disables the JSON mirror.
+    #[serde(default)]
+    pub audit_logs_json_target: Option<String>,
+    #[serde(default)]
+    pub access_logs_target: Option<String>,
+    #[serde(default)]
+    pub access_logs_format: Option<AccessLogFormat>,
+    #[serde(default)]
+    pub access_logs_colored: Option<bool>,
+    pub worker_count: Option<u16>,
+    pub worker_automatic_restart: Option<bool>,
+    pub metrics: Option<MetricsConfig>,
+    pub disable_cluster_metrics: Option<bool>,
+    pub listeners: Option<Vec<ListenerBuilder>>,
+    pub clusters: Option<HashMap<String, FileClusterConfig>>,
+    pub handle_process_affinity: Option<bool>,
+    pub ctl_command_timeout: Option<u64>,
+    pub pid_file_path: Option<String>,
+    pub activate_listeners: Option<bool>,
+    #[serde(default)]
+    pub front_timeout: Option<u32>,
+    #[serde(default)]
+    pub back_timeout: Option<u32>,
+    #[serde(default)]
+    pub connect_timeout: Option<u32>,
+    #[serde(default)]
+    pub zombie_check_interval: Option<u32>,
+    #[serde(default)]
+    pub accept_queue_timeout: Option<u32>,
+    #[serde(default)]
+    pub evict_on_queue_full: Option<bool>,
+    #[serde(default)]
+    pub request_timeout: Option<u32>,
+    #[serde(default)]
+    pub worker_timeout: Option<u32>,
+}
+
+impl FileConfig {
+    pub fn load_from_path(path: &str) -> Result<FileConfig, ConfigError> {
+        let data = Config::load_file(path)?;
+
+        let config: FileConfig = match toml::from_str(&data) {
+            Ok(config) => config,
+            Err(e) => {
+                return Err(ConfigError::DeserializeToml(toml_error_diagnostic(
+                    path, &e,
+                )));
+            }
+        };
+
+        let mut reserved_address: HashSet<ListenerKey> = HashSet::new();
+
+        if let Some(listeners) = config.listeners.as_ref() {
+            for listener in listeners.iter() {
+                let key = ListenerKey::new(listener.address, listener.interface.as_deref());
+                if reserved_address.contains(&key) {
+                    return Err(ConfigError::ListenerAlreadyDeclared(key));
+                }
+                reserved_address.insert(key);
+            }
+        }
+
+        //FIXME: verify how clusters and listeners share addresses
+        /*
+        if let Some(ref clusters) = config.clusters {
+          for (key, cluster) in clusters.iter() {
+            if let (Some(address), Some(port)) = (cluster.ip_address.clone(), cluster.port) {
+              let addr = (address, port);
+              if reserved_address.contains(&addr) {
+                println!("TCP cluster '{}' listening address ( {}:{} ) is already used in the configuration",
+                  key, addr.0, addr.1);
+                return Err(Error::new(
+                  ErrorKind::InvalidData,
+                  format!("TCP cluster '{}' listening address ( {}:{} ) is already used in the configuration",
+                    key, addr.0, addr.1)));
+              } else {
+                reserved_address.insert(addr.clone());
+              }
+            }
+          }
+        }
+        */
+
+        Ok(config)
+    }
+}
+
+/// A builder that converts [FileConfig] to [Config]
+pub struct ConfigBuilder {
+    file: FileConfig,
+    known_addresses: HashMap<SocketAddr, ListenerProtocol>,
+    expect_proxy_addresses: HashSet<SocketAddr>,
+    /// `false` skips the resolution of `host:port` backends, see
+    /// [`ConfigBuilder::without_backend_resolution`]
+    resolve_backends: bool,
+    built: Config,
+}
+
+impl ConfigBuilder {
+    /// starts building a [Config] with values from a [FileConfig], or defaults.
+    ///
+    /// please provide a config path, usefull for rebuilding the config later.
+    pub fn new<S>(file_config: FileConfig, config_path: S) -> Self
+    where
+        S: ToString,
+    {
+        let built = Config {
+            accept_queue_timeout: file_config
+                .accept_queue_timeout
+                .unwrap_or(DEFAULT_ACCEPT_QUEUE_TIMEOUT),
+            evict_on_queue_full: file_config
+                .evict_on_queue_full
+                .unwrap_or(DEFAULT_EVICT_ON_QUEUE_FULL),
+            activate_listeners: file_config.activate_listeners.unwrap_or(true),
+            automatic_state_save: file_config
+                .automatic_state_save
+                .unwrap_or(DEFAULT_AUTOMATIC_STATE_SAVE),
+            back_timeout: file_config.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            buffer_size: file_config.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
+            command_buffer_size: file_config
+                .command_buffer_size
+                .unwrap_or(DEFAULT_COMMAND_BUFFER_SIZE),
+            config_path: config_path.to_string(),
+            connect_timeout: file_config
+                .connect_timeout
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            ctl_command_timeout: file_config.ctl_command_timeout.unwrap_or(1_000),
+            front_timeout: file_config.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            handle_process_affinity: file_config.handle_process_affinity.unwrap_or(false),
+            access_logs_target: file_config.access_logs_target.clone(),
+            audit_logs_target: file_config.audit_logs_target.clone(),
+            audit_logs_json_target: file_config.audit_logs_json_target.clone(),
+            access_logs_format: file_config.access_logs_format.clone(),
+            access_logs_colored: file_config.access_logs_colored,
+            log_level: file_config
+                .log_level
+                .clone()
+                .unwrap_or_else(|| String::from("info")),
+            log_target: file_config
+                .log_target
+                .clone()
+                .unwrap_or_else(|| String::from("stdout")),
+            log_colored: file_config.log_colored,
+            max_buffers: file_config.max_buffers.unwrap_or(DEFAULT_MAX_BUFFERS),
+            max_command_buffer_size: file_config
+                .max_command_buffer_size
+                .unwrap_or(DEFAULT_MAX_COMMAND_BUFFER_SIZE),
+            max_connections: file_config
+                .max_connections
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            metrics: file_config.metrics.clone(),
+            disable_cluster_metrics: file_config
+                .disable_cluster_metrics
+                .unwrap_or(DEFAULT_DISABLE_CLUSTER_METRICS),
+            min_buffers: std::cmp::min(
+                file_config.min_buffers.unwrap_or(DEFAULT_MIN_BUFFERS),
+                file_config.max_buffers.unwrap_or(DEFAULT_MAX_BUFFERS),
+            ),
+            pid_file_path: file_config.pid_file_path.clone(),
+            request_timeout: file_config
+                .request_timeout
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+            saved_state: file_config.saved_state.clone(),
+            worker_automatic_restart: file_config
+                .worker_automatic_restart
+                .unwrap_or(DEFAULT_WORKER_AUTOMATIC_RESTART),
+            worker_count: file_config.worker_count.unwrap_or(DEFAULT_WORKER_COUNT),
+            zombie_check_interval: file_config
+                .zombie_check_interval
+                .unwrap_or(DEFAULT_ZOMBIE_CHECK_INTERVAL),
+            worker_timeout: file_config.worker_timeout.unwrap_or(DEFAULT_WORKER_TIMEOUT),
+            slab_entries_per_connection: file_config.slab_entries_per_connection.map(|n| {
+                n.clamp(
+                    ServerConfig::MIN_SLAB_ENTRIES_PER_CONNECTION,
+                    ServerConfig::MAX_SLAB_ENTRIES_PER_CONNECTION,
+                )
+            }),
+            command_allowed_uids: file_config.command_allowed_uids.clone(),
+            basic_auth_max_credential_bytes: file_config.basic_auth_max_credential_bytes,
+            max_connections_per_ip: file_config
+                .max_connections_per_ip
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP),
+            max_connections_per_subnet: file_config
+                .max_connections_per_subnet
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_SUBNET),
+            subnet_ipv4_prefix: file_config
+                .subnet_ipv4_prefix
+                .unwrap_or(DEFAULT_SUBNET_IPV4_PREFIX),
+            subnet_ipv6_prefix: file_config
+                .subnet_ipv6_prefix
+                .unwrap_or(DEFAULT_SUBNET_IPV6_PREFIX),
+            retry_after: file_config.retry_after.unwrap_or(DEFAULT_RETRY_AFTER),
+            max_connection_attempts: file_config
+                .max_connection_attempts
+                .unwrap_or(DEFAULT_MAX_CONNECTION_ATTEMPTS),
+            splice_pipe_capacity_bytes: file_config.splice_pipe_capacity_bytes,
+            ..Default::default()
+        };
+
+        // POST: the buffer free-list floor is clamped to never exceed the
+        // ceiling — the `std::cmp::min(min_buffers, max_buffers)` above is the
+        // sole guarantor of this, so assert it held.
+        debug_assert!(
+            built.min_buffers <= built.max_buffers,
+            "min_buffers must be clamped to <= max_buffers in the builder"
+        );
+        // POST: an explicit slab override, if present, was clamped into the
+        // documented [MIN, MAX] window; an absent override stays None.
+        debug_assert!(
+            built.slab_entries_per_connection.is_none_or(|n| {
+                (ServerConfig::MIN_SLAB_ENTRIES_PER_CONNECTION
+                    ..=ServerConfig::MAX_SLAB_ENTRIES_PER_CONNECTION)
+                    .contains(&n)
+            }),
+            "a set slab_entries_per_connection must be clamped into [MIN, MAX]"
+        );
+
+        Self {
+            file: file_config,
+            known_addresses: HashMap::new(),
+            expect_proxy_addresses: HashSet::new(),
+            resolve_backends: true,
+            built,
+        }
+    }
+
+    fn push_tls_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+        let listener = listener.to_tls(Some(&self.built))?;
+        self.built.https_listeners.push(listener);
+        Ok(())
+    }
+
+    fn push_http_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+        let listener = listener.to_http(Some(&self.built))?;
+        self.built.http_listeners.push(listener);
+        Ok(())
+    }
+
+    fn push_tcp_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+        let listener = listener.to_tcp(Some(&self.built))?;
+        self.built.tcp_listeners.push(listener);
+        Ok(())
+    }
+
+    fn push_udp_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+        let listener = listener.to_udp(Some(&self.built))?;
+        self.built.udp_listeners.push(listener);
+        Ok(())
+    }
+
+    fn populate_listeners(&mut self, listeners: Vec<ListenerBuilder>) -> Result<(), ConfigError> {
+        let mut declared: HashSet<ListenerKey> = HashSet::new();
+        for listener in listeners.iter() {
+            // A listener is identified by (address, interface): two listeners
+            // may share an address on different interfaces, never both.
+            let key = ListenerKey::new(listener.address, listener.interface.as_deref());
+            if !declared.insert(key.clone()) {
+                if key.interface.is_none() {
+                    return Err(ConfigError::ListenerAddressAlreadyInUse(listener.address));
+                }
+                return Err(ConfigError::ListenerAlreadyDeclared(key));
+            }
+
+            let protocol = listener
+                .protocol
+                .ok_or(ConfigError::Missing(MissingKind::Protocol))?;
+
+            // Frontends name their listener by address alone, and resolve its
+            // protocol from `known_addresses`: listeners sharing an address on
+            // different interfaces must agree on it.
+            if let Some(known) = self.known_addresses.get(&listener.address)
+                && *known != protocol
+            {
+                return Err(ConfigError::ListenerProtocolMismatchOnAddress(
+                    listener.address,
+                ));
+            }
+
+            self.known_addresses.insert(listener.address, protocol);
+            if listener.expect_proxy == Some(true) {
+                self.expect_proxy_addresses.insert(listener.address);
+            }
+
+            if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
+                return Err(ConfigError::Incompatible {
+                    object: ObjectKind::Listener,
+                    id: listener.address.to_string(),
+                    kind: IncompatibilityKind::PublicAddress,
+                });
+            }
+
+            match protocol {
+                ListenerProtocol::Https => self.push_tls_listener(listener.clone())?,
+                ListenerProtocol::Http => self.push_http_listener(listener.clone())?,
+                ListenerProtocol::Tcp => self.push_tcp_listener(listener.clone())?,
+                ListenerProtocol::Udp => self.push_udp_listener(listener.clone())?,
+            }
+        }
+        Ok(())
+    }
+
+    fn populate_clusters(
+        &mut self,
+        mut file_cluster_configs: HashMap<String, FileClusterConfig>,
+    ) -> Result<(), ConfigError> {
+        for (id, file_cluster_config) in file_cluster_configs.drain() {
+            let resolver: Option<&BackendResolver<'_>> =
+                self.resolve_backends.then_some(&system_resolver);
+            let mut cluster_config = file_cluster_config.to_cluster_config_with(
+                id.as_str(),
+                &self.expect_proxy_addresses,
+                resolver,
+            )?;
+
+            match cluster_config {
+                ClusterConfig::Http(ref mut http) => {
+                    for frontend in http.frontends.iter_mut() {
+                        match self.known_addresses.get(&frontend.address) {
+                            Some(ListenerProtocol::Tcp) => {
+                                return Err(ConfigError::WrongFrontendProtocol(
+                                    ListenerProtocol::Tcp,
+                                ));
+                            }
+                            Some(ListenerProtocol::Udp) => {
+                                return Err(ConfigError::WrongFrontendProtocol(
+                                    ListenerProtocol::Udp,
+                                ));
+                            }
+                            Some(ListenerProtocol::Http) => {
+                                if frontend.certificate.is_some() {
+                                    return Err(ConfigError::WrongFrontendProtocol(
+                                        ListenerProtocol::Http,
+                                    ));
+                                }
+                            }
+                            Some(ListenerProtocol::Https) => {
+                                if frontend.certificate.is_none() {
+                                    if let Some(https_listener) =
+                                        self.built.https_listeners.iter().find(|listener| {
+                                            listener.address == frontend.address.into()
+                                                && listener.certificate.is_some()
+                                        })
+                                    {
+                                        //println!("using listener certificate for {:}", frontend.address);
+                                        frontend
+                                            .certificate
+                                            .clone_from(&https_listener.certificate);
+                                        frontend.certificate_chain =
+                                            Some(https_listener.certificate_chain.clone());
+                                        frontend.key.clone_from(&https_listener.key);
+                                    }
+                                    if frontend.certificate.is_none() {
+                                        debug!("known addresses: {:?}", self.known_addresses);
+                                        debug!("frontend: {:?}", frontend);
+                                        return Err(ConfigError::WrongFrontendProtocol(
+                                            ListenerProtocol::Https,
+                                        ));
+                                    }
+                                }
+                            }
+                            None => {
+                                // create a default listener for that front
+                                let file_listener_protocol = if frontend.certificate.is_some() {
+                                    self.push_tls_listener(ListenerBuilder::new(
+                                        frontend.address.into(),
+                                        ListenerProtocol::Https,
+                                    ))?;
+
+                                    ListenerProtocol::Https
+                                } else {
+                                    self.push_http_listener(ListenerBuilder::new(
+                                        frontend.address.into(),
+                                        ListenerProtocol::Http,
+                                    ))?;
+
+                                    ListenerProtocol::Http
+                                };
+                                self.known_addresses
+                                    .insert(frontend.address, file_listener_protocol);
+                            }
+                        }
+                    }
+                }
+                ClusterConfig::Tcp(ref mut tcp) => {
+                    //FIXME: verify that different TCP clusters do not request the same address
+                    for frontend in tcp.frontends.iter_mut() {
+                        match self.known_addresses.get(&frontend.address) {
+                            Some(ListenerProtocol::Http) | Some(ListenerProtocol::Https) => {
+                                return Err(ConfigError::WrongFrontendProtocol(
+                                    ListenerProtocol::Http,
+                                ));
+                            }
+                            Some(ListenerProtocol::Udp) => {
+                                // A `protocol = "tcp"` cluster whose frontend
+                                // points at a `protocol = "udp"` listener is a
+                                // UDP cluster (datagram knobs under
+                                // `[clusters.<id>.udp]`). Mark the frontend so
+                                // `generate_requests` emits `AddUdpFrontend`.
+                                frontend.udp = true;
+                                // Datagrams are relayed over UDP sockets: a
+                                // UNIX stream backend cannot carry them.
+                                if let Some(backend) =
+                                    tcp.backends.iter().find(|b| b.unix_path.is_some())
+                                {
+                                    return Err(ConfigError::InvalidBackendUnixPath {
+                                        cluster_id: tcp.cluster_id.to_owned(),
+                                        address: backend.address,
+                                        reason: "a UDP cluster cannot use unix_path backends",
+                                    });
+                                }
+                            }
+                            Some(ListenerProtocol::Tcp) => {}
+                            None => {
+                                // create a default listener for that front
+                                self.push_tcp_listener(ListenerBuilder::new(
+                                    frontend.address.into(),
+                                    ListenerProtocol::Tcp,
+                                ))?;
+                                self.known_addresses
+                                    .insert(frontend.address, ListenerProtocol::Tcp);
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.built.clusters.insert(id, cluster_config);
+        }
+        Ok(())
+    }
+
+    /// Builds the [`Config`] without resolving `host:port` backends, for a
+    /// caller that only reads its scalar settings (the control commands).
+    /// Everything else is validated as usual.
+    pub fn without_backend_resolution(mut self) -> Self {
+        self.resolve_backends = false;
+        self
+    }
+
+    /// Builds a [`Config`], populated with listeners and clusters
+    pub fn into_config(&mut self) -> Result<Config, ConfigError> {
+        // Subnet prefix lengths must fit their address family. Checked
+        // here rather than clamped in `ConfigBuilder::new` (which cannot
+        // fail) so a typo such as `subnet_ipv4_prefix = 64` stops the
+        // load instead of quietly enforcing /32.
+        if self.built.subnet_ipv4_prefix > MAX_SUBNET_IPV4_PREFIX {
+            return Err(ConfigError::InvalidSubnetPrefix {
+                key: "subnet_ipv4_prefix",
+                family: "IPv4",
+                value: self.built.subnet_ipv4_prefix,
+                maximum: MAX_SUBNET_IPV4_PREFIX,
+            });
+        }
+        if self.built.subnet_ipv6_prefix > MAX_SUBNET_IPV6_PREFIX {
+            return Err(ConfigError::InvalidSubnetPrefix {
+                key: "subnet_ipv6_prefix",
+                family: "IPv6",
+                value: self.built.subnet_ipv6_prefix,
+                maximum: MAX_SUBNET_IPV6_PREFIX,
+            });
+        }
+        validate_max_connection_attempts(self.built.max_connection_attempts).map_err(|reason| {
+            ConfigError::InvalidMaxConnectionAttempts {
+                cluster_id: None,
+                value: self.built.max_connection_attempts,
+                reason,
+            }
+        })?;
+
+        if let Some(listeners) = &self.file.listeners {
+            self.populate_listeners(listeners.clone())?;
+        }
+
+        if let Some(file_cluster_configs) = &self.file.clusters {
+            self.populate_clusters(file_cluster_configs.clone())?;
+        }
+
+        // TCP SNI/ALPN routing invariants (sozu-proxy/sozu#1279). Collect
+        // every TCP frontend's (address, sni, alpn) across all clusters,
+        // then validate:
+        //   (c) a listener must not mix a no-SNI frontend with any
+        //       SNI-scoped frontend — an SNI-enabled listener prereads the
+        //       ClientHello, so a raw-TCP fallback on the same address is
+        //       unreachable for clients that don't send SNI and ambiguous
+        //       for those that do;
+        //   (b) two frontends on the same (address, sni) must not share an
+        //       ALPN protocol, and at most one may leave alpn empty (the
+        //       catch-all) — otherwise routing on that listener would
+        //       depend on iteration order rather than configuration;
+        //   (d)/(e) sni_preread_timeout must not exceed front_timeout, and
+        //       sni_preread_max_bytes must not exceed buffer_size, on any
+        //       listener an SNI frontend targets. Both are gated on
+        //       SNI-presence (not just any TCP listener) so a legacy
+        //       TCP-only config with a low front_timeout or small
+        //       buffer_size — set long before this feature existed and
+        //       never opting into SNI — keeps loading byte-identically.
+        type SniAlpnByAddress = HashMap<SocketAddr, Vec<(Option<String>, Vec<String>)>>;
+        let mut frontends_by_address: SniAlpnByAddress = HashMap::new();
+        let mut addresses_with_no_sni_frontend: HashSet<SocketAddr> = HashSet::new();
+        for cluster in self.built.clusters.values() {
+            if let ClusterConfig::Tcp(tcp) = cluster {
+                for frontend in &tcp.frontends {
+                    // A `protocol = "tcp"` cluster frontend resolved against a
+                    // `protocol = "udp"` listener (`frontend.udp`, set in
+                    // `populate_clusters`) emits `AddUdpFrontend`, which
+                    // carries no `sni`/`alpn` on the wire — it is not a real
+                    // SNI-preread TCP frontend and must not participate in
+                    // these TCP-only invariants.
+                    if frontend.udp {
+                        continue;
+                    }
+                    if frontend.sni.is_none() {
+                        addresses_with_no_sni_frontend.insert(frontend.address);
+                    }
+                    frontends_by_address
+                        .entry(frontend.address)
+                        .or_default()
+                        .push((frontend.sni.clone(), frontend.alpn.clone()));
+                }
+            }
+        }
+
+        let mut addresses_with_sni_frontend: HashSet<SocketAddr> = HashSet::new();
+        for (address, frontends) in &frontends_by_address {
+            if !frontends.iter().any(|(sni, _)| sni.is_some()) {
+                continue;
+            }
+            addresses_with_sni_frontend.insert(*address);
+
+            if addresses_with_no_sni_frontend.contains(address) {
+                return Err(ConfigError::TcpListenerMixesSniAndNoSni { address: *address });
+            }
+
+            let mut alpn_lists_by_sni: HashMap<Option<String>, Vec<&Vec<String>>> = HashMap::new();
+            for (sni, alpn) in frontends {
+                alpn_lists_by_sni.entry(sni.clone()).or_default().push(alpn);
+            }
+            for (sni, alpn_lists) in alpn_lists_by_sni {
+                let mut seen_protocols: HashSet<&str> = HashSet::new();
+                let mut catch_all_count = 0usize;
+                for alpn in alpn_lists {
+                    if alpn.is_empty() {
+                        catch_all_count += 1;
+                        if catch_all_count > 1 {
+                            return Err(ConfigError::TcpFrontendMultipleAlpnCatchAll {
+                                address: *address,
+                                sni: sni.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    for protocol in alpn {
+                        if !seen_protocols.insert(protocol.as_str()) {
+                            return Err(ConfigError::TcpFrontendAlpnOverlap {
+                                address: *address,
+                                sni: sni.clone(),
+                                protocol: protocol.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        for listener in &self.built.tcp_listeners {
+            let address: SocketAddr = listener.address.into();
+            if !addresses_with_sni_frontend.contains(&address) {
+                continue;
+            }
+            let sni_preread_timeout = listener
+                .sni_preread_timeout
+                .unwrap_or(DEFAULT_SNI_PREREAD_TIMEOUT);
+            if sni_preread_timeout > listener.front_timeout {
+                return Err(ConfigError::SniPrereadTimeoutExceedsFrontTimeout {
+                    address,
+                    sni_preread_timeout,
+                    front_timeout: listener.front_timeout,
+                });
+            }
+            let sni_preread_max_bytes = listener
+                .sni_preread_max_bytes
+                .unwrap_or(DEFAULT_SNI_PREREAD_MAX_BYTES);
+            if sni_preread_max_bytes < MIN_SNI_PREREAD_MAX_BYTES {
+                return Err(ConfigError::SniPrereadMaxBytesTooSmall {
+                    address,
+                    sni_preread_max_bytes,
+                    minimum: MIN_SNI_PREREAD_MAX_BYTES,
+                });
+            }
+            if u64::from(sni_preread_max_bytes) > self.built.buffer_size {
+                return Err(ConfigError::SniPrereadMaxBytesExceedsBufferSize {
+                    address,
+                    sni_preread_max_bytes,
+                    buffer_size: self.built.buffer_size,
+                });
+            }
+        }
+
+        // RFC 9113 §6.5.2 + §4.1: the H2 mux must accept up to
+        // SETTINGS_MAX_FRAME_SIZE (16 384) + 9-byte frame header in a single
+        // kawa buffer. If any HTTPS listener advertises "h2" in its ALPN list
+        // and the global buffer_size is below H2_MIN_BUFFER_SIZE, the mux
+        // deadlocks on full-size DATA / HEADERS / CONTINUATION frames until
+        // the session timeout fires. Reject at config load so the failure
+        // mode surfaces at boot, not under traffic.
+        // Long-form rationale: `lib/src/protocol/mux/LIFECYCLE.md`.
+        let h2_listeners = self
+            .built
+            .https_listeners
+            .iter()
+            .filter(|l| l.alpn_protocols.iter().any(|p| p == "h2"))
+            .count();
+        if h2_listeners > 0 && self.built.buffer_size < H2_MIN_BUFFER_SIZE {
+            return Err(ConfigError::BufferSizeTooSmallForH2 {
+                buffer_size: self.built.buffer_size,
+                minimum: H2_MIN_BUFFER_SIZE,
+                listeners: h2_listeners,
+            });
+        }
+
+        // The command channel (`Channel::new`, `command/src/channel.rs`) allocates its
+        // initial buffer at `command_buffer_size` and must never let it exceed
+        // `max_command_buffer_size` -- every growth/shrink path on that channel reasons
+        // against that ceiling. Reject at config load, where the error can name both
+        // keys and both values, rather than let a misconfigured pair reach the real
+        // master<->worker channel (sozu-proxy/sozu#1416).
+        if self.built.command_buffer_size > self.built.max_command_buffer_size {
+            return Err(ConfigError::CommandBufferSizeExceedsMax {
+                command_buffer_size: self.built.command_buffer_size,
+                max_command_buffer_size: self.built.max_command_buffer_size,
+            });
+        }
+
+        // Warn (no hard reject) when the configured Basic-auth credential
+        // cap is large enough to dominate the per-frontend buffer. The
+        // worker copies a decoded credential into a transient allocation
+        // sized by this cap; values >= 33% of `buffer_size` mean a single
+        // failed-auth attempt can hold a third of the buffer's worth of
+        // bytes, which combined with in-flight request/response framing
+        // pushes the buffer toward back-pressure under load. Log only —
+        // operators with deliberate threat models may choose this
+        // trade-off, but the surprise needs to be visible.
+        if let Some(cap) = self.built.basic_auth_max_credential_bytes {
+            let third = self.built.buffer_size / 3;
+            if cap >= third {
+                warn!(
+                    "basic_auth_max_credential_bytes = {} is >= buffer_size / 3 ({}); \
+                     a hostile peer can pin ~33% of the per-frontend buffer per failed auth \
+                     attempt. Consider lowering basic_auth_max_credential_bytes (typical \
+                     credentials are <100 bytes) or raising buffer_size.",
+                    cap, third
+                );
+            }
+        }
+
+        // The eviction batch is `(max_connections / 100).max(1)` — a 1% ratio
+        // by design. Below 100 connections the floor of 1 means each cap
+        // event evicts a larger share than 1% of capacity (e.g. 4% at
+        // max_connections=25), which can surprise an operator who reads the
+        // knob as "1% per round". Warn at config load so the discrepancy is
+        // visible at boot, not under traffic.
+        if self.built.evict_on_queue_full && self.built.max_connections < 100 {
+            let pct = 100usize.div_ceil(self.built.max_connections);
+            warn!(
+                "evict_on_queue_full enabled with max_connections = {}; the eviction batch \
+                 clamps to 1, equivalent to ~{}% of capacity per cap event (the knob is \
+                 documented as 1%). Confirm this is intended.",
+                self.built.max_connections, pct
+            );
+        }
+
+        let command_socket_path = self.file.command_socket.clone().unwrap_or({
+            let mut path = env::current_dir().map_err(|e| ConfigError::Env(e.to_string()))?;
+            path.push("sozu.sock");
+            let verified_path = path
+                .to_str()
+                .ok_or(ConfigError::InvalidPath(path.clone()))?;
+            verified_path.to_owned()
+        });
+
+        if let (None, Some(true)) = (&self.file.saved_state, &self.file.automatic_state_save) {
+            return Err(ConfigError::Missing(MissingKind::SavedState));
+        }
+
+        let command_socket_mode = match self.file.command_socket_mode.as_deref() {
+            Some(mode) => parse_command_socket_mode(mode)?,
+            None => DEFAULT_COMMAND_SOCKET_MODE,
+        };
+
+        let config = Config {
+            command_socket: command_socket_path,
+            command_socket_mode,
+            ..self.built.clone()
+        };
+
+        // POST: a successfully built config satisfies the buffer-pool
+        // invariants every worker relies on.
+        // 1. min_buffers <= max_buffers — guaranteed by the `std::cmp::min`
+        //    clamp in `new`; a violation would let a worker size its free-list
+        //    floor above its ceiling.
+        debug_assert!(
+            config.min_buffers <= config.max_buffers,
+            "min_buffers must not exceed max_buffers"
+        );
+        // 2. If any HTTPS listener advertises h2 in its ALPN, the global
+        //    buffer_size is at least the H2 minimum — otherwise the early
+        //    return above would have produced a BufferSizeTooSmallForH2 error
+        //    rather than this Ok. (Recomputed here so the assert is independent
+        //    of the local `h2_listeners` binding above.)
+        debug_assert!(
+            !config
+                .https_listeners
+                .iter()
+                .any(|l| l.alpn_protocols.iter().any(|p| p == "h2"))
+                || config.buffer_size >= H2_MIN_BUFFER_SIZE,
+            "an h2-advertising config must satisfy the H2 minimum buffer size"
+        );
+        Ok(config)
+    }
+}
+
+/// Sōzu configuration, populated with clusters and listeners.
+///
+/// This struct is used on startup to generate `WorkerRequest`s
+#[derive(Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
+pub struct Config {
+    pub config_path: String,
+    pub command_socket: String,
+    /// Permission bits applied to the command socket after `bind(2)`, at most
+    /// [`MAX_COMMAND_SOCKET_MODE`]. An upgrade snapshot written by a main
+    /// process that predates the key deserializes to
+    /// [`DEFAULT_COMMAND_SOCKET_MODE`].
+    #[serde(default = "default_command_socket_mode")]
+    pub command_socket_mode: u32,
+    pub command_buffer_size: u64,
+    pub max_command_buffer_size: u64,
+    pub max_connections: usize,
+    pub min_buffers: u64,
+    pub max_buffers: u64,
+    pub buffer_size: u64,
+    pub saved_state: Option<String>,
+    #[serde(default)]
+    pub automatic_state_save: bool,
+    pub log_level: String,
+    pub log_target: String,
+    pub log_colored: bool,
+    /// Optional dedicated file path for the control-plane audit log. See
+    /// `FileConfig::audit_logs_target` for rationale.
+    #[serde(default)]
+    pub audit_logs_target: Option<String>,
+    /// Optional JSON mirror of the audit log; see
+    /// `FileConfig::audit_logs_json_target`.
+    #[serde(default)]
+    pub audit_logs_json_target: Option<String>,
+    #[serde(default)]
+    pub access_logs_target: Option<String>,
+    pub access_logs_format: Option<AccessLogFormat>,
+    pub access_logs_colored: Option<bool>,
+    pub worker_count: u16,
+    pub worker_automatic_restart: bool,
+    pub metrics: Option<MetricsConfig>,
+    #[serde(default = "default_disable_cluster_metrics")]
+    pub disable_cluster_metrics: bool,
+    pub http_listeners: Vec<HttpListenerConfig>,
+    pub https_listeners: Vec<HttpsListenerConfig>,
+    pub tcp_listeners: Vec<TcpListenerConfig>,
+    #[serde(default)]
+    pub udp_listeners: Vec<UdpListenerConfig>,
+    pub clusters: HashMap<String, ClusterConfig>,
+    pub handle_process_affinity: bool,
+    pub ctl_command_timeout: u64,
+    pub pid_file_path: Option<String>,
+    pub activate_listeners: bool,
+    #[serde(default = "default_front_timeout")]
+    pub front_timeout: u32,
+    #[serde(default = "default_back_timeout")]
+    pub back_timeout: u32,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout: u32,
+    #[serde(default = "default_zombie_check_interval")]
+    pub zombie_check_interval: u32,
+    #[serde(default = "default_accept_queue_timeout")]
+    pub accept_queue_timeout: u32,
+    #[serde(default = "default_evict_on_queue_full")]
+    pub evict_on_queue_full: bool,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: u32,
+    #[serde(default = "default_worker_timeout")]
+    pub worker_timeout: u32,
+    /// Slab-entries-per-connection multiplier exposed for operators with
+    /// fan-out topologies that exceed the default 4 backends per session.
+    /// `None` means the default (4) applies; set values are clamped to
+    /// [`ServerConfig::MIN_SLAB_ENTRIES_PER_CONNECTION`,
+    /// `ServerConfig::MAX_SLAB_ENTRIES_PER_CONNECTION`] = [2, 32]. Slab
+    /// capacity is `10 + slab_entries_per_connection * max_connections`.
+    #[serde(default)]
+    pub slab_entries_per_connection: Option<u64>,
+    /// Optional allowlist of UIDs permitted to invoke command-socket
+    /// requests. `None` keeps the historical "any same-UID local process"
+    /// behaviour. When `Some`, every request whose `SO_PEERCRED` UID is
+    /// not in the list is rejected before reaching dispatch.
+    #[serde(default)]
+    pub command_allowed_uids: Option<Vec<u32>>,
+    /// Maximum length, in bytes, of a base64-decoded `Authorization: Basic`
+    /// payload accepted by `mux::auth`. `None` keeps the compile-time
+    /// default of 4096. Set once on each worker at boot via
+    /// [`ServerConfig::basic_auth_max_credential_bytes`].
+    #[serde(default)]
+    pub basic_auth_max_credential_bytes: Option<u64>,
+    /// Default per-(cluster, source-IP) connection limit. `0` means
+    /// unlimited. Each cluster may override via its own
+    /// `max_connections_per_ip`. Source IP attribution honours the
+    /// proxy-protocol header when present. UDP listeners ignore it: only a
+    /// cluster's own value limits UDP flows.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u64,
+    /// Default per-(cluster, source-SUBNET) connection limit. `0` means
+    /// unlimited and is the default, so the subnet limiter is inert
+    /// until an operator turns it on. An independent second counter
+    /// beside `max_connections_per_ip`, not a replacement: both gates
+    /// must admit. Each cluster may override.
+    #[serde(default = "default_max_connections_per_subnet")]
+    pub max_connections_per_subnet: u64,
+    /// IPv4 prefix length (bits, 0-32) defining the subnet key. 32
+    /// (default) masks nothing.
+    #[serde(default = "default_subnet_ipv4_prefix")]
+    pub subnet_ipv4_prefix: u32,
+    /// IPv6 prefix length (bits, 0-128) defining the subnet key. 128
+    /// (default) masks nothing.
+    #[serde(default = "default_subnet_ipv6_prefix")]
+    pub subnet_ipv6_prefix: u32,
+    /// Default `Retry-After` header value (seconds) emitted on HTTP 429
+    /// responses. `0` omits the header.
+    #[serde(default = "default_retry_after")]
+    pub retry_after: u32,
+    /// Backend connection attempt budget of every request, the first attempt
+    /// included. Each cluster may override it.
+    #[serde(default = "default_max_connection_attempts")]
+    pub max_connection_attempts: u32,
+    /// Requested kernel-pipe capacity, in bytes, for each `splice(2)`
+    /// zero-copy direction. `None` keeps the kernel default of 64 KiB.
+    /// Applied via `fcntl(F_SETPIPE_SZ)` per pipe at `SplicePipe::new`;
+    /// the kernel rounds up to a page boundary and clamps at
+    /// `/proc/sys/fs/pipe-max-size`. Linux-only; ignored on builds
+    /// without the `splice` feature.
+    #[serde(default)]
+    pub splice_pipe_capacity_bytes: Option<u64>,
+}
+
+fn default_command_socket_mode() -> u32 {
+    DEFAULT_COMMAND_SOCKET_MODE
+}
+
+/// Parse `command_socket_mode`: one to four octal digits, a leading `0`
+/// allowed (`"0660"` and `"660"` are the same mode), no `0o` prefix and no
+/// sign. The value must not exceed [`MAX_COMMAND_SOCKET_MODE`], which refuses
+/// setuid, setgid and the sticky bit, and must keep the owner's read and
+/// write bits: without them the proxy's own user could no longer connect to
+/// run `status`, `reload` or `upgrade`.
+pub fn parse_command_socket_mode(value: &str) -> Result<u32, ConfigError> {
+    let invalid = |reason| ConfigError::InvalidCommandSocketMode {
+        value: value.to_owned(),
+        reason,
+    };
+    if value.is_empty() || value.len() > 4 || !value.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return Err(invalid(
+            "expected one to four octal digits, such as \"0660\" or \"660\"",
+        ));
+    }
+    let mode =
+        u32::from_str_radix(value, 8).map_err(|_| invalid("expected one to four octal digits"))?;
+    if mode > MAX_COMMAND_SOCKET_MODE {
+        return Err(invalid(
+            "only permission bits (at most 0777) are allowed; setuid, setgid and sticky are refused",
+        ));
+    }
+    if mode & 0o600 != 0o600 {
+        return Err(invalid("the owner must keep read and write (0600)"));
+    }
+    Ok(mode)
+}
+
+fn default_front_timeout() -> u32 {
+    DEFAULT_FRONT_TIMEOUT
+}
+
+fn default_back_timeout() -> u32 {
+    DEFAULT_BACK_TIMEOUT
+}
+
+fn default_connect_timeout() -> u32 {
+    DEFAULT_CONNECT_TIMEOUT
+}
+
+fn default_request_timeout() -> u32 {
+    DEFAULT_REQUEST_TIMEOUT
+}
+
+fn default_zombie_check_interval() -> u32 {
+    DEFAULT_ZOMBIE_CHECK_INTERVAL
+}
+
+fn default_accept_queue_timeout() -> u32 {
+    DEFAULT_ACCEPT_QUEUE_TIMEOUT
+}
+
+fn default_evict_on_queue_full() -> bool {
+    DEFAULT_EVICT_ON_QUEUE_FULL
+}
+
+fn default_disable_cluster_metrics() -> bool {
+    DEFAULT_DISABLE_CLUSTER_METRICS
+}
+
+fn default_worker_timeout() -> u32 {
+    DEFAULT_WORKER_TIMEOUT
+}
+
+fn default_max_connections_per_ip() -> u64 {
+    DEFAULT_MAX_CONNECTIONS_PER_IP
+}
+
+fn default_max_connections_per_subnet() -> u64 {
+    DEFAULT_MAX_CONNECTIONS_PER_SUBNET
+}
+
+fn default_subnet_ipv4_prefix() -> u32 {
+    DEFAULT_SUBNET_IPV4_PREFIX
+}
+
+fn default_subnet_ipv6_prefix() -> u32 {
+    DEFAULT_SUBNET_IPV6_PREFIX
+}
+
+fn default_retry_after() -> u32 {
+    DEFAULT_RETRY_AFTER
+}
+
+fn default_max_connection_attempts() -> u32 {
+    DEFAULT_MAX_CONNECTION_ATTEMPTS
+}
+
+impl Config {
+    /// Parse a TOML file and build a config out of it
+    pub fn load_from_path(path: &str) -> Result<Config, ConfigError> {
+        let file_config = FileConfig::load_from_path(path)?;
+
+        let mut config = ConfigBuilder::new(file_config, path).into_config()?;
+
+        // replace saved_state with a verified path
+        config.saved_state = config.saved_state_path()?;
+
+        Ok(config)
+    }
+
+    /// Like [`Config::load_from_path`], but `host:port` backends are not
+    /// resolved: for the control commands, which read the scalar settings and
+    /// must not depend on DNS. The rest of the file is validated as usual.
+    pub fn load_from_path_for_control(path: &str) -> Result<Config, ConfigError> {
+        let file_config = FileConfig::load_from_path(path)?;
+
+        let mut config = ConfigBuilder::new(file_config, path)
+            .without_backend_resolution()
+            .into_config()?;
+        config.saved_state = config.saved_state_path()?;
+
+        Ok(config)
+    }
+
+    /// yields requests intended to recreate a proxy that match the config
+    pub fn generate_config_messages(&self) -> Result<Vec<WorkerRequest>, ConfigError> {
+        let mut v = Vec::new();
+        let mut count = 0u8;
+
+        for listener in &self.http_listeners {
+            v.push(WorkerRequest {
+                id: format!("CONFIG-{count}"),
+                content: RequestType::AddHttpListener(listener.clone()).into(),
+            });
+            count += 1;
+        }
+
+        for listener in &self.https_listeners {
+            v.push(WorkerRequest {
+                id: format!("CONFIG-{count}"),
+                content: RequestType::add_https_listener(listener.clone()).into(),
+            });
+            count += 1;
+        }
+
+        for listener in &self.tcp_listeners {
+            v.push(WorkerRequest {
+                id: format!("CONFIG-{count}"),
+                content: RequestType::AddTcpListener(listener.clone()).into(),
+            });
+            count += 1;
+        }
+
+        for listener in &self.udp_listeners {
+            v.push(WorkerRequest {
+                id: format!("CONFIG-{count}"),
+                content: RequestType::AddUdpListener(listener.clone()).into(),
+            });
+            count += 1;
+        }
+
+        for cluster in self.clusters.values() {
+            let mut orders = cluster.generate_requests()?;
+            for content in orders.drain(..) {
+                v.push(WorkerRequest {
+                    id: format!("CONFIG-{count}"),
+                    content,
+                });
+                count += 1;
+            }
+        }
+
+        if self.activate_listeners {
+            for listener in &self.http_listeners {
+                v.push(WorkerRequest {
+                    id: format!("CONFIG-{count}"),
+                    content: RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Http.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                });
+                count += 1;
+            }
+
+            for listener in &self.https_listeners {
+                v.push(WorkerRequest {
+                    id: format!("CONFIG-{count}"),
+                    content: RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Https.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                });
+                count += 1;
+            }
+
+            for listener in &self.tcp_listeners {
+                v.push(WorkerRequest {
+                    id: format!("CONFIG-{count}"),
+                    content: RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                });
+                count += 1;
+            }
+
+            for listener in &self.udp_listeners {
+                v.push(WorkerRequest {
+                    id: format!("CONFIG-{count}"),
+                    content: RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
+                        address: listener.address,
+                        proxy: ListenerType::Udp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                });
+                count += 1;
+            }
+        }
+
+        if self.disable_cluster_metrics {
+            v.push(WorkerRequest {
+                id: format!("CONFIG-{count}"),
+                content: RequestType::ConfigureMetrics(MetricsConfiguration::Disabled.into())
+                    .into(),
+            });
+            // count += 1; // uncomment if code is added below
+        }
+
+        Ok(v)
+    }
+
+    /// Get the path of the UNIX socket used to communicate with Sōzu
+    pub fn command_socket_path(&self) -> Result<String, ConfigError> {
+        let config_path_buf = PathBuf::from(self.config_path.clone());
+        let mut config_dir = config_path_buf
+            .parent()
+            .ok_or(ConfigError::NoFileParent(
+                config_path_buf.to_string_lossy().to_string(),
+            ))?
+            .to_path_buf();
+
+        let socket_path = PathBuf::from(self.command_socket.clone());
+
+        let mut socket_parent_dir = match socket_path.parent() {
+            // if the socket path is of the form "./sozu.sock",
+            // then the parent is the directory where config.toml is situated
+            None => config_dir,
+            Some(path) => {
+                // concatenate the config directory and the relative path of the socket
+                config_dir.push(path);
+                // canonicalize to remove double dots like /path/to/config/directory/../../path/to/socket/directory/
+                config_dir.canonicalize().map_err(|io_error| {
+                    ConfigError::SocketPathError(format!(
+                        "Could not canonicalize path {config_dir:?}: {io_error}"
+                    ))
+                })?
+            }
+        };
+
+        let socket_name = socket_path
+            .file_name()
+            .ok_or(ConfigError::SocketPathError(format!(
+                "could not get command socket file name from {socket_path:?}"
+            )))?;
+
+        // concatenate parent directory and socket file name
+        socket_parent_dir.push(socket_name);
+
+        let command_socket_path = socket_parent_dir
+            .to_str()
+            .ok_or(ConfigError::SocketPathError(format!(
+                "Invalid socket path {socket_parent_dir:?}"
+            )))?
+            .to_string();
+
+        Ok(command_socket_path)
+    }
+
+    /// Get the path of where the state will be saved
+    fn saved_state_path(&self) -> Result<Option<String>, ConfigError> {
+        let path = match self.saved_state.as_ref() {
+            Some(path) => path,
+            None => return Ok(None),
+        };
+
+        debug!("saved_stated path in the config: {}", path);
+        let config_path = PathBuf::from(self.config_path.clone());
+
+        debug!("Config path buffer: {:?}", config_path);
+        let config_dir = config_path
+            .parent()
+            .ok_or(ConfigError::SaveStatePath(format!(
+                "Could get parent directory of config file {config_path:?}"
+            )))?;
+
+        debug!("Config folder: {:?}", config_dir);
+        if !config_dir.exists() {
+            create_dir_all(config_dir).map_err(|io_error| {
+                ConfigError::SaveStatePath(format!(
+                    "failed to create state parent directory '{config_dir:?}': {io_error}"
+                ))
+            })?;
+        }
+
+        let mut saved_state_path_raw = config_dir.to_path_buf();
+        saved_state_path_raw.push(path);
+        debug!(
+            "Looking for saved state on the path {:?}",
+            saved_state_path_raw
+        );
+
+        match metadata(path) {
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
+                info!("Create an empty state file at '{}'", path);
+                File::create(path).map_err(|io_error| {
+                    ConfigError::SaveStatePath(format!(
+                        "failed to create state file '{path:?}': {io_error}"
+                    ))
+                })?;
+            }
+            _ => {}
+        }
+
+        saved_state_path_raw.canonicalize().map_err(|io_error| {
+            ConfigError::SaveStatePath(format!(
+                "could not get saved state path from config file input {path:?}: {io_error}"
+            ))
+        })?;
+
+        let stringified_path = saved_state_path_raw
+            .to_str()
+            .ok_or(ConfigError::SaveStatePath(format!(
+                "Invalid path {saved_state_path_raw:?}"
+            )))?
+            .to_string();
+
+        Ok(Some(stringified_path))
+    }
+
+    /// read any file to a string
+    pub fn load_file(path: &str) -> Result<String, ConfigError> {
+        std::fs::read_to_string(path).map_err(|io_error| ConfigError::FileRead {
+            path_to_read: path.to_owned(),
+            io_error,
+        })
+    }
+
+    /// read any file to bytes
+    pub fn load_file_bytes(path: &str) -> Result<Vec<u8>, ConfigError> {
+        std::fs::read(path).map_err(|io_error| ConfigError::FileRead {
+            path_to_read: path.to_owned(),
+            io_error,
+        })
+    }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("config_path", &self.config_path)
+            .field("command_socket", &self.command_socket)
+            .field(
+                "command_socket_mode",
+                &format_args!("{:o}", self.command_socket_mode),
+            )
+            .field("command_buffer_size", &self.command_buffer_size)
+            .field("max_command_buffer_size", &self.max_command_buffer_size)
+            .field("max_connections", &self.max_connections)
+            .field("min_buffers", &self.min_buffers)
+            .field("max_buffers", &self.max_buffers)
+            .field("buffer_size", &self.buffer_size)
+            .field("saved_state", &self.saved_state)
+            .field("automatic_state_save", &self.automatic_state_save)
+            .field("log_level", &self.log_level)
+            .field("log_target", &self.log_target)
+            .field("access_logs_target", &self.access_logs_target)
+            .field("audit_logs_target", &self.audit_logs_target)
+            .field("audit_logs_json_target", &self.audit_logs_json_target)
+            .field("access_logs_format", &self.access_logs_format)
+            .field("worker_count", &self.worker_count)
+            .field("worker_automatic_restart", &self.worker_automatic_restart)
+            .field("metrics", &self.metrics)
+            .field("disable_cluster_metrics", &self.disable_cluster_metrics)
+            .field("handle_process_affinity", &self.handle_process_affinity)
+            .field("ctl_command_timeout", &self.ctl_command_timeout)
+            .field("pid_file_path", &self.pid_file_path)
+            .field("activate_listeners", &self.activate_listeners)
+            .field("front_timeout", &self.front_timeout)
+            .field("back_timeout", &self.back_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("zombie_check_interval", &self.zombie_check_interval)
+            .field("accept_queue_timeout", &self.accept_queue_timeout)
+            .field("evict_on_queue_full", &self.evict_on_queue_full)
+            .field("request_timeout", &self.request_timeout)
+            .field("worker_timeout", &self.worker_timeout)
+            .finish()
+    }
+}
+
+/// The diagnostic of a configuration file that does not parse: its path and,
+/// when known, the byte range of the offence.
+///
+/// Neither the source nor `toml::de::Error`'s `Display` is used: the latter
+/// quotes the offending line, and a serde type error quotes the offending
+/// value, which may be a health-check header credential.
+fn toml_error_diagnostic(path: &str, error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(Range { start, end }) => format!(
+            "error parsing the configuration file '{path}' at bytes {start}..{end}: invalid TOML syntax or unexpected value (the offending text is not shown)"
+        ),
+        None => format!(
+            "error parsing the configuration file '{path}': invalid TOML syntax or unexpected value (the offending text is not shown)"
+        ),
+    }
+}
+
+impl ServerConfig {
+    /// Default number of slab entries per connection. Set to 4 to accommodate
+    /// H2 multiplexing (1 frontend + up to 3 backend connections per
+    /// frontend with stream multiplexing). Previous value was 2 for H1-only
+    /// operation. Operators with topologies that fan out across more
+    /// clusters per session can override via `slab_entries_per_connection`
+    /// in the config (clamped to [2, 32]).
+    pub const DEFAULT_SLAB_ENTRIES_PER_CONNECTION: u64 = 4;
+    /// Lower bound for the runtime knob. Below 2 the slab cannot hold one
+    /// frontend + one backend per session.
+    pub const MIN_SLAB_ENTRIES_PER_CONNECTION: u64 = 2;
+    /// Upper bound for the runtime knob. 32 caps memory blow-up from a
+    /// runaway config; 32 backends per frontend covers any sane topology.
+    pub const MAX_SLAB_ENTRIES_PER_CONNECTION: u64 = 32;
+
+    /// Effective slab-entries-per-connection. Applies the [MIN, MAX] clamp
+    /// and falls back to the default when the proto field is absent or 0.
+    pub fn effective_slab_entries_per_connection(&self) -> u64 {
+        let effective = match self.slab_entries_per_connection {
+            Some(0) | None => Self::DEFAULT_SLAB_ENTRIES_PER_CONNECTION,
+            Some(n) => n.clamp(
+                Self::MIN_SLAB_ENTRIES_PER_CONNECTION,
+                Self::MAX_SLAB_ENTRIES_PER_CONNECTION,
+            ),
+        };
+        // POST: the effective value is always inside the documented clamp
+        // window [MIN, MAX], regardless of the raw config input. The default
+        // itself sits inside that window, so every branch satisfies the bound.
+        debug_assert!(
+            (Self::MIN_SLAB_ENTRIES_PER_CONNECTION..=Self::MAX_SLAB_ENTRIES_PER_CONNECTION)
+                .contains(&effective),
+            "effective slab entries per connection must stay within [MIN, MAX]"
+        );
+        effective
+    }
+
+    /// Size of the slab for the Session manager.
+    ///
+    /// With HTTP/2 multiplexing, each frontend session can have multiple backend
+    /// connections (one per cluster), so we allocate
+    /// [`Self::effective_slab_entries_per_connection`] entries per connection
+    /// instead of the old H1-only multiplier of 2.
+    pub fn slab_capacity(&self) -> u64 {
+        let per_conn = self.effective_slab_entries_per_connection();
+        let capacity = 10 + per_conn * self.max_connections;
+        // POST: the slab always reserves the 10-entry base (listeners, command
+        // channel, etc.) plus at least MIN entries per connection, so it can
+        // never be smaller than the base. Strict `>` for any non-zero
+        // max_connections since per_conn >= MIN >= 2.
+        debug_assert!(
+            capacity >= 10,
+            "slab capacity must reserve the base entries"
+        );
+        debug_assert!(
+            self.max_connections == 0 || capacity > 10,
+            "a non-zero connection cap must reserve per-connection slab entries"
+        );
+        capacity
+    }
+}
+
+/// reduce the config to the bare minimum needed by a worker
+impl From<&Config> for ServerConfig {
+    fn from(config: &Config) -> Self {
+        let metrics = config.metrics.clone().map(|m| ServerMetricsConfig {
+            address: m.address.to_string(),
+            tagged_metrics: m.tagged_metrics,
+            prefix: m.prefix,
+            detail: Some(MetricDetail::from(m.detail) as i32),
+        });
+        let server_config = Self {
+            max_connections: config.max_connections as u64,
+            front_timeout: config.front_timeout,
+            back_timeout: config.back_timeout,
+            connect_timeout: config.connect_timeout,
+            zombie_check_interval: config.zombie_check_interval,
+            accept_queue_timeout: config.accept_queue_timeout,
+            min_buffers: config.min_buffers,
+            max_buffers: config.max_buffers,
+            buffer_size: config.buffer_size,
+            log_level: config.log_level.clone(),
+            log_target: config.log_target.clone(),
+            access_logs_target: config.access_logs_target.clone(),
+            audit_logs_target: config.audit_logs_target.clone(),
+            audit_logs_json_target: config.audit_logs_json_target.clone(),
+            command_buffer_size: config.command_buffer_size,
+            max_command_buffer_size: config.max_command_buffer_size,
+            metrics,
+            access_log_format: ProtobufAccessLogFormat::from(&config.access_logs_format) as i32,
+            log_colored: config.log_colored,
+            slab_entries_per_connection: config.slab_entries_per_connection,
+            basic_auth_max_credential_bytes: config.basic_auth_max_credential_bytes,
+            evict_on_queue_full: Some(config.evict_on_queue_full),
+            max_connections_per_ip: Some(config.max_connections_per_ip),
+            max_connections_per_subnet: Some(config.max_connections_per_subnet),
+            subnet_ipv4_prefix: Some(config.subnet_ipv4_prefix),
+            subnet_ipv6_prefix: Some(config.subnet_ipv6_prefix),
+            retry_after: Some(config.retry_after),
+            splice_pipe_capacity_bytes: config.splice_pipe_capacity_bytes,
+            max_connection_attempts: Some(config.max_connection_attempts),
+        };
+
+        // POST: the worker-facing config preserves the buffer-pool invariant
+        // (min <= max) and carries the sizing knobs through unchanged — a
+        // worker derives its slab and buffer pool straight from these, so any
+        // drift here would desynchronize the master's view from the worker's.
+        debug_assert!(
+            server_config.min_buffers <= server_config.max_buffers,
+            "ServerConfig must preserve min_buffers <= max_buffers"
+        );
+        debug_assert_eq!(
+            server_config.buffer_size, config.buffer_size,
+            "ServerConfig buffer_size must mirror the source config"
+        );
+        debug_assert_eq!(
+            server_config.max_connections, config.max_connections as u64,
+            "ServerConfig max_connections must mirror the source config"
+        );
+        server_config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use toml::to_string;
+
+    use super::*;
+
+    /// `redirect = "silent_close"` parses, in any case, to
+    /// `RedirectPolicy::SilentClose` (sozu-proxy/sozu#767); the hyphenated
+    /// spelling is not an alias and is refused like any unknown policy.
+    #[test]
+    fn silent_close_redirect_policy_parses_case_insensitively() {
+        for spelling in ["silent_close", "SILENT_CLOSE", "Silent_Close"] {
+            assert_eq!(
+                parse_redirect_policy(spelling).ok(),
+                Some(RedirectPolicy::SilentClose),
+                "{spelling} must parse to SilentClose"
+            );
+        }
+        assert!(matches!(
+            parse_redirect_policy("silent-close"),
+            Err(ConfigError::InvalidRedirectPolicy(value)) if value == "silent-close"
+        ));
+    }
+
+    #[test]
+    fn http_frontend_debug_redacts_pem_material() {
+        const CERTIFICATE_SECRET: &str = "HTTP_FRONTEND_CERTIFICATE_PEM_SECRET_SENTINEL";
+        const CHAIN_SECRET: &str = "HTTP_FRONTEND_CHAIN_PEM_SECRET_SENTINEL";
+        const KEY_SECRET: &str = "HTTP_FRONTEND_KEY_PEM_SECRET_SENTINEL";
+        const HOSTNAME_SECRET: &str = "HTTP_FRONTEND_HOSTNAME_SECRET_SENTINEL";
+        const PATH_SECRET: &str = "HTTP_FRONTEND_PATH_SECRET_SENTINEL";
+        const METHOD_SECRET: &str = "HTTP_FRONTEND_METHOD_SECRET_SENTINEL";
+        const TAG_KEY_SECRET: &str = "HTTP_FRONTEND_TAG_KEY_SECRET_SENTINEL";
+        const TAG_SECRET: &str = "HTTP_FRONTEND_TAG_VALUE_SECRET_SENTINEL";
+        const HEADER_KEY_SECRET: &str = "HTTP_FRONTEND_HEADER_KEY_SECRET_SENTINEL";
+        const HEADER_SECRET: &str = "HTTP_FRONTEND_HEADER_VALUE_SECRET_SENTINEL";
+        const REDIRECT_TEMPLATE_SECRET: &str = "HTTP_FRONTEND_REDIRECT_TEMPLATE_SECRET_SENTINEL";
+        const REWRITE_HOST_SECRET: &str = "HTTP_FRONTEND_REWRITE_HOST_SECRET_SENTINEL";
+        const REWRITE_PATH_SECRET: &str = "HTTP_FRONTEND_REWRITE_PATH_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let certificate = long_value(CERTIFICATE_SECRET);
+        let certificate_chain = long_value(CHAIN_SECRET);
+        let key = long_value(KEY_SECRET);
+        let hostname = long_value(HOSTNAME_SECRET);
+        let path = long_value(PATH_SECRET);
+        let method = long_value(METHOD_SECRET);
+        let redirect_template = long_value(REDIRECT_TEMPLATE_SECRET);
+        let rewrite_host = long_value(REWRITE_HOST_SECRET);
+        let rewrite_path = long_value(REWRITE_PATH_SECRET);
+
+        let frontend = HttpFrontendConfig {
+            address: "127.0.0.1:8443".parse().unwrap(),
+            hostname,
+            path: PathRule::prefix(path),
+            method: Some(method),
+            certificate: Some(certificate),
+            key: Some(key),
+            certificate_chain: Some(vec![certificate_chain]),
+            tls_versions: vec![TlsVersion::TlsV13],
+            position: RulePosition::Tree,
+            tags: Some(BTreeMap::from([(
+                long_value(TAG_KEY_SECRET),
+                long_value(TAG_SECRET),
+            )])),
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: Some(redirect_template),
+            rewrite_host: Some(rewrite_host),
+            rewrite_path: Some(rewrite_path),
+            rewrite_port: None,
+            required_auth: None,
+            headers: vec![Header {
+                position: HeaderPosition::Request as i32,
+                key: long_value(HEADER_KEY_SECRET),
+                val: long_value(HEADER_SECRET),
+            }],
+            hsts: None,
+            header_predicates: Vec::new(),
+        };
+
+        let output = format!("{frontend:?}");
+
+        let secrets = [
+            CERTIFICATE_SECRET,
+            CHAIN_SECRET,
+            KEY_SECRET,
+            HOSTNAME_SECRET,
+            PATH_SECRET,
+            METHOD_SECRET,
+            TAG_KEY_SECRET,
+            TAG_SECRET,
+            HEADER_KEY_SECRET,
+            HEADER_SECRET,
+            REDIRECT_TEMPLATE_SECRET,
+            REWRITE_HOST_SECRET,
+            REWRITE_PATH_SECRET,
+        ];
+        for secret in secrets {
+            assert!(
+                !output.contains(secret),
+                "HttpFrontendConfig Debug leaked secret marker {secret}: {output}"
+            );
+        }
+        let expected_metadata = [
+            "address: 127.0.0.1:8443".to_owned(),
+            format!("hostname_len: {}", long_value(HOSTNAME_SECRET).len()),
+            format!("path_kind: {}", PathRule::prefix(String::new()).kind),
+            format!("path_len: {}", long_value(PATH_SECRET).len()),
+            format!("method_len: Some({})", long_value(METHOD_SECRET).len()),
+            "certificate: Some(\"[redacted]\")".to_owned(),
+            format!(
+                "certificate_len: Some({})",
+                long_value(CERTIFICATE_SECRET).len()
+            ),
+            "key: Some(\"[redacted]\")".to_owned(),
+            format!("key_len: Some({})", long_value(KEY_SECRET).len()),
+            "certificate_chain: Some(\"[redacted]\")".to_owned(),
+            "certificate_chain_count: Some(1)".to_owned(),
+            format!(
+                "certificate_chain_len: Some({})",
+                long_value(CHAIN_SECRET).len()
+            ),
+            "tls_versions_count: 1".to_owned(),
+            "tags_count: 1".to_owned(),
+            format!(
+                "redirect_template_len: Some({})",
+                long_value(REDIRECT_TEMPLATE_SECRET).len()
+            ),
+            format!(
+                "rewrite_host_len: Some({})",
+                long_value(REWRITE_HOST_SECRET).len()
+            ),
+            format!(
+                "rewrite_path_len: Some({})",
+                long_value(REWRITE_PATH_SECRET).len()
+            ),
+            "headers_count: 1".to_owned(),
+        ];
+        for safe_metadata in expected_metadata {
+            assert!(
+                output.contains(&safe_metadata),
+                "HttpFrontendConfig Debug omitted safe metadata {safe_metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 1024,
+            "HttpFrontendConfig Debug output is not bounded: {} bytes",
+            output.len()
+        );
+
+        for (index, request) in frontend
+            .generate_requests("safe-cluster-id")
+            .into_iter()
+            .enumerate()
+        {
+            let generated_output = format!("{request:?}");
+            for secret in secrets {
+                assert!(
+                    !generated_output.contains(secret),
+                    "generated frontend request {index} Debug leaked secret marker {secret}: {generated_output}"
+                );
+            }
+            assert!(
+                generated_output.len() <= 2048,
+                "generated frontend request {index} Debug output is not bounded: {} bytes",
+                generated_output.len()
+            );
+        }
+    }
+
+    #[test]
+    fn hsts_to_proto_enabled_substitutes_default_max_age() {
+        let cfg = FileHstsConfig {
+            enabled: Some(true),
+            max_age: None,
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        };
+        let proto = cfg.to_proto("test").expect("should validate");
+        assert_eq!(proto.enabled, Some(true));
+        assert_eq!(proto.max_age, Some(DEFAULT_HSTS_MAX_AGE));
+    }
+
+    #[test]
+    fn hsts_to_proto_explicit_max_age_kept() {
+        let cfg = FileHstsConfig {
+            enabled: Some(true),
+            max_age: Some(63_072_000),
+            include_subdomains: Some(true),
+            preload: Some(true),
+            force_replace_backend: None,
+        };
+        let proto = cfg.to_proto("test").expect("should validate");
+        assert_eq!(proto.max_age, Some(63_072_000));
+        assert_eq!(proto.include_subdomains, Some(true));
+        assert_eq!(proto.preload, Some(true));
+    }
+
+    #[test]
+    fn hsts_to_proto_disabled_keeps_zero_intent() {
+        // `enabled = false` means "explicit disable" — the materialiser
+        // in `Frontend::new` won't append an edit, so the proto still
+        // round-trips with `enabled = Some(false)`.
+        let cfg = FileHstsConfig {
+            enabled: Some(false),
+            max_age: None,
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        };
+        let proto = cfg.to_proto("test").expect("should validate");
+        assert_eq!(proto.enabled, Some(false));
+    }
+
+    #[test]
+    fn hsts_to_proto_kill_switch_max_age_zero_allowed() {
+        // RFC 6797 §11.4: `max-age=0` instructs the UA to "cease
+        // regarding the host as a Known HSTS Host". Explicit operator
+        // intent — must NOT warn or fail.
+        let cfg = FileHstsConfig {
+            enabled: Some(true),
+            max_age: Some(0),
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        };
+        let proto = cfg.to_proto("test").expect("kill-switch must validate");
+        assert_eq!(proto.max_age, Some(0));
+    }
+
+    #[test]
+    fn hsts_to_proto_missing_enabled_errors() {
+        let cfg = FileHstsConfig {
+            enabled: None,
+            max_age: Some(31_536_000),
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        };
+        match cfg.to_proto("test").unwrap_err() {
+            ConfigError::HstsEnabledRequired(scope) => assert_eq!(scope, "test"),
+            other => panic!("expected HstsEnabledRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hsts_rejected_on_http_listener() {
+        // RFC 6797 §7.2: an [hsts] block on an HTTP listener must be
+        // rejected at TOML config-load — `HttpListenerConfig` carries no
+        // `hsts` field and silently dropping the operator's intent
+        // would be a worse failure mode than a typed error.
+        let mut listener = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        );
+        listener.hsts = Some(FileHstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        });
+        match listener.to_http(None).unwrap_err() {
+            ConfigError::HstsOnPlainHttp(scope) => assert!(
+                scope.contains("HTTP listener"),
+                "expected scope to mention 'HTTP listener', got {scope:?}"
+            ),
+            other => panic!("expected HstsOnPlainHttp, got {other:?}"),
+        }
+    }
+
+    /// Regression for sozu-proxy/sozu#1418: an H2 flood threshold of `0` set
+    /// in the config file reached `HttpListenerConfig` untouched. From there
+    /// `lib/src/http.rs::get_h2_flood_config` handed it to
+    /// `H2FloodDetector::new`, whose `check_flood` compares `count >
+    /// threshold` — so the first counted RST_STREAM of every H2 connection
+    /// tripped the detector and the listener answered `ENHANCE_YOUR_CALM` to
+    /// every client. `UpdateHttpListener` already refused the same value
+    /// (`validate_h2_flood_knobs_http`); the config-file path did not.
+    #[test]
+    fn h2_flood_threshold_zero_rejected_on_http_listener() {
+        let mut listener = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        );
+        listener.h2_max_rst_stream_per_window = Some(0);
+        match listener.to_http(None).unwrap_err() {
+            ConfigError::H2ThresholdBelowMinimum {
+                key,
+                value,
+                minimum,
+                ..
+            } => {
+                assert_eq!(key, "h2_max_rst_stream_per_window");
+                assert_eq!(value, 0);
+                assert_eq!(minimum, 1);
+            }
+            other => panic!("expected H2ThresholdBelowMinimum, got {other:?}"),
+        }
+    }
+
+    /// The HTTPS listener path (`to_tls`) carries the same knobs and needs the
+    /// same gate (sozu-proxy/sozu#1418). A lifetime cap is used here rather
+    /// than a per-window one so the `u64` knobs are covered too.
+    #[test]
+    fn h2_flood_threshold_zero_rejected_on_https_listener() {
+        let mut listener = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        listener.h2_max_rst_stream_abusive_lifetime = Some(0);
+        match listener.to_tls(None).unwrap_err() {
+            ConfigError::H2ThresholdBelowMinimum {
+                key,
+                value,
+                minimum,
+                ..
+            } => {
+                assert_eq!(key, "h2_max_rst_stream_abusive_lifetime");
+                assert_eq!(value, 0);
+                assert_eq!(minimum, 1);
+            }
+            other => panic!("expected H2ThresholdBelowMinimum, got {other:?}"),
+        }
+    }
+
+    /// `h2_stream_shrink_ratio` has a runtime floor of 2, not 1
+    /// (`lib/src/protocol/mux/h2.rs`'s `.max(2)`), and
+    /// `validate_h2_flood_knobs_http` rejects `< 2` on the update path. The
+    /// config-file path must agree (sozu-proxy/sozu#1418).
+    #[test]
+    fn h2_stream_shrink_ratio_below_two_rejected_on_http_listener() {
+        let mut listener = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        );
+        listener.h2_stream_shrink_ratio = Some(1);
+        match listener.to_http(None).unwrap_err() {
+            ConfigError::H2ThresholdBelowMinimum {
+                key,
+                value,
+                minimum,
+                ..
+            } => {
+                assert_eq!(key, "h2_stream_shrink_ratio");
+                assert_eq!(value, 1);
+                assert_eq!(minimum, 2);
+            }
+            other => panic!("expected H2ThresholdBelowMinimum, got {other:?}"),
+        }
+    }
+
+    /// The boundary itself must load: every documented minimum is an accepted
+    /// value, not a rejected one.
+    #[test]
+    fn h2_thresholds_at_their_minimum_accepted() {
+        let mut listener = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        );
+        listener.h2_max_rst_stream_per_window = Some(1);
+        listener.h2_max_rst_stream_abusive_lifetime = Some(1);
+        listener.h2_stream_shrink_ratio = Some(2);
+        let config = listener
+            .to_http(None)
+            .expect("thresholds at their minimum must be accepted");
+        assert_eq!(config.h2_max_rst_stream_per_window, Some(1));
+        assert_eq!(config.h2_max_rst_stream_abusive_lifetime, Some(1));
+        assert_eq!(config.h2_stream_shrink_ratio, Some(2));
+    }
+
+    #[test]
+    fn hsts_rejected_on_http_frontend() {
+        // A `FileClusterFrontendConfig` without a key+certificate pair
+        // generates `RequestType::AddHttpFrontend` in
+        // `HttpFrontendConfig::generate_requests`. RFC 6797 §7.2 forbids
+        // HSTS on plaintext HTTP, so an `[hsts]` block on a cert-less
+        // (HTTP-bound) frontend must be rejected at TOML config-load.
+        let frontend = FileClusterFrontendConfig {
+            address: "127.0.0.1:8080".parse().unwrap(),
+            hostname: Some("example.com".to_owned()),
+            alpn: vec![],
+            path: None,
+            path_type: None,
+            method: None,
+            certificate: None,
+            key: None,
+            certificate_chain: None,
+            tls_versions: vec![],
+            position: RulePosition::Tree,
+            tags: None,
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: None,
+            hsts: Some(FileHstsConfig {
+                enabled: Some(true),
+                max_age: Some(31_536_000),
+                include_subdomains: None,
+                preload: None,
+                force_replace_backend: None,
+            }),
+            header_predicates: None,
+        };
+        match frontend.to_http_front("api").unwrap_err() {
+            ConfigError::HstsOnPlainHttp(scope) => {
+                assert!(
+                    scope.contains("api") && scope.contains("example.com"),
+                    "expected scope to mention 'api' and 'example.com', got {scope:?}"
+                );
+            }
+            other => panic!("expected HstsOnPlainHttp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialize() {
+        let http = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        )
+        .with_answer_404_path(Some("404.html"))
+        .to_owned();
+        println!("http: {:?}", to_string(&http));
+
+        let https = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            ListenerProtocol::Https,
+        )
+        .with_answer_404_path(Some("404.html"))
+        .to_owned();
+        println!("https: {:?}", to_string(&https));
+
+        let listeners = vec![http, https];
+        let config = FileConfig {
+            command_socket: Some(String::from("./command_folder/sock")),
+            worker_count: Some(2),
+            worker_automatic_restart: Some(true),
+            max_connections: Some(500),
+            min_buffers: Some(1),
+            max_buffers: Some(500),
+            buffer_size: Some(16393),
+            metrics: Some(MetricsConfig {
+                address: "127.0.0.1:8125".parse().unwrap(),
+                tagged_metrics: false,
+                prefix: Some(String::from("sozu-metrics")),
+                detail: MetricDetailLevel::default(),
+            }),
+            listeners: Some(listeners),
+            ..Default::default()
+        };
+
+        println!("config: {:?}", to_string(&config));
+        let encoded = to_string(&config).unwrap();
+        println!("conf:\n{encoded}");
+    }
+
+    #[test]
+    fn parse() {
+        let path = "assets/config.toml";
+        let config = Config::load_from_path(path).unwrap_or_else(|load_error| {
+            panic!("Cannot load config from path {path}: {load_error:?}")
+        });
+        println!("config: {config:#?}");
+        //panic!();
+    }
+
+    #[test]
+    fn multiple_listeners_preserve_per_address_expect_proxy() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address = "172.16.20.1:80"
+            expect_proxy = true
+
+            [[listeners]]
+            protocol = "http"
+            address = "10.22.0.1:80"
+            expect_proxy = false
+
+            [[listeners]]
+            protocol = "https"
+            address = "192.168.1.1:443"
+            expect_proxy = true
+
+            [[listeners]]
+            protocol = "https"
+            address = "192.168.2.1:443"
+            expect_proxy = false
+        "#;
+
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+
+        let listeners = file_config.listeners.as_ref().expect("No listeners found");
+        assert_eq!(listeners.len(), 4);
+
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("Could not build config");
+
+        assert_eq!(config.http_listeners.len(), 2);
+        assert_eq!(config.https_listeners.len(), 2);
+
+        // HTTP listeners
+        let http_proxy = config
+            .http_listeners
+            .iter()
+            .find(|l| SocketAddr::from(l.address) == "172.16.20.1:80".parse().unwrap())
+            .expect("Listener on 172.16.20.1:80 not found");
+        let http_direct = config
+            .http_listeners
+            .iter()
+            .find(|l| SocketAddr::from(l.address) == "10.22.0.1:80".parse().unwrap())
+            .expect("Listener on 10.22.0.1:80 not found");
+
+        assert!(http_proxy.expect_proxy);
+        assert!(!http_direct.expect_proxy);
+
+        // HTTPS listeners
+        let https_proxy = config
+            .https_listeners
+            .iter()
+            .find(|l| SocketAddr::from(l.address) == "192.168.1.1:443".parse().unwrap())
+            .expect("Listener on 192.168.1.1:443 not found");
+        let https_direct = config
+            .https_listeners
+            .iter()
+            .find(|l| SocketAddr::from(l.address) == "192.168.2.1:443".parse().unwrap())
+            .expect("Listener on 192.168.2.1:443 not found");
+
+        assert!(https_proxy.expect_proxy);
+        assert!(!https_direct.expect_proxy);
+    }
+
+    /// #347: builds the HTTP cluster `cluster` from a TOML backend list.
+    fn http_cluster_from_backends(backends: &str) -> Result<HttpClusterConfig, ConfigError> {
+        let file: FileClusterConfig = toml::from_str(&format!(
+            "protocol = \"http\"\nfrontends = []\nbackends = [{backends}]\n"
+        ))
+        .expect("the cluster must parse");
+        match file.to_cluster_config("cluster", &HashSet::new())? {
+            ClusterConfig::Http(http) => Ok(http),
+            ClusterConfig::Tcp(_) => panic!("an http cluster must build as one"),
+        }
+    }
+
+    /// #347: a `host:port` backend address is resolved when the file is
+    /// loaded, into loopback backends with ids derived from the entry and
+    /// the address, and the same file always yields the same backends.
+    #[test]
+    fn a_backend_hostname_resolves_when_the_file_is_loaded() {
+        let backends = r#"{ address = "localhost:8080", weight = 50 }"#;
+        let http = http_cluster_from_backends(backends).expect("localhost must resolve");
+
+        assert!(
+            !http.backends.is_empty(),
+            "localhost resolves to an address"
+        );
+        let mut ids = HashSet::new();
+        for backend in &http.backends {
+            assert!(backend.address.ip().is_loopback(), "{backend:?}");
+            assert_eq!(backend.address.port(), 8080);
+            assert_eq!(backend.weight, Some(50));
+            assert_eq!(
+                backend.backend_id.as_deref(),
+                Some(format!("cluster-localhost:8080-{}", backend.address).as_str())
+            );
+            assert!(ids.insert(backend.backend_id.clone()), "ids are distinct");
+        }
+        assert_eq!(
+            http_cluster_from_backends(backends)
+                .expect("localhost must resolve")
+                .backends,
+            http.backends,
+            "the same file yields the same backends"
+        );
+
+        let orders = http.generate_requests().expect("the orders must build");
+        let added: Vec<&AddBackend> = orders
+            .iter()
+            .filter_map(|order| match order.request_type.as_ref() {
+                Some(RequestType::AddBackend(add)) => Some(add),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added.len(), http.backends.len());
+        for (add, backend) in added.iter().zip(&http.backends) {
+            assert_eq!(Some(&add.backend_id), backend.backend_id.as_ref());
+            assert_eq!(SocketAddr::from(add.address), backend.address);
+        }
+    }
+
+    /// #347: a socket-address literal never reaches the resolver and keeps
+    /// the positional default id, so existing files load unchanged.
+    #[test]
+    fn a_literal_backend_address_keeps_its_positional_id() {
+        let http = http_cluster_from_backends(
+            r#"{ address = "127.0.0.1:8080" }, { address = "[::1]:8081", backend_id = "six" }"#,
+        )
+        .expect("literals must build");
+        assert_eq!(
+            http.backends,
+            vec![
+                BackendConfig {
+                    address: "127.0.0.1:8080".parse().unwrap(),
+                    weight: None,
+                    sticky_id: None,
+                    backup: None,
+                    backend_id: Some("cluster-0-127.0.0.1:8080".to_owned()),
+                    unix_path: None,
+                },
+                BackendConfig {
+                    address: "[::1]:8081".parse().unwrap(),
+                    weight: None,
+                    sticky_id: None,
+                    backup: None,
+                    backend_id: Some("six".to_owned()),
+                    unix_path: None,
+                },
+            ]
+        );
+    }
+
+    /// #347: a literal keeps the id of its position in the file, whatever
+    /// the number of addresses a name before it resolved to, on the HTTP and
+    /// the TCP path alike. The resolver is injected, so the answer size does
+    /// not depend on the host.
+    #[test]
+    fn a_literal_after_a_name_keeps_its_file_position_id() {
+        let one: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        let two: SocketAddr = "10.0.0.3:8080".parse().unwrap();
+        let answer = |addresses: Vec<SocketAddr>| {
+            move |_: &str| -> std::io::Result<Vec<SocketAddr>> { Ok(addresses.clone()) }
+        };
+
+        for (protocol, addresses) in [
+            ("http", vec![one]),
+            ("http", vec![one, two]),
+            ("tcp", vec![one]),
+            ("tcp", vec![one, two]),
+        ] {
+            let resolver = answer(addresses.clone());
+            let file: FileClusterConfig = toml::from_str(&format!(
+                "protocol = \"{protocol}\"\nfrontends = []\n\
+                 backends = [{{ address = \"name:8080\" }}, {{ address = \"127.0.0.1:9000\" }}]\n"
+            ))
+            .expect("the cluster must parse");
+            let backends = match file
+                .to_cluster_config_with("cluster", &HashSet::new(), Some(&resolver))
+                .expect("the cluster must build")
+            {
+                ClusterConfig::Http(http) => http.backends,
+                ClusterConfig::Tcp(tcp) => tcp.backends,
+            };
+            assert_eq!(backends.len(), addresses.len() + 1, "{protocol}");
+            assert_eq!(
+                backends.last().and_then(|b| b.backend_id.as_deref()),
+                Some("cluster-1-127.0.0.1:9000"),
+                "{protocol} with {} resolved address(es)",
+                addresses.len()
+            );
+        }
+
+        let error = toml::from_str::<FileClusterConfig>(
+            "protocol = \"tcp\"\nfrontends = []\nbackends = [{ address = \"localhost\" }]\n",
+        )
+        .expect("the cluster must parse")
+        .to_cluster_config("cluster", &HashSet::new())
+        .expect_err("a missing port refuses the tcp cluster");
+        assert!(matches!(
+            error,
+            ConfigError::BackendAddressResolution { .. }
+        ));
+    }
+
+    /// #347: digit-and-dot hosts that are not an IP literal are refused
+    /// before the resolver, which would read them as legacy numeric
+    /// shorthand (`010.0.0.1` as `8.0.0.1`, `1.2.3` as `1.2.0.3`).
+    #[test]
+    fn numeric_shorthand_backend_hosts_never_reach_the_resolver() {
+        let shorthand = |_: &str| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec!["8.0.0.1:8080".parse().unwrap()])
+        };
+        for address in [
+            "010.0.0.1:8080",
+            "1.2.3:8080",
+            "2130706433:8080",
+            "0x7f000001:8080",
+            "0x7f.1:8080",
+            "0X7F.0.0.1:8080",
+            "0177.1:8080",
+            "0x7f.0177.1:8080",
+        ] {
+            let entry = FileBackendConfig {
+                address: address.to_owned(),
+                weight: None,
+                sticky_id: None,
+                backup: None,
+                backend_id: None,
+                unix_path: None,
+            };
+            let error = entry
+                .resolve("cluster", 0, &shorthand)
+                .expect_err("numeric shorthand must be refused");
+            let ConfigError::BackendAddressResolution {
+                cluster_id,
+                address: entry_address,
+                ..
+            } = &error
+            else {
+                panic!("{address}: unexpected error {error:?}");
+            };
+            assert_eq!(cluster_id, "cluster");
+            assert_eq!(entry_address, address);
+        }
+    }
+
+    /// #347: an IPv6 literal must be bracketed (`[addr]:port`); the
+    /// unbracketed forms are refused before the resolver, which splits on
+    /// the last colon and would accept them numerically. The bracketed form
+    /// still parses directly.
+    #[test]
+    fn unbracketed_ipv6_backend_hosts_never_reach_the_resolver() {
+        let unreachable = |address: &str| -> std::io::Result<Vec<SocketAddr>> {
+            panic!("{address}: must not reach the resolver")
+        };
+        for address in ["::1:8080", "2001:db8::1:8080", "fe80::1%eth0:80"] {
+            let entry = FileBackendConfig {
+                address: address.to_owned(),
+                weight: None,
+                sticky_id: None,
+                backup: None,
+                backend_id: None,
+                unix_path: None,
+            };
+            let error = entry
+                .resolve("cluster", 0, &unreachable)
+                .expect_err("an unbracketed IPv6 literal must be refused");
+            let ConfigError::BackendAddressResolution {
+                cluster_id,
+                address: entry_address,
+                reason,
+            } = &error
+            else {
+                panic!("{address}: unexpected error {error:?}");
+            };
+            assert_eq!(cluster_id, "cluster");
+            assert_eq!(entry_address, address);
+            assert!(reason.contains("[address]:port"), "{address}: {reason}");
+        }
+
+        let entry = FileBackendConfig {
+            address: "[2001:db8::1]:8080".to_owned(),
+            weight: Some(3),
+            sticky_id: Some("sticky".to_owned()),
+            backup: Some(true),
+            backend_id: None,
+            unix_path: None,
+        };
+        let backends = entry
+            .resolve("cluster", 2, &unreachable)
+            .expect("a bracketed IPv6 literal parses directly");
+        let address: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].address, address);
+        assert_eq!(backends[0].weight, Some(3));
+        assert_eq!(backends[0].sticky_id.as_deref(), Some("sticky"));
+        assert_eq!(backends[0].backup, Some(true));
+        assert_eq!(
+            backends[0].backend_id.as_deref(),
+            Some("cluster-2-[2001:db8::1]:8080")
+        );
+    }
+
+    /// #347: names that merely contain digits or hex-looking labels still
+    /// reach the resolver.
+    #[test]
+    fn benign_backend_hostnames_are_not_numeric_shorthand() {
+        let resolved = "10.0.0.2:8080".parse::<SocketAddr>().unwrap();
+        let resolver = |_: &str| -> std::io::Result<Vec<SocketAddr>> { Ok(vec![resolved]) };
+        for address in [
+            "123.example.com:8080",
+            "dead.beef:8080",
+            "0x.example.com:8080",
+            "1.2.3.example:8080",
+            "localhost:8080",
+        ] {
+            let entry = FileBackendConfig {
+                address: address.to_owned(),
+                weight: None,
+                sticky_id: None,
+                backup: None,
+                backend_id: None,
+                unix_path: None,
+            };
+            let backends = entry
+                .resolve("cluster", 0, &resolver)
+                .unwrap_or_else(|error| panic!("{address}: {error:?}"));
+            assert_eq!(backends.len(), 1, "{address}");
+        }
+        assert!(!is_legacy_numeric_host("dead.beef"));
+        assert!(!is_legacy_numeric_host("1..2"));
+        assert!(is_legacy_numeric_host("0x7f.1"));
+    }
+
+    /// #347: the control commands load the file without resolving backend
+    /// names; the startup and `config check` load still refuses it. `1.2.3`
+    /// is refused before any DNS query, so the test needs no network.
+    #[test]
+    fn a_control_load_does_not_resolve_backend_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "command_socket = \"/tmp/sozu_test.sock\"\n\
+             ctl_command_timeout = 4242\n\
+             [clusters.app]\n\
+             protocol = \"http\"\n\
+             frontends = [{ address = \"127.0.0.1:8080\", hostname = \"example.org\" }]\n\
+             backends = [{ address = \"1.2.3:8080\" }, { address = \"127.0.0.1:9000\" }]\n",
+        )
+        .expect("write config");
+        let path = path.to_str().expect("utf-8 path");
+
+        assert!(matches!(
+            Config::load_from_path(path),
+            Err(ConfigError::BackendAddressResolution { .. })
+        ));
+
+        let config = Config::load_from_path_for_control(path).expect("control load");
+        assert_eq!(config.ctl_command_timeout, 4242);
+        let Some(ClusterConfig::Http(app)) = config.clusters.get("app") else {
+            panic!("the cluster must still be validated and built");
+        };
+        assert_eq!(app.backends.len(), 1, "only the literal is kept");
+    }
+
+    /// #347: an address that is neither a socket address nor a resolvable
+    /// `host:port` refuses the file with an error naming the cluster and the
+    /// entry.
+    #[test]
+    fn an_unresolvable_backend_address_is_a_config_error() {
+        for address in ["localhost", "localhost:notaport"] {
+            let error = http_cluster_from_backends(&format!(r#"{{ address = "{address}" }}"#))
+                .expect_err("the address must not resolve");
+            let ConfigError::BackendAddressResolution {
+                cluster_id,
+                address: entry,
+                ..
+            } = &error
+            else {
+                panic!("{address}: unexpected error {error:?}");
+            };
+            assert_eq!(cluster_id, "cluster");
+            assert_eq!(entry, address);
+            assert!(error.to_string().contains(address), "{error}");
+        }
+    }
+
+    /// #152 + #347: every address a name expands to, and a socket-address
+    /// literal, keeps the entry's `unix_path`.
+    #[test]
+    fn every_expanded_backend_keeps_its_unix_path() {
+        let entry = |address: &str| FileBackendConfig {
+            address: address.to_owned(),
+            weight: None,
+            sticky_id: None,
+            backup: None,
+            backend_id: None,
+            unix_path: Some("/run/app.sock".to_owned()),
+        };
+        let v4: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        let v6: SocketAddr = "[fd00::1]:8080".parse().unwrap();
+        let expanded = entry("ingress:8080")
+            .expand("cluster", vec![v4, v6])
+            .expect("two addresses expand");
+        assert_eq!(expanded.len(), 2);
+        assert!(
+            expanded
+                .iter()
+                .all(|backend| backend.unix_path.as_deref() == Some("/run/app.sock"))
+        );
+
+        let literal = entry("127.0.0.1:8080")
+            .resolve("cluster", 0, &system_resolver)
+            .expect("a literal resolves");
+        assert_eq!(literal[0].unix_path.as_deref(), Some("/run/app.sock"));
+    }
+
+    /// #347: a name resolving to several addresses yields one backend per
+    /// distinct address, sorted, each with a distinct id and, when one is
+    /// configured, a distinct sticky id.
+    #[test]
+    fn a_name_with_several_addresses_expands_into_distinct_backends() {
+        let entry = FileBackendConfig {
+            address: "ingress:8080".to_owned(),
+            weight: None,
+            sticky_id: Some("pinned".to_owned()),
+            backup: Some(true),
+            backend_id: Some("ingress".to_owned()),
+            unix_path: None,
+        };
+        let v4: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        let v6: SocketAddr = "[fd00::1]:8080".parse().unwrap();
+        let backends = entry
+            .expand("cluster", vec![v6, v4, v6])
+            .expect("two addresses expand");
+        assert_eq!(
+            backends,
+            vec![
+                BackendConfig {
+                    address: v4,
+                    weight: None,
+                    sticky_id: Some(format!("pinned-{v4}")),
+                    backup: Some(true),
+                    backend_id: Some(format!("ingress-{v4}")),
+                    unix_path: None,
+                },
+                BackendConfig {
+                    address: v6,
+                    weight: None,
+                    sticky_id: Some(format!("pinned-{v6}")),
+                    backup: Some(true),
+                    backend_id: Some(format!("ingress-{v6}")),
+                    unix_path: None,
+                },
+            ]
+        );
+
+        // The sticky id does not depend on how many addresses came back.
+        let single = entry.expand("cluster", vec![v4]).expect("one address");
+        assert_eq!(single[0].sticky_id, Some(format!("pinned-{v4}")));
+        assert!(matches!(
+            entry.expand("cluster", Vec::new()),
+            Err(ConfigError::BackendAddressResolution { .. })
+        ));
+    }
+
+    /// #524: `affinity_header` travels from the TOML file to the
+    /// `AddCluster` order the workers receive.
+    #[test]
+    fn an_affinity_header_reaches_the_add_cluster_order() {
+        let file: FileClusterConfig = toml::from_str(
+            r#"
+            protocol = "http"
+            load_balancing = "HRW"
+            affinity_header = "X-Tenant"
+            frontends = []
+            backends = []
+            "#,
+        )
+        .expect("the cluster must parse");
+        let ClusterConfig::Http(http) = file
+            .to_cluster_config("keyed", &HashSet::new())
+            .expect("the cluster must build")
+        else {
+            panic!("an http cluster must build as one");
+        };
+        let orders = http.generate_requests().expect("the orders must build");
+        let Some(RequestType::AddCluster(cluster)) =
+            orders.first().and_then(|order| order.request_type.as_ref())
+        else {
+            panic!("the orders must lead with an AddCluster");
+        };
+        assert_eq!(cluster.affinity_header.as_deref(), Some("X-Tenant"));
+        assert_eq!(cluster.affinity_cookie, None);
+    }
+
+    /// #152: a backend's `unix_path` travels from the TOML file to the
+    /// `AddUnixBackend` order, next to the identity `address`; a backend
+    /// without one keeps `AddBackend`.
+    #[test]
+    fn a_unix_path_backend_reaches_the_add_unix_backend_order() {
+        let file: FileClusterConfig = toml::from_str(
+            r#"
+            protocol = "http"
+            frontends = []
+            backends = [
+                { address = "127.0.0.1:1", unix_path = "/run/app.sock" },
+                { address = "127.0.0.1:2" },
+            ]
+            "#,
+        )
+        .expect("the cluster must parse");
+        let ClusterConfig::Http(http) = file
+            .to_cluster_config("app", &HashSet::new())
+            .expect("the cluster must build")
+        else {
+            panic!("an http cluster must build as one");
+        };
+        let unix_paths: Vec<_> = http
+            .generate_requests()
+            .expect("the orders must build")
+            .into_iter()
+            .filter_map(|order| match order.request_type {
+                Some(RequestType::AddUnixBackend(backend)) => {
+                    Some(("AddUnixBackend", backend.unix_path))
+                }
+                Some(RequestType::AddBackend(backend)) => Some(("AddBackend", backend.unix_path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unix_paths,
+            vec![
+                ("AddUnixBackend", Some("/run/app.sock".to_owned())),
+                ("AddBackend", None)
+            ]
+        );
+    }
+
+    /// #152: sozu tells backends apart by address, so a unix backend's
+    /// identity address may not be shared with another backend.
+    #[test]
+    fn a_unix_path_backend_needs_a_unique_address() {
+        for protocol in ["http", "tcp"] {
+            let file: FileClusterConfig = toml::from_str(&format!(
+                "protocol = \"{protocol}\"\nfrontends = []\nbackends = [\n\
+                 {{ address = \"127.0.0.1:1\", unix_path = \"/run/a.sock\" }},\n\
+                 {{ address = \"127.0.0.1:1\", unix_path = \"/run/b.sock\" }},\n]\n"
+            ))
+            .expect("the cluster must parse");
+            assert!(
+                matches!(
+                    file.to_cluster_config("app", &HashSet::new()),
+                    Err(ConfigError::InvalidBackendUnixPath { .. })
+                ),
+                "a {protocol} cluster must refuse a shared unix backend address"
+            );
+        }
+    }
+
+    /// A probe `port` targets a backend IP and a `unix_path` backend has none:
+    /// the file refuses the pair, whichever protocol, whether the entry is a
+    /// literal or a name DNS expands, and whether or not a resolver runs.
+    #[test]
+    fn a_health_check_port_and_a_unix_path_backend_never_share_a_file_cluster() {
+        let resolver = |_: &str| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec!["10.0.0.2:8080".parse().unwrap()])
+        };
+        for protocol in ["http", "tcp"] {
+            for address in ["127.0.0.1:1", "ingress:8080"] {
+                let build = |health_check: &str, resolver: Option<&BackendResolver<'_>>| {
+                    toml::from_str::<FileClusterConfig>(&format!(
+                        "protocol = \"{protocol}\"\nfrontends = []\nbackends = [\n\
+                         {{ address = \"{address}\", unix_path = \"/run/app.sock\" }},\n]\n\
+                         [health_check]\n{health_check}"
+                    ))
+                    .expect("the cluster must parse")
+                    .to_cluster_config_with("app", &HashSet::new(), resolver)
+                };
+                for resolver in [Some(&resolver as &BackendResolver<'_>), None] {
+                    let error = build("mode = \"TCP\"\nport = 8081\n", resolver)
+                        .expect_err("a probe port next to a unix backend must be refused");
+                    assert!(
+                        matches!(
+                            &error,
+                            ConfigError::InvalidHealthCheck { cluster_id, reason }
+                                if cluster_id == "app" && *reason == HEALTH_CHECK_PORT_UNIX_REFUSED
+                        ),
+                        "{protocol} {address}: unexpected {error:?}"
+                    );
+                    build("mode = \"TCP\"\n", resolver)
+                        .expect("a unix backend without a probe port stays valid");
+                }
+            }
+        }
+    }
+
+    /// #152: what `parse_backend_unix_path` accepts and refuses.
+    #[test]
+    fn parse_backend_unix_path_accepts_absolute_and_abstract_names_only() {
+        let path = parse_backend_unix_path("/run/app.sock").expect("an absolute path parses");
+        assert_eq!(
+            path.as_pathname(),
+            Some(std::path::Path::new("/run/app.sock"))
+        );
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            let named = parse_backend_unix_path("@app").expect("an abstract name parses");
+            assert_eq!(named.as_abstract_name(), Some(&b"app"[..]));
+            assert_eq!(named.as_pathname(), None);
+        }
+        let too_long = format!("/{}", "a".repeat(200));
+        for refused in ["", "run/app.sock", "@", "/run/a\0b", too_long.as_str()] {
+            assert!(
+                parse_backend_unix_path(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+    }
+
+    /// #1253: `header_predicates` travel from the TOML file to the
+    /// `AddHttpFrontend` order, `match` parsed case-insensitively.
+    #[test]
+    fn header_predicates_reach_the_add_http_frontend_order() {
+        let file: FileClusterConfig = toml::from_str(
+            r#"
+            protocol = "http"
+            frontends = [
+              { address = "0.0.0.0:80", hostname = "api.example.com", header_predicates = [
+                { name = "X-Canary", match = "EXACT", value = "always" },
+                { name = "X-Region", match = "regex", value = "eu-.*" },
+                { name = "X-Beta", match = "present" },
+              ] },
+            ]
+            backends = []
+            "#,
+        )
+        .expect("the cluster must parse");
+        let ClusterConfig::Http(http) = file
+            .to_cluster_config("canary", &HashSet::new())
+            .expect("the cluster must build")
+        else {
+            panic!("an http cluster must build as one");
+        };
+        let orders = http.generate_requests().expect("the orders must build");
+        let front = orders
+            .iter()
+            .find_map(|order| match order.request_type.as_ref() {
+                Some(RequestType::AddHttpFrontendWithHeaderPredicates(front)) => Some(front),
+                _ => None,
+            })
+            .expect("the orders must add the frontend");
+        let predicate = |name: &str, kind: HeaderMatchKind, value: Option<&str>| HeaderPredicate {
+            name: name.to_owned(),
+            kind: kind as i32,
+            value: value.map(str::to_owned),
+        };
+        assert_eq!(
+            front.header_predicates,
+            vec![
+                predicate("X-Canary", HeaderMatchKind::Exact, Some("always")),
+                predicate("X-Region", HeaderMatchKind::Regex, Some("eu-.*")),
+                predicate("X-Beta", HeaderMatchKind::Present, None),
+            ]
+        );
+    }
+
+    /// #1253: a predicate no request could satisfy is refused at config
+    /// load with its index, never left to silently match nothing.
+    #[test]
+    fn unusable_header_predicates_are_refused_at_config_load() {
+        for entry in [
+            r#"{ name = "X-Canary", match = "equals", value = "1" }"#,
+            r#"{ name = "Host", match = "exact", value = "example.com" }"#,
+            r#"{ name = "Cookie", match = "present" }"#,
+            r#"{ name = "X-Canary", match = "present", value = "1" }"#,
+            r#"{ name = "X-Canary", match = "exact" }"#,
+            r#"{ name = "X Canary", match = "present" }"#,
+        ] {
+            let file: FileClusterConfig = toml::from_str(&format!(
+                r#"
+                protocol = "http"
+                frontends = [
+                  {{ address = "0.0.0.0:80", hostname = "api.example.com", header_predicates = [
+                    {{ name = "X-Valid", match = "present" }},
+                    {entry},
+                  ] }},
+                ]
+                backends = []
+                "#
+            ))
+            .expect("the cluster must parse");
+            match file.to_cluster_config("canary", &HashSet::new()) {
+                Err(ConfigError::InvalidHeaderPredicate { index: 1, .. }) => {}
+                other => panic!("{entry}: expected InvalidHeaderPredicate at 1, got {other:?}"),
+            }
+        }
+    }
+
+    /// #524: a TCP cluster has no request to read a header or a cookie
+    /// from, so declaring one is refused rather than silently ignored.
+    #[test]
+    fn a_tcp_cluster_refuses_an_affinity_header_or_cookie() {
+        for key in [
+            "affinity_header = \"X-Tenant\"",
+            "affinity_cookie = \"tenant\"",
+        ] {
+            let file: FileClusterConfig = toml::from_str(&format!(
+                "protocol = \"tcp\"\nload_balancing = \"MAGLEV\"\n{key}\nfrontends = []\nbackends = []\n"
+            ))
+            .expect("the cluster must parse");
+            assert!(
+                matches!(
+                    file.to_cluster_config("keyed", &HashSet::new()),
+                    Err(ConfigError::InvalidAffinityKey { .. })
+                ),
+                "a TCP cluster must refuse `{key}`"
+            );
+        }
+    }
+
+    /// #524: at most one key source, and a name a request can carry.
+    #[test]
+    fn validate_affinity_key_accepts_one_token_and_refuses_the_rest() {
+        assert!(validate_affinity_key(None, None).is_ok());
+        assert!(validate_affinity_key(Some("X-Tenant"), None).is_ok());
+        assert!(validate_affinity_key(None, Some("tenant_id")).is_ok());
+        assert!(validate_affinity_key(Some("X-Tenant"), Some("tenant")).is_err());
+        for unreachable in ["Host", "host", "HOST", "Cookie", "cookie"] {
+            assert!(
+                validate_affinity_key(Some(unreachable), None).is_err(),
+                "header {unreachable:?} can never be found and must be refused"
+            );
+        }
+        // A cookie merely NAMED like those headers is an ordinary cookie.
+        assert!(validate_affinity_key(None, Some("host")).is_ok());
+        for bad in ["", "X Tenant", "X-Tenant:", "tenant\r\n", "t=1"] {
+            assert!(
+                validate_affinity_key(Some(bad), None).is_err(),
+                "header {bad:?} must be refused"
+            );
+            assert!(
+                validate_affinity_key(None, Some(bad)).is_err(),
+                "cookie {bad:?} must be refused"
+            );
+        }
+    }
+
+    /// #524: shard knobs travel from the TOML file to the `AddCluster`
+    /// order, and an invalid combination is refused at load.
+    #[test]
+    fn shuffle_sharding_reaches_the_add_cluster_order_and_is_validated() {
+        let parse = |extra: &str| -> FileClusterConfig {
+            toml::from_str(&format!(
+                "protocol = \"http\"\nfrontends = []\nbackends = []\n{extra}"
+            ))
+            .expect("the cluster must parse")
+        };
+        let ClusterConfig::Http(http) =
+            parse("shard_percent = 25\nshard_min_backends = 4\nshard_mode = \"STRICT\"\n")
+                .to_cluster_config("sharded", &HashSet::new())
+                .expect("a valid sharded cluster builds")
+        else {
+            panic!("an http cluster must build as one");
+        };
+        let orders = http.generate_requests().expect("the orders must build");
+        let Some(RequestType::AddCluster(cluster)) =
+            orders.first().and_then(|order| order.request_type.as_ref())
+        else {
+            panic!("the orders must lead with an AddCluster");
+        };
+        assert_eq!(
+            (
+                cluster.shard_percent,
+                cluster.shard_min_backends,
+                cluster.shard_mode
+            ),
+            (Some(25), Some(4), Some(ShardMode::Strict as i32))
+        );
+        for bad in [
+            "shard_percent = 0\n",
+            "shard_percent = 101\n",
+            "shard_percent = 25\nshard_min_backends = 1\n",
+            "shard_min_backends = 8\n",
+            "shard_mode = \"STRICT\"\n",
+        ] {
+            assert!(
+                matches!(
+                    parse(bad).to_cluster_config("sharded", &HashSet::new()),
+                    Err(ConfigError::InvalidShuffleSharding { .. })
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// #1801: `accepted_statuses` entries parse to inclusive ranges, and
+    /// everything outside the documented syntax or `100..=599` is refused.
+    #[test]
+    fn http_status_range_parses_codes_ranges_classes_and_any() {
+        let range = |start, end| HttpStatusRange { start, end };
+        for (spec, expected) in [
+            ("404", range(404, 404)),
+            ("200-399", range(200, 399)),
+            (" 200 - 399 ", range(200, 399)),
+            ("2xx", range(200, 299)),
+            ("5XX", range(500, 599)),
+            ("any", range(100, 599)),
+            ("ANY", range(100, 599)),
+            ("100-599", range(100, 599)),
+        ] {
+            assert_eq!(parse_http_status_range(spec), Ok(expected), "{spec:?}");
+        }
+        for spec in [
+            "", "abc", "99", "600", "0", "6xx", "0xx", "2x", "2xxx", "399-200", "200-", "-200",
+            "+200", "200-600", "1-2-3", "2xx-3xx",
+        ] {
+            assert!(
+                parse_http_status_range(spec).is_err(),
+                "{spec:?} must be refused"
+            );
+        }
+    }
+
+    /// #1801: the rendering used by `sozu cluster health-check list` parses
+    /// back to the same range.
+    #[test]
+    fn http_status_range_display_round_trips_through_the_parser() {
+        for spec in ["404", "200-399", "2xx", "any", "101-102"] {
+            let range = parse_http_status_range(spec).unwrap();
+            assert_eq!(range.to_string(), spec);
+            assert_eq!(parse_http_status_range(&range.to_string()), Ok(range));
+        }
+    }
+
+    /// #1801: validation of the probe mode, the TCP-mode URI exemption, the
+    /// range bounds and the `expected_status` / `accepted_statuses`
+    /// exclusion — the rules shared by the CLI, the TOML loader, the master
+    /// state and the worker.
+    #[test]
+    fn health_check_validation_covers_mode_uri_and_accepted_statuses() {
+        let http = HealthCheckConfig {
+            uri: "/health".to_owned(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            expected_status: 0,
+            mode: HealthCheckMode::Http as i32,
+            accepted_statuses: Vec::new(),
+            port: None,
+            headers: Vec::new(),
+        };
+        assert_eq!(validate_health_check_config(&http), Ok(()));
+
+        // TCP mode ignores the URI, so an empty one is fine; HTTP mode is not.
+        let tcp_no_uri = HealthCheckConfig {
+            uri: String::new(),
+            mode: HealthCheckMode::Tcp as i32,
+            ..http.clone()
+        };
+        assert_eq!(validate_health_check_config(&tcp_no_uri), Ok(()));
+        let http_no_uri = HealthCheckConfig {
+            uri: String::new(),
+            ..http.clone()
+        };
+        assert!(validate_health_check_config(&http_no_uri).is_err());
+        // Control bytes are refused in every mode.
+        let tcp_crlf = HealthCheckConfig {
+            uri: "/a\r\nGET /b".to_owned(),
+            ..tcp_no_uri.clone()
+        };
+        assert!(validate_health_check_config(&tcp_crlf).is_err());
+
+        // TCP mode judges no status, so status fields beside it are refused.
+        let tcp_expected = HealthCheckConfig {
+            expected_status: 200,
+            ..tcp_no_uri.clone()
+        };
+        assert!(validate_health_check_config(&tcp_expected).is_err());
+        let tcp_accepted = HealthCheckConfig {
+            accepted_statuses: vec![HttpStatusRange {
+                start: 100,
+                end: 599,
+            }],
+            ..tcp_no_uri.clone()
+        };
+        assert!(validate_health_check_config(&tcp_accepted).is_err());
+
+        let unknown_mode = HealthCheckConfig {
+            mode: 7,
+            ..http.clone()
+        };
+        assert!(validate_health_check_config(&unknown_mode).is_err());
+
+        let accepted = HealthCheckConfig {
+            accepted_statuses: vec![HttpStatusRange {
+                start: 200,
+                end: 499,
+            }],
+            ..http.clone()
+        };
+        assert_eq!(validate_health_check_config(&accepted), Ok(()));
+        let both = HealthCheckConfig {
+            expected_status: 200,
+            ..accepted.clone()
+        };
+        assert!(
+            validate_health_check_config(&both).is_err(),
+            "expected_status and accepted_statuses must not both be set"
+        );
+        for (start, end) in [(99, 200), (200, 600), (300, 200)] {
+            let bad_range = HealthCheckConfig {
+                accepted_statuses: vec![HttpStatusRange { start, end }],
+                ..http.clone()
+            };
+            assert!(
+                validate_health_check_config(&bad_range).is_err(),
+                "{start}-{end} must be refused"
+            );
+        }
+    }
+
+    /// #1801: the TOML block defaults to HTTP mode on `/`, accepts
+    /// `mode = "TCP"` without a `uri`, carries `accepted_statuses` to the
+    /// `AddCluster` order, and refuses a bad block at load.
+    #[test]
+    fn health_check_toml_mode_and_accepted_statuses_reach_the_add_cluster_order() {
+        let parse = |block: &str| -> FileClusterConfig {
+            toml::from_str(&format!(
+                "protocol = \"http\"\nfrontends = []\nbackends = []\n[health_check]\n{block}"
+            ))
+            .expect("the cluster must parse")
+        };
+        let health_check = |block: &str| -> HealthCheckConfig {
+            let ClusterConfig::Http(http) = parse(block)
+                .to_cluster_config("checked", &HashSet::new())
+                .expect("a valid health check builds")
+            else {
+                panic!("an http cluster must build as one");
+            };
+            let orders = http.generate_requests().expect("the orders must build");
+            let Some(RequestType::AddCluster(cluster)) =
+                orders.first().and_then(|order| order.request_type.as_ref())
+            else {
+                panic!("the orders must lead with an AddCluster");
+            };
+            cluster
+                .health_check
+                .clone()
+                .expect("the health check must travel")
+        };
+
+        // A legacy block keeps its meaning: HTTP mode, no list.
+        let legacy = health_check("uri = \"/health\"\nexpected_status = 204\n");
+        assert_eq!(legacy.mode, HealthCheckMode::Http as i32);
+        assert_eq!(
+            (legacy.uri.as_str(), legacy.expected_status),
+            ("/health", 204)
+        );
+        assert!(legacy.accepted_statuses.is_empty());
+
+        let defaulted = health_check("");
+        assert_eq!(defaulted.mode, HealthCheckMode::Http as i32);
+        assert_eq!(defaulted.uri, "/");
+
+        let tcp = health_check("mode = \"TCP\"\n");
+        assert_eq!(tcp.mode, HealthCheckMode::Tcp as i32);
+
+        let accepted = health_check("uri = \"/livez\"\naccepted_statuses = [\"2xx\", \"404\"]\n");
+        assert_eq!(
+            accepted.accepted_statuses,
+            vec![
+                HttpStatusRange {
+                    start: 200,
+                    end: 299
+                },
+                HttpStatusRange {
+                    start: 404,
+                    end: 404
+                },
+            ]
+        );
+
+        for bad in [
+            "accepted_statuses = [\"6xx\"]\n",
+            "expected_status = 200\naccepted_statuses = [\"any\"]\n",
+            "uri = \"health\"\n",
+            "mode = \"TCP\"\nexpected_status = 200\n",
+            "mode = \"TCP\"\naccepted_statuses = [\"any\"]\n",
+        ] {
+            assert!(
+                matches!(
+                    parse(bad).to_cluster_config("checked", &HashSet::new()),
+                    Err(ConfigError::InvalidHealthCheck { .. })
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// The probe `port` is optional; when set it must be a non-zero 16-bit
+    /// port, in either mode.
+    #[test]
+    fn health_check_validation_bounds_the_probe_port() {
+        for mode in [HealthCheckMode::Http, HealthCheckMode::Tcp] {
+            let config = |port: Option<u32>| HealthCheckConfig {
+                uri: "/health".to_owned(),
+                interval: 10,
+                timeout: 5,
+                healthy_threshold: 3,
+                unhealthy_threshold: 3,
+                mode: mode as i32,
+                port,
+                ..Default::default()
+            };
+            for port in [None, Some(1), Some(8080), Some(65535)] {
+                assert_eq!(
+                    validate_health_check_config(&config(port)),
+                    Ok(()),
+                    "{mode:?} probe port {port:?} must be accepted"
+                );
+            }
+            for port in [0, 65536, u32::MAX] {
+                assert_eq!(
+                    validate_health_check_config(&config(Some(port))),
+                    Err("health check port must lie in 1..=65535"),
+                    "{mode:?} probe port {port} must be refused"
+                );
+            }
+        }
+    }
+
+    /// The TOML `port` reaches the `AddCluster` order, an absent one stays
+    /// unset, and an out-of-range one is refused at load.
+    #[test]
+    fn health_check_toml_port_reaches_the_add_cluster_order() {
+        let build = |block: &str| {
+            toml::from_str::<FileClusterConfig>(&format!(
+                "protocol = \"tcp\"\nfrontends = []\nbackends = []\n[health_check]\n{block}"
+            ))
+            .expect("the cluster must parse")
+            .to_cluster_config("checked", &HashSet::new())
+        };
+        let port = |block: &str| -> Option<u32> {
+            let Ok(ClusterConfig::Tcp(tcp)) = build(block) else {
+                panic!("a tcp cluster with a valid health check must build as one");
+            };
+            tcp.health_check.expect("the health check must travel").port
+        };
+
+        assert_eq!(port("mode = \"TCP\"\n"), None);
+        assert_eq!(port("mode = \"TCP\"\nport = 8081\n"), Some(8081));
+        assert_eq!(port("uri = \"/health\"\nport = 65535\n"), Some(65535));
+        for bad in ["port = 0\n", "port = 65536\n"] {
+            assert!(
+                matches!(build(bad), Err(ConfigError::InvalidHealthCheck { .. })),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// A valid HTTP health check carrying `headers`, for the header tests.
+    fn health_check_with_headers(headers: &[(&str, &str)]) -> HealthCheckConfig {
+        HealthCheckConfig {
+            uri: "/".to_owned(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            expected_status: 0,
+            mode: HealthCheckMode::Http as i32,
+            accepted_statuses: Vec::new(),
+            port: None,
+            headers: headers
+                .iter()
+                .map(|(name, _)| HealthCheckHeader {
+                    name: (*name).to_owned(),
+                    fingerprint: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Names, then values, through both validators a protected order meets.
+    fn check_headers(headers: &[(&str, &str)]) -> Result<(), &'static str> {
+        let config = health_check_with_headers(headers);
+        validate_health_check_config(&config)?;
+        let values: Vec<HealthCheckHeaderValue> = headers
+            .iter()
+            .map(|(name, value)| HealthCheckHeaderValue {
+                name: (*name).to_owned(),
+                value: value.as_bytes().to_vec(),
+            })
+            .collect();
+        validate_health_check_header_values(&config, &values)
+    }
+
+    /// RFC 9113 §8.2.1: a field value must not begin or end with SP or HTAB.
+    /// Direct protobuf and TOML values keep their exact bytes, so a value
+    /// that would need trimming is refused rather than silently changed; an
+    /// empty value and inner whitespace stay valid.
+    #[test]
+    fn health_check_header_value_refuses_leading_and_trailing_ows() {
+        for value in [" v", "v ", "\tv", "v\t", " ", "\t", " v ", "a b \t"] {
+            assert_eq!(
+                check_headers(&[("x-a", value)]),
+                Err("health check header value must not begin or end with a space or a tab"),
+                "{value:?} must be refused"
+            );
+        }
+        for value in ["", "v", "a b", "a\tb", "é ü", "\u{a0}v"] {
+            assert_eq!(
+                check_headers(&[("x-a", value)]),
+                Ok(()),
+                "{value:?} must be accepted"
+            );
+        }
+    }
+
+    /// Every refusal class of the custom health-check headers, and the edge
+    /// each bound accepts.
+    #[test]
+    fn health_check_header_validation_covers_every_class() {
+        let refused = |headers: &[(&str, &str)], reason: &str| {
+            assert_eq!(
+                check_headers(headers),
+                Err(reason),
+                "{headers:?} must be refused"
+            );
+        };
+
+        // Accepted shapes: ordered, mixed case, empty value, tab inside,
+        // obs-text (valid UTF-8 above 0x7F).
+        assert_eq!(
+            check_headers(&[
+                ("Authorization", "Bearer t"),
+                ("X-Empty", ""),
+                ("x-tab", "a\tb"),
+                ("x-utf8", "caf\u{e9} \u{1F600}"),
+            ]),
+            Ok(())
+        );
+
+        // TCP mode sends no request.
+        let mut tcp = health_check_with_headers(&[("x-a", "1")]);
+        tcp.mode = HealthCheckMode::Tcp as i32;
+        assert_eq!(
+            validate_health_check_config(&tcp),
+            Err("health check headers apply to HTTP mode only: leave them unset with mode TCP")
+        );
+
+        // Count: 32 pass, 33 do not.
+        let names: Vec<String> = (0..33).map(|i| format!("x-{i}")).collect();
+        let many = |count: usize| -> Vec<(&str, &str)> {
+            names[..count].iter().map(|n| (n.as_str(), "v")).collect()
+        };
+        assert_eq!(check_headers(&many(32)), Ok(()));
+        refused(&many(33), "health check carries more than 32 headers");
+
+        // Reserved names, whatever the case, and pseudo-header names.
+        for name in [
+            ":authority",
+            ":x",
+            "Host",
+            "HOST",
+            "connection",
+            "Keep-Alive",
+            "proxy-connection",
+            "Transfer-Encoding",
+            "content-length",
+            "TE",
+            "trailer",
+            "upgrade",
+            "Expect",
+        ] {
+            refused(
+                &[(name, "v")],
+                "health check header name is reserved for the probe or its framing",
+            );
+        }
+
+        // Names that are not an RFC 9110 token.
+        for name in [
+            "",
+            " x",
+            "x ",
+            "a b",
+            "a:b",
+            "caf\u{e9}",
+            "a\r",
+            "a\"b",
+            "a(b",
+        ] {
+            refused(
+                &[(name, "v")],
+                "health check header name must be a non-empty RFC 9110 token",
+            );
+        }
+
+        // Control bytes: CR, LF, NUL, other C0 except HTAB, DEL.
+        for value in [
+            "a\rb", "a\nb", "a\0b", "a\x01b", "a\x08b", "a\x0bb", "a\x1fb", "a\x7fb",
+        ] {
+            refused(
+                &[("x-a", value)],
+                "health check header value must not contain control bytes",
+            );
+        }
+
+        // Duplicate names compare case-insensitively.
+        refused(
+            &[("X-Token", "1"), ("x-token", "2")],
+            "health check header names must be unique, compared case-insensitively",
+        );
+
+        // The 8192-byte wire sum is name + value + 4 per header.
+        let value_fits = "v".repeat(8192 - 1 - 4);
+        assert_eq!(check_headers(&[("x", &value_fits)]), Ok(()));
+        let value_over = "v".repeat(8192 - 1 - 4 + 1);
+        refused(
+            &[("x", &value_over)],
+            "health check headers exceed 8192 bytes (name + value + 4 per header)",
+        );
+
+        // The HTTP/2 block bound counts the URI as well: the URI alone, or the
+        // headers alone, pass; together they may exceed one HEADERS frame.
+        let mut long_uri = health_check_with_headers(&[]);
+        long_uri.uri = format!("/{}", "a".repeat(9000));
+        assert_eq!(validate_health_check_config(&long_uri), Ok(()));
+        long_uri.headers = vec![HealthCheckHeader {
+            name: "x".to_owned(),
+            fingerprint: String::new(),
+        }];
+        assert_eq!(validate_health_check_config(&long_uri), Ok(()));
+        let carrier = HealthCheckHeaderValue {
+            name: "x".to_owned(),
+            value: "v".repeat(8000).into_bytes(),
+        };
+        assert_eq!(
+            validate_health_check_header_values(&long_uri, &[carrier]),
+            Err("health check URI and headers may exceed the 16384-byte HTTP/2 probe block")
+        );
+
+        // A value that does not follow its header's name, count or order is
+        // refused, and so is one that is not UTF-8, without echoing either.
+        let one = health_check_with_headers(&[("x-a", ""), ("x-b", "")]);
+        let carrier = |name: &str, value: &[u8]| HealthCheckHeaderValue {
+            name: name.to_owned(),
+            value: value.to_vec(),
+        };
+        assert_eq!(
+            validate_health_check_header_values(&one, &[carrier("x-a", b"1")]),
+            Err("health check carries a header value count different from its header count")
+        );
+        assert_eq!(
+            validate_health_check_header_values(
+                &one,
+                &[carrier("x-b", b"1"), carrier("x-a", b"2")]
+            ),
+            Err("health check header values must follow the order and names of the headers")
+        );
+        assert_eq!(
+            validate_health_check_header_values(
+                &one,
+                &[carrier("x-a", b"1"), carrier("x-b", &[0xff])]
+            ),
+            Err("health check header value must be valid UTF-8")
+        );
+        // A fingerprint that is not one is no metadata.
+        let mut spoofed = health_check_with_headers(&[("x-a", "")]);
+        spoofed.headers[0].fingerprint = "not a fingerprint".to_owned();
+        assert_eq!(
+            validate_health_check_config(&spoofed),
+            Err("health check header fingerprint is malformed")
+        );
+    }
+
+    /// An older state record or peer carries no `headers`: it loads as an empty
+    /// list. A list survives JSON (state file) and protobuf (command socket)
+    /// round trips with its order and exact bytes.
+    #[test]
+    fn health_check_headers_default_empty_and_round_trip_in_order() {
+        use prost::Message;
+
+        let config = health_check_with_headers(&[
+            ("Z-Last-Alphabetically", "1"),
+            ("authorization", "Bearer \u{e9}\tx"),
+            ("A-First-Alphabetically", ""),
+        ]);
+
+        // JSON without the key.
+        let mut value = serde_json::to_value(&config).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("an object")
+            .remove("headers")
+            .expect("the key is serialized");
+        let legacy: HealthCheckConfig = serde_json::from_value(value).expect("legacy record loads");
+        assert!(legacy.headers.is_empty());
+
+        // JSON round trip.
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: HealthCheckConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, config);
+        assert_eq!(
+            back.headers
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Z-Last-Alphabetically",
+                "authorization",
+                "A-First-Alphabetically"
+            ]
+        );
+
+        // Protobuf: a message without field 10 decodes to an empty list, and
+        // the list round-trips in order.
+        let headerless = HealthCheckConfig {
+            headers: Vec::new(),
+            ..config.clone()
+        };
+        let decoded =
+            HealthCheckConfig::decode(headerless.encode_to_vec().as_slice()).expect("decodes");
+        assert!(decoded.headers.is_empty());
+        let decoded =
+            HealthCheckConfig::decode(config.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(decoded, config);
+    }
+
+    /// `[[clusters.<id>.health_check.headers]]` keeps array order down to the
+    /// metadata and the `value_file` references, is held to the name
+    /// validator, and is refused where it would become a bare `AddCluster`
+    /// name with no value.
+    ///
+    /// Contract change: this test used to give each header a literal `value`
+    /// and read the clear values back from `to_protected_parts`, whose exact
+    /// bytes and OWS rules it checked here. A configuration now holds no value,
+    /// only a `value_file` reference that is stored unread, so the order, the
+    /// empty fingerprints, the bare-conversion refusal, the name and mode
+    /// refusals and the unknown-key refusal are asserted on `to_parts`; the
+    /// byte-exact value rules stay covered by `check_headers` and move to the
+    /// moment the file is read.
+    #[test]
+    fn health_check_toml_headers_split_into_metadata_and_ordered_references() {
+        let parse = |block: &str| {
+            toml::from_str::<FileHealthCheckConfig>(&format!("uri = \"/health\"\n{block}"))
+                .expect("the table parses")
+        };
+
+        let file = parse(
+            "[[headers]]\nname = \"Z-Second\"\nvalue_file = \"/missing/z\"\n\
+             [[headers]]\nname = \"Authorization\"\nvalue_file = \"rel/a\"\n\
+             [[headers]]\nname = \"X-Empty\"\nvalue_file = \"/missing/e\"\n",
+        );
+        let (config, files) = file.to_parts().expect("a valid list builds");
+        assert_eq!(
+            config
+                .headers
+                .iter()
+                .map(|h| (h.name.as_str(), h.fingerprint.as_str()))
+                .collect::<Vec<_>>(),
+            [("Z-Second", ""), ("Authorization", ""), ("X-Empty", "")],
+            "metadata names the headers and carries no value or fingerprint"
+        );
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| (f.name.as_str(), f.value_file.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Z-Second", "/missing/z"),
+                ("Authorization", "rel/a"),
+                ("X-Empty", "/missing/e")
+            ]
+        );
+        // The bare conversion would leave names no probe could fill in.
+        assert_eq!(
+            file.to_proto(),
+            Err(
+                "health check headers from the configuration file are not available yet: their values need the protected channel"
+            )
+        );
+
+        // No `headers` key: the bare conversion still works.
+        let bare = parse("");
+        assert!(bare.to_proto().expect("builds").headers.is_empty());
+        assert!(bare.to_parts().expect("builds").1.is_empty());
+
+        // Refusals: TCP mode, reserved name, duplicate name.
+        for bad in [
+            "mode = \"TCP\"\n[[headers]]\nname = \"x\"\nvalue_file = \"/v\"\n",
+            "[[headers]]\nname = \"Host\"\nvalue_file = \"/v\"\n",
+            "[[headers]]\nname = \"x\"\nvalue_file = \"/v\"\n\
+             [[headers]]\nname = \"X\"\nvalue_file = \"/w\"\n",
+        ] {
+            assert!(parse(bad).to_parts().is_err(), "{bad:?} must be refused");
+        }
+        // An unknown table key is a parse error.
+        assert!(
+            toml::from_str::<FileHealthCheckConfig>(
+                "uri = \"/\"\n[[headers]]\nname = \"x\"\nvalue_file = \"/v\"\nextra = 1\n"
+            )
+            .is_err()
+        );
+    }
+
+    /// Marker planted in every value the protected-header tests must never
+    /// see echoed back, and in the reference path that Debug must redact.
+    const HEADER_SENTINEL: &str = "SENTINEL-HEADER-VALUE-7f3a91";
+    const REF_SENTINEL: &str = "sentinel-ref-dir-9c1e42";
+
+    /// A file cluster of `protocol` whose health check carries `headers`
+    /// as `(name, value_file)` pairs, in order.
+    fn value_file_cluster(protocol: &str, headers: &[(&str, &str)]) -> FileClusterConfig {
+        let tables: String = headers
+            .iter()
+            .map(|(name, path)| {
+                format!("[[health_check.headers]]\nname = \"{name}\"\nvalue_file = \"{path}\"\n")
+            })
+            .collect();
+        toml::from_str(&format!(
+            "protocol = \"{protocol}\"\nfrontends = []\nbackends = []\n\
+             [health_check]\nuri = \"/health\"\n{tables}"
+        ))
+        .expect("a value_file reference parses")
+    }
+
+    /// The JSON view of a built cluster, for asserting on serialized
+    /// field names and order.
+    fn cluster_json(cluster: &ClusterConfig) -> serde_json::Value {
+        match cluster {
+            ClusterConfig::Http(http) => serde_json::to_value(http),
+            ClusterConfig::Tcp(tcp) => serde_json::to_value(tcp),
+        }
+        .expect("a cluster serializes")
+    }
+
+    /// `value_file` is a reference: it is kept unchanged and in order, never
+    /// opened (the paths below cannot exist), and reaches both cluster kinds
+    /// next to the name-only metadata, through a `Config` serde round trip.
+    #[test]
+    fn health_check_value_file_is_kept_unopened_in_order_for_http_and_tcp() {
+        let missing_a = format!("/{REF_SENTINEL}/missing/a.secret");
+        let missing_b = format!("relative/../{REF_SENTINEL}/b.secret");
+        let headers = [
+            ("Z-Second", missing_a.as_str()),
+            ("Authorization", &missing_b),
+        ];
+
+        for protocol in ["http", "tcp"] {
+            let file = value_file_cluster(protocol, &headers);
+            let cluster = file
+                .to_cluster_config("checked", &HashSet::new())
+                .expect("a reference to a missing file builds: nothing opens it");
+            let json = cluster_json(&cluster);
+
+            let metadata: Vec<(&str, &str)> = json["health_check"]["headers"]
+                .as_array()
+                .expect("the metadata lists the headers")
+                .iter()
+                .map(|h| {
+                    (
+                        h["name"].as_str().expect("a name"),
+                        h["fingerprint"].as_str().expect("a fingerprint"),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                metadata,
+                [("Z-Second", ""), ("Authorization", "")],
+                "{protocol}: ordered names, empty fingerprints"
+            );
+            assert_eq!(
+                json["health_check_header_files"],
+                serde_json::json!([
+                    { "name": "Z-Second", "value_file": missing_a },
+                    { "name": "Authorization", "value_file": missing_b },
+                ]),
+                "{protocol}: references are stored unchanged and in order"
+            );
+
+            let mut config = Config::default();
+            config
+                .clusters
+                .insert("checked".to_owned(), cluster.clone());
+            let text = serde_json::to_string(&config).expect("a Config serializes");
+            let back: Config = serde_json::from_str(&text).expect("a Config deserializes");
+            assert_eq!(
+                back.clusters.get("checked"),
+                Some(&cluster),
+                "{protocol}: references survive Config serde"
+            );
+        }
+
+        // A cluster without headers carries no reference.
+        let bare: FileClusterConfig = toml::from_str(
+            "protocol = \"http\"\nfrontends = []\nbackends = []\n[health_check]\nuri = \"/\"\n",
+        )
+        .expect("parses");
+        let built = bare
+            .to_cluster_config("bare", &HashSet::new())
+            .expect("builds");
+        assert_eq!(
+            cluster_json(&built)["health_check_header_files"],
+            serde_json::json!([])
+        );
+    }
+
+    /// The old `value = "<secret>"` key and every other shape but a
+    /// `value_file` reference are refused, and neither the parse diagnostic
+    /// nor Debug echoes a value or a reference path.
+    #[test]
+    fn health_check_header_refuses_a_literal_or_env_value_and_never_echoes() {
+        let parse = |table: &str| {
+            toml::from_str::<FileHealthCheckConfig>(&format!("uri = \"/\"\n[[headers]]\n{table}\n"))
+        };
+
+        for bad in [
+            format!("name = \"x\"\nvalue = \"{HEADER_SENTINEL}\""),
+            format!("name = \"x\"\nvalue_env = \"{HEADER_SENTINEL}\""),
+            "name = \"x\"".to_owned(),
+            "value_file = \"/p\"".to_owned(),
+            format!("name = \"x\"\nvalue_file = \"/p\"\nvalue = \"{HEADER_SENTINEL}\""),
+            format!("name = \"x\"\nvalue_file = \"/p\"\nvalue_env = \"{HEADER_SENTINEL}\""),
+            format!("name = \"x\"\nvalue_file = \"/p\"\nextra = \"{HEADER_SENTINEL}\""),
+            format!("name = \"x\"\nvalue_file = 12\nextra = \"{HEADER_SENTINEL}\""),
+        ] {
+            let error = parse(&bad).expect_err(&format!("{bad:?} must be refused"));
+            let diagnostic = toml_error_diagnostic("/etc/sozu.toml", &error);
+            assert!(
+                !diagnostic.contains(HEADER_SENTINEL),
+                "the diagnostic must not echo a value: {diagnostic}"
+            );
+        }
+
+        let accepted = parse(&format!("name = \"x\"\nvalue_file = \"/{REF_SENTINEL}/v\""))
+            .expect("a name and a value_file parse");
+        assert_eq!(accepted.headers.len(), 1);
+        let debug = format!("{accepted:?}");
+        assert!(
+            !debug.contains(REF_SENTINEL),
+            "Debug must redact the reference path: {debug}"
+        );
+    }
+
+    /// Until the protected activation exists, no `WorkerRequest` may leave a
+    /// cluster whose header values live in files: the refusal is static, comes
+    /// before any order is returned, and names no reference. A cluster without
+    /// headers keeps generating its orders.
+    #[test]
+    fn health_check_value_file_cluster_generates_no_worker_request() {
+        for protocol in ["http", "tcp"] {
+            let path = format!("/{REF_SENTINEL}/v");
+            let file = value_file_cluster(protocol, &[("x-token", &path)]);
+            let cluster = file
+                .to_cluster_config("guarded", &HashSet::new())
+                .expect("builds");
+
+            let direct = cluster
+                .generate_requests()
+                .expect_err("no order may carry a name without its value");
+            assert!(
+                matches!(direct, ConfigError::InvalidHealthCheck { .. }),
+                "{protocol}: {direct:?}"
+            );
+
+            let mut config = Config::default();
+            config.clusters.insert("guarded".to_owned(), cluster);
+            let error = config
+                .generate_config_messages()
+                .expect_err("the whole generation is refused before any order is returned");
+            let shown = format!("{error} {error:?}");
+            assert!(
+                matches!(error, ConfigError::InvalidHealthCheck { .. })
+                    && shown.contains("guarded")
+                    && !shown.contains(REF_SENTINEL),
+                "{protocol}: {shown}"
+            );
+        }
+
+        let headerless: FileClusterConfig = toml::from_str(
+            "protocol = \"http\"\nfrontends = []\nbackends = []\n[health_check]\nuri = \"/\"\n",
+        )
+        .expect("parses");
+        let cluster = headerless
+            .to_cluster_config("plain", &HashSet::new())
+            .expect("builds");
+        assert!(cluster.generate_requests().is_ok());
+    }
+
+    #[test]
+    fn multiple_listeners_generate_correct_worker_requests() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            activate_listeners = true
+
+            [[listeners]]
+            protocol = "http"
+            address = "172.16.20.1:80"
+            expect_proxy = true
+
+            [[listeners]]
+            protocol = "http"
+            address = "10.22.0.1:80"
+            expect_proxy = false
+        "#;
+
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("Could not build config");
+
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+
+        let add_listener_count = messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.content.request_type,
+                    Some(RequestType::AddHttpListener(_))
+                )
+            })
+            .count();
+
+        let activate_listener_count = messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.content.request_type,
+                    Some(RequestType::ActivateListener(ActivateListener {
+                        proxy,
+                        ..
+                    })) if proxy == ListenerType::Http as i32
+                )
+            })
+            .count();
+
+        assert_eq!(add_listener_count, 2);
+        assert_eq!(activate_listener_count, 2);
+    }
+
+    #[test]
+    fn documented_udp_dns_example_loads_and_emits_udp_requests() {
+        // The DNS example from doc/configure.md ("#### UDP clusters"): a
+        // `protocol = "udp"` listener + a `protocol = "tcp"` cluster whose
+        // frontend points at that UDP listener address, with datagram knobs
+        // under `[clusters.dns.udp]`. This must load without a
+        // `WrongFrontendProtocol` error and emit an `AddUdpListener` and an
+        // `AddUdpFrontend` (not `AddTcpFrontend`).
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            activate_listeners = true
+
+            [[listeners]]
+            protocol = "udp"
+            address  = "0.0.0.0:53"
+
+            [clusters.dns]
+            protocol       = "tcp"
+            load_balancing = "HRW"
+            frontends = [
+              { address = "0.0.0.0:53" }
+            ]
+            backends = [
+              { address = "10.0.0.10:53" },
+              { address = "10.0.0.11:53" }
+            ]
+
+            [clusters.dns.udp]
+            affinity_key        = "SOURCE_IP"
+            responses           = 1
+            requests            = 0
+            send_proxy_protocol = true
+
+            [clusters.dns.udp.health]
+            mode      = "TCP_PROBE"
+            tcp_port  = 53
+            rise      = 2
+            fall      = 3
+            fail_open = true
+        "#;
+
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse documented DNS TOML");
+
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("documented UDP DNS example must load without WrongFrontendProtocol");
+
+        // The UDP listener was registered.
+        assert_eq!(
+            config.udp_listeners.len(),
+            1,
+            "the protocol=\"udp\" listener must be built"
+        );
+
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+
+        let add_udp_listener_count = messages
+            .iter()
+            .filter(|m| matches!(m.content.request_type, Some(RequestType::AddUdpListener(_))))
+            .count();
+        assert_eq!(
+            add_udp_listener_count, 1,
+            "must emit exactly one AddUdpListener"
+        );
+
+        let add_udp_frontend_count = messages
+            .iter()
+            .filter(|m| matches!(m.content.request_type, Some(RequestType::AddUdpFrontend(_))))
+            .count();
+        assert_eq!(
+            add_udp_frontend_count, 1,
+            "the cluster frontend on the UDP listener must emit AddUdpFrontend"
+        );
+
+        // It must NOT have been emitted as a TCP frontend.
+        let add_tcp_frontend_count = messages
+            .iter()
+            .filter(|m| matches!(m.content.request_type, Some(RequestType::AddTcpFrontend(_))))
+            .count();
+        assert_eq!(
+            add_tcp_frontend_count, 0,
+            "a UDP-listener-addressed frontend must not be emitted as AddTcpFrontend"
+        );
+
+        // The AddUdpFrontend carries the cluster id and address.
+        let udp_frontend = messages
+            .iter()
+            .find_map(|m| match &m.content.request_type {
+                Some(RequestType::AddUdpFrontend(f)) => Some(f),
+                _ => None,
+            })
+            .expect("AddUdpFrontend must be present");
+        assert_eq!(udp_frontend.cluster_id, "dns");
+        assert_eq!(
+            SocketAddr::from(udp_frontend.address),
+            "0.0.0.0:53".parse().unwrap()
+        );
+
+        // The UDP cluster knobs from [clusters.dns.udp] survive onto the
+        // AddCluster request.
+        let cluster = messages
+            .iter()
+            .find_map(|m| match &m.content.request_type {
+                Some(RequestType::AddCluster(c)) if c.cluster_id == "dns" => Some(c),
+                _ => None,
+            })
+            .expect("AddCluster for 'dns' must be present");
+        let udp = cluster
+            .udp
+            .as_ref()
+            .expect("[clusters.dns.udp] block must carry onto the cluster");
+        assert_eq!(udp.responses, Some(1));
+    }
+
+    /// The `interface` key round-trips from the TOML file into every
+    /// listener config and its activation, and a listener that omits it keeps
+    /// `interface = None` — today's behaviour. Two listeners may share an
+    /// address on different interfaces; the same (address, interface) twice is
+    /// still a duplicate.
+    #[test]
+    fn listener_interface_round_trips_from_the_config_file() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            activate_listeners = true
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "wg0"
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "lo"
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8081"
+
+            [[listeners]]
+            protocol = "https"
+            address = "0.0.0.0:8443"
+            interface = "wg0"
+
+            [[listeners]]
+            protocol = "tcp"
+            address = "0.0.0.0:9000"
+            interface = "wg0"
+
+            [[listeners]]
+            protocol = "udp"
+            address = "0.0.0.0:5353"
+            interface = "wg0"
+        "#;
+
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("the interface key must parse");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("listeners on one address with different interfaces must build");
+
+        let http: Vec<(String, Option<&str>)> = config
+            .http_listeners
+            .iter()
+            .map(|l| {
+                (
+                    SocketAddr::from(l.address).to_string(),
+                    l.interface.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            http,
+            vec![
+                ("0.0.0.0:8080".to_owned(), Some("wg0")),
+                ("0.0.0.0:8080".to_owned(), Some("lo")),
+                ("0.0.0.0:8081".to_owned(), None),
+            ]
+        );
+        assert_eq!(config.https_listeners[0].interface.as_deref(), Some("wg0"));
+        assert_eq!(config.tcp_listeners[0].interface.as_deref(), Some("wg0"));
+        assert_eq!(config.udp_listeners[0].interface.as_deref(), Some("wg0"));
+
+        let activations: Vec<Option<String>> = config
+            .generate_config_messages()
+            .expect("generate the config messages")
+            .into_iter()
+            .filter_map(|request| match request.content.request_type {
+                Some(RequestType::ActivateListener(activate)) => Some(activate.interface),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            activations,
+            vec![
+                Some("wg0".to_owned()),
+                Some("lo".to_owned()),
+                None,
+                Some("wg0".to_owned()),
+                Some("wg0".to_owned()),
+                Some("wg0".to_owned()),
+            ]
+        );
+
+        let duplicate = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "wg0"
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "wg0"
+        "#;
+        let file_config: FileConfig = toml::from_str(duplicate).expect("parse");
+        assert!(
+            ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+                .into_config()
+                .is_err(),
+            "the same (address, interface) twice must be refused"
+        );
+    }
+
+    /// An interface name the kernel would refuse is reported at config load,
+    /// naming the listener and the interface.
+    #[test]
+    fn invalid_listener_interface_rejected_at_config_load() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "wg/0"
+        "#;
+        let file_config: FileConfig = toml::from_str(toml_content).expect("parse");
+        let error = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect_err("an invalid interface name must be refused");
+        let message = error.to_string();
+        assert!(message.contains("0.0.0.0:8080"), "{message}");
+        assert!(message.contains("wg/0"), "{message}");
+    }
+
+    #[test]
+    fn duplicate_listener_address_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:80"
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:80"
+        "#;
+
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+
+        assert!(
+            result.is_err(),
+            "Should reject duplicate listener addresses"
+        );
+    }
+
+    #[test]
+    fn buffer_size_below_h2_minimum_rejected() {
+        // Default ALPN ["h2", "http/1.1"] + buffer_size = 8192 must error.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol = "https"
+            address = "127.0.0.1:8443"
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::BufferSizeTooSmallForH2 {
+                buffer_size: 8192,
+                minimum: 16_393,
+                listeners: 1,
+            }) => {}
+            other => panic!("expected BufferSizeTooSmallForH2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buffer_size_below_h2_minimum_accepted_when_no_h2_listener() {
+        // Drop "h2" from ALPN — buffer_size = 8192 is now valid.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol = "https"
+            address = "127.0.0.1:8443"
+            alpn_protocols = ["http/1.1"]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "non-H2 HTTPS listener with sub-16393 buffer should be accepted: {result:?}"
+        );
+    }
+
+    fn command_socket_mode_of(mode_line: &str) -> Result<Config, ConfigError> {
+        let toml_content = format!(
+            r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            {mode_line}
+        "#
+        );
+        let file_config: FileConfig =
+            toml::from_str(&toml_content).expect("Could not parse TOML config");
+        ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config()
+    }
+
+    #[test]
+    fn command_socket_mode_defaults_to_0600() {
+        let config = command_socket_mode_of("").expect("config without the key must load");
+        assert_eq!(config.command_socket_mode, 0o600);
+        assert_eq!(DEFAULT_COMMAND_SOCKET_MODE, 0o600);
+    }
+
+    #[test]
+    fn command_socket_mode_accepts_octal_strings() {
+        for (value, expected) in [
+            ("0660", 0o660),
+            ("660", 0o660),
+            ("0600", 0o600),
+            ("0666", 0o666),
+            ("777", 0o777),
+            ("0777", 0o777),
+            ("600", 0o600),
+            ("0640", 0o640),
+        ] {
+            let config = command_socket_mode_of(&format!("command_socket_mode = \"{value}\""))
+                .unwrap_or_else(|e| panic!("{value:?} must load: {e}"));
+            assert_eq!(config.command_socket_mode, expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn command_socket_mode_rejects_invalid_values() {
+        for value in [
+            "", "8", "0668", "abc", "0o660", "0x1b6", "-660", "+660", " 660", "660 ", "1660",
+            "2770", "4755", "7777", "01000", "00660", "0", "0000", "0066", "0200", "0400", "0466",
+        ] {
+            match command_socket_mode_of(&format!("command_socket_mode = \"{value}\"")) {
+                Err(ConfigError::InvalidCommandSocketMode {
+                    value: rejected, ..
+                }) => {
+                    assert_eq!(rejected, value)
+                }
+                other => panic!("{value:?} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn command_socket_mode_rejects_a_toml_integer() {
+        // `660` as a TOML integer is decimal 660 = 0o1224: refuse the type
+        // rather than guess which base the operator meant. The refusal is a
+        // TOML deserialization error, raised before `parse_command_socket_mode`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "command_socket = \"/tmp/sozu_test.sock\"\ncommand_socket_mode = 660\n",
+        )
+        .expect("write config");
+        match FileConfig::load_from_path(path.to_str().expect("utf-8 path")) {
+            Err(ConfigError::DeserializeToml(message)) => assert!(
+                message.contains("config.toml") && message.contains(" at bytes "),
+                "the diagnostic keeps the path and the byte range: {message}"
+            ),
+            other => panic!("an integer mode must fail as DeserializeToml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_without_command_socket_mode_deserializes_to_0600() {
+        // An upgrade snapshot written by a main process that predates the key
+        // carries a `Config` without it.
+        let mut encoded = serde_json::to_value(Config::default()).expect("serialize Config");
+        encoded
+            .as_object_mut()
+            .expect("Config serializes to an object")
+            .remove("command_socket_mode")
+            .expect("Config serializes command_socket_mode");
+        let decoded: Config = serde_json::from_value(encoded).expect("deserialize Config");
+        assert_eq!(decoded.command_socket_mode, 0o600);
+    }
+
+    #[test]
+    fn command_buffer_size_exceeds_max_rejected() {
+        // command_buffer_size > max_command_buffer_size must be rejected at load
+        // (sozu-proxy/sozu#1416): otherwise the real command Channel::new starts its
+        // front/back buffers larger than the ceiling max_buffer_size is supposed to
+        // enforce.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            command_buffer_size = 2000000
+            max_command_buffer_size = 1000000
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::CommandBufferSizeExceedsMax {
+                command_buffer_size: 2_000_000,
+                max_command_buffer_size: 1_000_000,
+            }) => {}
+            other => panic!("expected CommandBufferSizeExceedsMax, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_buffer_size_equal_to_max_accepted() {
+        // The boundary itself (command_buffer_size == max_command_buffer_size) must
+        // load: `Channel::new` allocates exactly at the ceiling, never above it.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            command_buffer_size = 1000000
+            max_command_buffer_size = 1000000
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "command_buffer_size == max_command_buffer_size should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn buffer_size_at_h2_minimum_accepted() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 16393
+
+            [[listeners]]
+            protocol = "https"
+            address = "127.0.0.1:8443"
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "buffer_size at the H2 minimum should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn alpn_protocols_default() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_custom() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned()]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_invalid_rejected() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["h3".to_owned()]));
+        let result = builder.to_tls(None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("h3"),
+            "error should mention the invalid protocol: {err}"
+        );
+    }
+
+    #[test]
+    fn alpn_protocols_empty_uses_default() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec![]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_deduplicated() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec![
+            "h2".to_owned(),
+            "h2".to_owned(),
+            "http/1.1".to_owned(),
+        ]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_order_preserved() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned(), "h2".to_owned()]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["http/1.1", "h2"]);
+    }
+
+    /// CRLF or NUL in a `[[clusters.<id>.frontends.headers]]` value
+    /// would let an operator-supplied config splice arbitrary
+    /// header / request lines into the H1 wire on the backend side
+    /// (CWE-113). The H2 emission path filters at runtime; we reject
+    /// at config-load time as a defense in depth.
+    #[test]
+    fn parse_header_edit_rejects_crlf_in_value() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X-Test".to_owned(),
+            value: "value\r\nEvil-Header: stolen".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("CRLF in value must be rejected");
+        match err {
+            ConfigError::InvalidHeaderBytes { index, field } => {
+                assert_eq!(index, 0);
+                assert_eq!(field, "value");
+            }
+            other => panic!("expected InvalidHeaderBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_lf_in_key() {
+        let entry = HeaderEditConfig {
+            position: "response".to_owned(),
+            key: "X-\nTest".to_owned(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(2, &entry).expect_err("LF in key must be rejected");
+        match err {
+            ConfigError::InvalidHeaderBytes { index, field } => {
+                assert_eq!(index, 2);
+                assert_eq!(field, "key");
+            }
+            other => panic!("expected InvalidHeaderBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_nul() {
+        let entry = HeaderEditConfig {
+            position: "both".to_owned(),
+            key: "X-Test".to_owned(),
+            value: "with\0nul".to_owned(),
+        };
+        assert!(matches!(
+            parse_header_edit(0, &entry),
+            Err(ConfigError::InvalidHeaderBytes { .. })
+        ));
+    }
+
+    /// Horizontal tab `\t` (0x09) is permitted in field values per
+    /// RFC 9110 §5.5 (folded-header obs-fold parts). The value-side
+    /// validator must NOT reject it — otherwise legitimate operator
+    /// configs (e.g. `Authorization: Basic\tCREDENTIALS`) become
+    /// unusable. The key-side validator IS stricter (token grammar).
+    #[test]
+    fn parse_header_edit_accepts_tab_in_value() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X-Test".to_owned(),
+            value: "with\ttab".to_owned(),
+        };
+        let header = parse_header_edit(0, &entry).expect("tab in value must be accepted");
+        assert_eq!(header.val, "with\ttab");
+    }
+
+    /// Header NAMES follow `token` grammar per RFC 9110 §5.1. HTAB and
+    /// SP are NOT tchar; the key-side validator must reject them even
+    /// though the value-side validator permits HTAB. Without this,
+    /// an operator entry like `key = "Host\t"` would emit `Host\t: …`
+    /// on the H1 wire and produce an invalid (but parser-tolerant)
+    /// header line that some backends silently accept as `Host:`.
+    #[test]
+    fn parse_header_edit_rejects_tab_in_key() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "Host\t".to_owned(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("HTAB in key must be rejected");
+        match err {
+            ConfigError::InvalidHeaderBytes { field, .. } => assert_eq!(field, "key"),
+            other => panic!("expected InvalidHeaderBytes{{field=\"key\"}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_space_in_key() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X Test".to_owned(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("SP in key must be rejected");
+        assert!(matches!(err, ConfigError::InvalidHeaderBytes { .. }));
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_empty_key() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: String::new(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("empty key must be rejected");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidHeaderBytes { field: "key", .. }
+        ));
+    }
+
+    #[test]
+    fn parse_header_edit_accepts_clean_value() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X-Tenant".to_owned(),
+            value: "alpha".to_owned(),
+        };
+        let header = parse_header_edit(0, &entry).expect("clean value must be accepted");
+        assert_eq!(header.key, "X-Tenant");
+        assert_eq!(header.val, "alpha");
+    }
+
+    /// A bare string with no scheme prefix is the inline literal body.
+    /// This is the common case — short canned responses inline in TOML
+    /// or a `--answer` flag, no disk I/O.
+    #[test]
+    fn resolve_answer_source_bare_string_is_literal() {
+        let body = resolve_answer_source("HTTP/1.1 503 Service Unavailable\r\n\r\nbusy")
+            .expect("bare-string source must resolve");
+        assert_eq!(body, "HTTP/1.1 503 Service Unavailable\r\n\r\nbusy");
+    }
+
+    #[test]
+    fn resolve_answer_source_empty_string_is_legitimate() {
+        let body = resolve_answer_source("").expect("empty source must resolve");
+        assert_eq!(body, "");
+    }
+
+    /// `file://` opts into reading the path off disk. A non-existent
+    /// path bubbles up as `ConfigError::FileOpen` so the operator gets
+    /// the same diagnostics as the existing per-status `answer_NNN`
+    /// flow.
+    #[test]
+    fn resolve_answer_source_file_scheme_missing_file_errors() {
+        let err = resolve_answer_source("file:///nonexistent/sozu-test/never.http")
+            .expect_err("missing path must error");
+        assert!(matches!(err, ConfigError::FileOpen { .. }));
+    }
+
+    /// `file://` strips the scheme; an empty path after the scheme is
+    /// rejected (empty path on filesystem read).
+    #[test]
+    fn resolve_answer_source_file_scheme_empty_path_errors() {
+        let err = resolve_answer_source("file://").expect_err("empty path must error");
+        assert!(matches!(err, ConfigError::FileOpen { .. }));
+    }
+
+    // ── TCP SNI/ALPN frontends (sozu-proxy/sozu#1279) ───────────────────────
+
+    /// A legacy-style TCP frontend TOML (no `hostname`/`alpn` keys at all)
+    /// must still parse, and the built frontend/listener must carry the
+    /// same values as before this feature existed: `sni = None`,
+    /// `alpn = []`, and the proto default SNI-preread knobs (unused since
+    /// no SNI frontend targets the listener).
+    #[test]
+    fn legacy_tcp_frontend_toml_without_sni_alpn_parses_unchanged() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9000"
+
+            [clusters.legacy]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9000" }
+            ]
+            backends = [
+              { address = "10.0.0.1:9000" }
+            ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse legacy TCP TOML");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("legacy TCP config without sni/alpn must load unchanged");
+
+        assert_eq!(config.tcp_listeners.len(), 1);
+        let listener = &config.tcp_listeners[0];
+        assert_eq!(
+            listener.sni_preread_timeout,
+            Some(DEFAULT_SNI_PREREAD_TIMEOUT),
+            "proto default sni_preread_timeout must be populated even though unused"
+        );
+        assert_eq!(
+            listener.sni_preread_max_bytes,
+            Some(DEFAULT_SNI_PREREAD_MAX_BYTES),
+            "proto default sni_preread_max_bytes must be populated even though unused"
+        );
+
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let tcp_frontend = messages
+            .iter()
+            .find_map(|m| match &m.content.request_type {
+                Some(RequestType::AddTcpFrontend(f)) => Some(f),
+                _ => None,
+            })
+            .expect("AddTcpFrontend must be present");
+        assert_eq!(tcp_frontend.sni, None, "legacy frontend must carry no sni");
+        assert!(
+            tcp_frontend.alpn.is_empty(),
+            "legacy frontend must carry no alpn"
+        );
+    }
+
+    /// sozu#633: the catch-all frontend `doc/configure.md` documents —
+    /// `hostname = "*"` with `position = "POST"` — loads from TOML and
+    /// reaches the worker as a `Post` rule on `*`. The position is an enum
+    /// spelled in upper case: `"Post"` is refused with the serde message the
+    /// documentation quotes, rather than silently falling back to `TREE`.
+    ///
+    /// To SEE THIS RED: in `command/build.rs`, drop the
+    /// `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` enum attribute. The
+    /// first `toml::from_str` then fails with
+    /// "unknown variant `POST`, expected one of `Pre`, `Post`, `Tree`".
+    #[test]
+    fn a_catch_all_post_frontend_loads_from_toml_and_rejects_a_mixed_case_position() {
+        let catch_all = |position: &str| {
+            format!(
+                r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+
+            [clusters.fallback]
+            protocol = "http"
+            frontends = [
+              {{ address = "127.0.0.1:8080", hostname = "*", position = "{position}" }}
+            ]
+            backends = [
+              {{ address = "10.0.0.1:8000" }}
+            ]
+        "#
+            )
+        };
+
+        let file_config: FileConfig = toml::from_str(&catch_all("POST"))
+            .expect("an upper-case `position = \"POST\"` must parse");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("a catch-all POST frontend must load");
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let frontend = messages
+            .iter()
+            .find_map(|m| match &m.content.request_type {
+                Some(RequestType::AddHttpFrontend(f)) => Some(f),
+                _ => None,
+            })
+            .expect("AddHttpFrontend must be present");
+        assert_eq!(frontend.hostname, "*");
+        assert_eq!(frontend.position, RulePosition::Post as i32);
+
+        let error = toml::from_str::<FileConfig>(&catch_all("Post"))
+            .expect_err("a mixed-case `position = \"Post\"` must be refused")
+            .to_string();
+        assert!(
+            error.contains("unknown variant `Post`, expected one of `PRE`, `POST`, `TREE`"),
+            "unexpected error: {error}",
+        );
+    }
+
+    /// sozu#322: `forwarded_headers` is a per-listener enum spelled
+    /// `both`, `x_forwarded`, `rfc7239` or `none`. Each value reaches the
+    /// wire config of an HTTP and an HTTPS listener, an absent key is
+    /// `both` (the historical behaviour), and any other spelling is refused
+    /// by serde instead of silently falling back to the default.
+    #[test]
+    fn forwarded_headers_parses_every_mode_defaults_to_both_and_rejects_others() {
+        let listeners = |value: Option<&str>| {
+            let line = value
+                .map(|value| format!("forwarded_headers = \"{value}\""))
+                .unwrap_or_default();
+            format!(
+                r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+            {line}
+
+            [[listeners]]
+            protocol = "https"
+            address  = "127.0.0.1:8443"
+            {line}
+            "#
+            )
+        };
+        let load = |value: Option<&str>| {
+            let file_config: FileConfig =
+                toml::from_str(&listeners(value)).expect("the listeners must parse");
+            let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+                .into_config()
+                .expect("the listeners must load");
+            (
+                config.http_listeners[0].forwarded_headers,
+                config.https_listeners[0].forwarded_headers,
+            )
+        };
+
+        for (spelling, expected) in [
+            (None, ForwardedHeaders::Both),
+            (Some("both"), ForwardedHeaders::Both),
+            (Some("x_forwarded"), ForwardedHeaders::XForwarded),
+            (Some("rfc7239"), ForwardedHeaders::Rfc7239),
+            (Some("none"), ForwardedHeaders::None),
+        ] {
+            let expected = Some(expected as i32);
+            assert_eq!(load(spelling), (expected, expected), "{spelling:?}");
+        }
+
+        for invalid in ["RFC7239", "x-forwarded", "forwarded", ""] {
+            let error = toml::from_str::<FileConfig>(&listeners(Some(invalid)))
+                .expect_err("an unknown forwarded_headers value must be refused")
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "unknown variant `{invalid}`, expected one of `both`, `x_forwarded`, `rfc7239`, `none`"
+                )),
+                "{invalid:?}: unexpected error: {error}",
+            );
+        }
+    }
+
+    /// `hostname` on a TCP frontend maps to the wire `sni` field, exact
+    /// hostnames and a single leading `*.` wildcard are both accepted.
+    #[test]
+    fn tcp_frontend_hostname_maps_to_sni_exact_and_wildcard() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9010"
+
+            [clusters.exact]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9010", hostname = "example.com", alpn = ["h2"] }
+            ]
+            backends = [ { address = "10.0.0.1:9010" } ]
+
+            [clusters.wildcard]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9010", hostname = "*.example.com" }
+            ]
+            backends = [ { address = "10.0.0.2:9010" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("exact + wildcard SNI frontends on distinct sni must load");
+
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let mut frontends: Vec<_> = messages
+            .iter()
+            .filter_map(|m| match &m.content.request_type {
+                Some(RequestType::AddTcpFrontend(f)) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
+        frontends.sort_by(|a, b| a.cluster_id.cmp(&b.cluster_id));
+
+        assert_eq!(frontends.len(), 2);
+        assert_eq!(frontends[0].sni, Some("example.com".to_string()));
+        assert_eq!(frontends[0].alpn, vec!["h2".to_string()]);
+        assert_eq!(frontends[1].sni, Some("*.example.com".to_string()));
+        assert!(frontends[1].alpn.is_empty());
+    }
+
+    /// (a) An SNI pattern with more than one wildcard label, an embedded
+    /// `*`, an empty label, or any `/` (a leftmost `/.../` label would be
+    /// inserted into the `pattern_trie` route table as a REGEX segment,
+    /// silently widening routing) is rejected at config-load.
+    #[test]
+    fn tcp_frontend_invalid_sni_pattern_rejected() {
+        for invalid in [
+            "*.*.example.com",
+            "foo.*.com",
+            "*",
+            "example..com",
+            "",
+            "/[a-z]+/.example.com",
+            "foo/bar.example.com",
+        ] {
+            let frontend = FileClusterFrontendConfig {
+                address: "127.0.0.1:8080".parse().unwrap(),
+                hostname: Some(invalid.to_string()),
+                alpn: vec![],
+                path: None,
+                path_type: None,
+                method: None,
+                certificate: None,
+                key: None,
+                certificate_chain: None,
+                tls_versions: vec![],
+                position: RulePosition::Tree,
+                tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: None,
+                hsts: None,
+                header_predicates: None,
+            };
+            match frontend.to_tcp_front() {
+                Err(ConfigError::InvalidSniPattern { sni }) => assert_eq!(sni, invalid),
+                other => panic!("expected InvalidSniPattern for {invalid:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// (a) A non-ASCII SNI pattern is rejected loudly: on-wire SNI is
+    /// always an ASCII A-label (RFC 6066 / IDNA), so a Unicode U-label in
+    /// the config would load fine but never match a ClientHello — a
+    /// silent routing failure. The error names the punycode form the
+    /// operator must write instead.
+    #[test]
+    fn tcp_frontend_non_ascii_sni_pattern_rejected() {
+        for non_ascii in ["münchen.example", "*.bücher.example", "日本.example"] {
+            let frontend = FileClusterFrontendConfig {
+                address: "127.0.0.1:8080".parse().unwrap(),
+                hostname: Some(non_ascii.to_string()),
+                alpn: vec![],
+                path: None,
+                path_type: None,
+                method: None,
+                certificate: None,
+                key: None,
+                certificate_chain: None,
+                tls_versions: vec![],
+                position: RulePosition::Tree,
+                tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: None,
+                hsts: None,
+                header_predicates: None,
+            };
+            match frontend.to_tcp_front() {
+                Err(ConfigError::NonAsciiSniPattern { sni }) => assert_eq!(sni, non_ascii),
+                other => panic!("expected NonAsciiSniPattern for {non_ascii:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The punycode A-label form of an internationalized hostname — what
+    /// the NonAsciiSniPattern error tells the operator to write — is
+    /// accepted, both exact and wildcarded, and case-normalized like any
+    /// other ASCII pattern.
+    #[test]
+    fn tcp_frontend_punycode_sni_pattern_accepted() {
+        assert_eq!(
+            validate_sni_pattern("xn--mnchen-3ya.example").expect("A-label must be accepted"),
+            "xn--mnchen-3ya.example"
+        );
+        assert_eq!(
+            validate_sni_pattern("*.xn--bcher-kva.example")
+                .expect("wildcarded A-label must be accepted"),
+            "*.xn--bcher-kva.example"
+        );
+        assert_eq!(
+            validate_sni_pattern("XN--MNCHEN-3YA.Example")
+                .expect("mixed-case A-label must be accepted"),
+            "xn--mnchen-3ya.example",
+            "A-label patterns are ASCII-lowercased like any other pattern"
+        );
+    }
+
+    /// `alpn` is a TCP-only concept; setting it on an HTTP frontend is
+    /// rejected rather than silently ignored.
+    #[test]
+    fn alpn_rejected_on_http_frontend() {
+        let frontend = FileClusterFrontendConfig {
+            address: "127.0.0.1:8080".parse().unwrap(),
+            hostname: Some("example.com".to_owned()),
+            alpn: vec!["h2".to_string()],
+            path: None,
+            path_type: None,
+            method: None,
+            certificate: None,
+            key: None,
+            certificate_chain: None,
+            tls_versions: vec![],
+            position: RulePosition::Tree,
+            tags: None,
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: None,
+            hsts: None,
+            header_predicates: None,
+        };
+        match frontend.to_http_front("api") {
+            Err(ConfigError::InvalidFrontendConfig(field)) => assert_eq!(field, "alpn"),
+            other => panic!("expected InvalidFrontendConfig(\"alpn\"), got {other:?}"),
+        }
+    }
+
+    /// `header_predicates` is an HTTP-only guard; a TCP frontend that sets it
+    /// is rejected instead of silently routing unconditionally.
+    #[test]
+    fn header_predicates_rejected_on_tcp_frontend() {
+        let frontend = FileClusterFrontendConfig {
+            address: "127.0.0.1:8080".parse().unwrap(),
+            hostname: None,
+            alpn: vec![],
+            path: None,
+            path_type: None,
+            method: None,
+            certificate: None,
+            key: None,
+            certificate_chain: None,
+            tls_versions: vec![],
+            position: RulePosition::Tree,
+            tags: None,
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: None,
+            hsts: None,
+            header_predicates: Some(vec![]),
+        };
+        match frontend.to_tcp_front() {
+            Err(ConfigError::InvalidFrontendConfig(field)) => {
+                assert_eq!(field, "header_predicates")
+            }
+            other => panic!("expected InvalidFrontendConfig(\"header_predicates\"), got {other:?}"),
+        }
+    }
+
+    /// A TCP frontend that sets `alpn` but leaves `hostname` (the wire
+    /// `sni` field) unset is a config error: an ALPN matcher only ever gets
+    /// consulted from within the SNI-scoped preread route table, so a
+    /// no-SNI frontend would install the raw catch-all path and silently
+    /// never enforce the configured protocol list.
+    #[test]
+    fn tcp_frontend_alpn_without_sni_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9019"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9019", alpn = ["h2"] }
+            ]
+            backends = [ { address = "10.0.0.1:9019" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::AlpnWithoutSni { address }) => {
+                assert_eq!(address.to_string(), "127.0.0.1:9019");
+            }
+            other => panic!("expected AlpnWithoutSni, got {other:?}"),
+        }
+    }
+
+    /// (b) Two TCP frontends on the same (address, sni) advertising an
+    /// overlapping ALPN protocol is a config error — routing on that
+    /// listener would otherwise depend on iteration order.
+    #[test]
+    fn tcp_frontend_alpn_overlap_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9020"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9020", hostname = "example.com", alpn = ["h2"] }
+            ]
+            backends = [ { address = "10.0.0.1:9020" } ]
+
+            [clusters.b]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9020", hostname = "example.com", alpn = ["h2", "http/1.1"] }
+            ]
+            backends = [ { address = "10.0.0.2:9020" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::TcpFrontendAlpnOverlap { protocol, .. }) => {
+                assert_eq!(protocol, "h2");
+            }
+            other => panic!("expected TcpFrontendAlpnOverlap, got {other:?}"),
+        }
+    }
+
+    /// (b) At most one TCP frontend per (address, sni) may leave `alpn`
+    /// empty (the catch-all match); a second is as ambiguous as an
+    /// overlapping explicit protocol.
+    #[test]
+    fn tcp_frontend_multiple_alpn_catch_all_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9021"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9021", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9021" } ]
+
+            [clusters.b]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9021", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.2:9021" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::TcpFrontendMultipleAlpnCatchAll { .. })
+            ),
+            "expected TcpFrontendMultipleAlpnCatchAll, got {result:?}"
+        );
+    }
+
+    /// (c) A listener targeted by both a no-SNI frontend and an SNI-scoped
+    /// frontend is a config error: an SNI-enabled listener must not also
+    /// carry a raw-TCP fallback.
+    #[test]
+    fn tcp_listener_mixes_sni_and_no_sni_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9022"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9022", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9022" } ]
+
+            [clusters.b]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9022" }
+            ]
+            backends = [ { address = "10.0.0.2:9022" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            matches!(result, Err(ConfigError::TcpListenerMixesSniAndNoSni { .. })),
+            "expected TcpListenerMixesSniAndNoSni, got {result:?}"
+        );
+    }
+
+    /// (d) `sni_preread_timeout` (proto default: 5s) exceeding the
+    /// listener's `front_timeout` is rejected — but only when an SNI
+    /// frontend actually targets that listener, so legacy TCP-only
+    /// configs with a low front_timeout keep loading unchanged.
+    #[test]
+    fn sni_preread_timeout_exceeding_front_timeout_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol      = "tcp"
+            address       = "127.0.0.1:9030"
+            front_timeout = 2
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9030", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9030" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::SniPrereadTimeoutExceedsFrontTimeout {
+                sni_preread_timeout: 5,
+                front_timeout: 2,
+                ..
+            }) => {}
+            other => panic!("expected SniPrereadTimeoutExceedsFrontTimeout, got {other:?}"),
+        }
+    }
+
+    /// (e) `sni_preread_max_bytes` (proto default: 16384) exceeding the
+    /// global `buffer_size` is rejected — again only when an SNI frontend
+    /// targets the listener.
+    #[test]
+    fn sni_preread_max_bytes_exceeding_buffer_size_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9031"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9031", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9031" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::SniPrereadMaxBytesExceedsBufferSize {
+                sni_preread_max_bytes: 16384,
+                buffer_size: 8192,
+                ..
+            }) => {}
+            other => panic!("expected SniPrereadMaxBytesExceedsBufferSize, got {other:?}"),
+        }
+    }
+
+    /// `sni_preread_max_bytes = 0` on an SNI-enabled listener is rejected:
+    /// the preread shell would issue zero-length reads that never make
+    /// progress, spinning until the event-loop iteration guard trips
+    /// instead of ever reaching a routing decision.
+    #[test]
+    fn sni_preread_max_bytes_zero_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol             = "tcp"
+            address              = "127.0.0.1:9033"
+            sni_preread_max_bytes = 0
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9033", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9033" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::SniPrereadMaxBytesTooSmall {
+                sni_preread_max_bytes: 0,
+                minimum: 5,
+                ..
+            }) => {}
+            other => panic!("expected SniPrereadMaxBytesTooSmall, got {other:?}"),
+        }
+    }
+
+    /// The floor itself (`MIN_SNI_PREREAD_MAX_BYTES` = 5 bytes) must load
+    /// successfully — only values strictly below it are rejected.
+    #[test]
+    fn sni_preread_max_bytes_at_the_floor_loads() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol             = "tcp"
+            address              = "127.0.0.1:9034"
+            sni_preread_max_bytes = 5
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9034", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9034" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "sni_preread_max_bytes at the exact floor must load: {result:?}"
+        );
+    }
+
+    /// Gating proof for (d)/(e): a TCP listener with a low front_timeout
+    /// and small buffer_size, but *no* SNI frontend, must load unchanged —
+    /// the new knobs are dead weight on a listener that never prereads.
+    #[test]
+    fn sni_preread_validation_ignored_without_sni_frontend() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol      = "tcp"
+            address       = "127.0.0.1:9032"
+            front_timeout = 2
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9032" }
+            ]
+            backends = [ { address = "10.0.0.1:9032" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "a no-SNI TCP listener must ignore sni_preread validation entirely: {result:?}"
+        );
+    }
+
+    /// The actual use case sozu-proxy/sozu#1279 exists for: two TCP
+    /// frontends sharing the same `(address, sni)` with disjoint,
+    /// non-empty `alpn` lists must load successfully and both must be
+    /// individually reachable — ALPN multiplexing within one SNI. The
+    /// negative tests above only prove overlap is rejected; this proves
+    /// non-overlap actually works.
+    #[test]
+    fn tcp_frontend_disjoint_alpn_same_sni_both_load() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9040"
+
+            [clusters.h2_cluster]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9040", hostname = "example.com", alpn = ["h2"] }
+            ]
+            backends = [ { address = "10.0.0.1:9040" } ]
+
+            [clusters.http11_cluster]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9040", hostname = "example.com", alpn = ["http/1.1"] }
+            ]
+            backends = [ { address = "10.0.0.2:9040" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("disjoint non-empty ALPN lists on the same (address, sni) must load");
+
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let mut frontends: Vec<_> = messages
+            .iter()
+            .filter_map(|m| match &m.content.request_type {
+                Some(RequestType::AddTcpFrontend(f)) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
+        frontends.sort_by(|a, b| a.cluster_id.cmp(&b.cluster_id));
+
+        assert_eq!(frontends.len(), 2, "both frontends must be emitted");
+        assert_eq!(frontends[0].cluster_id, "h2_cluster");
+        assert_eq!(frontends[0].sni, Some("example.com".to_string()));
+        assert_eq!(frontends[0].alpn, vec!["h2".to_string()]);
+        assert_eq!(frontends[1].cluster_id, "http11_cluster");
+        assert_eq!(frontends[1].sni, Some("example.com".to_string()));
+        assert_eq!(frontends[1].alpn, vec!["http/1.1".to_string()]);
+    }
+
+    /// A `protocol = "tcp"` cluster frontend resolved against a
+    /// `protocol = "udp"` listener (`TcpFrontendConfig.udp = true`, set in
+    /// `populate_clusters`) emits `AddUdpFrontend`, not `AddTcpFrontend` —
+    /// it carries no `sni`/`alpn` on the wire and must not participate in
+    /// the TCP-only mixing-ban / ALPN-overlap invariants. Two "tcp"
+    /// clusters at the same UDP-listener address, one with `hostname` set
+    /// and one without, must build and emit their messages rather than
+    /// spuriously tripping `TcpListenerMixesSniAndNoSni`.
+    ///
+    /// Message GENERATION is all this asserts. A UDP address is claimed by
+    /// exactly one frontend (`ConfigState::add_udp_frontend`), so at apply
+    /// time `load_static_config` admits the first of these two and skips the
+    /// second with `Skipping a config entry the state refused`. That is the
+    /// config-file face of the same collision, and it is deliberately not
+    /// asserted here: this test owns the SNI invariants, not admission.
+    #[test]
+    fn udp_routed_tcp_frontends_are_excluded_from_sni_invariants() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "udp"
+            address  = "127.0.0.1:9050"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9050", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9050" } ]
+
+            [clusters.b]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9050" }
+            ]
+            backends = [ { address = "10.0.0.2:9050" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "UDP-routed tcp-cluster frontends must not trip the SNI mixing-ban: {result:?}"
+        );
+
+        let config = result.expect("checked is_ok above");
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let add_udp_frontend_count = messages
+            .iter()
+            .filter(|m| matches!(m.content.request_type, Some(RequestType::AddUdpFrontend(_))))
+            .count();
+        assert_eq!(
+            add_udp_frontend_count, 2,
+            "both cluster frontends on the udp listener must emit AddUdpFrontend"
+        );
+    }
+
+    /// The three subnet keys must travel from TOML through `Config`,
+    /// and the per-cluster override with them. Nothing else asserts this
+    /// plumbing: a swapped or dropped key would only surface as a cap
+    /// that silently never fires.
+    #[test]
+    fn subnet_connection_limit_keys_round_trip_from_toml() {
+        let toml_content = r#"
+            command_socket   = "/tmp/sozu.sock"
+            saved_state      = "./state.json"
+            worker_count     = 1
+
+            max_connections_per_ip     = 10
+            max_connections_per_subnet = 100
+            subnet_ipv4_prefix         = 24
+            subnet_ipv6_prefix         = 56
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+
+            [clusters.api]
+            protocol       = "http"
+            load_balancing = "ROUND_ROBIN"
+            max_connections_per_subnet = 7
+            frontends = [
+              { address = "127.0.0.1:8080", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:8080" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("a config with valid subnet prefixes must load");
+
+        assert_eq!(
+            config.max_connections_per_subnet, 100,
+            "the global subnet cap must survive the TOML round trip"
+        );
+        assert_eq!(
+            config.subnet_ipv4_prefix, 24,
+            "subnet_ipv4_prefix must survive the TOML round trip"
+        );
+        assert_eq!(
+            config.subnet_ipv6_prefix, 56,
+            "subnet_ipv6_prefix must survive the TOML round trip — a swap with the IPv6 \
+             key would leave a cap that silently never fires"
+        );
+        assert_eq!(
+            config.max_connections_per_ip, 10,
+            "the pre-existing per-IP cap must be unaffected: the two are independent"
+        );
+
+        let cluster = config
+            .clusters
+            .get("api")
+            .expect("the staged cluster must be present");
+        let override_value = match cluster {
+            ClusterConfig::Http(http) => http.max_connections_per_subnet,
+            other => panic!("expected an HTTP cluster, got {other:?}"),
+        };
+        assert_eq!(
+            override_value,
+            Some(7),
+            "the per-cluster subnet override must reach the cluster config"
+        );
+    }
+
+    /// The backend connection attempt budget (sozu-proxy/sozu#1800): five by
+    /// default, set globally and per cluster from TOML, carried to the worker
+    /// in `ServerConfig` and to the cluster in its `AddCluster`.
+    #[test]
+    fn max_connection_attempts_defaults_to_five_and_round_trips_from_toml() {
+        let config_with = |global: &str, cluster: &str| -> Config {
+            let toml_content = format!(
+                r#"
+            command_socket = "/tmp/sozu.sock"
+            saved_state    = "./state.json"
+            worker_count   = 1
+            {global}
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+
+            [clusters.api]
+            protocol       = "http"
+            load_balancing = "ROUND_ROBIN"
+            {cluster}
+            frontends = [
+              {{ address = "127.0.0.1:8080", hostname = "example.com" }}
+            ]
+            backends = [ {{ address = "10.0.0.1:8080" }} ]
+        "#
+            );
+            let file_config: FileConfig =
+                toml::from_str(&toml_content).expect("Could not parse TOML config");
+            ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+                .into_config()
+                .expect("a valid attempt budget must load")
+        };
+        let cluster_attempts = |config: &Config| match config.clusters.get("api") {
+            Some(ClusterConfig::Http(http)) => http.max_connection_attempts,
+            other => panic!("expected the HTTP cluster, got {other:?}"),
+        };
+        let add_cluster_attempts = |config: &Config| {
+            config
+                .generate_config_messages()
+                .expect("Could not generate config messages")
+                .into_iter()
+                .find_map(|message| match message.content.request_type {
+                    Some(RequestType::AddCluster(cluster)) => Some(cluster.max_connection_attempts),
+                    _ => None,
+                })
+                .expect("the cluster is added")
+        };
+
+        let defaults = config_with("", "");
+        assert_eq!(DEFAULT_MAX_CONNECTION_ATTEMPTS, 5);
+        assert_eq!(defaults.max_connection_attempts, 5);
+        assert_eq!(
+            ServerConfig::from(&defaults).max_connection_attempts,
+            Some(5),
+            "the worker receives the default"
+        );
+        assert_eq!(
+            cluster_attempts(&defaults),
+            None,
+            "a cluster inherits by default"
+        );
+        assert_eq!(add_cluster_attempts(&defaults), None);
+
+        let set = config_with("max_connection_attempts = 2", "max_connection_attempts = 7");
+        assert_eq!(set.max_connection_attempts, 2);
+        assert_eq!(ServerConfig::from(&set).max_connection_attempts, Some(2));
+        assert_eq!(cluster_attempts(&set), Some(7));
+        assert_eq!(add_cluster_attempts(&set), Some(7));
+    }
+
+    /// A budget allowing no attempt, or more than the attempt counters hold,
+    /// is rejected at load, globally and per cluster; both bounds are
+    /// inclusive.
+    #[test]
+    fn an_out_of_range_max_connection_attempts_is_rejected() {
+        let load = |global: &str, cluster: &str| {
+            let toml_content = format!(
+                r#"
+            command_socket = "/tmp/sozu.sock"
+            saved_state    = "./state.json"
+            worker_count   = 1
+            {global}
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+
+            [clusters.api]
+            protocol       = "http"
+            load_balancing = "ROUND_ROBIN"
+            {cluster}
+            frontends = [
+              {{ address = "127.0.0.1:8080", hostname = "example.com" }}
+            ]
+            backends = [ {{ address = "10.0.0.1:8080" }} ]
+        "#
+            );
+            let file_config: FileConfig =
+                toml::from_str(&toml_content).expect("Could not parse TOML config");
+            ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config()
+        };
+        for value in ["0", "256"] {
+            let global = format!("max_connection_attempts = {value}");
+            assert!(
+                matches!(
+                    load(&global, ""),
+                    Err(ConfigError::InvalidMaxConnectionAttempts {
+                        cluster_id: None,
+                        ..
+                    })
+                ),
+                "a global budget of {value} must be rejected"
+            );
+            assert!(
+                matches!(
+                    load("", &global),
+                    Err(ConfigError::InvalidMaxConnectionAttempts {
+                        cluster_id: Some(_),
+                        ..
+                    })
+                ),
+                "a cluster budget of {value} must be rejected"
+            );
+        }
+        for value in ["1", "255"] {
+            let budget = format!("max_connection_attempts = {value}");
+            assert!(load(&budget, &budget).is_ok(), "{value} is in range");
+        }
+    }
+
+    /// An out-of-range prefix is REJECTED, never silently clamped. A
+    /// narrowed mask would enforce a policy other than the one written
+    /// in the file, and nothing in the config would say so.
+    #[test]
+    fn an_out_of_range_subnet_prefix_is_rejected_not_clamped() {
+        let with_prefixes = |v4: &str, v6: &str| -> String {
+            format!(
+                r#"
+            command_socket = "/tmp/sozu.sock"
+            saved_state    = "./state.json"
+            worker_count   = 1
+
+            max_connections_per_subnet = 100
+            subnet_ipv4_prefix         = {v4}
+            subnet_ipv6_prefix         = {v6}
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+        "#
+            )
+        };
+
+        for (v4, v6, key) in [
+            ("33", "56", "subnet_ipv4_prefix"),
+            ("24", "129", "subnet_ipv6_prefix"),
+        ] {
+            let file_config: FileConfig =
+                toml::from_str(&with_prefixes(v4, v6)).expect("Could not parse TOML config");
+            let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+            match result {
+                Err(ConfigError::InvalidSubnetPrefix { key: reported, .. }) => {
+                    assert_eq!(
+                        reported, key,
+                        "the rejection must name the key that is out of range"
+                    );
+                }
+                other => panic!("{key} out of range must be rejected, got {other:?}"),
+            }
+        }
+
+        // Positive space: both bounds are INCLUSIVE, so the widest legal
+        // pair must still load.
+        let file_config: FileConfig =
+            toml::from_str(&with_prefixes("32", "128")).expect("Could not parse TOML config");
+        assert!(
+            ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+                .into_config()
+                .is_ok(),
+            "the full-width prefixes are legal and are the defaults — they must load"
+        );
+    }
+
+    #[test]
+    fn old_state_file_without_client_auth_fields_deserializes() {
+        // A state file written before mTLS landed carries no `client_ca_*`
+        // fields. `#[serde(default)]` (via build.rs) must let it round-trip,
+        // defaulting the new repeated fields to empty rather than erroring on a
+        // missing field.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let config = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("default HTTPS listener config");
+
+        let mut json: serde_json::Value =
+            serde_json::to_value(&config).expect("serialize HttpsListenerConfig");
+        let obj = json.as_object_mut().expect("object");
+        obj.remove("client_ca_certificates");
+        obj.remove("client_ca_crls");
+        obj.remove("client_auth");
+
+        let restored: HttpsListenerConfig =
+            serde_json::from_value(json).expect("old state file must deserialize");
+        assert!(restored.client_ca_certificates.is_empty());
+        assert!(restored.client_ca_crls.is_empty());
+        assert_eq!(restored.client_auth, None);
+    }
+
+    #[test]
+    fn client_auth_fields_rejected_on_non_https_listener() {
+        // A TCP listener carrying client_auth must be rejected, not silently
+        // started unauthenticated.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9000);
+        let mut tcp = ListenerBuilder::new_tcp(address);
+        tcp.client_auth = Some(ClientAuthConfig::Required);
+        assert!(matches!(
+            tcp.to_tcp(None),
+            Err(ConfigError::ClientAuthOnNonHttps(_))
+        ));
+
+        // A CA bundle without an explicit mode is equally a misconfiguration.
+        let mut http = ListenerBuilder::new_http(address);
+        http.client_ca_certificates = Some(vec!["ca.pem".to_owned()]);
+        assert!(matches!(
+            http.to_http(None),
+            Err(ConfigError::ClientAuthOnNonHttps(_))
+        ));
+    }
+
+    #[test]
+    fn none_mode_ignores_stale_ca_paths() {
+        // With client auth disabled, an unreadable CA/CRL path must not block
+        // the HTTPS listener from materializing.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9443);
+        let mut https = ListenerBuilder::new_https(address);
+        https.client_auth = Some(ClientAuthConfig::None);
+        https.client_ca_certificates = Some(vec!["/nonexistent/ca.pem".to_owned()]);
+        https.client_ca_crls = Some(vec!["/nonexistent/crl.pem".to_owned()]);
+        let config = https.to_tls(None).expect("NONE mode must ignore CA paths");
+        assert!(config.client_ca_certificates.is_empty());
+        assert!(config.client_ca_crls.is_empty());
+    }
+
+    /// The configuration file names the CA and CRL files; the main process
+    /// reads them at config-load and sends their contents to the workers, on
+    /// the verb a worker that predates mutual TLS cannot decode.
+    #[test]
+    fn client_auth_listener_inlines_its_ca_and_crl_files_into_the_listener_request() {
+        let asset =
+            |name: &str| format!("{}/../lib/assets/mtls/{name}", env!("CARGO_MANIFEST_DIR"));
+        let (ca_path, crl_path) = (asset("ca-cert.pem"), asset("crl-revoked.pem"));
+        let toml_content = format!(
+            r#"
+            command_socket = "/tmp/sozu.sock"
+            saved_state    = "./state.json"
+            worker_count   = 1
+
+            [[listeners]]
+            protocol = "https"
+            address  = "127.0.0.1:8443"
+            client_auth = "required"
+            client_ca_certificates = ["{ca_path}"]
+            client_ca_crls = ["{crl_path}"]
+        "#
+        );
+        let file_config: FileConfig =
+            toml::from_str(&toml_content).expect("Could not parse TOML config");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("a client auth listener with readable CA and CRL files must load");
+
+        let listeners: Vec<HttpsListenerConfig> = config
+            .generate_config_messages()
+            .expect("the config must produce its worker requests")
+            .into_iter()
+            .filter_map(|request| match request.content.request_type {
+                Some(RequestType::AddHttpsListenerWithClientAuth(listener)) => Some(listener),
+                Some(RequestType::AddHttpsListener(_)) => {
+                    panic!("a client auth listener must not go out as AddHttpsListener")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listeners.len(), 1, "one HTTPS listener is configured");
+        let listener = &listeners[0];
+        assert_eq!(
+            listener.client_auth,
+            Some(ClientAuthMode::ClientAuthRequired as i32)
+        );
+        assert_eq!(
+            listener.client_ca_certificates,
+            vec![std::fs::read_to_string(&ca_path).expect("read the CA fixture")],
+            "the CA file content, not its path, must reach the worker"
+        );
+        assert_eq!(
+            listener.client_ca_crls,
+            vec![std::fs::read_to_string(&crl_path).expect("read the CRL fixture")],
+            "the CRL file content, not its path, must reach the worker"
+        );
+        assert!(
+            listener.client_ca_crls[0].contains("BEGIN X509 CRL"),
+            "the inlined CRL is the PEM body"
+        );
+    }
+
+    #[test]
+    fn client_auth_listener_with_an_unreadable_crl_file_does_not_load() {
+        // A CRL the operator configured but Sozu cannot read would silently
+        // disable the revocation they asked for.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9443);
+        let mut https = ListenerBuilder::new_https(address);
+        https.client_auth = Some(ClientAuthConfig::Required);
+        https.client_ca_certificates = Some(vec![format!(
+            "{}/../lib/assets/mtls/ca-cert.pem",
+            env!("CARGO_MANIFEST_DIR")
+        )]);
+        https.client_ca_crls = Some(vec!["/nonexistent/crl.pem".to_owned()]);
+        assert!(
+            https.to_tls(None).is_err(),
+            "an unreadable CRL file must fail the listener, not drop the revocation check"
+        );
+    }
+
+    #[test]
+    fn client_auth_files_without_a_mode_are_rejected() {
+        // The mode defaults to `none`, which ignores these files: a listener
+        // naming a CA or a CRL with no mode would start unauthenticated.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9443);
+        for (cas, crls) in [
+            (Some(vec!["/etc/sozu/client-ca.pem".to_owned()]), None),
+            (None, Some(vec!["/etc/sozu/client-ca.crl.pem".to_owned()])),
+        ] {
+            let mut https = ListenerBuilder::new_https(address);
+            https.client_ca_certificates = cas;
+            https.client_ca_crls = crls;
+            assert!(matches!(
+                https.to_tls(None),
+                Err(ConfigError::ClientAuthModeMissing(_))
+            ));
+        }
+        // Positive space: an explicit `none` keeps the files unused (and is
+        // only warned about), and no file at all needs no mode.
+        let mut explicit_none = ListenerBuilder::new_https(address);
+        explicit_none.client_auth = Some(ClientAuthConfig::None);
+        explicit_none.client_ca_certificates = Some(vec!["/nonexistent/ca.pem".to_owned()]);
+        assert!(explicit_none.to_tls(None).is_ok());
+        assert!(ListenerBuilder::new_https(address).to_tls(None).is_ok());
+    }
+
+    #[test]
+    fn client_auth_config_parses_documented_lowercase_names() {
+        // The documented TOML values (`none`/`optional`/`required`) must parse,
+        // not just the protobuf enum's SCREAMING_SNAKE_CASE.
+        assert_eq!(
+            serde_json::from_str::<ClientAuthConfig>("\"required\"").unwrap(),
+            ClientAuthConfig::Required
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientAuthConfig>("\"optional\"").unwrap(),
+            ClientAuthConfig::Optional
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientAuthConfig>("\"none\"").unwrap(),
+            ClientAuthConfig::None
+        );
+        assert_eq!(
+            ClientAuthMode::from(ClientAuthConfig::Required),
+            ClientAuthMode::ClientAuthRequired
+        );
+    }
+}

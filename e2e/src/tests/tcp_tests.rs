@@ -1,0 +1,1917 @@
+/// End-to-end tests for Sozu's TCP proxy layer.
+///
+/// These tests exercise TCP passthrough proxying — where Sozu forwards raw
+/// bytes between a client and a backend without any protocol awareness.
+/// They cover:
+/// - Basic bidirectional byte forwarding
+/// - Large payload handling (1 MB)
+/// - TCP half-close semantics
+/// - Backend connection failure resilience
+/// - Refused-backend failure accounting and avoidance
+/// - Proxy protocol V2 with TCP listeners
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    net::{Shutdown, SocketAddr, TcpStream},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
+use sozu_command_lib::{
+    config::ListenerBuilder,
+    proto::command::{
+        ActivateListener, ListenerType, ProxyProtocolConfig, QueryMetricsOptions, ResponseStatus,
+        filtered_metrics, request::RequestType, response_content::ContentType,
+    },
+};
+
+use crate::{
+    mock::{client::Client, sync_backend::Backend as SyncBackend},
+    port_registry::bind_std_listener,
+    sozu::worker::Worker,
+    tests::{State, repeat_until_error_or},
+};
+
+use super::tests::{create_local_address, create_unbound_local_address};
+
+const BUFFER_SIZE: usize = 4096;
+
+// =========================================================================
+// Helpers
+// =========================================================================
+
+/// Set up a Sozu worker with a single TCP listener, cluster, frontend, and
+/// the given number of backends. Returns (worker, backend_addresses).
+pub(super) fn setup_tcp_test(
+    name: &str,
+    nb_backends: usize,
+) -> (Worker, Vec<SocketAddr>, SocketAddr) {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address.into())
+            .to_tcp(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Tcp.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
+        "cluster_0",
+        front_address,
+    )));
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            format!("cluster_0-{i}"),
+            back_address,
+            None,
+        )));
+        backends.push(back_address);
+    }
+
+    worker.read_to_last();
+    (worker, backends, front_address)
+}
+
+/// Set up a Sozu worker with a TCP listener that expects proxy protocol V2.
+fn setup_tcp_proxy_protocol_test(
+    name: &str,
+    nb_backends: usize,
+) -> (Worker, Vec<SocketAddr>, SocketAddr) {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address.into())
+            .with_expect_proxy(true)
+            .to_tcp(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Tcp.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
+        "cluster_0",
+        front_address,
+    )));
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            format!("cluster_0-{i}"),
+            back_address,
+            None,
+        )));
+        backends.push(back_address);
+    }
+
+    worker.read_to_last();
+    (worker, backends, front_address)
+}
+
+/// Connect a raw TCP stream with read/write timeouts.
+fn raw_connect(addr: SocketAddr) -> TcpStream {
+    let stream = TcpStream::connect(addr).expect("could not connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    stream
+}
+
+/// Read all available data from a TCP stream into a Vec<u8>.
+/// Reads in a loop until a short read or timeout, to handle data that
+/// arrives in multiple segments (common with large payloads).
+fn raw_read_all(stream: &mut TcpStream) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut buf = [0u8; BUFFER_SIZE];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => result.extend_from_slice(&buf[..n]),
+            Err(e) => {
+                // WouldBlock / TimedOut means no more data right now
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                {
+                    break;
+                }
+                // Other errors (e.g. ConnectionReset) also terminate
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Build a proxy protocol V2 PROXY header with IPv4 addresses (28 bytes).
+fn pp_v2_proxy_ipv4(src_port: u16, dst_port: u16) -> Vec<u8> {
+    let mut h = vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // magic
+        0x21, // version 2, command PROXY
+        0x11, // AF_INET, STREAM
+        0x00, 0x0C, // address length: 12
+        127, 0, 0, 1, // source IP
+        127, 0, 0, 1, // dest IP
+    ];
+    h.extend_from_slice(&src_port.to_be_bytes());
+    h.extend_from_slice(&dst_port.to_be_bytes());
+    h
+}
+
+// =========================================================================
+// Test 1: Basic TCP proxy — bidirectional byte forwarding
+//
+// Verifies the fundamental TCP proxy contract: raw bytes sent by a client
+// pass through Sozu unmodified to the backend, and the backend's response
+// passes back unmodified to the client.
+// =========================================================================
+
+fn try_tcp_proxy_basic() -> State {
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-BASIC", 1);
+
+    let mut backend = SyncBackend::new("BACKEND_0", backend_addrs[0], "pong");
+    backend.connect();
+
+    let mut client = Client::new("CLIENT", front_address, "ping");
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    let received = backend.receive(0);
+    if received.as_deref() != Some("ping") {
+        println!("Backend did not receive expected data: {received:?}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    backend.send(0);
+    let response = client.receive();
+    if response.as_deref() != Some("pong") {
+        println!("Client did not receive expected response: {response:?}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    println!(
+        "{} sent: {}, received: {}",
+        client.name, client.requests_sent, client.responses_received
+    );
+    println!(
+        "{} sent: {}, received: {}",
+        backend.name, backend.responses_sent, backend.requests_received
+    );
+
+    if success { State::Success } else { State::Fail }
+}
+
+#[test]
+fn test_tcp_proxy_basic() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "TCP basic: raw bytes forwarded bidirectionally through Sozu",
+            try_tcp_proxy_basic,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 2: Large payload (1 MB) over TCP proxy
+//
+// Sends 1 MB of deterministic data through the proxy to verify that Sozu
+// handles large payloads without truncation, corruption, or buffer issues.
+// The backend echoes back a 1 MB response to test both directions.
+// =========================================================================
+
+fn try_tcp_proxy_large_payload() -> State {
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-LARGE", 1);
+
+    let back_address = backend_addrs[0];
+
+    // Spawn a backend thread that reads all incoming data, then sends back
+    // a 1 MB response. We use a raw thread because the SyncBackend helper
+    // is limited to a fixed BUFFER_SIZE per read.
+    let backend_handle = thread::spawn(move || {
+        let listener = bind_std_listener(back_address, "tcp test backend");
+        listener
+            .set_nonblocking(false)
+            .expect("could not set blocking");
+
+        let (mut stream, _) = listener.accept().expect("backend accept failed");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set write timeout");
+
+        // Read until we get all 1 MB
+        let expected_len: usize = 1024 * 1024;
+        let mut received = Vec::with_capacity(expected_len);
+        let mut buf = [0u8; 8192];
+        while received.len() < expected_len {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    println!("Backend read timed out after {} bytes", received.len());
+                    break;
+                }
+                Err(e) => {
+                    println!("Backend read error: {e}");
+                    break;
+                }
+            }
+        }
+        println!("Backend received {} bytes total", received.len());
+
+        // Send back a 1 MB response (different pattern for validation)
+        let response: Vec<u8> = (0..expected_len)
+            .map(|i| ((i % 251) as u8).wrapping_add(1))
+            .collect();
+        let mut offset = 0;
+        while offset < response.len() {
+            match stream.write(&response[offset..]) {
+                Ok(0) => break,
+                Ok(n) => offset += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    println!("Backend write error: {e}");
+                    break;
+                }
+            }
+        }
+        println!("Backend sent {} bytes total", offset);
+
+        (received, offset)
+    });
+
+    // Give the backend time to bind and listen
+    thread::sleep(Duration::from_millis(50));
+
+    // Client: connect and send 1 MB of deterministic data
+    let payload_size: usize = 1024 * 1024;
+    let payload: Vec<u8> = (0..payload_size).map(|i| (i % 256) as u8).collect();
+
+    let mut stream = raw_connect(front_address);
+    // Use a longer read timeout for large payloads
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+
+    // Write the full payload
+    let mut offset = 0;
+    while offset < payload.len() {
+        match stream.write(&payload[offset..]) {
+            Ok(0) => break,
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                println!("Client write error: {e}");
+                break;
+            }
+        }
+    }
+    println!("Client sent {} bytes", offset);
+
+    if offset != payload_size {
+        println!("Client could not send full payload: {offset}/{payload_size}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // Read the backend's response
+    let response = raw_read_all(&mut stream);
+    println!("Client received {} bytes", response.len());
+
+    // Wait for backend thread
+    let (backend_received, _backend_sent) = backend_handle.join().expect("backend thread panicked");
+
+    // Validate: backend received our full payload
+    if backend_received.len() != payload_size {
+        println!(
+            "Backend received {}/{} bytes",
+            backend_received.len(),
+            payload_size
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    if backend_received != payload {
+        println!("Backend received corrupted data");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // Validate: client received the full response
+    let expected_response: Vec<u8> = (0..payload_size)
+        .map(|i| ((i % 251) as u8).wrapping_add(1))
+        .collect();
+    if response.len() != payload_size {
+        println!(
+            "Client received {}/{} response bytes",
+            response.len(),
+            payload_size
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    if response != expected_response {
+        println!("Client received corrupted response data");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    if success { State::Success } else { State::Fail }
+}
+
+#[test]
+fn test_tcp_proxy_large_payload() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP large payload: 1 MB forwarded without truncation or corruption",
+            try_tcp_proxy_large_payload,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 3: TCP half-close handling across every PROXY-protocol role
+//
+// A client FIN does not promise that the old session will carry a backend
+// response. The accepted contract is narrower: drain every request byte that
+// preceded the FIN, close that session, then let the client start a clean new
+// session. Expect consumes the inbound PPv2 header, Relay forwards it verbatim,
+// and Send synthesizes one before the payload. The first request is deliberately
+// larger than the userspace pipe buffer so the FIN can race with bytes still in
+// flight; the second connection proves that no transparent replay or stale
+// session state is needed for progress.
+// =========================================================================
+
+fn proxy_mode_wire_bytes(
+    mode: Option<ProxyProtocolConfig>,
+    front_address: SocketAddr,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut wire = match mode {
+        Some(ProxyProtocolConfig::ExpectHeader | ProxyProtocolConfig::RelayHeader) => {
+            pp_v2_proxy_ipv4(54_321, front_address.port())
+        }
+        Some(ProxyProtocolConfig::SendHeader) | None => Vec::new(),
+    };
+    wire.extend_from_slice(payload);
+    wire
+}
+
+fn proxy_mode_backend_bytes(
+    mode: Option<ProxyProtocolConfig>,
+    front_address: SocketAddr,
+    client_address: SocketAddr,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut expected = match mode {
+        Some(ProxyProtocolConfig::ExpectHeader) | None => Vec::new(),
+        Some(ProxyProtocolConfig::RelayHeader) => pp_v2_proxy_ipv4(54_321, front_address.port()),
+        Some(ProxyProtocolConfig::SendHeader) => {
+            pp_v2_proxy_ipv4(client_address.port(), front_address.port())
+        }
+    };
+    expected.extend_from_slice(payload);
+    expected
+}
+
+fn try_tcp_proxy_half_close_starts_fresh_session() -> State {
+    const FRESH_PAYLOAD: &[u8] = b"fresh-session-request";
+    const FRESH_RESPONSE: &[u8] = b"fresh-session-response";
+
+    let half_closed_payload: Vec<u8> = (0..256 * 1024)
+        .map(|index| b'a' + (index % 23) as u8)
+        .collect();
+    let modes = [
+        (None, "plain"),
+        (Some(ProxyProtocolConfig::ExpectHeader), "expect"),
+        (Some(ProxyProtocolConfig::RelayHeader), "relay"),
+        (Some(ProxyProtocolConfig::SendHeader), "send"),
+    ];
+
+    let mut all_modes_ok = true;
+    for (mode, name) in modes {
+        let (mut worker, front_address, back_address) =
+            setup_tcp_proxy_mode_cluster_test(&format!("TCP-HALFCLOSE-{name}"), mode);
+        let listener = bind_std_listener(back_address, "tcp half-close backend");
+        let (expected_tx, expected_rx) = mpsc::channel::<Vec<u8>>();
+        let (observed_tx, observed_rx) = mpsc::channel::<(Vec<u8>, bool)>();
+
+        let backend = thread::spawn(move || {
+            for session in 0..2 {
+                let (mut stream, _) = listener.accept().expect("backend accept failed");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set backend read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("set backend write timeout");
+                let expected = expected_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("expected backend bytes");
+                let received = super::h2_utils::read_at_least(
+                    &mut stream,
+                    expected.len(),
+                    Duration::from_secs(2),
+                );
+
+                if session == 0 {
+                    let mut extra = [0u8; 1];
+                    let closed_after_request = match stream.read(&mut extra) {
+                        Ok(0) => true,
+                        Err(error)
+                            if !matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            true
+                        }
+                        Ok(_) | Err(_) => false,
+                    };
+                    observed_tx
+                        .send((received, closed_after_request))
+                        .expect("send old-session observation");
+                } else {
+                    stream
+                        .write_all(FRESH_RESPONSE)
+                        .expect("write fresh-session response");
+                    observed_tx
+                        .send((received, true))
+                        .expect("send fresh-session observation");
+                }
+            }
+        });
+
+        let mut old_client = raw_connect(front_address);
+        old_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set old-client read timeout");
+        let old_expected = proxy_mode_backend_bytes(
+            mode,
+            front_address,
+            old_client.local_addr().expect("old client local address"),
+            &half_closed_payload,
+        );
+        expected_tx
+            .send(old_expected.clone())
+            .expect("send expected old bytes");
+        old_client
+            .write_all(&proxy_mode_wire_bytes(
+                mode,
+                front_address,
+                &half_closed_payload,
+            ))
+            .expect("write half-closed request");
+        old_client
+            .shutdown(Shutdown::Write)
+            .expect("half-close old client");
+
+        let (old_received, backend_saw_close) = observed_rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("old-session observation deadline");
+        let mut unexpected = [0u8; 1];
+        let old_client_closed = match old_client.read(&mut unexpected) {
+            Ok(0) => true,
+            Err(error)
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                true
+            }
+            Ok(_) | Err(_) => false,
+        };
+
+        let mut fresh_client = raw_connect(front_address);
+        fresh_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set fresh-client read timeout");
+        let fresh_expected = proxy_mode_backend_bytes(
+            mode,
+            front_address,
+            fresh_client
+                .local_addr()
+                .expect("fresh client local address"),
+            FRESH_PAYLOAD,
+        );
+        expected_tx
+            .send(fresh_expected.clone())
+            .expect("send expected fresh bytes");
+        fresh_client
+            .write_all(&proxy_mode_wire_bytes(mode, front_address, FRESH_PAYLOAD))
+            .expect("write fresh request");
+        let mut fresh_response = vec![0u8; FRESH_RESPONSE.len()];
+        let fresh_response_ok = fresh_client.read_exact(&mut fresh_response).is_ok()
+            && fresh_response == FRESH_RESPONSE;
+        let (fresh_received, _) = observed_rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("fresh-session observation deadline");
+
+        backend.join().expect("backend thread panicked");
+        worker.soft_stop();
+        let stopped = worker.wait_for_server_stop();
+        let mode_ok = old_received == old_expected
+            && backend_saw_close
+            && old_client_closed
+            && fresh_received == fresh_expected
+            && fresh_response_ok
+            && stopped;
+        println!(
+            "half-close {name}: old={}/{} backend_closed={backend_saw_close} client_closed={old_client_closed} fresh={}/{} response={fresh_response_ok} stopped={stopped}",
+            old_received.len(),
+            old_expected.len(),
+            fresh_received.len(),
+            fresh_expected.len(),
+        );
+        all_modes_ok &= mode_ok;
+    }
+
+    if all_modes_ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_proxy_half_close_starts_fresh_session_for_every_proxy_mode() {
+    assert_eq!(
+        try_tcp_proxy_half_close_starts_fresh_session(),
+        State::Success,
+        "TCP half-close must drain the old request, close it, and admit a clean new session"
+    );
+}
+
+// =========================================================================
+// Test 4: Backend connection failure handling
+//
+// Verifies that Sozu handles unreachable backends gracefully: when a client
+// connects and the backend address has nothing listening, Sozu should not
+// crash or panic. The client connection should close cleanly.
+// =========================================================================
+
+fn try_tcp_backend_connection_failure() -> State {
+    let front_address = create_local_address();
+    let dead_backend_address = create_unbound_local_address();
+
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned("TCP-DEADBACKEND", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address.into())
+            .to_tcp(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Tcp.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    // Point to an address where nothing is listening
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        dead_backend_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Client connects and sends data — backend is unreachable
+    let mut stream = raw_connect(front_address);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+
+    let write_result = stream.write_all(b"hello dead backend");
+    println!("Client write result: {write_result:?}");
+
+    // Wait for Sozu to attempt connecting to the dead backend and close
+    thread::sleep(Duration::from_millis(500));
+
+    // The client should see a connection close (read returns 0 or error)
+    let mut buf = [0u8; BUFFER_SIZE];
+    let read_result = stream.read(&mut buf);
+    println!("Client read result: {read_result:?}");
+
+    match read_result {
+        Ok(0) => println!("Client: connection closed cleanly (EOF)"),
+        Err(e) => println!("Client: connection error (expected): {e}"),
+        Ok(n) => println!("Client: received {n} bytes (unexpected but not a failure)"),
+    }
+
+    // The real assertion: Sozu did not crash. Verify by stopping it cleanly.
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    if success {
+        println!("Worker stopped cleanly — no crash on backend connection failure");
+        State::Success
+    } else {
+        println!("Worker did not stop cleanly");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_backend_connection_failure() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "TCP backend failure: unreachable backend handled without crash",
+            try_tcp_backend_connection_failure,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 4b: a refused backend is accounted for and avoided
+//
+// A cluster with two backends, the first one refusing connections. Each
+// session that lands on it fails over to the live backend inside its
+// retry budget, so the client never sees the difference. What must see it
+// is the backend's own failure accounting: `TcpSession::fail_backend_connection`
+// feeds the retry policy, which takes the refused backend out of selection
+// for its back-off window, and emits `backend.connections.error` for it —
+// exactly what the mux does for HTTP. Without the session holding the
+// selected `Backend` handle, that accounting is a no-op: the counter never
+// appears and round-robin keeps dialing the dead backend in every session.
+//
+// The avoidance bound is derived from the retry policy, not from a guess
+// about how fast the sessions run. `ExponentialBackoffPolicy::fail` arms a
+// wait of at least one second on every failure it records, and a backend
+// inside its wait fails `Backend::can_open`, so it is not a selection
+// candidate while the live backend is (no fail-open). Two consecutive dials
+// of the refused backend are therefore at least one second apart, and over
+// an interval of `elapsed` it can be dialed at most `1 + floor(elapsed)`
+// times. Without that accounting, round-robin over the constant pair
+// alternates on every selection: a session that starts on the refused
+// backend uses two selections (refused, then live) and the next one starts
+// on it again, a session that starts on the live one uses one, so every
+// session but possibly the first dials the refused backend, at least
+// `SESSIONS - 1` times. The test requires the policy bound to sit strictly
+// below that count, so it can tell the two apart however loaded the runner.
+// =========================================================================
+
+/// Cluster-level metrics of `cluster_id`. At the default `Cluster` metric
+/// detail, a metric emitted with a `(cluster, backend)` label pair lands in
+/// its cluster's row with the backend label dropped.
+fn query_cluster_metrics(
+    worker: &mut Worker,
+    cluster_id: &str,
+) -> Option<HashMap<String, filtered_metrics::Inner>> {
+    worker.send_proxy_request_type(RequestType::QueryMetrics(QueryMetricsOptions {
+        list: false,
+        cluster_ids: vec![cluster_id.to_owned()],
+        backend_ids: vec![],
+        metric_names: vec![],
+        no_clusters: false,
+        workers: false,
+    }));
+    let response = worker.read_proxy_response()?;
+    if response.status != ResponseStatus::Ok as i32 {
+        return None;
+    }
+    let ContentType::WorkerMetrics(metrics) = response.content?.content_type? else {
+        return None;
+    };
+    let cluster = metrics.clusters.get(cluster_id)?;
+    Some(
+        cluster
+            .cluster
+            .iter()
+            .filter_map(|(name, metric)| Some((name.to_owned(), metric.inner.clone()?)))
+            .collect(),
+    )
+}
+
+fn try_tcp_refused_backend_is_accounted_and_avoided() -> State {
+    const SESSIONS: usize = 16;
+    let front_address = create_local_address();
+    let dead_backend_address = create_unbound_local_address();
+    let live_backend_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned("TCP-REFUSED", config, listeners, state);
+    worker.send_proxy_request_type(RequestType::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address.into())
+            .to_tcp(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Tcp.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-dead",
+        dead_backend_address,
+        None,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-live",
+        live_backend_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Live backend: echo one message per accepted connection.
+    let listener = bind_std_listener(live_backend_address, "refused-test live backend");
+    let backend_handle = thread::spawn(move || {
+        let mut echoed = 0usize;
+        for _ in 0..SESSIONS {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("set read timeout");
+            let mut buf = [0u8; 64];
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    if stream.write_all(&buf[..n]).is_ok() {
+                        echoed += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        echoed
+    });
+
+    // Sessions run one after the other: each one must reach the live
+    // backend, whichever backend the balancer tried first.
+    let mut served = 0usize;
+    let started = Instant::now();
+    for i in 0..SESSIONS {
+        let mut stream = raw_connect(front_address);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set read timeout");
+        let request = format!("session-{i}");
+        stream.write_all(request.as_bytes()).expect("client write");
+        let mut buf = [0u8; 64];
+        if let Ok(n) = stream.read(&mut buf)
+            && buf[..n] == *request.as_bytes()
+        {
+            served += 1;
+        }
+    }
+    // Every dial and every refusal of the refused backend happened inside
+    // this interval: each session was answered before the next one started.
+    let elapsed = started.elapsed();
+    let echoed = backend_handle.join().expect("backend thread");
+
+    let metrics = query_cluster_metrics(&mut worker, "cluster_0");
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!("refused-backend test: served {served}/{SESSIONS}, echoed {echoed}");
+    println!("cluster_0 metrics: {metrics:#?}");
+
+    // Only the refused backend can fail a connect: the live one is
+    // listening for the whole test, so the cluster's count is its count.
+    let dead_errors = metrics
+        .as_ref()
+        .and_then(|values| values.get("backend.connections.error"))
+        .and_then(|inner| match inner {
+            filtered_metrics::Inner::Count(value) => Some(*value),
+            _ => None,
+        });
+
+    // Dials the back-off allows in `elapsed` (at least one second between
+    // two of them), and dials round-robin makes without it: see the test
+    // header for both derivations.
+    let readmission_bound = 1 + elapsed.as_secs() as usize;
+    let unaccounted_dials = SESSIONS - 1;
+    let discriminates = readmission_bound < unaccounted_dials;
+    let accounted = matches!(dead_errors, Some(errors) if errors >= 1);
+    let avoided = matches!(dead_errors, Some(errors) if errors as usize <= readmission_bound);
+    println!(
+        "dead backend backend.connections.error = {dead_errors:?}, sessions took {elapsed:?}, \
+         back-off allows at most {readmission_bound}, round-robin without it makes at least \
+         {unaccounted_dials}"
+    );
+    if !discriminates {
+        println!(
+            "the sessions took too long for the back-off bound to sit below the round-robin count"
+        );
+    }
+
+    if stopped && served == SESSIONS && echoed == SESSIONS && accounted && avoided && discriminates
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_refused_backend_is_accounted_and_avoided() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP refused backend: failure accounted and backend avoided",
+            try_tcp_refused_backend_is_accounted_and_avoided,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 5: Proxy protocol V2 with TCP listener
+//
+// Verifies that a TCP listener configured with `expect_proxy = true`
+// correctly accepts a proxy protocol V2 PROXY header followed by raw
+// TCP data. The backend should receive the data (without the proxy
+// protocol header) and be able to respond.
+// =========================================================================
+
+fn try_tcp_proxy_protocol_v2() -> State {
+    // Note: TCP listeners pass through all bytes including PP headers.
+    // The `expect_proxy` option is only effective on HTTP/HTTPS listeners.
+    // This test verifies that a TCP listener with `expect_proxy` still
+    // forwards the PP V2 header + payload as raw bytes to the backend,
+    // demonstrating passthrough behavior.
+    let (mut worker, backend_addrs, front_address) = setup_tcp_proxy_protocol_test("TCP-PPV2", 1);
+
+    let back_address = backend_addrs[0];
+
+    let backend_handle = thread::spawn(move || {
+        let listener = bind_std_listener(back_address, "tcp test backend");
+        let (mut stream, _) = listener.accept().expect("backend accept failed");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("set write timeout");
+
+        // Client splits the PP header (28 bytes) and payload (16 bytes) into
+        // two `write_all` calls; TCP segmentation can deliver them as two
+        // reads. Loop until the full 44 bytes or deadline.
+        const EXPECTED_TOTAL: usize = 44;
+        let received =
+            super::h2_utils::read_at_least(&mut stream, EXPECTED_TOTAL, Duration::from_secs(2));
+        println!(
+            "Backend: received {} bytes (expected {EXPECTED_TOTAL})",
+            received.len()
+        );
+
+        // Send a response
+        let response = b"ppv2-tcp-response";
+        stream.write_all(response).expect("backend write failed");
+        println!("Backend: sent response");
+
+        received
+    });
+
+    // Give the backend time to bind
+    thread::sleep(Duration::from_millis(50));
+
+    // Client: send PP V2 header followed by raw TCP payload
+    let pp_header = pp_v2_proxy_ipv4(54321, front_address.port());
+    let payload = b"ppv2-tcp-request";
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+
+    stream.write_all(&pp_header).expect("write PP header");
+    stream.write_all(payload).expect("write TCP payload");
+    println!(
+        "Client: sent PP header ({} bytes) + payload ({} bytes)",
+        pp_header.len(),
+        payload.len()
+    );
+
+    // Read the backend's response
+    let response = raw_read_all(&mut stream);
+    println!("Client: received {} bytes", response.len());
+
+    let backend_received = backend_handle.join().expect("backend thread panicked");
+
+    // TCP passthrough: backend receives PP header + payload concatenated.
+    let mut expected = pp_header.clone();
+    expected.extend_from_slice(payload);
+
+    if backend_received == expected {
+        println!("Backend received PP header + payload as raw passthrough (expected)");
+    } else if backend_received == payload.to_vec() {
+        println!("Backend received payload only — PP header was stripped (also valid)");
+    } else {
+        println!(
+            "Backend received {} bytes, expected {} (passthrough) or {} (stripped)",
+            backend_received.len(),
+            expected.len(),
+            payload.len(),
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // Client should have received the response regardless
+    if response != b"ppv2-tcp-response" {
+        println!(
+            "Client received {:?}, expected {:?}",
+            String::from_utf8_lossy(&response),
+            "ppv2-tcp-response",
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    if success { State::Success } else { State::Fail }
+}
+
+#[test]
+fn test_tcp_proxy_protocol_v2() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "TCP proxy protocol V2: PP header stripped, raw bytes forwarded",
+            try_tcp_proxy_protocol_v2,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 6: Concurrent TCP sessions across multiple backends
+//
+// Exercises the splice fast path under concurrency: N clients connect to
+// the proxy at once, each backed by an independent backend. Sozu must
+// allocate one SplicePipe per session and drive them in parallel from the
+// single-threaded event loop. The buffered path passes the same test, so
+// this also serves as a feature-flag equivalence check on CI.
+// =========================================================================
+
+fn try_tcp_proxy_concurrent_async() -> State {
+    const N: usize = 4;
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-CONCURRENT", N);
+
+    // Spawn N independent backend echo servers, one per registered
+    // backend address. Each accepts a single connection, reads the
+    // request, and writes a backend-tagged response so we can match
+    // requests to responses without relying on Sozu's load-balancing
+    // policy.
+    let backend_handles: Vec<_> = backend_addrs
+        .into_iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            thread::spawn(move || {
+                let listener = bind_std_listener(addr, "concurrent backend");
+                let (mut stream, _) = listener.accept().expect("backend accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("set read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .expect("set write timeout");
+                let mut buf = [0u8; 256];
+                let n = stream.read(&mut buf).expect("backend read");
+                let response = format!("response-from-backend-{i}");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("backend write");
+                n
+            })
+        })
+        .collect();
+
+    // Give the backend listeners a moment to enter accept().
+    thread::sleep(Duration::from_millis(50));
+
+    // N concurrent clients. Each writes a tagged request and reads
+    // until short-read so segmented responses are handled correctly.
+    let client_handles: Vec<_> = (0..N)
+        .map(|i| {
+            thread::spawn(move || {
+                let mut stream = raw_connect(front_address);
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("set read timeout");
+                let req = format!("request-from-client-{i}");
+                stream.write_all(req.as_bytes()).expect("client write");
+                raw_read_all(&mut stream)
+            })
+        })
+        .collect();
+
+    let responses: Vec<Vec<u8>> = client_handles
+        .into_iter()
+        .map(|h| h.join().expect("client thread"))
+        .collect();
+    for h in backend_handles {
+        h.join().expect("backend thread");
+    }
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    // Every client must have received some response. We don't assert
+    // a specific client→backend mapping because the load balancer's
+    // policy is implementation-defined; the spliced byte streams just
+    // have to round-trip cleanly.
+    let all_received = responses.iter().all(|r| !r.is_empty());
+    let total_bytes: usize = responses.iter().map(|r| r.len()).sum();
+    println!(
+        "Concurrent test: {} responses, {total_bytes} total bytes",
+        responses.len()
+    );
+
+    if stopped && all_received {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_proxy_concurrent_async() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TCP concurrent: N clients × N backends round-trip in parallel",
+            try_tcp_proxy_concurrent_async,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 7: Multiple request/response cycles on a single TCP session
+//
+// Long-lived TCP connections (databases, custom protocols, websocket-like
+// streams) drive many request/response cycles over the same socket. For
+// the splice path this exercises the SplicePipe lifecycle across
+// successive `splice_in`/`splice_out` calls without recreating pipes.
+// =========================================================================
+
+fn try_tcp_proxy_multiple_requests() -> State {
+    const N_REQUESTS: usize = 5;
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-MULTIREQ", 1);
+    let back_address = backend_addrs[0];
+
+    // Backend: accept one connection, then echo N_REQUESTS messages.
+    let backend_handle = thread::spawn(move || {
+        let listener = bind_std_listener(back_address, "multireq backend");
+        let (mut stream, _) = listener.accept().expect("backend accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .expect("set write timeout");
+
+        let mut total_echoed = 0usize;
+        for _ in 0..N_REQUESTS {
+            let mut buf = [0u8; 64];
+            let n = match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            stream.write_all(&buf[..n]).expect("backend write echo");
+            total_echoed += 1;
+        }
+        total_echoed
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set read timeout");
+
+    let mut received = Vec::with_capacity(N_REQUESTS);
+    for i in 0..N_REQUESTS {
+        let req = format!("req-{i}");
+        stream.write_all(req.as_bytes()).expect("client write");
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).expect("client read");
+        received.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+    }
+    drop(stream);
+
+    let echoed = backend_handle.join().expect("backend thread");
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "Multi-request test: client got {} echoes, backend echoed {echoed}",
+        received.len(),
+    );
+
+    let all_match = received.len() == N_REQUESTS
+        && received
+            .iter()
+            .enumerate()
+            .all(|(i, r)| r == &format!("req-{i}"));
+
+    if stopped && all_match && echoed == N_REQUESTS {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_proxy_multiple_requests() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TCP multiple requests: N round-trips on one persistent connection",
+            try_tcp_proxy_multiple_requests,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 7b: Successive TCP sessions each carry only their own bytes
+//
+// With the splice feature, a worker hands a session's kernel pipes back to
+// a pool when the session ends empty, and the next session takes them
+// (`lib/src/splice.rs`). Each session here sends a payload of its own,
+// several pipe capacities long, that the backend checks and echoes back:
+// a byte of an earlier session reaching a later one fails the test.
+// Protocol-level, so it runs identically without the feature.
+// =========================================================================
+
+fn session_payload(session: usize, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i.wrapping_mul(7).wrapping_add(session * 31) % 251) as u8)
+        .collect()
+}
+
+fn try_tcp_proxy_successive_sessions_keep_their_own_bytes() -> State {
+    const SESSIONS: usize = 8;
+    const LEN: usize = 256 * 1024;
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-SUCCESSIVE", 1);
+    // Bound before the client connects, so no wait is needed for the
+    // backend to listen.
+    let listener = bind_std_listener(backend_addrs[0], "successive sessions backend");
+    listener
+        .set_nonblocking(false)
+        .expect("could not set blocking");
+
+    let backend_handle = thread::spawn(move || {
+        let mut intact = 0usize;
+        for session in 0..SESSIONS {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("set write timeout");
+            let mut request = vec![0u8; LEN];
+            if stream.read_exact(&mut request).is_err() {
+                println!("backend: session {session} request truncated");
+                break;
+            }
+            if request != session_payload(session, LEN) {
+                println!("backend: session {session} received bytes it did not send");
+                break;
+            }
+            if stream.write_all(&request).is_err() {
+                break;
+            }
+            intact += 1;
+        }
+        intact
+    });
+
+    let mut intact = 0usize;
+    for session in 0..SESSIONS {
+        let mut stream = raw_connect(front_address);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set write timeout");
+        let payload = session_payload(session, LEN);
+        if stream.write_all(&payload).is_err() {
+            break;
+        }
+        let mut response = vec![0u8; LEN];
+        if stream.read_exact(&mut response).is_err() {
+            println!("client: session {session} response truncated");
+            break;
+        }
+        if response != payload {
+            println!("client: session {session} received bytes it did not send");
+            break;
+        }
+        intact += 1;
+    }
+
+    let backend_intact = backend_handle.join().expect("backend thread");
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    println!(
+        "successive sessions: client {intact}/{SESSIONS}, backend {backend_intact}/{SESSIONS}"
+    );
+
+    if stopped && intact == SESSIONS && backend_intact == SESSIONS {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_proxy_successive_sessions_keep_their_own_bytes() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP successive sessions: each session carries only its own bytes",
+            try_tcp_proxy_successive_sessions_keep_their_own_bytes,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 7c/7d: A session that ends with bytes in its splice pipe
+//
+// The two tests above and below end their sessions with empty pipes, so
+// they would pass even if a pipe still holding bytes were handed to the
+// next session. These two end session A while one direction is saturated
+// end to end, so that its kernel pipe (on the splice path) still holds A's
+// bytes when the session closes, then check that session B carries only
+// its own bytes. Every wait is on an event: EAGAIN for saturation, a peeked
+// byte for data having crossed the proxy, and the peer's close for the
+// proxy having torn session A down (the worker drops a session in the
+// same event-loop pass as it closes its sockets, so session B, accepted in
+// a later pass, can only take a pair session A returned).
+// =========================================================================
+
+const SESSION_B: &[u8] = b"session-B";
+
+/// Write `byte` on a non-blocking `stream` until the kernel answers EAGAIN:
+/// every buffer between here and a peer that does not read is then full.
+/// Returns false on any other error.
+fn write_until_saturated(stream: &mut TcpStream, byte: u8) -> bool {
+    let chunk = vec![byte; 64 * 1024];
+    stream.set_nonblocking(true).expect("set nonblocking");
+    let saturated = loop {
+        match stream.write(&chunk) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break true,
+            Err(e) => {
+                println!("write until saturated: {e}");
+                break false;
+            }
+        }
+    };
+    stream.set_nonblocking(false).expect("set blocking");
+    saturated
+}
+
+/// Block until the proxy closes `stream`: a read that returns end of file or
+/// a reset. A read timeout is not a close.
+fn wait_for_proxy_close(stream: &mut TcpStream) -> bool {
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::ConnectionAborted =>
+            {
+                return true;
+            }
+            Err(e) => {
+                println!("wait for proxy close: {e}");
+                return false;
+            }
+        }
+    }
+}
+
+fn set_timeouts(stream: &TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+}
+
+/// Client → backend: the backend never reads session A, the client fills
+/// every buffer up to the frontend pipe, and the backend closes A with
+/// unread bytes. The backend must then read exactly session B's bytes.
+fn try_tcp_request_bytes_left_in_the_pipe_never_reach_the_next_session() -> State {
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-LEFTOVER-IN", 1);
+    let listener = bind_std_listener(backend_addrs[0], "leftover request backend");
+    listener
+        .set_nonblocking(false)
+        .expect("could not set blocking");
+    let (saturated_tx, saturated_rx) = mpsc::channel::<()>();
+
+    let backend_handle = thread::spawn(move || {
+        let (session_a, _) = listener.accept().expect("backend accept A");
+        set_timeouts(&session_a);
+        // Session A's bytes crossed the proxy before we close it.
+        let mut first = [0u8; 1];
+        let crossed = session_a.peek(&mut first).is_ok_and(|n| n == 1);
+        if saturated_rx.recv().is_err() {
+            return None;
+        }
+        // Closing with unread bytes resets the proxy's backend connection.
+        drop(session_a);
+
+        let (mut session_b, _) = listener.accept().expect("backend accept B");
+        set_timeouts(&session_b);
+        let mut received = vec![0u8; SESSION_B.len()];
+        session_b.read_exact(&mut received).ok()?;
+        Some((crossed, received))
+    });
+
+    let mut session_a = raw_connect(front_address);
+    set_timeouts(&session_a);
+    let saturated = write_until_saturated(&mut session_a, b'a');
+    saturated_tx.send(()).expect("signal backend");
+    let a_closed = saturated && wait_for_proxy_close(&mut session_a);
+    drop(session_a);
+
+    let mut session_b = raw_connect(front_address);
+    set_timeouts(&session_b);
+    let sent_b = a_closed && session_b.write_all(SESSION_B).is_ok();
+
+    let backend = backend_handle.join().expect("backend thread");
+    drop(session_b);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let (crossed, received) = backend.unwrap_or_default();
+    println!(
+        "leftover request bytes: saturated={saturated} crossed={crossed} a_closed={a_closed} \
+         backend received {:?}",
+        String::from_utf8_lossy(&received)
+    );
+    if stopped && crossed && sent_b && received == SESSION_B {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_request_bytes_left_in_the_pipe_never_reach_the_next_session() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP: request bytes session A left in the proxy never reach session B's backend",
+            try_tcp_request_bytes_left_in_the_pipe_never_reach_the_next_session,
+        ),
+        State::Success,
+    );
+}
+
+/// Backend → client: client A never reads, the backend fills every buffer
+/// up to the backend pipe, and client A closes with unread bytes. Client B
+/// must then read exactly its own bytes.
+fn try_tcp_response_bytes_left_in_the_pipe_never_reach_the_next_session() -> State {
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-LEFTOVER-OUT", 1);
+    let listener = bind_std_listener(backend_addrs[0], "leftover response backend");
+    listener
+        .set_nonblocking(false)
+        .expect("could not set blocking");
+    let (saturated_tx, saturated_rx) = mpsc::channel::<bool>();
+    let (a_closed_tx, a_closed_rx) = mpsc::channel::<bool>();
+
+    let backend_handle = thread::spawn(move || {
+        let (mut session_a, _) = listener.accept().expect("backend accept A");
+        set_timeouts(&session_a);
+        let saturated = write_until_saturated(&mut session_a, b'z');
+        saturated_tx.send(saturated).expect("signal client");
+        // The proxy closes its backend connection once session A is torn
+        // down.
+        let closed = saturated && wait_for_proxy_close(&mut session_a);
+        a_closed_tx.send(closed).expect("signal client");
+        if !closed {
+            return false;
+        }
+        let (mut session_b, _) = listener.accept().expect("backend accept B");
+        set_timeouts(&session_b);
+        session_b.write_all(SESSION_B).is_ok()
+    });
+
+    let session_a = raw_connect(front_address);
+    set_timeouts(&session_a);
+    // Session A's bytes crossed the proxy before we close it.
+    let mut first = [0u8; 1];
+    let crossed = session_a.peek(&mut first).is_ok_and(|n| n == 1);
+    let saturated = saturated_rx.recv().unwrap_or(false);
+    // Closing with unread bytes resets the proxy's frontend connection.
+    drop(session_a);
+    let a_closed = a_closed_rx.recv().unwrap_or(false);
+
+    let mut received = vec![0u8; SESSION_B.len()];
+    let mut read_b = false;
+    if a_closed {
+        let mut session_b = raw_connect(front_address);
+        set_timeouts(&session_b);
+        read_b = session_b.read_exact(&mut received).is_ok();
+    }
+
+    let sent_b = backend_handle.join().expect("backend thread");
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "leftover response bytes: crossed={crossed} saturated={saturated} a_closed={a_closed} \
+         client B received {:?}",
+        String::from_utf8_lossy(&received)
+    );
+    if stopped && crossed && sent_b && read_b && received == SESSION_B {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_response_bytes_left_in_the_pipe_never_reach_the_next_session() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP: response bytes session A left in the proxy never reach client B",
+            try_tcp_response_bytes_left_in_the_pipe_never_reach_the_next_session,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 8: Soft-stop with an active TCP session
+//
+// Triggers `soft_stop` while a TCP session is mid-flight (data exchanged,
+// no FIN yet). The worker must drain in-flight bytes (including any
+// kernel-pipe pending data on the splice path) and exit cleanly.
+// =========================================================================
+
+fn try_tcp_soft_stop_with_active_sessions() -> State {
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-SOFTSTOP", 1);
+    let back_address = backend_addrs[0];
+
+    // Backend: accept, read the client's request, send a response,
+    // then linger briefly so the soft_stop arrives while the session
+    // is still attached.
+    let backend_handle = thread::spawn(move || {
+        let listener = bind_std_listener(back_address, "softstop backend");
+        let (mut stream, _) = listener.accept().expect("backend accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .expect("set write timeout");
+        let mut buf = [0u8; 256];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        if n > 0 {
+            let _ = stream.write_all(b"backend-mid-stream-response");
+        }
+        // Hold the socket open while the test triggers soft_stop.
+        thread::sleep(Duration::from_millis(300));
+        n
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let client_handle = thread::spawn(move || {
+        let mut stream = raw_connect(front_address);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set read timeout");
+        stream
+            .write_all(b"client-mid-stream-request")
+            .expect("client write");
+        // Try to read; soft_stop may interleave with the response.
+        let mut buf = [0u8; 256];
+        stream.read(&mut buf).unwrap_or(0)
+    });
+
+    // Let the data start flowing through the pipe in both directions
+    // before the soft-stop hits.
+    thread::sleep(Duration::from_millis(150));
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let backend_read = backend_handle.join().expect("backend thread");
+    let client_read = client_handle.join().expect("client thread");
+
+    println!(
+        "Soft-stop test: backend read {backend_read} request bytes, client read {client_read} response bytes, worker stopped cleanly: {stopped}"
+    );
+
+    // The contract here is "no panic, no hang". Any bytes that flowed
+    // before soft_stop are a bonus; what matters is that the worker
+    // returned from wait_for_server_stop without timing out.
+    if stopped { State::Success } else { State::Fail }
+}
+
+#[test]
+fn test_tcp_soft_stop_with_active_sessions() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TCP soft-stop: graceful shutdown with active TCP session",
+            try_tcp_soft_stop_with_active_sessions,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test: an `ExpectHeader` TCP cluster survives a client that sends nothing
+//
+// A cluster configured with `proxy_protocol = ExpectHeader` puts its session
+// in `TcpStateMachine::ExpectProxyProtocol`, which has NO backend side at all:
+// `back_readiness` returns `None` for it and `set_back_socket` is a bare
+// `panic!`. `ready_inner`'s connect gate used to dial unconditionally from
+// there, and the frontend is registered `READABLE | WRITABLE`, so epoll
+// reports WRITABLE on a freshly accepted socket and the gate ran before the
+// peer had sent a single byte — one unauthenticated connection that merely
+// completed the TCP handshake took the worker down, and every other session
+// on it. `attempt_backend_connect_if_needed` now refuses to dial while the
+// state is `ExpectProxyProtocol`.
+//
+// The silent client is held open for the whole test so its session cannot be
+// reaped before the second, well-behaved session proves the worker is intact.
+// =========================================================================
+
+/// Set up a Sōzu worker whose cluster selects one PROXY-protocol role. This is
+/// distinct from [`setup_tcp_proxy_protocol_test`], which sets `expect_proxy`
+/// on the listener even though raw TCP treats that listener flag as passthrough.
+fn setup_tcp_proxy_mode_cluster_test(
+    name: &str,
+    proxy_protocol: Option<ProxyProtocolConfig>,
+) -> (Worker, SocketAddr, SocketAddr) {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address.into())
+            .to_tcp(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Tcp.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(
+        sozu_command_lib::proto::command::Cluster {
+            proxy_protocol: proxy_protocol.map(|mode| mode as i32),
+            ..Worker::default_cluster("cluster_0")
+        },
+    ));
+    worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    (worker, front_address, back_address)
+}
+
+/// A PROXY-v2 receiver must consume the exact `16 + len` bytes declared by
+/// the header. Payload bytes can arrive in the same TCP segment, and must stay
+/// available to the pipe after the expect state upgrades.
+fn try_tcp_expect_proxy_preserves_coalesced_payload() -> State {
+    const PAYLOAD: &[u8] = b"coalesced-application-payload";
+
+    let (mut worker, front_address, back_address) = setup_tcp_proxy_mode_cluster_test(
+        "TCP-EXPECT-COALESCED-PAYLOAD",
+        Some(ProxyProtocolConfig::ExpectHeader),
+    );
+    let listener = bind_std_listener(back_address, "tcp expect-header payload backend");
+
+    let mut ipv4_with_tlv = pp_v2_proxy_ipv4(54321, front_address.port());
+    ipv4_with_tlv[14..16].copy_from_slice(&20u16.to_be_bytes());
+    ipv4_with_tlv.extend_from_slice(&[0xe0, 0, 5, 1, 2, 3, 4, 5]);
+
+    let mut ipv6_with_tlv = vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // magic
+        0x21, // version 2, command PROXY
+        0x21, // AF_INET6, STREAM
+        0x00, 0x2C, // address length: 36 address bytes + 8 TLV bytes
+    ];
+    ipv6_with_tlv.extend_from_slice(&[0; 32]);
+    ipv6_with_tlv.extend_from_slice(&54321u16.to_be_bytes());
+    ipv6_with_tlv.extend_from_slice(&front_address.port().to_be_bytes());
+    ipv6_with_tlv.extend_from_slice(&[0xe0, 0, 5, 1, 2, 3, 4, 5]);
+
+    let mut max_header = vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // magic
+        0x20, // version 2, command LOCAL
+        0x00, // AF_UNSPEC
+        0x00, 0xD8, // address length: 216 (232 bytes total)
+    ];
+    max_header.resize(232, 0);
+
+    let cases = [
+        (
+            "LOCAL-16",
+            vec![
+                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x20, 0x00,
+                0x00, 0x00,
+            ],
+        ),
+        (
+            "IPv4-28-positive-witness",
+            pp_v2_proxy_ipv4(54321, front_address.port()),
+        ),
+        ("IPv4-plus-TLV-36", ipv4_with_tlv),
+        ("IPv6-plus-TLV-60", ipv6_with_tlv),
+        ("LOCAL-maximum-232", max_header),
+    ];
+
+    let (backend_tx, backend_rx) = mpsc::channel();
+    let case_count = cases.len();
+    let backend_handle = thread::spawn(move || {
+        for _ in 0..case_count {
+            let (mut stream, _) = listener.accept().expect("backend accept failed");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("set backend read timeout");
+            let received =
+                super::h2_utils::read_at_least(&mut stream, PAYLOAD.len(), Duration::from_secs(1));
+            backend_tx.send(received).expect("send backend observation");
+        }
+    });
+
+    // Keep every client write-open until the backend observations complete:
+    // this test does not exercise the half-close policy tracked in #1840.
+    let mut clients = Vec::new();
+    let mut observations = Vec::new();
+    for (name, header) in &cases {
+        let mut stream = raw_connect(front_address);
+        let mut coalesced = header.clone();
+        coalesced.extend_from_slice(PAYLOAD);
+        stream
+            .write_all(&coalesced)
+            .expect("write coalesced PROXY header and payload");
+        clients.push(stream);
+        observations.push((
+            *name,
+            backend_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("backend observation deadline elapsed"),
+        ));
+    }
+
+    backend_handle.join().expect("backend thread panicked");
+    let mut all_payloads_preserved = true;
+    for (name, received) in &observations {
+        println!(
+            "TCP expect-header {name}: received {}/{} payload bytes",
+            received.len(),
+            PAYLOAD.len()
+        );
+        all_payloads_preserved &= received.as_slice() == PAYLOAD;
+    }
+
+    drop(clients);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if all_payloads_preserved && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_expect_proxy_preserves_coalesced_payload() {
+    assert_eq!(
+        try_tcp_expect_proxy_preserves_coalesced_payload(),
+        State::Success,
+        "expect_proxy must consume exactly the declared v2 header length"
+    );
+}
+
+/// To SEE THIS RED: in `lib/src/tcp.rs`, delete the
+/// `if matches!(&self.state, TcpStateMachine::ExpectProxyProtocol(_)) { return None; }`
+/// guard from `attempt_backend_connect_if_needed`. The silent connection then
+/// drives `connect_to_backend` into `set_back_socket`'s
+/// "We should not set the back socket for the expect proxy protocol" panic:
+/// the worker thread dies, the second session gets no answer, and the harness
+/// fails on the dead command channel.
+fn try_tcp_expect_proxy_zero_bytes_keeps_the_worker_alive() -> State {
+    let (mut worker, front_address, back_address) = setup_tcp_proxy_mode_cluster_test(
+        "TCP-EXPECT-SILENT",
+        Some(ProxyProtocolConfig::ExpectHeader),
+    );
+
+    // A client that completes the handshake and sends NOTHING. Held open for
+    // the rest of the test.
+    let silent = TcpStream::connect(front_address).expect("could not open the silent connection");
+    silent
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set read timeout");
+
+    // An exposure window, not a synchronisation point: this waits for the
+    // defect to have its chance to fire, and the thing being waited for is
+    // that NOTHING observable happens (the pre-fix worker dies here, on the
+    // WRITABLE epoll reports for a socket that sent no byte). There is no
+    // condition to poll for, which is why `doc/testing.md` §7's "prefer
+    // deadlines over sleep" rule does not apply — a deadline loop would poll
+    // for the absence of an event. The worker's death is observed by the
+    // assertions below, not by this wait.
+    thread::sleep(Duration::from_millis(300));
+
+    // A second, well-behaved session must still work end to end.
+    let backend_handle = thread::spawn(move || {
+        let listener = bind_std_listener(back_address, "tcp expect-header backend");
+        let (mut stream, _) = listener.accept().expect("backend accept failed");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set read timeout");
+        let received = super::h2_utils::read_at_least(&mut stream, 7, Duration::from_secs(2));
+        stream
+            .write_all(b"expect-header-response")
+            .expect("backend write failed");
+        received
+    });
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    stream
+        .write_all(&pp_v2_proxy_ipv4(54321, front_address.port()))
+        .expect("write PP header");
+    stream.write_all(b"payload").expect("write TCP payload");
+
+    let response = raw_read_all(&mut stream);
+    let backend_received = backend_handle.join().expect("backend thread panicked");
+    // The backend must see the payload with the PROXY header stripped, which
+    // is what proves the expect upgrade ran rather than being bypassed.
+    let second_session_ok = response.as_slice() == b"expect-header-response".as_slice()
+        && backend_received.as_slice() == b"payload".as_slice();
+
+    println!(
+        "TCP expect-header: backend received {:?}, client received {} bytes",
+        String::from_utf8_lossy(&backend_received),
+        response.len()
+    );
+
+    drop(silent);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!("TCP expect-header: second_session_ok={second_session_ok} stopped={stopped}");
+    if second_session_ok && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_expect_proxy_zero_bytes_keeps_the_worker_alive() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP expect-header: a client that sends zero bytes does not kill the worker",
+            try_tcp_expect_proxy_zero_bytes_keeps_the_worker_alive,
+        ),
+        State::Success,
+    );
+}

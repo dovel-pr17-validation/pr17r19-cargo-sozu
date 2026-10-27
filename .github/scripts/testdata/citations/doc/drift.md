@@ -1,0 +1,22 @@
+# Drift fixture — the head revision, and the only three drifts the rule may report
+
+Every citation here resolves to a non-blank line, so the blank-line rule passes
+this document at both revisions. Only a comparison against the base revision
+separates the five cases below.
+
+Unchanged, and must stay silent: `Drift::stable` is declared at `drift.rs:8`
+and its body spans `drift.rs:8-10`.
+
+Drifted, and NOT re-anchored by this changeset — must be reported:
+`Drift::moved` was declared at `drift.rs:12`, where an unrelated method now sits.
+
+Drifted at the END of a range whose start did not move — must be reported too,
+because the blank-line rule guards both ends of a range and this one must not
+guard fewer: `drift.rs:8-13`, whose moved end is also cited bare as `:13`.
+
+Re-anchored by this changeset, and must stay silent because the author moved it
+on purpose: `Drift::moved` is declared at `drift.rs:16`.
+
+Drifted PAST the width a quoted line is clipped to, so the report has to clip
+around the difference rather than from column 0 or it prints one string twice:
+`wide.md:11` is a catalogue row whose only edit lands beyond that width.

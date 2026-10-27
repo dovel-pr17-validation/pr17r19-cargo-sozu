@@ -1,0 +1,123 @@
+[package]
+name = "sozu-e2e"
+version = "2.3.3"
+rust-version = "1.93.1"
+edition = "2024"
+publish = false
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(tarpaulin)"]
+
+[dependencies]
+base64 = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
+hyper-rustls = { workspace = true, features = ["webpki-tokio", "http1", "http2", "tls12", "logging"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
+hickory-proto = { workspace = true, optional = true }
+libc = { workspace = true }
+lapin = { workspace = true, optional = true, features = ["tokio"] }
+magnetar = { workspace = true, optional = true, features = ["tokio", "crypto-ring"] }
+mio = { workspace = true }
+mongodb = { workspace = true, optional = true, features = ["compat-3-0-0", "rustls-tls"] }
+mysql_async = { workspace = true, optional = true, features = ["minimal-rust"] }
+redis = { workspace = true, optional = true, features = ["tokio-comp"] }
+rskafka = { workspace = true, optional = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-postgres = { workspace = true, optional = true, features = ["runtime"] }
+tonic = { workspace = true, optional = true, features = ["codegen", "router", "transport"] }
+tonic-prost = { workspace = true, optional = true }
+
+sozu-command-lib = { workspace = true }
+sozu-lib = { workspace = true, features = ["e2e-hooks"] }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+# Serialise tests that share global state (e.g. the e2e-hooks
+# `FORCE_NEW_H2_CLIENT_FAILURE` `AtomicBool` consumed by both
+# `e2e_session_router_connect_failure_no_leak` and
+# `e2e_session_stream_id_exhaustion_graceful`). Without this, the
+# default `cargo test` parallel scheduler can let the FIX-22 smoke
+# request consume the failure injection that FIX-18 just armed,
+# producing the wrong response code for both tests on CI.
+serial_test = { workspace = true }
+# Encode forged length-delimited protobuf payloads in
+# `tests/command_channel_security_tests.rs` to reproduce the
+# `ScmSocket::receive_listeners` slice-OOB pre-fix and prove the
+# `ListenersCountInconsistent` rejection path post-fix.
+prost = { workspace = true }
+# `sendmsg` syscall wrapper used by the same test to ship a
+# malformed `ListenersCount` over the SCM socket without going
+# through `ScmSocket::send_listeners` (which keeps addresses and
+# FDs in sync by construction).
+nix = { workspace = true, features = ["socket", "uio"] }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true, optional = true }
+
+[features]
+# Forward sozu-lib's `splice` feature so the dependency-tree compiles
+# the splice integration in `lib/src/protocol/pipe.rs`. The TCP tests
+# in `tests/tcp_tests.rs` are protocol-level and run identically with
+# or without the feature enabled — CI exercises both configurations.
+splice = ["sozu-lib/splice"]
+# Crypto-provider forwarding so `cargo test -p sozu-e2e --features
+# crypto-aws-lc-rs` etc. exercises the matrix end-to-end. The default
+# is `crypto-ring`, matching the `sozu` binary default; CI's matrix
+# job overrides via `--no-default-features --features <provider>`.
+#
+# Each provider feature also forwards the matching `hyper-rustls`
+# feature so the test client and the proxy use the SAME rustls
+# provider in the same process. Without this, hyper-rustls's
+# default `ring` feature would link a second provider into the
+# binary alongside sozu-lib's selection, and rustls 0.23.39's
+# `CryptoProvider::get_default_or_install_from_crate_features()`
+# panics with "Could not automatically determine the process-level
+# CryptoProvider" because two `from_crate_features` candidates
+# match (`crypto/mod.rs:249`). For `crypto-openssl` no
+# hyper-rustls feature is needed: `rustls-openssl` is a separate
+# crate that registers the provider explicitly, so the
+# `from_crate_features` path is not exercised.
+default = ["crypto-ring"]
+grpc-e2e = ["dep:tonic", "dep:tonic-prost", "dep:tonic-prost-build"]
+crypto-ring = ["sozu-lib/crypto-ring", "hyper-rustls/ring"]
+crypto-aws-lc-rs = ["sozu-lib/crypto-aws-lc-rs", "hyper-rustls/aws-lc-rs"]
+crypto-openssl = ["sozu-lib/crypto-openssl", "hyper-rustls/aws-lc-rs"]
+fips = ["sozu-lib/fips", "hyper-rustls/aws-lc-rs"]
+# Forward `opentelemetry` and `simd` pass-throughs so a CI cell that
+# passes both flags via `cargo test -p sozu-e2e --features ...` does
+# not fail with "Package `sozu-e2e` does not have feature `<name>`".
+# The features only affect `sozu-lib` internals; the e2e suite does
+# not itself observe behaviour differences.
+#
+# `logs-debug` / `logs-trace` compile `debug!` / `trace!` into release
+# builds. They are forwarded so a `--release` e2e run can enable them and
+# so a test can gate a log oracle on
+# `cfg!(any(debug_assertions, feature = "logs-trace"))`
+# (`e2e/src/tests/h2_log_context_tests.rs`).
+logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
+logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
+opentelemetry = ["sozu-lib/opentelemetry"]
+simd = ["sozu-lib/simd"]
+# Pass-through for the tolerant H1 parser, so feature-gated e2e tests
+# (e.g. `test_h1_tolerant_high_byte_method_no_ub` in
+# `tests/h1_security_tests.rs`) can be selected with
+# `cargo test -p sozu-e2e --features tolerant-http1-parser`.
+tolerant-http1-parser = ["sozu-lib/tolerant-http1-parser"]
+
+# Real protocol services are isolated opt-ins so the regular E2E and crypto
+# matrices do not compile heavyweight database or broker clients.
+service-postgres = ["dep:tokio-postgres"]
+service-mysql = ["dep:mysql_async"]
+service-redis = ["dep:redis"]
+service-mongodb = ["dep:mongodb"]
+service-kafka = ["dep:rskafka"]
+service-rabbitmq = ["dep:lapin"]
+service-pulsar = ["dep:magnetar"]
+service-coredns = ["dep:hickory-proto"]

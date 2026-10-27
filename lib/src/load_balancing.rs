@@ -1,0 +1,3106 @@
+use std::{
+    cell::RefCell, cmp::Ordering, fmt::Debug, hash::Hasher, net::SocketAddr, ops::Index, rc::Rc,
+    time::Instant,
+};
+
+use rand::{
+    RngExt, SeedableRng,
+    distr::uniform::{UniformInt, UniformSampler},
+    prelude::IndexedRandom,
+    rngs::StdRng,
+};
+
+use sozu_command::config::DEFAULT_SHARD_MIN_BACKENDS;
+
+use crate::{
+    backends::Backend,
+    sozu_command::proto::command::{LoadMetric, ShardMode},
+};
+
+/// Default weight applied when a backend declares no explicit
+/// `load_balancing_parameters.weight`. Mirrors the value used by the
+/// `Random` algorithm so weighting stays consistent across policies.
+const DEFAULT_WEIGHT: i32 = 100;
+
+/// Fixed seed used by the affinity hashers (HRW / Maglev). It must NOT be a
+/// `RandomState`: the selection has to be reproducible across workers and
+/// across process restarts so that every Sōzu instance routing the same flow
+/// key lands on the same backend. The constant is arbitrary but stable.
+pub const DEFAULT_HASH_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Read a backend's weight, defaulting to [`DEFAULT_WEIGHT`] when unset. Weight
+/// is clamped to at least `1` so a `0`/negative configured weight never zeroes
+/// out a backend's share (which would make weighted hashing degenerate).
+fn backend_weight(backend: &Backend) -> u32 {
+    let weight = backend
+        .load_balancing_parameters
+        .as_ref()
+        .map(|p| p.weight)
+        .unwrap_or(DEFAULT_WEIGHT)
+        .max(1) as u32;
+    // The clamp guarantees every backend carries a strictly positive weight,
+    // otherwise weighted hashing (HRW score, Maglev slot share) would zero out
+    // the backend's share and skew or divide-by-zero the distribution.
+    debug_assert!(weight >= 1, "backend weight must be clamped to at least 1");
+    weight
+}
+
+/// Whether `other`, at list position `other_position`, takes the place of
+/// `backend`, at `position`, as the one candidate of their shared address.
+///
+/// One address is one share: however many backend ids a cluster configures
+/// at one address, the policies see that address as ONE candidate. Its
+/// representative is the heaviest of its ids ([`backend_weight`], clamped),
+/// the earliest in list order among equally heavy ones; the address then
+/// weighs what its representative weighs. That is the rule [`Rendezvous`]
+/// has always applied, and it is spelled here so every other policy and
+/// shuffle sharding apply it too: the HRW score of an address grows with the
+/// weight, and a tie keeps the earliest backend, so HRW picks exactly this
+/// representative among the ids of an address. With equal weights, the
+/// common case, the representative is the first id in list order.
+///
+/// Callers compare candidates that already passed their eligibility filter,
+/// so a down or backing-off id never represents an address an eligible
+/// sibling could serve.
+pub(crate) fn outranks_at_address(
+    other: &Backend,
+    other_position: usize,
+    backend: &Backend,
+    position: usize,
+) -> bool {
+    count_sibling_step();
+    if other.address != backend.address || other_position == position {
+        return false;
+    }
+    let (other_weight, weight) = (backend_weight(other), backend_weight(backend));
+    other_weight > weight || (other_weight == weight && other_position < position)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Work spent on shared addresses: one per [`outranks_at_address`]
+    /// comparison and one per step along a sibling ring. Lets a test hold
+    /// that a selection pays for the ids that share an address, not for the
+    /// size of the list.
+    pub(crate) static SIBLING_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one unit of shared-address work, in tests only (see
+/// `SIBLING_STEPS`); compiles to nothing otherwise.
+#[inline(always)]
+pub(crate) fn count_sibling_step() {
+    #[cfg(test)]
+    SIBLING_STEPS.with(|steps| steps.set(steps.get() + 1));
+}
+
+/// Deterministic, seedable 64-bit hash over the backend's STABLE identifier.
+///
+/// We hash the backend **socket address** (`SocketAddr`) rather than the
+/// `backend_id` string: the address is where traffic actually goes, so it is
+/// the routing-stable part of a backend and survives a reconfiguration that
+/// merely re-emits the same backend. Backend lifecycle identity is the
+/// `(backend_id, address)` pair (`BackendList::remove_backend` removes only
+/// the backend matching both, so two ids may share an address), but placement
+/// deliberately keys on the address alone: HRW/Maglev then stay stable when
+/// the control plane renames a backend without moving it.
+///
+/// Keying on the address also means one address is one share: two ids at one
+/// address hash identically, so under HRW they compete once, and Maglev
+/// claims table slots once per distinct address. Every policy follows the
+/// same rule, since `BackendList` hands it one candidate per address, the
+/// representative [`outranks_at_address`] defines.
+///
+/// Uses `std::hash::SipHasher13` indirectly via a tiny FNV-1a construction with
+/// an injected seed — fully reproducible, never `RandomState`.
+fn hash_backend(seed: u64, key: u64, addr: &SocketAddr) -> u64 {
+    let mut h = FnvHasher::with_seed(seed);
+    h.write_u64(key);
+    match addr {
+        SocketAddr::V4(v4) => {
+            h.write_u8(4);
+            h.write(&v4.ip().octets());
+            h.write_u16(v4.port());
+        }
+        SocketAddr::V6(v6) => {
+            h.write_u8(6);
+            h.write(&v6.ip().octets());
+            h.write_u16(v6.port());
+        }
+    }
+    // FNV-1a alone has weak avalanche on structured input (the low bits barely
+    // mix), which skews rendezvous/Maglev distribution. Apply a splitmix64
+    // finalizer to scatter the bits before the consumers reduce mod M or feed
+    // it into the score function. Deterministic and seed-independent.
+    splitmix64_finalize(h.finish())
+}
+
+/// splitmix64 mixing step — a strong, reversible 64-bit avalanche finalizer.
+/// Used to scatter the FNV output so downstream `% M` / `ln(h)` reductions see
+/// well-distributed bits.
+fn splitmix64_finalize(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Domain tag of an affinity key derived from a client IP address. Keeps an
+/// address and a header value spelling the same bytes on distinct keys.
+const AFFINITY_DOMAIN_IP: u8 = 0x49; // 'I'
+/// Domain tag of an affinity key derived from a request header or cookie value.
+const AFFINITY_DOMAIN_VALUE: u8 = 0x56; // 'V'
+
+/// The affinity key [`Rendezvous`] and [`Maglev`] pin a client with, derived
+/// from its source address.
+///
+/// The address is canonicalised first, so a dual-stack listener that reports
+/// an IPv4 client as `::ffff:a.b.c.d` keys it exactly as an IPv4 listener
+/// would. The hash is [`DEFAULT_HASH_SEED`]-seeded FNV-1a with the splitmix64
+/// finalizer: a pure function of the address, so every worker and every
+/// restart derives the same key for the same client, and it reads no clock,
+/// draws no randomness and allocates nothing.
+pub fn affinity_key_from_ip(ip: std::net::IpAddr) -> u64 {
+    let mut h = FnvHasher::with_seed(DEFAULT_HASH_SEED);
+    h.write_u8(AFFINITY_DOMAIN_IP);
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            h.write_u8(4);
+            h.write(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            h.write_u8(6);
+            h.write(&v6.octets());
+        }
+    }
+    splitmix64_finalize(h.finish())
+}
+
+/// The affinity key derived from the bytes of a request header or cookie
+/// value, for a cluster that keys its clients on one.
+///
+/// Same construction as [`affinity_key_from_ip`] under another domain tag, so
+/// a value never collides with an address by spelling its bytes. The bytes
+/// are hashed where they lie in the request buffer: nothing is copied.
+pub fn affinity_key_from_value(value: &[u8]) -> u64 {
+    let mut h = FnvHasher::with_seed(DEFAULT_HASH_SEED);
+    h.write_u8(AFFINITY_DOMAIN_VALUE);
+    h.write(value);
+    splitmix64_finalize(h.finish())
+}
+
+/// A cluster's shuffle-sharding policy (sozu-proxy/sozu#524).
+///
+/// Shuffle sharding (Colm MacCárthaigh, *Workload isolation using shuffle
+/// sharding*, Amazon Builders' Library, 2019) gives each client a shard: a
+/// small subset of the cluster's backends, drawn so that two clients rarely
+/// share all of theirs. A client that overloads or poisons its shard then
+/// takes down only the clients whose shard is entirely inside its own. With
+/// `N` backends in shards of `k` there are `C(N, k)` shards, against `N / k`
+/// with plain partitioning: `C(8, 2) = 28` against 4.
+///
+/// Here a client's shard is the top `k` of the rendezvous (HRW) ranking of
+/// its affinity key over the cluster's primary backends ([`hrw_score`];
+/// David Thaler and Chinya Ravishankar, *Using name-based mappings to
+/// increase hit rates*, IEEE/ACM Transactions on Networking, 1998). That
+/// makes a shard stable: removing a backend outside a client's shard leaves
+/// the shard unchanged, and adding one can only displace the shard's
+/// lowest-ranked member, so a change of `N` moves clients only at the tail of
+/// their ranking. The cluster's load-balancing policy then selects inside the
+/// shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShuffleSharding {
+    /// Share of the primary backends in a shard, `1..=100`.
+    pub percent: u32,
+    /// Sharding applies only from this many primary backends.
+    pub min_backends: u32,
+    /// What an exhausted shard does.
+    pub mode: ShardMode,
+}
+
+impl ShuffleSharding {
+    /// The sharding a cluster configures, `None` when `shard_percent` is
+    /// unset. `shard_min_backends` defaults to
+    /// [`DEFAULT_SHARD_MIN_BACKENDS`], `shard_mode` to `FALLBACK`.
+    pub fn from_cluster(
+        shard_percent: Option<u32>,
+        shard_min_backends: Option<u32>,
+        shard_mode: Option<i32>,
+    ) -> Option<Self> {
+        let percent = shard_percent?;
+        Some(Self {
+            percent,
+            min_backends: shard_min_backends.unwrap_or(DEFAULT_SHARD_MIN_BACKENDS),
+            mode: shard_mode
+                .and_then(|mode| ShardMode::try_from(mode).ok())
+                .unwrap_or(ShardMode::Fallback),
+        })
+    }
+
+    /// The shard size `k` for a cluster of `primaries` primary backends:
+    /// `max(2, ceil(percent × primaries / 100))`, capped at `primaries`.
+    /// `None` below `min_backends`, where the cluster is not sharded.
+    pub fn shard_size(&self, primaries: usize) -> Option<usize> {
+        if primaries < self.min_backends as usize || primaries == 0 {
+            return None;
+        }
+        let k = (self.percent as usize * primaries)
+            .div_ceil(100)
+            .max(2)
+            .min(primaries);
+        debug_assert!(
+            (1..=primaries).contains(&k),
+            "a shard holds at least one and at most every primary backend"
+        );
+        debug_assert!(
+            k >= 2 || primaries < 2,
+            "a shard keeps room for a retry whenever the cluster has two backends"
+        );
+        Some(k)
+    }
+}
+
+/// Smallest prime `>= n`. Maglev requires a prime table size `M`: it keeps the
+/// permutation stride coprime with `M` so the population loop visits every
+/// slot, and `M >= 2` so `skip = h2 % (M - 1) + 1` never divides by zero.
+/// Runs once at construction (off the datapath); a trial-division check is more
+/// than fast enough for the small sizes Sōzu uses (default 65537).
+fn next_prime(n: usize) -> usize {
+    let mut candidate = n.max(2);
+    while !is_prime(candidate) {
+        candidate += 1;
+    }
+    // The result is the smallest prime not below `max(n, 2)`: it is prime, it
+    // is at least 2, and it never went below the requested floor.
+    debug_assert!(is_prime(candidate), "next_prime must return a prime");
+    debug_assert!(candidate >= 2, "next_prime must return at least 2");
+    debug_assert!(
+        candidate >= n,
+        "next_prime ({candidate}) must be >= the requested floor ({n})"
+    );
+    candidate
+}
+
+/// Trial-division primality test. Module-level (not nested in `next_prime`) so
+/// the Maglev `rebuild` post-condition can re-assert that the table size stayed
+/// the prime it was constructed with.
+fn is_prime(x: usize) -> bool {
+    if x < 2 {
+        return false;
+    }
+    if x.is_multiple_of(2) {
+        return x == 2;
+    }
+    let mut d = 3;
+    while d * d <= x {
+        if x.is_multiple_of(d) {
+            return false;
+        }
+        d += 2;
+    }
+    true
+}
+
+/// Minimal FNV-1a 64-bit hasher with a seeded offset basis. Deterministic and
+/// dependency-free — used for the affinity algorithms so results are
+/// reproducible across runs (unlike `std::collections::hash_map::RandomState`).
+struct FnvHasher {
+    state: u64,
+}
+
+impl FnvHasher {
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+    fn with_seed(seed: u64) -> Self {
+        Self {
+            state: Self::OFFSET ^ seed,
+        }
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.state ^= u64::from(b);
+            self.state = self.state.wrapping_mul(Self::PRIME);
+        }
+    }
+}
+
+/// The candidates of one selection: a borrowed view of a cluster's backend
+/// list, restricted to the positions a caller retained.
+///
+/// `BackendList` retains one position per address: when several eligible ids
+/// share an address, only their representative (`outranks_at_address`) is
+/// a candidate, so every policy gives that address the share of one backend.
+///
+/// Position `i` of the view is `backends[indices[i]]`, so a policy that
+/// indexes the view (`RoundRobin`'s cursor, `PowerOfTwo`'s two samples,
+/// `Random`'s draw) computes exactly the index it computed over the
+/// `Vec` of cloned candidates this view replaces. Building the view borrows
+/// and copies nothing: the caller owns `indices`, and only the backend a
+/// policy returns has its `Rc` cloned.
+///
+/// The view also carries the instant the selection happens at, which a
+/// policy reading `LoadMetric::ConnectionTime` decays each average to: no
+/// policy reads a clock of its own (#1684).
+#[derive(Clone, Copy, Debug)]
+pub struct Candidates<'a> {
+    backends: &'a [Rc<RefCell<Backend>>],
+    indices: &'a [usize],
+    /// Sibling ring of `backends`: `siblings[i]` is the next position whose
+    /// backend shares the address of position `i`, cyclically, and `i` itself
+    /// for an address with one id. Empty when the caller tracks no siblings.
+    siblings: &'a [usize],
+    now: Instant,
+}
+
+impl<'a> Candidates<'a> {
+    /// View `backends` through `indices` for a selection at `now`. Every
+    /// index must address a slot of `backends`, and the indices must be
+    /// strictly increasing.
+    pub fn new(backends: &'a [Rc<RefCell<Backend>>], indices: &'a [usize], now: Instant) -> Self {
+        debug_assert!(
+            indices.iter().all(|&index| index < backends.len()),
+            "a candidate index must address a slot of the backend list"
+        );
+        // Strictly increasing positions keep the view in list order, which
+        // the first-wins tie-breaks of `LeastLoaded` and `Rendezvous` and the
+        // probe order of `Maglev` depend on, and rule out a duplicate.
+        debug_assert!(
+            indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "candidate indices must be strictly increasing"
+        );
+        Self {
+            backends,
+            indices,
+            siblings: &[],
+            now,
+        }
+    }
+
+    /// [`Candidates::new`] with the sibling ring of `backends` (see the
+    /// field docs), which [`Candidates::siblings`] walks so a load-aware
+    /// policy can read the load of a whole address.
+    pub fn with_siblings(
+        backends: &'a [Rc<RefCell<Backend>>],
+        indices: &'a [usize],
+        siblings: &'a [usize],
+        now: Instant,
+    ) -> Self {
+        // A ring of another length was built for another list (a caller
+        // edited the public backend list directly): ignore it rather than
+        // follow stale positions, as if no address were shared.
+        let siblings = if siblings.len() == backends.len() {
+            siblings
+        } else {
+            &[]
+        };
+        debug_assert!(
+            siblings.iter().all(|&next| next < backends.len()),
+            "a sibling must address a slot of the backend list"
+        );
+        Self {
+            siblings,
+            ..Self::new(backends, indices, now)
+        }
+    }
+
+    /// Every OTHER backend at the address of the candidate at `index`,
+    /// eligible or not: the ids a collapsed address hides behind its
+    /// representative. Empty without a sibling ring, and for an address with
+    /// one id, which costs one read.
+    pub fn siblings(
+        &self,
+        index: usize,
+    ) -> impl Iterator<Item = &'a Rc<RefCell<Backend>>> + use<'a> {
+        let start = self.indices[index];
+        let ring = self.siblings;
+        let backends = self.backends;
+        let next = move |position: usize| ring.get(position).copied().unwrap_or(start);
+        std::iter::successors(Some(next(start)), move |&position| Some(next(position)))
+            .take_while(move |&position| position != start)
+            .map(move |position| {
+                count_sibling_step();
+                &backends[position]
+            })
+    }
+
+    /// The position in the backend list of the candidate at `index`.
+    fn position(&self, index: usize) -> usize {
+        self.indices[index]
+    }
+
+    /// The length of the backend list the view reads.
+    fn list_len(&self) -> usize {
+        self.backends.len()
+    }
+
+    /// The instant this selection happens at.
+    pub fn now(&self) -> Instant {
+        self.now
+    }
+
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    /// The candidate at position `index` of the view.
+    pub fn get(&self, index: usize) -> Option<&'a Rc<RefCell<Backend>>> {
+        self.indices.get(index).map(|&slot| &self.backends[slot])
+    }
+
+    /// The candidates in view order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a Rc<RefCell<Backend>>> + use<'a> {
+        let backends = self.backends;
+        self.indices.iter().map(move |&slot| &backends[slot])
+    }
+
+    /// A uniformly chosen candidate, drawn exactly as
+    /// `IndexedRandom::choose` draws over a slice of the same length.
+    fn choose<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> Option<&'a Rc<RefCell<Backend>>> {
+        self.indices.choose(rng).map(|&slot| &self.backends[slot])
+    }
+}
+
+impl Index<usize> for Candidates<'_> {
+    type Output = Rc<RefCell<Backend>>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.backends[self.indices[index]]
+    }
+}
+
+pub trait LoadBalancingAlgorithm: Debug {
+    /// Select the next backend among `candidates`.
+    ///
+    /// `key` carries an optional affinity hash: the UDP affinity key, or the
+    /// client key of an HTTP, HTTPS or TCP request ([`affinity_key_from_ip`],
+    /// [`affinity_key_from_value`]). The
+    /// stateless/round-robin policies ignore it; the consistent-hashing
+    /// policies ([`Rendezvous`], [`Maglev`]) use it to pin a key to a backend.
+    /// Passing `None` preserves the historical, key-agnostic behavior.
+    ///
+    /// A policy reads the candidates through the borrowed [`Candidates`] view
+    /// and clones the `Rc` of the one backend it returns, nothing else, so a
+    /// selection allocates nothing.
+    fn next_available_backend(
+        &mut self,
+        key: Option<u64>,
+        candidates: Candidates<'_>,
+    ) -> Option<Rc<RefCell<Backend>>>;
+
+    /// Called by the control plane when the live backend set for a cluster
+    /// changes, so table-based policies (Maglev) can recompute their lookup
+    /// table off the datapath. The default is a no-op; [`Maglev`] rebuilds
+    /// its table, and [`RoundRobin`] (with the round-robin fallback of
+    /// [`Rendezvous`] and [`Maglev`]) resets its running weights.
+    fn rebuild(&mut self, _backends: &[Rc<RefCell<Backend>>]) {}
+}
+
+/// Round-robin selection, weighted by `weight` through smooth weighted round
+/// robin (the nginx `ngx_http_upstream_get_peer` scheme).
+///
+/// # Equal weights: the cursor
+///
+/// When every candidate carries the same weight — the default, since an unset
+/// `weight` reads as `DEFAULT_WEIGHT` — the selection is the historical
+/// cursor over the candidate view: position `next_backend % len`, then the
+/// cursor advances. The weighted scheme would visit a fixed set in the same
+/// order, but the cursor is what decides how a selection continues once the
+/// set shrinks or grows (a backend backs off, recovers, or is excluded by a
+/// retry), so keeping it for equal weights keeps every such sequence exactly
+/// as it was.
+///
+/// # Unequal weights: smooth weighted round robin
+///
+/// Each backend of the list carries a running `current` weight. A selection
+/// adds every candidate's weight to its `current`, picks the candidate with
+/// the largest `current` (the first in view order on a tie), and subtracts the
+/// sum of the candidates' weights from the winner's. Over a fixed set, a
+/// backend of weight `w` is picked exactly `w` times in every `Σw` selections,
+/// and the picks interleave rather than bunch: weights `5, 1, 1` yield
+/// `a a b a c a a`, not `a a a a a b c`.
+///
+/// The weight is `backend_weight`'s, clamped to at least `1`, as for
+/// [`Rendezvous`] and [`Maglev`]: a `0` or negative weight leaves a backend in
+/// the rotation at the smallest share, never out of it.
+///
+/// The running weights are indexed by list position. [`Self::rebuild`], which
+/// the backend list calls whenever a backend is added, removed or reweighted,
+/// resets them, off the datapath; a backend that is not a candidate of one
+/// selection keeps its running weight for the next.
+///
+/// Telling the two cases apart reads every candidate's weight on each
+/// selection. That is deliberate: the candidates are the eligible subset of
+/// the list, which changes with health and retries, so a flag cached on the
+/// list could not say whether THIS subset is uniform.
+#[derive(Debug)]
+pub struct RoundRobin {
+    pub next_backend: u32,
+    /// Smooth weighted round robin's running weight of each backend, by list
+    /// position. Sized to the list by [`Self::rebuild`]; a selection over a
+    /// list of another length resizes it first.
+    current_weights: Vec<i64>,
+}
+
+impl LoadBalancingAlgorithm for RoundRobin {
+    fn next_available_backend(
+        &mut self,
+        _key: Option<u64>,
+        backends: Candidates<'_>,
+    ) -> Option<Rc<RefCell<Backend>>> {
+        // Guard against an empty set: `% backends.len()` would panic with a
+        // divide-by-zero. This also covers the `Rendezvous`/`Maglev` policies,
+        // which delegate here on `key == None`.
+        if backends.is_empty() {
+            return None;
+        }
+        debug_assert!(
+            !backends.is_empty(),
+            "round-robin index math runs only on a non-empty set"
+        );
+
+        if !uniform_weights(backends) {
+            return Some(self.smooth_weighted(backends));
+        }
+
+        let index = self.next_backend as usize % backends.len();
+        // The reduced index always addresses a real slot, so the lookup yields
+        // a backend (never the `None` arm of `get`).
+        debug_assert!(index < backends.len(), "round-robin index out of bounds");
+        let res = backends.get(index).cloned();
+        debug_assert!(
+            res.is_some(),
+            "round-robin must select a backend from a non-empty set"
+        );
+
+        self.next_backend = (self.next_backend + 1) % backends.len() as u32;
+        // The cursor stays a valid index into the current set after advancing,
+        // so the next call never starts out of range.
+        debug_assert!(
+            (self.next_backend as usize) < backends.len(),
+            "round-robin cursor must stay within bounds"
+        );
+        res
+    }
+
+    fn rebuild(&mut self, backends: &[Rc<RefCell<Backend>>]) {
+        self.current_weights.clear();
+        self.current_weights.resize(backends.len(), 0);
+    }
+}
+
+/// Whether every candidate carries the same [`backend_weight`].
+fn uniform_weights(backends: Candidates<'_>) -> bool {
+    let mut weights = backends.iter().map(|b| backend_weight(&b.borrow()));
+    match weights.next() {
+        Some(first) => weights.all(|weight| weight == first),
+        None => true,
+    }
+}
+
+impl Default for RoundRobin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RoundRobin {
+    pub fn new() -> Self {
+        Self {
+            next_backend: 0,
+            current_weights: Vec::new(),
+        }
+    }
+
+    /// One step of smooth weighted round robin over a non-empty `backends`.
+    fn smooth_weighted(&mut self, backends: Candidates<'_>) -> Rc<RefCell<Backend>> {
+        debug_assert!(
+            !backends.is_empty(),
+            "smooth weighted round robin runs only on a non-empty set"
+        );
+        if self.current_weights.len() != backends.list_len() {
+            // A list `rebuild` never saw: start every running weight afresh.
+            self.current_weights.clear();
+            self.current_weights.resize(backends.list_len(), 0);
+        }
+
+        let mut total: i64 = 0;
+        let mut best: Option<usize> = None;
+        for index in 0..backends.len() {
+            let position = backends.position(index);
+            let weight = i64::from(backend_weight(&backends[index].borrow()));
+            self.current_weights[position] += weight;
+            total += weight;
+            let current = self.current_weights[position];
+            // Strictly greater: the first candidate in view order wins a tie.
+            if best.is_none_or(|best| current > self.current_weights[backends.position(best)]) {
+                best = Some(index);
+            }
+        }
+        let best = best.expect("a non-empty set yields a winner");
+        let position = backends.position(best);
+        self.current_weights[position] -= total;
+        // The candidates' running weights were raised by `total` in all and
+        // the winner's lowered by it: a step moves no weight in or out, so
+        // the running weights of the whole list still sum to zero, as they
+        // did when reset.
+        debug_assert!(total >= backends.len() as i64, "every weight is at least 1");
+        debug_assert_eq!(
+            self.current_weights.iter().sum::<i64>(),
+            0,
+            "smooth weighted round robin's running weights must sum to zero"
+        );
+        backends[best].clone()
+    }
+}
+
+/// Uniform (optionally weight-biased) random backend selection.
+///
+/// The RNG is seeded once, at construction, and never from an ambient source
+/// on the selection hot path — but, unlike [`Rendezvous`]/[`Maglev`], it is NOT seeded from the shared
+/// [`DEFAULT_HASH_SEED`] constant. `Rendezvous`/`Maglev` feed their seed into
+/// a *pure, stateless* hash function (`hash_backend`): same `(seed, key,
+/// addr)` in, same score out, independent of call history, so sharing the
+/// seed fleet-wide is exactly the point — it is what makes the same affinity
+/// key land on the same backend across workers and restarts.
+/// `Random` feeds its seed into a *stateful, advancing* `StdRng`, where the
+/// n-th pick depends on the whole call history. Seeding that from a shared
+/// compile-time constant would make every worker, on every cold start, with
+/// an identically-ordered backend list, draw from a bit-for-bit identical
+/// keystream — so every fresh worker's first pick over N equal-weight
+/// backends would be the same backend index, fleet-wide, on every restart:
+/// exactly the correlated-load event uniform selection exists to prevent,
+/// arriving at the worst possible moment (a synchronised redeploy, when every
+/// worker's call counter resets together and initial load is otherwise
+/// indistinguishable). So the seed is the caller's, and the production caller
+/// draws it from an OS-seeded generator: `BackendMap::new` seeds its own
+/// generator from the OS once, at construction, and hands every cluster's
+/// policy a seed drawn from it (`crate::backends::BackendMap`, #1684). Each
+/// worker's keystream is therefore independent, as with the thread-local
+/// `rng()` this replaced, while a simulator that builds the map with
+/// `BackendMap::with_seed` gets a fixed, reproducible sequence (mirrors
+/// `quinn-proto`'s `rng_seed` construction shape).
+///
+/// This does NOT make `Random` return a fixed backend: `next_available_backend`
+/// *advances* the internal RNG on every call, so a sequence of calls still
+/// draws a well-distributed spread of backends. "Random" here means
+/// "statistically spread, and — given `with_seed` — reproducible for a fixed
+/// seed and exact call sequence" — not "constant". Two instances built with
+/// `with_seed` on the same seed and driven through the same sequence of
+/// backend sets reproduce the same sequence of picks (what makes this
+/// testable); a single instance called repeatedly keeps drawing fresh values
+/// from its advancing RNG state, exactly like a real RNG would; two lists of
+/// one map, or two maps, draw from independent keystreams.
+#[derive(Debug)]
+pub struct Random {
+    rng: StdRng,
+}
+
+impl Random {
+    /// A policy whose draws are the keystream of `seed`. Never
+    /// `DEFAULT_HASH_SEED` in production — see the struct docs for why a
+    /// shared compile-time constant would correlate every worker's picks.
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+}
+
+impl Random {
+    /// Weighted draw over `backends`, identical, RNG draw for RNG draw, to
+    /// `rand::distr::weighted::WeightedIndex::<i32>` built over the same
+    /// weights, without the two `Vec`s building one allocates (the weights and
+    /// their cumulative sums).
+    ///
+    /// `WeightedIndex::new` accepts a set that is non-empty, holds no negative
+    /// weight, sums without `i32` overflow, and sums to more than zero; this
+    /// accepts exactly those, and returns `None` otherwise so the caller falls
+    /// back to the uniform draw as it did on `new`'s error. On acceptance it
+    /// draws once from the same `UniformInt::<i32>` over `[0, total)`, then
+    /// returns the first position whose inclusive prefix sum exceeds the draw:
+    /// the `partition_point` `WeightedIndex::sample` runs over its cumulative
+    /// weights, as a scan. `random_weighted_pick_matches_weighted_index`
+    /// holds the equivalence.
+    fn weighted_index(&mut self, backends: Candidates<'_>) -> Option<usize> {
+        if backends.is_empty() {
+            return None;
+        }
+        let mut total: i32 = 0;
+        for backend in backends.iter() {
+            let weight = random_weight(&backend.borrow());
+            if weight < 0 {
+                return None;
+            }
+            total = total.checked_add(weight)?;
+        }
+        if total == 0 {
+            return None;
+        }
+        let drawn = UniformInt::<i32>::new(0, total)
+            .expect("a positive total is a non-empty range")
+            .sample(&mut self.rng);
+        debug_assert!(
+            (0..total).contains(&drawn),
+            "the weighted draw must land inside [0, total)"
+        );
+
+        let last = backends.len() - 1;
+        let mut prefix: i32 = 0;
+        for (index, backend) in backends.iter().take(last).enumerate() {
+            prefix += random_weight(&backend.borrow());
+            if prefix > drawn {
+                return Some(index);
+            }
+        }
+        // Every earlier prefix is at most the draw, and the full sum `total`
+        // exceeds it: the draw falls in the last backend's share.
+        Some(last)
+    }
+}
+
+/// The weight `Random` draws with: the configured weight, or `DEFAULT_WEIGHT`
+/// when none is set. Unlike [`backend_weight`] it is not clamped, so a zero or
+/// negative weight reaches `Random::weighted_index` and is rejected there.
+fn random_weight(backend: &Backend) -> i32 {
+    backend
+        .load_balancing_parameters
+        .as_ref()
+        .map(|p| p.weight)
+        .unwrap_or(DEFAULT_WEIGHT)
+}
+
+impl LoadBalancingAlgorithm for Random {
+    fn next_available_backend(
+        &mut self,
+        _key: Option<u64>,
+        backends: Candidates<'_>,
+    ) -> Option<Rc<RefCell<Backend>>> {
+        let len = backends.len();
+        if let Some(index) = self.weighted_index(backends) {
+            // The weighted draw only returns a position of the view.
+            debug_assert!(index < len, "Random sampled an out-of-range index");
+            backends.get(index).cloned()
+        } else {
+            // The weighted draw declines only an empty set, a negative weight,
+            // an overflowing sum or an all-zero set; the uniform `choose` then
+            // selects iff non-empty.
+            let chosen = backends.choose(&mut self.rng).cloned();
+            debug_assert_eq!(
+                chosen.is_some(),
+                len > 0,
+                "Random fallback selects iff the set is non-empty"
+            );
+            chosen
+        }
+    }
+}
+
+/// The load of the candidate at `index` under a count metric, summed over
+/// every id at its address ([`Candidates::siblings`]): what a server serving
+/// two ids actually carries. The connection-time average is a latency, not a
+/// count, and is read from the representative alone.
+fn address_count(
+    candidates: Candidates<'_>,
+    index: usize,
+    count: impl Fn(&Backend) -> usize,
+) -> usize {
+    let own = count(&candidates[index].borrow());
+    let total = candidates.siblings(index).fold(own, |sum, sibling| {
+        sum.saturating_add(count(&sibling.borrow()))
+    });
+    debug_assert!(
+        total >= own,
+        "an address carries at least its representative's load"
+    );
+    total
+}
+
+/// Order two candidates by load per unit of weight, `load_a / weight_a`
+/// against `load_b / weight_b`, without a division: the two are compared
+/// cross-multiplied, exactly, in `u128`. With equal weights this is the order
+/// of the raw loads, so an unweighted cluster selects exactly as before.
+fn cmp_count_per_weight(load_a: usize, weight_a: u32, load_b: usize, weight_b: u32) -> Ordering {
+    debug_assert!(
+        weight_a >= 1 && weight_b >= 1,
+        "a weight reaches the comparison clamped to at least 1"
+    );
+    let order =
+        (load_a as u128 * u128::from(weight_b)).cmp(&(load_b as u128 * u128::from(weight_a)));
+    debug_assert!(
+        weight_a != weight_b || order == load_a.cmp(&load_b),
+        "equal weights must order the raw loads"
+    );
+    order
+}
+
+/// [`cmp_count_per_weight`] for a load that is a latency (`f64`). Equal weights
+/// compare the raw values, untouched by any rounding, so the comparison is
+/// then exactly the one the policies made before they read `weight`; unequal
+/// weights compare the cross-multiplied values. `None` only when a value is
+/// NaN, as `f64::partial_cmp`.
+fn cmp_cost_per_weight(cost_a: f64, weight_a: u32, cost_b: f64, weight_b: u32) -> Option<Ordering> {
+    debug_assert!(
+        weight_a >= 1 && weight_b >= 1,
+        "a weight reaches the comparison clamped to at least 1"
+    );
+    if weight_a == weight_b {
+        cost_a.partial_cmp(&cost_b)
+    } else {
+        (cost_a * f64::from(weight_b)).partial_cmp(&(cost_b * f64::from(weight_a)))
+    }
+}
+
+/// The least loaded candidate, load measured per unit of weight.
+///
+/// A candidate's load (`address_count` under a count metric, the
+/// representative's peak-EWMA connection time under
+/// [`LoadMetric::ConnectionTime`]) is divided by its `backend_weight`: a
+/// backend of weight `200` carrying `10` connections is as loaded as one of
+/// weight `100` carrying `5`. The weight is clamped to at least `1`, as for
+/// every weighted policy but [`Random`], so a `0` or negative weight counts as
+/// `1`, the smallest share, and never excludes a backend.
+///
+/// The first minimum in view order wins a tie. With equal weights (the
+/// default: an unset weight reads as `DEFAULT_WEIGHT`) the comparison is the
+/// one on raw loads, so the selection is the one made before the weight was
+/// read.
+#[derive(Debug)]
+pub struct LeastLoaded {
+    pub metric: LoadMetric,
+}
+
+impl LoadBalancingAlgorithm for LeastLoaded {
+    fn next_available_backend(
+        &mut self,
+        _key: Option<u64>,
+        backends: Candidates<'_>,
+    ) -> Option<Rc<RefCell<Backend>>> {
+        let was_empty = backends.is_empty();
+        let weight = |index: usize| backend_weight(&backends[index].borrow());
+        // One address is one share: a count metric reads the address's load,
+        // the sum over its ids (`address_count`), and the address weighs what
+        // its representative weighs. `min_by` keeps the first minimum.
+        let count = |metric: fn(&Backend) -> usize| {
+            (0..backends.len())
+                .map(|index| (address_count(backends, index, metric), weight(index), index))
+                .min_by(|&(load_a, weight_a, _), &(load_b, weight_b, _)| {
+                    cmp_count_per_weight(load_a, weight_a, load_b, weight_b)
+                })
+                .and_then(|(_, _, index)| backends.get(index))
+        };
+        let opt_b = match self.metric {
+            LoadMetric::Connections => count(|b| b.active_connections),
+            LoadMetric::Requests => count(|b| b.active_requests),
+            LoadMetric::ConnectionTime => {
+                let mut b: Option<(f64, u32, &Rc<RefCell<Backend>>)> = None;
+                let now = backends.now();
+                for backend in backends.iter() {
+                    let cost2 = backend.borrow_mut().peak_ewma_connection(now);
+                    let weight2 = backend_weight(&backend.borrow());
+
+                    match b.take() {
+                        None => b = Some((cost2, weight2, backend)),
+                        Some((cost1, weight1, back1)) => {
+                            // Keep the earlier unless the later is strictly
+                            // lighter (or the earlier's cost is NaN), as the
+                            // raw `cost1 <= cost2` did.
+                            if matches!(
+                                cmp_cost_per_weight(cost1, weight1, cost2, weight2),
+                                Some(Ordering::Less | Ordering::Equal)
+                            ) {
+                                b = Some((cost1, weight1, back1));
+                            } else {
+                                b = Some((cost2, weight2, backend));
+                            }
+                        }
+                    }
+                }
+
+                b.map(|(_cost, _weight, backend)| backend)
+            }
+        };
+        // Least-loaded over a non-empty set always finds a minimum; an empty
+        // set yields nothing. (`min_by` / the manual fold both have this
+        // shape.)
+        debug_assert_eq!(
+            opt_b.is_some(),
+            !was_empty,
+            "LeastLoaded selects iff the candidate set is non-empty"
+        );
+        opt_b.cloned()
+    }
+}
+
+/// Power-of-two-choices (P2C) load-aware selection: sample two candidates,
+/// keep the lighter one, and coin-flip a tie.
+///
+/// # Cost: two load reads per selection, whatever the cluster size
+///
+/// The two candidates are drawn uniformly at random from the candidate set
+/// and only those two are measured, so a selection costs `O(1)` load reads
+/// against [`LeastLoaded`]'s `O(n)` scan.
+///
+/// That is a statement about load READS and nothing more. It is NOT a claim
+/// that a selection is `O(1)`: every selection, under every policy, first
+/// collects the candidate positions in
+/// [`crate::backends::BackendList::next_available_backend_with_key`], which
+/// walks the cluster's backend list and records the position of each healthy
+/// backend in a buffer the list reuses across selections, before any policy
+/// runs. That walk is in the caller, this policy does not remove it, and no
+/// policy here is sub-linear per request.
+/// So P2C is not the "cheap" alternative to a scan — picking it to shorten a
+/// per-request walk that lives somewhere else buys nothing.
+///
+/// What the two-read bound does buy is real but narrower: under
+/// [`LoadMetric::ConnectionTime`] a load read is a `PeakEWMA::observe` call
+/// that decays the backend's average to the selection's instant, so
+/// two of them per selection instead of `n` is measurable work removed —
+/// under `Connections`/`Requests` a load read is a field read and the saving
+/// is small.
+///
+/// The reason to choose this policy over [`LeastLoaded`] is balance, not
+/// cost: P2C buys most of least-loaded's balance — the classic result is a
+/// maximum load of `O(log log n)` where uniform-random gives `O(log n)` —
+/// without ever computing a global minimum. Sōzu's workers each select from
+/// their own view, and that missing global minimum is what keeps them from
+/// herding: no worker can steer toward "the least loaded backend" because no
+/// worker ever computes one.
+///
+/// `power_of_two_touches_exactly_two_backends` pins the read count, and
+/// `power_of_two_sample_size_is_two_not_the_whole_set` measures the same
+/// property from the selection distribution alone. Both exist because a test
+/// that only checks "a backend came back" passes for an `O(n)` scan too.
+///
+/// # Tie-break: seeded-random, deliberately NOT deterministic-by-id
+///
+/// Unlike [`Rendezvous`]/[`Maglev`], `PowerOfTwo` carries no affinity `key` —
+/// every call is an independent, unlabeled selection event, so there is no
+/// "the same key must land on the same backend across workers/restarts"
+/// requirement to *preserve* here. But answering "must we preserve
+/// agreement?" is not the same question as "does this mechanism *create*
+/// agreement?" — see the next section for why that distinction is the whole
+/// reason its seed is never [`DEFAULT_HASH_SEED`].
+///
+/// A deterministic tie-break (e.g. "lowest backend id wins") was considered
+/// and rejected: ties are common, not rare — every backend starts at zero
+/// load, so a cold start, a post-scale-up rebalance, or any tick where two
+/// backends carry identical load all resolve through this branch. Always
+/// awarding the tie to the same backend (e.g. the lowest id) would bias the
+/// distribution toward that backend on exactly the events P2C exists to
+/// spread out, reintroducing the herding effect P2C is designed to avoid —
+/// on every one of Sōzu's single-threaded workers simultaneously, since they
+/// would all observe the same tie and resolve it the same deterministic way.
+/// A seeded RNG that *advances* per call keeps ties spread across the
+/// candidate set over the process lifetime while still satisfying the
+/// no-ambient-entropy-on-the-hot-path rule.
+///
+/// # Seed source: the backend map's OS-seeded generator, NOT `DEFAULT_HASH_SEED`
+///
+/// `Rendezvous`/`Maglev` feed their seed into a *pure, stateless* hash
+/// function: sharing [`DEFAULT_HASH_SEED`] fleet-wide is exactly what gives
+/// them cross-worker/cross-restart agreement for the same key. `PowerOfTwo`
+/// feeds its seed into a *stateful, advancing* `StdRng`, where the n-th
+/// tie-break depends on the whole call history. Seeding that from the same
+/// shared constant would make every worker, on every cold start, draw from a
+/// bit-for-bit identical keystream — so the very first tie any two workers
+/// hit after a synchronised redeploy (and ties are the common case here, see
+/// above) would resolve identically, fleet-wide, on every restart. That is
+/// the deterministic-tie-break herding problem above, reintroduced by the
+/// "fix" instead of prevented by it. The production seed therefore comes from
+/// `BackendMap`'s generator, which reads the OS once, at construction — off
+/// the datapath — so each worker's keystream is independent, the same
+/// property the old thread-local `rng()` had, while `BackendMap::with_seed`
+/// gives a simulator a fixed, reproducible sequence (#1684).
+#[derive(Debug)]
+pub struct PowerOfTwo {
+    pub metric: LoadMetric,
+    rng: StdRng,
+}
+
+impl PowerOfTwo {
+    /// A policy whose tie-breaks are the keystream of `seed`. Never
+    /// `DEFAULT_HASH_SEED` in production — see the struct docs.
+    pub fn with_seed(seed: u64, metric: LoadMetric) -> Self {
+        Self {
+            metric,
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+
+    /// Read the load of the candidates at `first` and `second` under the
+    /// configured metric and order them by load per unit of weight, `first`
+    /// against `second`. `None` only for a NaN connection time.
+    ///
+    /// Each backend is read exactly once, `first` then `second`, whatever the
+    /// cluster size — that call count is the algorithm, not an implementation
+    /// detail of it. The `ConnectionTime` arm needs `borrow_mut` because
+    /// `peak_ewma_connection` decays the EWMA, to the selection's instant
+    /// `now`, as it reads it.
+    ///
+    /// A count metric reads the load of the candidate's whole address, the
+    /// sum over its ids (`address_count`), and compares the two counts as
+    /// integers ([`cmp_count_per_weight`]): converting a count to `f64` would
+    /// round it above 2^53 and could order two different loads as equal.
+    fn compare(&self, backends: Candidates<'_>, first: usize, second: usize) -> Option<Ordering> {
+        let weight = |index: usize| backend_weight(&backends[index].borrow());
+        let counts = |metric: fn(&Backend) -> usize| {
+            let first_load = address_count(backends, first, metric);
+            let second_load = address_count(backends, second, metric);
+            Some(cmp_count_per_weight(
+                first_load,
+                weight(first),
+                second_load,
+                weight(second),
+            ))
+        };
+        match self.metric {
+            LoadMetric::Connections => counts(|b| b.active_connections),
+            LoadMetric::Requests => counts(|b| b.active_requests),
+            LoadMetric::ConnectionTime => {
+                let first_load = backends[first]
+                    .borrow_mut()
+                    .peak_ewma_connection(backends.now());
+                let second_load = backends[second]
+                    .borrow_mut()
+                    .peak_ewma_connection(backends.now());
+                cmp_cost_per_weight(first_load, weight(first), second_load, weight(second))
+            }
+        }
+    }
+}
+
+impl LoadBalancingAlgorithm for PowerOfTwo {
+    fn next_available_backend(
+        &mut self,
+        _key: Option<u64>,
+        backends: Candidates<'_>,
+    ) -> Option<Rc<RefCell<Backend>>> {
+        let len = backends.len();
+        match len {
+            0 => return None,
+            // A singleton set has no second candidate to compare against, so
+            // the sample degenerates to the only backend there is.
+            1 => return backends.get(0).cloned(),
+            _ => {}
+        }
+
+        // Sample two DISTINCT backends uniformly at random. The second index
+        // is drawn from the `len - 1` remaining slots and shifted past the
+        // first, which is a uniform draw over "every index except `first`"
+        // with no rejection loop — so the sampling has no unbounded worst
+        // case, and the whole selection reads exactly two backends whatever
+        // the cluster size.
+        let first = self.rng.random_range(0..len);
+        let mut second = self.rng.random_range(0..len - 1);
+        if second >= first {
+            second += 1;
+        }
+        debug_assert_ne!(
+            first, second,
+            "power-of-two must sample two distinct backends"
+        );
+        debug_assert!(
+            second < len,
+            "the shifted second index must stay inside the candidate set"
+        );
+
+        // Load per unit of weight: with equal weights, the raw loads.
+        let order = self.compare(backends, first, second);
+
+        // Keep the lighter of the two samples. An exact tie is broken by a
+        // coin flip rather than by index order: ties are the common case
+        // (every backend starts at zero load), and always awarding them to
+        // the lower index would reintroduce the herding P2C exists to avoid
+        // — see the struct docs.
+        let chosen = match order {
+            Some(Ordering::Less) => first,
+            Some(Ordering::Greater) => second,
+            _ if self.rng.random_bool(0.5) => first,
+            _ => second,
+        };
+        // Asserted on the already-computed measures on purpose: re-reading a
+        // backend under `LoadMetric::ConnectionTime` decays its EWMA, and a
+        // `debug_assert!` that mutates would make debug and release builds
+        // diverge.
+        debug_assert!(
+            (chosen == first && order != Some(Ordering::Greater))
+                || (chosen == second && order != Some(Ordering::Less)),
+            "power-of-two must never keep the strictly heavier of its two samples"
+        );
+
+        backends.get(chosen).cloned()
+    }
+}
+
+/// Weighted Rendezvous (Highest Random Weight) hashing.
+///
+/// For an affinity `key`, the chosen backend is the one maximizing a stable,
+/// per-(key, backend) score. With no key it degrades to plain round-robin;
+/// every datapath supplies one for a client it can identify (the UDP affinity
+/// key, and the client key of HTTP, HTTPS and TCP, sozu-proxy/sozu#524), so the
+/// fallback is reached only for a request with no source address.
+///
+/// # Weighting
+///
+/// We use the standard continuous weighted-rendezvous score
+/// (Schindelhauer–Schomaker / "logarithmic method"):
+///
+/// ```text
+///     score(key, backend) = -weight / ln(h)
+/// ```
+///
+/// where `h = hash64(seed, key, backend_addr) / 2^64 ∈ (0, 1)`. Because
+/// `ln(h) < 0`, the score is positive and grows with `weight`, so heavier
+/// backends win proportionally more keys while the choice stays deterministic
+/// and minimally disruptive: removing a non-winning backend cannot change the
+/// winner, and adding one only steals the keys for which it now scores highest.
+/// Selection is `O(N)` per key.
+#[derive(Debug)]
+pub struct Rendezvous {
+    /// Reproducible hash seed (NOT a `RandomState`).
+    seed: u64,
+    /// Round-robin cursor used for the `key == None` fallback.
+    round_robin: RoundRobin,
+}
+
+impl Default for Rendezvous {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rendezvous {
+    pub fn new() -> Self {
+        Self::with_seed(DEFAULT_HASH_SEED)
+    }
+
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            seed,
+            round_robin: RoundRobin::new(),
+        }
+    }
+
+    /// Continuous weighted-rendezvous score for a (key, backend) pair.
+    /// Larger is better. See the struct docs for the formula.
+    fn score(&self, key: u64, backend: &Backend) -> f64 {
+        hrw_score_with_seed(self.seed, key, backend)
+    }
+}
+
+/// The weighted rendezvous (HRW) score of `backend` for the affinity `key`,
+/// under [`DEFAULT_HASH_SEED`]: the score [`Rendezvous`] ranks a cluster's
+/// backends by. Larger is better. Shuffle sharding
+/// ([`ShuffleSharding`]) takes a client's shard as the top of this ranking,
+/// and a test that needs to predict a shard computes it with this function.
+pub fn hrw_score(key: u64, backend: &Backend) -> f64 {
+    hrw_score_with_seed(DEFAULT_HASH_SEED, key, backend)
+}
+
+/// [`hrw_score`] under an explicit seed. See [`Rendezvous`] for the formula.
+fn hrw_score_with_seed(seed: u64, key: u64, backend: &Backend) -> f64 {
+    let weight = backend_weight(backend) as f64;
+    // Map the 64-bit hash into the open interval (0, 1). Guard the
+    // endpoints so `ln` stays finite: 0 would give -inf, 1 would give 0.
+    let h = hash_backend(seed, key, &backend.address);
+    // (h + 0.5) / 2^64 keeps the value strictly inside (0, 1).
+    let unit = (h as f64 + 0.5) / (u64::MAX as f64 + 1.0);
+    // `unit` must land strictly inside (0, 1) so `ln(unit) < 0` and the
+    // score stays a positive, finite number — the whole HRW ordering relies
+    // on a well-defined comparable score for every backend.
+    debug_assert!(
+        unit > 0.0 && unit < 1.0,
+        "HRW unit must lie strictly inside (0, 1), got {unit}"
+    );
+    let score = -weight / unit.ln();
+    debug_assert!(
+        score.is_finite() && score > 0.0,
+        "HRW score must be finite and positive, got {score}"
+    );
+    score
+}
+
+impl LoadBalancingAlgorithm for Rendezvous {
+    fn next_available_backend(
+        &mut self,
+        key: Option<u64>,
+        backends: Candidates<'_>,
+    ) -> Option<Rc<RefCell<Backend>>> {
+        let Some(key) = key else {
+            // No affinity key: behave exactly like RoundRobin.
+            return self.round_robin.next_available_backend(None, backends);
+        };
+
+        if backends.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<(f64, &Rc<RefCell<Backend>>)> = None;
+        for backend in backends.iter() {
+            let score = self.score(key, &backend.borrow());
+            match best {
+                Some((best_score, _)) if best_score >= score => {}
+                _ => best = Some((score, backend)),
+            }
+        }
+        // A non-empty set always yields a winner, and that winner's score is the
+        // maximum over the whole set (HRW = highest random weight).
+        debug_assert!(
+            best.is_some(),
+            "HRW must select a winner from a non-empty set"
+        );
+        #[cfg(debug_assertions)]
+        if let Some((best_score, _)) = best {
+            for backend in backends.iter() {
+                debug_assert!(
+                    best_score >= self.score(key, &backend.borrow()),
+                    "HRW winner does not maximize the score over the set"
+                );
+            }
+        }
+        best.map(|(_, backend)| backend.clone())
+    }
+
+    fn rebuild(&mut self, backends: &[Rc<RefCell<Backend>>]) {
+        // Only the round-robin fallback keeps state across selections.
+        self.round_robin.rebuild(backends);
+    }
+}
+
+/// Maglev consistent hashing (Google, NSDI'16).
+///
+/// Builds a precomputed lookup table of `M` (a prime, default 65537) slots from
+/// the **stable, full** backend set. Each backend derives a `(offset, skip)`
+/// permutation from two seeded hashes and claims slots in permutation order
+/// until the table is full; a backend's share of slots is proportional to its
+/// weight.
+///
+/// The table holds one entry per distinct **address**: several backend ids at
+/// one address claim the slots of one backend, weighted by the heaviest of
+/// them over the full set (`outranks_at_address`), and the lookup returns
+/// the one candidate the caller retained at that address.
+///
+/// # Rebuild discipline (never on the hot path)
+///
+/// The table is rebuilt **only when the full backend set changes**
+/// ([`Maglev::rebuild`], wired into `BackendList::add_backend` /
+/// `remove_backend`), never per packet. Building the table is `O(M)` = 65537
+/// slot writes; doing it per datagram would be a DoS amplifier (one unhealthy
+/// backend would trigger a full rebuild on every selection) and would also
+/// destroy Maglev's stability, since the table would track a shifting subset.
+///
+/// # Selection (handles a shrunk healthy subset without rebuilding)
+///
+/// At selection time the caller passes the **healthy subset** of backends.
+/// Lookup is near-`O(1)`: compute `slot = key % M`, then probe forward through
+/// the table (`table[(slot + i) % M]`) and return the first entry whose address
+/// is present in the healthy subset. The table maps to the full set it was
+/// built from; membership is checked against the subset, so an unhealthy
+/// backend is simply skipped — no rebuild, and healthy keys stay pinned. If no
+/// table entry resolves to a healthy backend, fall back to round-robin over the
+/// subset. With no key it falls back to round-robin, which, as for
+/// [`Rendezvous`], only a request with no source address reaches.
+#[derive(Debug)]
+pub struct Maglev {
+    seed: u64,
+    /// Prime table size `M`.
+    size: usize,
+    /// `table[i]` is an index into `backends` (the set captured at the last
+    /// [`rebuild`]). Empty when there are no backends.
+    table: Vec<usize>,
+    /// Backend addresses captured at the last rebuild, in the order used to
+    /// build `table`. The lookup maps a table entry back to the live backend
+    /// by address so it survives `Vec` reordering between rebuilds.
+    backend_addrs: Vec<SocketAddr>,
+    /// Round-robin cursor used for the `key == None` fallback.
+    round_robin: RoundRobin,
+}
+
+impl Default for Maglev {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Maglev {
+    /// Default prime table size. 65537 is the smallest prime above 2^16; large
+    /// enough to keep per-key disruption small on backend churn, small enough
+    /// to rebuild cheaply off the datapath.
+    pub const DEFAULT_TABLE_SIZE: usize = 65537;
+
+    pub fn new() -> Self {
+        Self::with_seed(DEFAULT_HASH_SEED)
+    }
+
+    pub fn with_seed(seed: u64) -> Self {
+        Self::with_seed_and_size(seed, Self::DEFAULT_TABLE_SIZE)
+    }
+
+    pub fn with_seed_and_size(seed: u64, size: usize) -> Self {
+        Self {
+            seed,
+            // The Maglev permutation uses `skip = h2 % (m - 1) + 1`, which
+            // panics (divide-by-zero) when `m == 1`, and a single-slot table
+            // is degenerate anyway. Clamp to the next prime `>= max(size, 2)`
+            // so the table is always usable and the permutation stride is
+            // coprime with `m` (a prime), guaranteeing the population loop
+            // visits every slot.
+            size: next_prime(size.max(2)),
+            table: Vec::new(),
+            backend_addrs: Vec::new(),
+            round_robin: RoundRobin::new(),
+        }
+    }
+
+    /// Rebuild the lookup table from `backends`. Called on backend-set change,
+    /// NOT per packet. Honors backend weight via proportional slot share.
+    pub fn rebuild(&mut self, backends: &[Rc<RefCell<Backend>>]) {
+        self.rebuild_from(backends.iter());
+    }
+
+    /// [`Maglev::rebuild`] over any ordered backend sequence, so the cold-start
+    /// build in `next_available_backend` can read its [`Candidates`] view
+    /// without collecting it.
+    fn rebuild_from<'a>(
+        &mut self,
+        backends: impl ExactSizeIterator<Item = &'a Rc<RefCell<Backend>>>,
+    ) {
+        let ids = backends.len();
+        self.backend_addrs.clear();
+        self.table.clear();
+        if ids == 0 || self.size == 0 {
+            return;
+        }
+
+        let m = self.size;
+
+        // Per-address (offset, skip) permutation parameters and weights. One
+        // address is one share: a second id at an address already captured
+        // claims no slots of its own, it only raises the address's weight to
+        // the heaviest of its ids. Linear search, on the control plane.
+        let mut offsets = Vec::with_capacity(ids);
+        let mut skips = Vec::with_capacity(ids);
+        let mut weights: Vec<u64> = Vec::with_capacity(ids);
+        for backend in backends {
+            let b = backend.borrow();
+            let addr = b.address;
+            let w = backend_weight(&b) as u64;
+            if let Some(known) = self.backend_addrs.iter().position(|a| *a == addr) {
+                weights[known] = weights[known].max(w);
+                continue;
+            }
+            self.backend_addrs.push(addr);
+            // Two independent seeded hashes give the permutation seeds. We mix
+            // distinct domain separators into the `key` slot of `hash_backend`
+            // so `offset` and `skip` are uncorrelated.
+            let h1 = hash_backend(self.seed, 0x6F66_6673_6574, &addr); // "offset"
+            let h2 = hash_backend(self.seed, 0x736B_6970_5F5F, &addr); // "skip__"
+            let offset = (h1 % m as u64) as usize;
+            let skip = (h2 % (m as u64 - 1)) as usize + 1;
+            // The permutation parameters must address valid slots and keep a
+            // non-zero stride; `skip ∈ [1, m-1]` is coprime with the prime `m`,
+            // which is what guarantees the population loop visits every slot.
+            debug_assert!(offset < m, "Maglev offset must be a valid slot");
+            debug_assert!(
+                (1..m).contains(&skip),
+                "Maglev skip must lie in [1, m-1] to stay coprime with the prime table"
+            );
+            offsets.push(offset);
+            skips.push(skip);
+            weights.push(w);
+        }
+        let n = self.backend_addrs.len();
+        let total_weight: u64 = weights.iter().sum();
+        debug_assert!(
+            (1..=ids).contains(&n),
+            "Maglev captures between one and every backend's address"
+        );
+        // Every backend contributes weight >= 1, so a non-empty set has a
+        // strictly positive total — the proportional target math divides by it.
+        debug_assert!(
+            total_weight > 0,
+            "Maglev total weight must be positive for a non-empty backend set"
+        );
+
+        // Target slot count per backend, proportional to weight. The sum of
+        // targets equals `m` (remainder handed to the heaviest/first backends).
+        let mut targets = vec![0usize; n];
+        let mut assigned = 0usize;
+        for (i, &w) in weights.iter().enumerate() {
+            let t = ((w as u128 * m as u128) / total_weight as u128) as usize;
+            targets[i] = t;
+            assigned += t;
+        }
+        // Distribute the rounding remainder so the table fills exactly.
+        let mut i = 0;
+        while assigned < m {
+            targets[i % n] += 1;
+            assigned += 1;
+            i += 1;
+        }
+        // The targets must sum to exactly `m`: this is the termination
+        // guarantee for the population loop below — it writes one slot per unit
+        // of target budget and stops at `count == m`, so an under/over sum would
+        // either leave holes (`usize::MAX` entries) or loop forever.
+        debug_assert_eq!(
+            assigned, m,
+            "Maglev target budget must sum to the table size"
+        );
+        debug_assert_eq!(
+            targets.iter().sum::<usize>(),
+            m,
+            "Maglev per-backend targets must sum to the table size"
+        );
+
+        // Standard Maglev population loop, capped per backend by `targets`.
+        let mut table = vec![usize::MAX; m];
+        let mut next = vec![0usize; n];
+        let mut filled = vec![0usize; n];
+        let mut count = 0usize;
+        while count < m {
+            for b in 0..n {
+                if filled[b] >= targets[b] {
+                    continue;
+                }
+                // Find this backend's next free preferred slot.
+                let mut c = (offsets[b] + next[b] * skips[b]) % m;
+                while table[c] != usize::MAX {
+                    next[b] += 1;
+                    c = (offsets[b] + next[b] * skips[b]) % m;
+                }
+                table[c] = b;
+                next[b] += 1;
+                filled[b] += 1;
+                count += 1;
+                if count >= m {
+                    break;
+                }
+            }
+        }
+        // The loop terminates with every slot claimed exactly once: `count`
+        // reached `m`, no slot still holds the `usize::MAX` sentinel, and each
+        // backend filled precisely its target budget.
+        debug_assert_eq!(count, m, "Maglev population loop must fill exactly m slots");
+        debug_assert!(
+            table.iter().all(|&slot| slot != usize::MAX),
+            "Maglev population loop left an unfilled slot"
+        );
+        debug_assert!(
+            filled == targets,
+            "Maglev filled counts must match the per-backend targets"
+        );
+
+        self.table = table;
+
+        // Post-conditions (TigerStyle). The table is either fully built or empty:
+        //   * `size` is the prime chosen at construction — rebuild never changes
+        //     it (the permutation math depends on a coprime stride over a prime).
+        //   * a populated table is exactly `size` slots, every entry a valid
+        //     index into `backend_addrs` (`< backend_addrs.len() <= size`), so a
+        //     later `table[slot]` lookup can never index out of `backend_addrs`.
+        //   * `backend_addrs` is non-empty whenever the table is non-empty (the
+        //     table maps slots to addresses; an empty address vector would make
+        //     every lookup resolve to nothing).
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                is_prime(self.size),
+                "Maglev table size {} is not prime",
+                self.size
+            );
+            if self.table.is_empty() {
+                debug_assert!(
+                    self.backend_addrs.is_empty(),
+                    "Maglev: empty table but non-empty backend_addrs"
+                );
+            } else {
+                debug_assert_eq!(
+                    self.table.len(),
+                    self.size,
+                    "Maglev table must have exactly `size` slots"
+                );
+                debug_assert!(
+                    !self.backend_addrs.is_empty(),
+                    "Maglev: non-empty table but empty backend_addrs"
+                );
+                debug_assert!(
+                    self.table.iter().all(|&idx| idx < self.backend_addrs.len()),
+                    "Maglev table holds an index out of backend_addrs range"
+                );
+            }
+        }
+    }
+}
+
+impl LoadBalancingAlgorithm for Maglev {
+    fn next_available_backend(
+        &mut self,
+        key: Option<u64>,
+        backends: Candidates<'_>,
+    ) -> Option<Rc<RefCell<Backend>>> {
+        let Some(key) = key else {
+            return self.round_robin.next_available_backend(None, backends);
+        };
+
+        if backends.is_empty() {
+            return None;
+        }
+
+        // Cold start ONLY: the table is empty because no `rebuild` has fired
+        // yet (the control plane wires `rebuild` into backend-set mutations,
+        // but a freshly constructed policy or a never-mutated cluster may not
+        // have one). Build once from the current set. This is NOT a per-packet
+        // rebuild: once populated, the table is only refreshed by `rebuild` on
+        // an actual set change — a partial outage (shrunk healthy subset) never
+        // rebuilds, it is handled by the probe-forward below.
+        if self.table.is_empty() {
+            self.rebuild_from(backends.iter());
+        }
+
+        if self.table.is_empty() {
+            // Still empty (e.g. zero backends captured): nothing to select.
+            return None;
+        }
+
+        // Probe forward from `key % M` through the table and return the first
+        // entry whose backend address is present in the passed healthy subset.
+        // The table was built from the full set; checking membership against
+        // the subset lets us skip unhealthy backends WITHOUT rebuilding, which
+        // is what keeps a partial outage off the hot path and keeps healthy
+        // keys pinned to the same backend.
+        let start = (key % self.size as u64) as usize;
+        // `key % size` is always a valid table slot, and the table is exactly
+        // `size` long here (non-empty checked above, rebuild post-condition).
+        debug_assert!(start < self.size, "Maglev start slot out of range");
+        debug_assert_eq!(
+            self.table.len(),
+            self.size,
+            "Maglev lookup on a table whose length != size"
+        );
+        for i in 0..self.size {
+            let slot = (start + i) % self.size;
+            // Both the running slot and the index it stores are in range: the
+            // table is `size` long and every entry is a valid `backend_addrs`
+            // index (rebuild post-condition), so the resolution below is total.
+            debug_assert!(slot < self.size, "Maglev probe slot out of range");
+            let idx = self.table[slot];
+            debug_assert!(
+                idx < self.backend_addrs.len(),
+                "Maglev table entry indexes outside the captured address set"
+            );
+            // Resolve the table's backend index back to an address captured at
+            // the last rebuild, then look it up in the live healthy subset.
+            if let Some(addr) = self.backend_addrs.get(idx)
+                && let Some(backend) = backends.iter().find(|b| b.borrow().address == *addr)
+            {
+                // The chosen backend is, by construction, a member of the
+                // healthy subset we were handed.
+                debug_assert!(
+                    backends
+                        .iter()
+                        .any(|b| b.borrow().address == backend.borrow().address),
+                    "Maglev must return a backend from the healthy subset"
+                );
+                return Some(backend.clone());
+            }
+        }
+
+        // None of the table entries resolved to a healthy backend (every
+        // backend the table knows about is currently unhealthy/absent). Fall
+        // back to round-robin over the healthy subset so we still route.
+        self.round_robin.next_available_backend(None, backends)
+    }
+
+    fn rebuild(&mut self, backends: &[Rc<RefCell<Backend>>]) {
+        Maglev::rebuild(self, backends);
+        self.round_robin.rebuild(backends);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
+
+    use super::*;
+    use crate::{
+        PeakEWMA,
+        backends::{BackendStatus, HealthState},
+        retry::{ExponentialBackoffPolicy, RetryPolicyWrapper},
+        sozu_command::proto::command::{LoadBalancingParams, LoadMetric},
+    };
+
+    /// Run `policy` over every backend of `backends`, the way a caller whose
+    /// whole list is available would.
+    fn pick(
+        policy: &mut (impl LoadBalancingAlgorithm + ?Sized),
+        key: Option<u64>,
+        backends: &[Rc<RefCell<Backend>>],
+    ) -> Option<Rc<RefCell<Backend>>> {
+        pick_at(policy, key, backends, Instant::now())
+    }
+
+    /// [`pick`] for a selection at `now`.
+    fn pick_at(
+        policy: &mut (impl LoadBalancingAlgorithm + ?Sized),
+        key: Option<u64>,
+        backends: &[Rc<RefCell<Backend>>],
+        now: Instant,
+    ) -> Option<Rc<RefCell<Backend>>> {
+        let indices: Vec<usize> = (0..backends.len()).collect();
+        policy.next_available_backend(key, Candidates::new(backends, &indices, now))
+    }
+
+    fn create_backend(id: String, connections: Option<usize>) -> Backend {
+        Backend {
+            sticky_id: None,
+            backend_id: id,
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            status: BackendStatus::Normal,
+            retry_policy: RetryPolicyWrapper::ExponentialBackoff(ExponentialBackoffPolicy::new(1)),
+            active_connections: connections.unwrap_or(0),
+            active_requests: 0,
+            failures: 0,
+            load_balancing_parameters: None,
+            backup: false,
+            connection_time: PeakEWMA::new(Instant::now()),
+            health: HealthState::default(),
+            unix_path: None,
+        }
+    }
+
+    #[test]
+    fn it_should_find_the_backend_with_least_connections() {
+        let backend_with_least_connection =
+            Rc::new(RefCell::new(create_backend("yolo".to_string(), Some(1))));
+
+        let backends = vec![
+            Rc::new(RefCell::new(create_backend("nolo".to_string(), Some(10)))),
+            Rc::new(RefCell::new(create_backend("philo".to_string(), Some(20)))),
+            backend_with_least_connection.clone(),
+        ];
+
+        let mut least_connection_algorithm = LeastLoaded {
+            metric: LoadMetric::Connections,
+        };
+
+        let backend_res = pick(&mut least_connection_algorithm, None, &backends).unwrap();
+        let backend = backend_res.borrow();
+
+        assert!(*backend == *backend_with_least_connection.borrow());
+    }
+
+    #[test]
+    fn it_shouldnt_find_backend_with_least_connections_when_list_is_empty() {
+        let backends = vec![];
+
+        let mut least_connection_algorithm = LeastLoaded {
+            metric: LoadMetric::Connections,
+        };
+
+        let backend = pick(&mut least_connection_algorithm, None, &backends);
+        assert!(backend.is_none());
+    }
+
+    #[test]
+    fn it_should_find_backend_with_roundrobin_when_some_backends_were_removed() {
+        let mut backends = vec![
+            Rc::new(RefCell::new(create_backend("toto".to_string(), None))),
+            Rc::new(RefCell::new(create_backend("voto".to_string(), None))),
+            Rc::new(RefCell::new(create_backend("yoto".to_string(), None))),
+        ];
+
+        let mut roundrobin = RoundRobin {
+            next_backend: 1,
+            ..RoundRobin::new()
+        };
+        let backend = pick(&mut roundrobin, None, &backends);
+        assert_eq!(backend.as_ref(), backends.get(1));
+
+        backends.remove(1);
+
+        let backend2 = pick(&mut roundrobin, None, &backends);
+        assert_eq!(backend2.as_ref(), backends.first());
+    }
+
+    // ----- HRW (Rendezvous) and Maglev affinity tests -----
+
+    /// Build a backend with a distinct address so the address-based affinity
+    /// hashers (HRW / Maglev) see distinct identities, and an optional weight.
+    fn addr_backend(id: &str, last_octet: u8, port: u16, weight: Option<i32>) -> Backend {
+        let mut b = create_backend(id.to_string(), None);
+        b.address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, last_octet)), port);
+        b.load_balancing_parameters = weight.map(|weight| LoadBalancingParams { weight });
+        b
+    }
+
+    fn rc(b: Backend) -> Rc<RefCell<Backend>> {
+        Rc::new(RefCell::new(b))
+    }
+
+    fn make_backends(n: u8) -> Vec<Rc<RefCell<Backend>>> {
+        (0..n)
+            .map(|i| rc(addr_backend(&format!("b{i}"), i + 1, 8000 + i as u16, None)))
+            .collect()
+    }
+
+    fn chosen_addr(b: &Rc<RefCell<Backend>>) -> SocketAddr {
+        b.borrow().address
+    }
+
+    #[test]
+    fn hrw_is_deterministic_for_a_fixed_key() {
+        let backends = make_backends(5);
+        let mut hrw = Rendezvous::new();
+
+        let first = pick(&mut hrw, Some(42), &backends).map(|b| chosen_addr(&b));
+        for _ in 0..50 {
+            let again = pick(&mut hrw, Some(42), &backends).map(|b| chosen_addr(&b));
+            assert_eq!(first, again, "HRW must be deterministic for a fixed key");
+        }
+    }
+
+    #[test]
+    fn hrw_none_key_falls_back_to_round_robin() {
+        let backends = make_backends(3);
+        let mut hrw = Rendezvous::new();
+
+        // With None it should cycle round-robin: addresses in order then wrap.
+        let a = chosen_addr(&pick(&mut hrw, None, &backends).unwrap());
+        let b = chosen_addr(&pick(&mut hrw, None, &backends).unwrap());
+        let c = chosen_addr(&pick(&mut hrw, None, &backends).unwrap());
+        let d = chosen_addr(&pick(&mut hrw, None, &backends).unwrap());
+        assert_eq!(a, chosen_addr(&backends[0]));
+        assert_eq!(b, chosen_addr(&backends[1]));
+        assert_eq!(c, chosen_addr(&backends[2]));
+        assert_eq!(d, a, "round-robin should wrap around");
+    }
+
+    #[test]
+    fn hrw_minimal_disruption_when_removing_a_non_winner() {
+        // For every key whose winner is NOT the removed backend, the choice
+        // must be unchanged after removal (HRW minimal-disruption property).
+        let mut backends = make_backends(6);
+        let mut hrw = Rendezvous::new();
+
+        // Pick a backend to remove (index 3).
+        let removed_addr = chosen_addr(&backends[3]);
+
+        // Record winners for many keys on the full set.
+        let mut before = std::collections::HashMap::new();
+        for key in 0..2000u64 {
+            let w = chosen_addr(&pick(&mut hrw, Some(key), &backends).unwrap());
+            before.insert(key, w);
+        }
+
+        // Remove the backend and re-evaluate.
+        backends.remove(3);
+        for key in 0..2000u64 {
+            let after = chosen_addr(&pick(&mut hrw, Some(key), &backends).unwrap());
+            let prev = before[&key];
+            if prev != removed_addr {
+                assert_eq!(
+                    prev, after,
+                    "removing a non-winner changed the choice for key {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hrw_distribution_is_roughly_even() {
+        let n = 5u8;
+        let backends = make_backends(n);
+        let mut hrw = Rendezvous::new();
+
+        let total = 20_000u64;
+        let mut counts: std::collections::HashMap<SocketAddr, u64> =
+            std::collections::HashMap::new();
+        for key in 0..total {
+            let w = chosen_addr(&pick(&mut hrw, Some(key), &backends).unwrap());
+            *counts.entry(w).or_default() += 1;
+        }
+
+        let expected = total / n as u64;
+        for b in &backends {
+            let c = counts.get(&chosen_addr(b)).copied().unwrap_or(0);
+            // Allow generous +/-35% slack: this is a statistical property.
+            assert!(
+                c > expected * 65 / 100 && c < expected * 135 / 100,
+                "HRW distribution skewed: backend got {c}, expected ~{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn maglev_is_deterministic_for_a_fixed_key() {
+        let backends = make_backends(7);
+        let mut mag = Maglev::new();
+        mag.rebuild(&backends);
+
+        let sel = backends.clone();
+        let first = chosen_addr(&pick(&mut mag, Some(12345), &sel).unwrap());
+        for _ in 0..50 {
+            let again = chosen_addr(&pick(&mut mag, Some(12345), &sel).unwrap());
+            assert_eq!(first, again, "Maglev must be deterministic for a fixed key");
+        }
+    }
+
+    #[test]
+    fn maglev_none_key_falls_back_to_round_robin() {
+        let backends = make_backends(3);
+        let mut mag = Maglev::new();
+        mag.rebuild(&backends);
+
+        let a = chosen_addr(&pick(&mut mag, None, &backends).unwrap());
+        let b = chosen_addr(&pick(&mut mag, None, &backends).unwrap());
+        let c = chosen_addr(&pick(&mut mag, None, &backends).unwrap());
+        let d = chosen_addr(&pick(&mut mag, None, &backends).unwrap());
+        assert_eq!(a, chosen_addr(&backends[0]));
+        assert_eq!(b, chosen_addr(&backends[1]));
+        assert_eq!(c, chosen_addr(&backends[2]));
+        assert_eq!(d, a);
+    }
+
+    #[test]
+    fn maglev_distribution_is_roughly_even() {
+        let n = 5u8;
+        let backends = make_backends(n);
+        // Use a small prime table so the test is fast but still representative.
+        let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1009);
+        mag.rebuild(&backends);
+
+        let total = 50_000u64;
+        let mut counts: std::collections::HashMap<SocketAddr, u64> =
+            std::collections::HashMap::new();
+        let sel = backends.clone();
+        for key in 0..total {
+            let w = chosen_addr(&pick(&mut mag, Some(key), &sel).unwrap());
+            *counts.entry(w).or_default() += 1;
+        }
+
+        let expected = total / n as u64;
+        for b in &backends {
+            let c = counts.get(&chosen_addr(b)).copied().unwrap_or(0);
+            // Maglev is more even than HRW; +/-15% is comfortable.
+            assert!(
+                c > expected * 85 / 100 && c < expected * 115 / 100,
+                "Maglev distribution skewed: backend got {c}, expected ~{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn maglev_table_rebuild_keeps_most_keys_stable() {
+        // Adding a backend should move only a bounded fraction of keys
+        // (Maglev disruption bound ~ 1/N of the table, well under 50%).
+        let backends5 = make_backends(5);
+        let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1009);
+        mag.rebuild(&backends5);
+
+        let total = 20_000u64;
+        let mut before = std::collections::HashMap::new();
+        let sel = backends5.clone();
+        for key in 0..total {
+            before.insert(key, chosen_addr(&pick(&mut mag, Some(key), &sel).unwrap()));
+        }
+
+        // Add a sixth backend and rebuild.
+        let mut backends6 = backends5.clone();
+        backends6.push(rc(addr_backend("b5", 6, 8005, None)));
+        mag.rebuild(&backends6);
+
+        let mut moved = 0u64;
+        let sel6 = backends6.clone();
+        for key in 0..total {
+            let after = chosen_addr(&pick(&mut mag, Some(key), &sel6).unwrap());
+            if after != before[&key] {
+                moved += 1;
+            }
+        }
+
+        // Disruption should be well under half: most keys stay on their backend.
+        assert!(
+            moved < total / 2,
+            "Maglev rebuild moved too many keys: {moved}/{total}"
+        );
+    }
+
+    #[test]
+    fn maglev_partial_outage_does_not_rebuild_and_stays_stable() {
+        // FIX 1 guard: a partial outage (one backend missing from the healthy
+        // subset passed to `next_available_backend`) must NOT rebuild the
+        // table — the table tracks the full set captured at `rebuild`, and the
+        // unhealthy backend is simply skipped via probe-forward. Selection for
+        // keys that did not land on the unhealthy backend stays identical.
+        let full = make_backends(5);
+        let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1009);
+        mag.rebuild(&full);
+
+        // Snapshot the table state built from the FULL set.
+        let table_before = mag.table.clone();
+        let addrs_before = mag.backend_addrs.clone();
+        assert_eq!(addrs_before.len(), 5, "table built from the full set");
+
+        // Record winners on the full healthy set.
+        let total = 4000u64;
+        let mut before = std::collections::HashMap::new();
+        let sel_full = full.clone();
+        for key in 0..total {
+            before.insert(
+                key,
+                chosen_addr(&pick(&mut mag, Some(key), &sel_full).unwrap()),
+            );
+        }
+
+        // Now mark backend index 2 unhealthy by passing a REDUCED subset
+        // (everything except index 2). This is exactly what
+        // `BackendList::next_available_backend_with_key` does when a backend
+        // fails its health check / enters retry backoff.
+        let unhealthy_addr = chosen_addr(&full[2]);
+        let subset: Vec<_> = full
+            .iter()
+            .filter(|b| chosen_addr(b) != unhealthy_addr)
+            .cloned()
+            .collect();
+
+        for key in 0..total {
+            let after = chosen_addr(&pick(&mut mag, Some(key), &subset).unwrap());
+            // The unhealthy backend must never be selected.
+            assert_ne!(
+                after, unhealthy_addr,
+                "selection returned the unhealthy backend for key {key}"
+            );
+            // Keys that did NOT previously land on the unhealthy backend must
+            // keep their original backend — probe-forward only reroutes the
+            // keys that were pinned to the now-missing backend.
+            if before[&key] != unhealthy_addr {
+                assert_eq!(
+                    before[&key], after,
+                    "a healthy key moved during a partial outage (key {key})"
+                );
+            }
+        }
+
+        // The crux of FIX 1: the table was NOT rebuilt by the partial outage.
+        // Neither the table contents nor the captured address set changed.
+        assert_eq!(
+            mag.table, table_before,
+            "partial outage must not rebuild the Maglev table"
+        );
+        assert_eq!(
+            mag.backend_addrs, addrs_before,
+            "partial outage must not change the captured backend set"
+        );
+    }
+
+    #[test]
+    fn maglev_all_table_backends_unhealthy_falls_back_to_round_robin() {
+        // When the healthy subset shares NO address with the table (every
+        // table backend is down), probe-forward finds nothing and we fall back
+        // to round-robin over the subset rather than returning None.
+        let table_set = make_backends(3);
+        let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1009);
+        mag.rebuild(&table_set);
+        let table_before = mag.table.clone();
+
+        // A disjoint healthy subset (different addresses than the table).
+        let fresh = vec![
+            rc(addr_backend("n0", 50, 9000, None)),
+            rc(addr_backend("n1", 51, 9001, None)),
+        ];
+        let fresh_addrs: Vec<_> = fresh.iter().map(chosen_addr).collect();
+
+        let picked = chosen_addr(&pick(&mut mag, Some(7), &fresh).unwrap());
+        assert!(
+            fresh_addrs.contains(&picked),
+            "fallback must route to a backend in the healthy subset"
+        );
+        // And still no rebuild happened.
+        assert_eq!(
+            mag.table, table_before,
+            "fallback must not rebuild the table"
+        );
+    }
+
+    #[test]
+    fn maglev_cold_start_builds_table_once() {
+        // A freshly constructed Maglev with no prior `rebuild` must still
+        // select (one-time cold-start build), then keep the table populated.
+        let backends = make_backends(4);
+        let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1009);
+        assert!(mag.table.is_empty(), "table starts empty (cold)");
+
+        let _ = pick(&mut mag, Some(99), &backends).unwrap();
+        assert_eq!(mag.table.len(), mag.size, "cold start populated the table");
+        let table_after_cold = mag.table.clone();
+
+        // A subsequent selection (still the full set) must NOT rebuild.
+        let _ = pick(&mut mag, Some(100), &backends).unwrap();
+        assert_eq!(
+            mag.table, table_after_cold,
+            "selection after cold start must not rebuild"
+        );
+    }
+
+    #[test]
+    fn round_robin_empty_set_returns_none_without_panic() {
+        // FIX 2 guard: `% backends.len()` would panic on an empty Vec.
+        let empty: Vec<Rc<RefCell<Backend>>> = vec![];
+        let mut rr = RoundRobin::new();
+        assert!(pick(&mut rr, None, &empty).is_none());
+
+        // Delegators (Rendezvous / Maglev with key == None) route through
+        // RoundRobin and must be safe on an empty set too.
+        let mut hrw = Rendezvous::new();
+        assert!(pick(&mut hrw, None, &empty).is_none());
+        let mut mag = Maglev::new();
+        assert!(pick(&mut mag, None, &empty).is_none());
+    }
+
+    #[test]
+    fn maglev_table_size_one_is_clamped_to_a_prime() {
+        // FIX 3 guard: requesting size 1 would make `skip = h2 % (m - 1)`
+        // divide by zero. The constructor must clamp to a prime >= 2.
+        let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1);
+        assert!(
+            mag.size >= 2,
+            "size must be clamped to >= 2, got {}",
+            mag.size
+        );
+
+        let backends = make_backends(3);
+        // Building and selecting must not panic.
+        mag.rebuild(&backends);
+        assert_eq!(mag.table.len(), mag.size);
+        let _ = pick(&mut mag, Some(1), &backends).unwrap();
+    }
+
+    #[test]
+    fn next_prime_picks_the_smallest_prime_at_least_n() {
+        assert_eq!(next_prime(0), 2);
+        assert_eq!(next_prime(1), 2);
+        assert_eq!(next_prime(2), 2);
+        assert_eq!(next_prime(3), 3);
+        assert_eq!(next_prime(4), 5);
+        assert_eq!(next_prime(1009), 1009); // already prime — preserved
+        assert_eq!(next_prime(65537), 65537); // default size is prime
+    }
+
+    #[test]
+    fn maglev_honors_weight() {
+        // A backend with 4x weight should win clearly more slots.
+        let backends = vec![
+            rc(addr_backend("light", 1, 8001, Some(100))),
+            rc(addr_backend("heavy", 2, 8002, Some(400))),
+        ];
+        let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1009);
+        mag.rebuild(&backends);
+
+        let heavy_addr = chosen_addr(&backends[1]);
+        let total = 20_000u64;
+        let mut heavy = 0u64;
+        let sel = backends.clone();
+        for key in 0..total {
+            if chosen_addr(&pick(&mut mag, Some(key), &sel).unwrap()) == heavy_addr {
+                heavy += 1;
+            }
+        }
+        // Expected ~80% (400 / 500); allow a margin.
+        assert!(
+            heavy > total * 70 / 100,
+            "weighted Maglev did not favor the heavy backend: {heavy}/{total}"
+        );
+    }
+
+    /// One address, one share: two ids at one address claim the table slots
+    /// of ONE backend, weighted by the heaviest of them, not one share each.
+    ///
+    /// TO SEE THIS RED: push every backend in `Maglev::rebuild_from` instead
+    /// of one entry per distinct address; the shared address then holds two
+    /// thirds of the table.
+    #[test]
+    fn maglev_gives_a_shared_address_the_slots_of_one_backend() {
+        let count_shared = |backends: &[Rc<RefCell<Backend>>]| {
+            let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1009);
+            mag.rebuild(backends);
+            let shared = chosen_addr(&backends[0]);
+            mag.table
+                .iter()
+                .filter(|&&index| mag.backend_addrs[index] == shared)
+                .count()
+        };
+        let equal = vec![
+            rc(addr_backend("a", 1, 8001, None)),
+            rc(addr_backend("b", 1, 8001, None)),
+            rc(addr_backend("c", 2, 8002, None)),
+        ];
+        // 1009 slots between two addresses of equal weight.
+        assert_eq!(count_shared(&equal), 505);
+
+        // The heaviest id weighs for the address: 300 against 100.
+        let unequal = vec![
+            rc(addr_backend("a", 1, 8001, Some(100))),
+            rc(addr_backend("b", 1, 8001, Some(300))),
+            rc(addr_backend("c", 2, 8002, Some(100))),
+        ];
+        assert_eq!(count_shared(&unequal), 1009 * 3 / 4 + 1);
+    }
+
+    // ----- Random / PowerOfTwo: injected, seedable entropy -----
+
+    /// Map a test backend's address back to the index `make_backends` gave it
+    /// (`last_octet - 1`), so a selection sequence can be asserted as a
+    /// compact `Vec<u8>` instead of a `Vec<SocketAddr>`.
+    fn addr_index(addr: SocketAddr) -> u8 {
+        match addr.ip() {
+            IpAddr::V4(v4) => v4.octets()[3] - 1,
+            IpAddr::V6(_) => unreachable!("test backends are always IPv4"),
+        }
+    }
+
+    #[test]
+    fn random_is_deterministic_and_matches_an_expected_sequence() {
+        let backends = make_backends(4);
+        let mut r1 = Random::with_seed(DEFAULT_HASH_SEED);
+        let mut r2 = Random::with_seed(DEFAULT_HASH_SEED);
+
+        let sel1 = backends.clone();
+        let sel2 = backends.clone();
+
+        let seq1: Vec<u8> = (0..20)
+            .map(|_| addr_index(chosen_addr(&pick(&mut r1, None, &sel1).unwrap())))
+            .collect();
+        let seq2: Vec<u8> = (0..20)
+            .map(|_| addr_index(chosen_addr(&pick(&mut r2, None, &sel2).unwrap())))
+            .collect();
+
+        // Reproducibility: same seed + same inputs + same call sequence must
+        // give the same picks.
+        assert_eq!(
+            seq1, seq2,
+            "Random::with_seed must reproduce the same sequence for the same seed"
+        );
+
+        // Absolute-value check (paired with the determinism check above so a
+        // test that is merely "reproducible" but reproducibly wrong still
+        // fails): the sequence for DEFAULT_HASH_SEED over 4 uniformly
+        // weighted backends, captured from this implementation.
+        //
+        // Brittleness note: this literal is coupled to `rand` 0.10.2's exact
+        // `StdRng` algorithm (ChaCha12) and `seed_from_u64`'s splitmix64
+        // expansion. A `rand` version bump that changes either (the type's
+        // own docs disclaim portability/reproducibility across versions) will
+        // break this assertion for reasons unrelated to Sōzu's load-balancing
+        // logic — recapture the sequence, don't "fix" the algorithm.
+        let expected: Vec<u8> = vec![1, 2, 1, 1, 0, 2, 1, 3, 1, 0, 3, 1, 0, 0, 3, 2, 1, 3, 3, 1];
+        assert_eq!(
+            seq1, expected,
+            "Random sequence for DEFAULT_HASH_SEED regressed"
+        );
+    }
+
+    #[test]
+    fn random_distribution_does_not_collapse() {
+        // A seeded RNG must still spread draws across every backend rather
+        // than pinning one — determinism is per-(seed, sequence), not
+        // "always the same backend".
+        //
+        // This is a smoke check, not a uniformity test: the +/-35% band is
+        // wide enough (roughly ±12 sigma at n=5, total=5000) to reliably
+        // catch full collapse (one backend gets ~0 or ~100%) or a gross bias,
+        // but a systematic ~20-25% skew would pass it. Tightening the band
+        // to something a real skew would fail is a legitimate follow-up; the
+        // name deliberately promises no more than "does not collapse".
+        let n = 5u8;
+        let backends = make_backends(n);
+        let mut r = Random::with_seed(DEFAULT_HASH_SEED);
+        let sel = backends.clone();
+
+        let total = 5_000u64;
+        let mut counts = [0u64; 5];
+        for _ in 0..total {
+            let idx = addr_index(chosen_addr(&pick(&mut r, None, &sel).unwrap()));
+            counts[idx as usize] += 1;
+        }
+
+        let expected = total / n as u64;
+        for (idx, &c) in counts.iter().enumerate() {
+            assert!(
+                c > expected * 65 / 100 && c < expected * 135 / 100,
+                "Random distribution skewed for backend {idx}: got {c}, expected ~{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_tie_break_is_deterministic_and_matches_an_expected_sequence() {
+        // All backends report the same load (0 active connections), so both
+        // sampled candidates always tie and every call reaches the coin-flip
+        // branch.
+        let backends = make_backends(4);
+        let mut p1 = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let mut p2 = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+
+        let sel1 = backends.clone();
+        let sel2 = backends.clone();
+
+        let seq1: Vec<u8> = (0..20)
+            .map(|_| addr_index(chosen_addr(&pick(&mut p1, None, &sel1).unwrap())))
+            .collect();
+        let seq2: Vec<u8> = (0..20)
+            .map(|_| addr_index(chosen_addr(&pick(&mut p2, None, &sel2).unwrap())))
+            .collect();
+
+        // Reproducibility: `with_seed` is deterministic given the same seed
+        // and call sequence — the property tests/simulation need. This is
+        // NOT a claim about production: there the seed comes from the
+        // backend map's generator, which `BackendMap::new` seeds from OS
+        // entropy specifically so two independent worker processes do NOT
+        // draw from the same keystream (see the struct docs' "Seed source"
+        // section for why sharing a seed here would be a regression, not a
+        // feature).
+        assert_eq!(
+            seq1, seq2,
+            "PowerOfTwo::with_seed must reproduce the same tie-break sequence for the same seed"
+        );
+
+        // Absolute-value check: the sequence ranges over all four backends,
+        // because each call samples a fresh uniformly random PAIR and the
+        // tie then resolves inside that pair. That is the visible signature
+        // of random sampling — the O(n) fold this replaced could only ever
+        // emit backends 2 and 3, the last two it happened to retain.
+        //
+        // Brittleness note: this literal is coupled to `rand` 0.10.2's exact
+        // `StdRng` algorithm (ChaCha12), to `seed_from_u64`'s splitmix64
+        // expansion, AND to the exact order and shape of the draws
+        // `PowerOfTwo::next_available_backend` makes. TWO kinds of change
+        // move it legitimately, not one: a `rand` version bump that alters
+        // either generator (the type's own docs disclaim
+        // portability/reproducibility across versions), and a deliberate
+        // change to the selection procedure itself. The second is not
+        // hypothetical — this literal was recaptured once already, when the
+        // two-lightest fold became real power-of-two-choices and the
+        // sequence stopped being confined to backends 2 and 3.
+        //
+        // HOW TO TELL A LEGITIMATE RECAPTURE FROM PAPERING OVER A
+        // REGRESSION. Every other `power_of_two_*` test in this module
+        // asserts a SEMANTIC property that no RNG stream can shift. There
+        // are SEVEN of them — `grep -cE '^\s+fn power_of_two_'` in this file
+        // gives eight, this test included — and the rule below covers all
+        // seven, not a convenient subset. The pattern is anchored on
+        // purpose: unanchored it also counts this very comment, reports
+        // nine, and sends the reader after a test that does not exist. The
+        // seven are:
+        // `power_of_two_tie_break_distribution_does_not_collapse`,
+        // `power_of_two_tie_break_is_decided_by_the_coin_flip_not_by_sample_position`,
+        // `power_of_two_touches_exactly_two_backends`,
+        // `power_of_two_always_returns_the_lighter_of_two_backends`,
+        // `power_of_two_handles_empty_and_singleton_sets_without_panic`,
+        // `power_of_two_never_returns_the_strictly_heaviest_backend` and
+        // `power_of_two_sample_size_is_two_not_the_whole_set`.
+        // The eighth this rule used to name, the seed-correlation guard, is
+        // `power_of_two_policies_seeded_by_the_os_are_not_correlated` in
+        // `backends.rs` now that the production seed comes from `BackendMap`
+        // (#1684); it belongs in the rule too.
+        // Recapture only when THIS assertion is the only failing one and all
+        // eight are green with their bodies untouched. If any of them is
+        // red, or one had to be edited to get green, the algorithm regressed
+        // and the new sequence is evidence of it — do not capture it. Check
+        // the grep count first: a `power_of_two_*` test added after this
+        // comment was written belongs in the rule too.
+        let expected: Vec<u8> = vec![1, 3, 1, 1, 1, 2, 1, 2, 0, 1, 2, 3, 1, 3, 3, 3, 0, 2, 0, 2];
+        assert_eq!(
+            seq1, expected,
+            "PowerOfTwo selection sequence for DEFAULT_HASH_SEED regressed"
+        );
+    }
+
+    #[test]
+    fn power_of_two_tie_break_distribution_does_not_collapse() {
+        // Every backend reports the same load, so the pair sample is uniform
+        // and the tie inside it resolves by coin flip: the selection must
+        // spread over ALL FOUR backends, not pin one — otherwise the seeded
+        // RNG would have traded "ambient nondeterminism" for "deterministic
+        // bias", the regression the herding argument in `PowerOfTwo`'s doc
+        // comment warns about.
+        //
+        // This assertion got STRICTER when the O(n) scan became real
+        // power-of-two-choices: it used to require backends 0 and 1 to win
+        // exactly ZERO times, because the old fold could only ever retain
+        // the last two backends it walked. Requiring all four to take a
+        // roughly equal share is a stronger statement about the same draws.
+        //
+        // Smoke check, not a uniformity test: the +/-35% band (~14 sigma at
+        // p=0.25, total=5000) reliably catches a collapse onto a subset but
+        // would pass a systematic skew — see the equivalent note on
+        // `random_distribution_does_not_collapse`.
+        let backends = make_backends(4);
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let sel = backends.clone();
+
+        let total = 5_000u64;
+        let mut counts = [0u64; 4];
+        for _ in 0..total {
+            let idx = addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap()));
+            counts[idx as usize] += 1;
+        }
+
+        // Uniform pair sampling over four equally loaded backends makes
+        // every backend equally likely, so each must take roughly a quarter
+        // and none may be starved.
+        let expected = total / 4;
+        for (idx, &c) in counts.iter().enumerate() {
+            assert!(
+                c > expected * 65 / 100 && c < expected * 135 / 100,
+                "PowerOfTwo distribution skewed for backend {idx}: got {c}, expected ~{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_tie_break_is_decided_by_the_coin_flip_not_by_sample_position() {
+        // `power_of_two_tie_break_distribution_does_not_collapse` CANNOT see
+        // the coin flip, and neither can any other distribution test here.
+        // The sampler draws an ordered pair uniformly — `first` over
+        // `0..len`, `second` uniformly over the rest — so the two positions
+        // are exchangeable, and "always keep `first`" has exactly the same
+        // marginal distribution as a fair coin. Replacing
+        // `self.rng.random_bool(0.5)` with `true` leaves every other test in
+        // this module green except the captured-sequence one, which would
+        // only fail through RNG-stream drift — the same way a `rand` upgrade
+        // fails it, and whose own comment invites a recapture. A dropped
+        // coin flip could ride in behind such a recapture unnoticed.
+        //
+        // This test makes the tie-break directly observable instead. Each
+        // trial is the first selection of a policy seeded with the trial's
+        // own seed, so the pair is the first two draws of that seed's
+        // keystream, and a generator seeded alike replays which backend was
+        // drawn as `first` and which as `second`. The replay stops before the
+        // coin flip, so it agrees with the policy whether the flip is there
+        // or not. (It used to read the order off `PeakEWMA` stamps taken on
+        // the wall clock; a selection now measures both samples at one
+        // injected instant, #1684.)
+        //
+        // The replay mirrors the sampler's exact draws, so it is checked, not
+        // trusted: with THREE equally loaded backends the pair leaves one out,
+        // and every pick must be one of the two the replay predicts. A change
+        // to the sampling desynchronises the replay, and a pick then lands on
+        // the backend it left out, failing this test loudly instead of
+        // quietly counting noise.
+        //
+        // Every backend carries the same load, so every selection is an exact
+        // tie and every one of them reaches the tie-break.
+        const TOTAL: usize = 2_000;
+        const BACKENDS: u8 = 3;
+        let backends = make_backends(BACKENDS);
+
+        let sel = backends.clone();
+        let mut second_measured_won = 0usize;
+        for trial in 0..TOTAL as u64 {
+            let seed = DEFAULT_HASH_SEED ^ trial;
+            let mut p = PowerOfTwo::with_seed(seed, LoadMetric::Connections);
+            let mut replay = StdRng::seed_from_u64(seed);
+            let len = usize::from(BACKENDS);
+            let first = replay.random_range(0..len);
+            let mut second = replay.random_range(0..len - 1);
+            if second >= first {
+                second += 1;
+            }
+            let picked = usize::from(addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap())));
+            assert!(
+                picked == first || picked == second,
+                "trial {trial}: picked backend {picked}, outside the pair ({first}, {second}) \
+                 the replay predicts; the sampler no longer draws the pair this test replays"
+            );
+            if picked == second {
+                second_measured_won += 1;
+            }
+        }
+
+        // A fair coin gives the second-measured backend half the ties. The
+        // band is +/-20 percentage points around 50%, so its half-width is
+        // `0.2 * TOTAL` against a standard deviation of `sqrt(TOTAL * 0.25)`:
+        // 400 against sigma 22.4, ~17.9 sigma. It cannot flake, and it is
+        // two-sided: pinning the tie-break to `first` drives this to 0,
+        // pinning it to `second` drives it to `TOTAL`.
+        let low = TOTAL * 30 / 100;
+        let high = TOTAL * 70 / 100;
+        assert!(
+            second_measured_won > low && second_measured_won < high,
+            "power-of-two resolved {second_measured_won} of {TOTAL} exact ties in favour of \
+             the second-measured sample; a coin flip must land near {}, and a count at either \
+             end means the tie is being awarded by sample position instead",
+            TOTAL / 2
+        );
+    }
+
+    // ----- PowerOfTwo: the sampling itself, not just the outcome -----
+
+    #[test]
+    fn power_of_two_touches_exactly_two_backends() {
+        // The two-load-reads claim, MEASURED rather than asserted
+        // structurally. It is a claim about how many backends the POLICY
+        // reads, not about the cost of a selection: the caller has already
+        // walked every backend in `BackendList::next_available_backend_with_key`
+        // to build the candidate set handed in here, so a selection is `O(n)` whatever
+        // this policy does. `LoadMetric::ConnectionTime` reads a backend's load
+        // through `Backend::peak_ewma_connection` -> `PeakEWMA::get` ->
+        // `PeakEWMA::observe`, and `observe` stamps `last_event` with the
+        // selection's instant. That stamp is an exact per-backend receipt saying
+        // "this backend's load was measured", so the number of fresh stamps
+        // after one selection IS the number of backends the algorithm
+        // consulted: a full scan leaves `n` of them, power-of-two-choices
+        // leaves exactly 2.
+        //
+        // This is the assertion a "did a backend come back?" test cannot
+        // make: the scan-then-coin-flip shape this replaced also returned a
+        // backend, it just read all 64 first.
+        const N: u8 = 64;
+        let backends = make_backends(N);
+
+        // Stamp every backend with one instant and select one nanosecond
+        // later on the injected clock, so "was this backend measured?" is
+        // decidable without depending on the wall clock's resolution.
+        let before = Instant::now();
+        for backend in &backends {
+            backend.borrow_mut().connection_time.last_event = before;
+        }
+
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::ConnectionTime);
+        assert!(pick_at(&mut p, None, &backends, before + Duration::from_nanos(1)).is_some());
+
+        let touched = backends
+            .iter()
+            .filter(|backend| backend.borrow().connection_time.last_event > before)
+            .count();
+        assert_eq!(
+            touched, 2,
+            "power-of-two must measure exactly 2 of the {N} backends; measuring {touched} means \
+             the policy reads every backend's load, which the name exists to rule out"
+        );
+    }
+
+    #[test]
+    fn power_of_two_always_returns_the_lighter_of_two_backends() {
+        // With exactly two backends the sample IS the whole set, so P2C is
+        // fully determined and needs no statistics: the lighter backend must
+        // win every single call. The scan-then-coin-flip shape this replaced
+        // computed both measures, asserted their order, and then discarded
+        // that order for a coin flip — returning the HEAVIER backend about
+        // half the time.
+        let backends = make_backends(2);
+        backends[0].borrow_mut().active_connections = 7;
+        backends[1].borrow_mut().active_connections = 1;
+
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let sel = backends.clone();
+        for call in 0..200 {
+            let picked = addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap()));
+            assert_eq!(
+                picked, 1,
+                "power-of-two must keep the lighter of the two sampled backends (call {call} \
+                 picked backend {picked}, which carries 7 connections against 1)"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_handles_empty_and_singleton_sets_without_panic() {
+        // Sampling a second DISTINCT index draws from `len - 1` slots, which
+        // is an empty range for a one-backend set — `random_range` panics on
+        // an empty range, so the singleton case must short-circuit before the
+        // draw. A cluster scaled down to one backend is ordinary, not exotic.
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+
+        let empty: Vec<Rc<RefCell<Backend>>> = vec![];
+        assert!(
+            pick(&mut p, None, &empty).is_none(),
+            "power-of-two selects nothing from an empty candidate set"
+        );
+
+        let single = make_backends(1);
+        for _ in 0..10 {
+            assert_eq!(
+                addr_index(chosen_addr(&pick(&mut p, None, &single).unwrap())),
+                0,
+                "power-of-two returns the only backend of a singleton set"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_never_returns_the_strictly_heaviest_backend() {
+        // Regression guard for the load profile that broke the O(n) fold
+        // this replaced. With three strictly ordered loads the heaviest
+        // backend loses EVERY pairing it can be drawn into, so P2C can never
+        // return it — a deterministic assertion over any number of calls.
+        //
+        // The previous implementation walked every backend keeping a
+        // `(first, second)` pair, and its "otherwise" branch fired both when
+        // the new measure was lighter than `first` AND when it was heavier
+        // than `second`, evicting both candidates in the second case. On
+        // loads [0, 1, 5] that left `first = 5` and `second = 0`, tripping
+        // its own `first <= second` invariant (a debug-build panic) and, in
+        // a release build, coin-flipping the HEAVIEST backend into the
+        // result half the time.
+        let backends = make_backends(3);
+        backends[0].borrow_mut().active_connections = 0;
+        backends[1].borrow_mut().active_connections = 1;
+        backends[2].borrow_mut().active_connections = 5;
+
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let sel = backends.clone();
+        for call in 0..2_000 {
+            let picked = addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap()));
+            assert_ne!(
+                picked, 2,
+                "power-of-two returned the strictly heaviest backend on call {call}: it is \
+                 heavier than either backend it can be paired against"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_sample_size_is_two_not_the_whole_set() {
+        // Same two-load-reads property as `power_of_two_touches_exactly_two_backends`,
+        // measured from the OUTSIDE — through the selection distribution
+        // alone, with no access to a backend's internals.
+        //
+        // Give one backend a uniquely light load among `N`. A policy that
+        // samples `k` backends uniformly and keeps the lightest returns that
+        // backend with probability exactly `k / N`, so the observed hit rate
+        // MEASURES the sample size: `k = hit_rate * N`. Power-of-two-choices
+        // gives `k = 2`.
+        //
+        // The fold this replaced scores worse here than ANY sample size.
+        // Restored under this exact test it gives `k_est = 0.00`: the unique
+        // minimum came back 0 times out of 100_000. It was `first` after
+        // backend 0, but from backend 2 on every remaining measure tied
+        // `second`, so the fold's "otherwise" branch fired on every step,
+        // shifting `first` into `second` and evicting the minimum for good.
+        // What it returned was a coin flip between the last two backends it
+        // happened to walk.
+        const N: u8 = 100;
+        let backends = make_backends(N);
+        for backend in backends.iter().skip(1) {
+            backend.borrow_mut().active_connections = 1_000;
+        }
+        // `backends[0]` keeps 0 active connections: the unique minimum.
+
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let sel = backends.clone();
+        let total = 100_000u32;
+        let mut hits = 0u32;
+        for _ in 0..total {
+            if addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap())) == 0 {
+                hits += 1;
+            }
+        }
+
+        // At k = 2, N = 100 and total = 100_000 the standard deviation of
+        // `k_est` is `N * sqrt(p * (1 - p) / total)` ~ 0.044, so the
+        // [1.5, 2.5] band is a ~11-sigma envelope: wide enough never to
+        // flake, narrow enough to exclude k = 1 (plain random), k = 3, and
+        // the k_est = 0.00 the old fold produced.
+        let k_est = f64::from(hits) / f64::from(total) * f64::from(N);
+        assert!(
+            (1.5..=2.5).contains(&k_est),
+            "power-of-two consulted ~{k_est:.2} of {N} backends (unique minimum returned \
+             {hits}/{total} times); the algorithm must sample exactly 2"
+        );
+    }
+
+    /// The weighted draw `Random` made before it stopped allocating: collect
+    /// the weights, build a `WeightedIndex`, and fall back to a uniform
+    /// `choose` when `WeightedIndex::new` rejects them.
+    fn weighted_index_reference(rng: &mut StdRng, weights: &[i32]) -> Option<usize> {
+        use rand::distr::{Distribution, weighted::WeightedIndex};
+        match WeightedIndex::new(weights.to_vec()) {
+            Ok(distribution) => Some(distribution.sample(rng)),
+            Err(_) => {
+                let positions: Vec<usize> = (0..weights.len()).collect();
+                positions.choose(rng).copied()
+            }
+        }
+    }
+
+    #[test]
+    fn random_weighted_pick_matches_weighted_index() {
+        // Weight sets covering every branch of `WeightedIndex::new`: valid,
+        // zero weights among positive ones, all zero, a negative weight
+        // (first and later), an `i32` overflow, a singleton and the empty set.
+        let weight_sets: &[&[i32]] = &[
+            &[100, 100, 100],
+            &[1, 2, 3, 4, 5, 6, 7],
+            &[0, 5, 0, 0, 9, 0],
+            &[7, 0, 0],
+            &[0, 0, 0, 3],
+            &[0, 0, 0],
+            &[-1, 5, 5],
+            &[5, 5, -1, 5],
+            &[i32::MAX, 1],
+            &[i32::MAX / 2, i32::MAX / 2, 1],
+            &[i32::MAX / 2, i32::MAX / 2, 2],
+            &[42],
+            &[],
+        ];
+        for (set, weights) in weight_sets.iter().enumerate() {
+            let backends: Vec<_> = weights
+                .iter()
+                .enumerate()
+                .map(|(index, &weight)| rc(addr_backend("w", index as u8 + 1, 80, Some(weight))))
+                .collect();
+            for seed in 0..64 {
+                let mut policy = Random::with_seed(seed);
+                let mut reference = StdRng::seed_from_u64(seed);
+                for draw in 0..32 {
+                    let expected = weighted_index_reference(&mut reference, weights);
+                    let got = pick(&mut policy, None, &backends).map(|backend| {
+                        backends
+                            .iter()
+                            .position(|candidate| Rc::ptr_eq(candidate, &backend))
+                            .expect("the pick is one of the candidates")
+                    });
+                    assert_eq!(
+                        got, expected,
+                        "weight set {set} {weights:?}, seed {seed}, draw {draw}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ----- #524: the client affinity key of HTTP, HTTPS and TCP -----
+
+    /// #524: the affinity key is a pure function of the client, pinned to a
+    /// value.
+    ///
+    /// Every worker of every instance must derive the same key for the same
+    /// client, or `HRW`/`MAGLEV` send one client to different backends
+    /// depending on which worker accepted it, and an upgrade to a build whose
+    /// hash moved would remap every client at once. The pinned values make a
+    /// change to the construction a deliberate, visible edit.
+    ///
+    /// TO SEE THIS RED: seed [`affinity_key_from_ip`] with anything other than
+    /// [`DEFAULT_HASH_SEED`], or drop its domain tag.
+    #[test]
+    fn affinity_keys_are_pinned_across_workers_and_releases() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
+        assert_eq!(affinity_key_from_ip(ip), affinity_key_from_ip(ip));
+        assert_eq!(affinity_key_from_ip(ip), PINNED_IP_KEY);
+        assert_eq!(affinity_key_from_value(b"tenant-42"), PINNED_VALUE_KEY);
+    }
+    /// [`affinity_key_from_ip`] of `192.0.2.7`, measured when the construction
+    /// was introduced.
+    const PINNED_IP_KEY: u64 = 12_659_869_658_761_991_936;
+    /// [`affinity_key_from_value`] of `tenant-42`, measured likewise.
+    const PINNED_VALUE_KEY: u64 = 4_927_821_811_038_511_670;
+
+    /// #524: a dual-stack listener reports an IPv4 client as the mapped
+    /// `::ffff:a.b.c.d`; it must key exactly as the same client seen on an
+    /// IPv4 listener, or one client lands on two backends depending on which
+    /// listener it reached.
+    #[test]
+    fn an_ipv4_mapped_client_keys_as_its_ipv4_address() {
+        let v4 = Ipv4Addr::new(198, 51, 100, 9);
+        assert_eq!(
+            affinity_key_from_ip(IpAddr::V6(v4.to_ipv6_mapped())),
+            affinity_key_from_ip(IpAddr::V4(v4)),
+            "a mapped IPv4 client must key as its IPv4 address"
+        );
+        assert_ne!(
+            affinity_key_from_ip(IpAddr::V6(v4.to_ipv6_compatible())),
+            affinity_key_from_ip(IpAddr::V4(v4)),
+            "only the mapped form is the same client; a compatible address is a distinct IPv6 one"
+        );
+    }
+
+    /// #524: a header value spelling an address's bytes is not that address.
+    /// The two constructions carry distinct domain tags, so a client cannot
+    /// collide with another client's source IP by choosing its header value.
+    #[test]
+    fn a_value_never_keys_as_the_address_it_spells() {
+        let v4 = Ipv4Addr::new(10, 1, 2, 3);
+        let mut spelled = vec![4u8];
+        spelled.extend_from_slice(&v4.octets());
+        assert_ne!(
+            affinity_key_from_value(&spelled),
+            affinity_key_from_ip(IpAddr::V4(v4))
+        );
+        assert_ne!(
+            affinity_key_from_value(b"tenant-a"),
+            affinity_key_from_value(b"tenant-b")
+        );
+    }
+
+    /// #524: `k = max(2, ceil(percent × N / 100))`, capped at N, and no
+    /// shard at all below `min_backends`.
+    #[test]
+    fn a_shard_size_follows_the_decided_formula() {
+        let sharding = |percent, min_backends| ShuffleSharding {
+            percent,
+            min_backends,
+            mode: ShardMode::Fallback,
+        };
+        for (percent, min_backends, primaries, expected) in [
+            (1, 8, 8, Some(2)),     // ceil(0.08) = 1, floored at 2
+            (25, 8, 8, Some(2)),    // exactly 2
+            (30, 8, 10, Some(3)),   // exactly 3
+            (50, 8, 9, Some(5)),    // ceil(4.5)
+            (34, 8, 100, Some(34)), // exactly 34
+            (100, 8, 12, Some(12)), // every backend
+            (25, 8, 7, None),       // below the threshold
+            (25, 2, 2, Some(2)),    // the smallest cluster that shards
+            (1, 2, 3, Some(2)),     // floored at 2
+        ] {
+            assert_eq!(
+                sharding(percent, min_backends).shard_size(primaries),
+                expected,
+                "percent={percent} min={min_backends} N={primaries}"
+            );
+        }
+        assert_eq!(
+            ShuffleSharding::from_cluster(Some(10), None, None),
+            Some(sharding(10, DEFAULT_SHARD_MIN_BACKENDS)),
+            "min_backends defaults to 8 and the mode to FALLBACK"
+        );
+        assert_eq!(ShuffleSharding::from_cluster(None, Some(4), Some(1)), None);
+    }
+
+    // ----- `weight` under ROUND_ROBIN, LEAST_LOADED and POWER_OF_TWO -----
+
+    /// Backends at distinct addresses carrying `weights`, `None` for unset.
+    fn weighted_backends(weights: &[Option<i32>]) -> Vec<Rc<RefCell<Backend>>> {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(i, &weight)| rc(addr_backend(&format!("w{i}"), i as u8 + 1, 8000, weight)))
+            .collect()
+    }
+
+    /// The list positions `policy` picks over `count` selections.
+    fn sequence(
+        policy: &mut impl LoadBalancingAlgorithm,
+        backends: &[Rc<RefCell<Backend>>],
+        count: usize,
+    ) -> Vec<usize> {
+        (0..count)
+            .map(|_| {
+                let picked = pick(policy, None, backends).expect("a non-empty set selects");
+                backends
+                    .iter()
+                    .position(|backend| Rc::ptr_eq(backend, &picked))
+                    .expect("the pick is one of the candidates")
+            })
+            .collect()
+    }
+
+    /// Smooth weighted round robin interleaves the heavy backend's picks
+    /// instead of bunching them, and repeats every `Σw` selections.
+    ///
+    /// TO SEE THIS RED: drop the `smooth_weighted` branch of
+    /// `RoundRobin::next_available_backend`; the cursor then yields
+    /// `0 1 2 0 1 2 0`.
+    #[test]
+    fn round_robin_smooth_weighted_interleaves_picks() {
+        let backends = weighted_backends(&[Some(5), Some(1), Some(1)]);
+        let mut round_robin = RoundRobin::new();
+        let cycle = [0, 0, 1, 0, 2, 0, 0];
+        let expected: Vec<usize> = cycle.iter().chain(cycle.iter()).copied().collect();
+        assert_eq!(sequence(&mut round_robin, &backends, 14), expected);
+    }
+
+    /// Over one full cycle of `Σw` selections, each backend is picked exactly
+    /// `w` times. A `0` or negative weight counts as `1`: the backend keeps
+    /// the smallest share, as under `HRW` and `MAGLEV`.
+    #[test]
+    fn round_robin_picks_each_backend_exactly_its_weight_per_cycle() {
+        let backends = weighted_backends(&[Some(300), None, Some(0), Some(-5), Some(7)]);
+        // `None` reads as the default weight, 100.
+        let weights = [300, DEFAULT_WEIGHT as usize, 1, 1, 7];
+        let total: usize = weights.iter().sum();
+        let mut round_robin = RoundRobin::new();
+        for cycle in 0..3 {
+            let mut counts = [0usize; 5];
+            for position in sequence(&mut round_robin, &backends, total) {
+                counts[position] += 1;
+            }
+            assert_eq!(counts, weights, "cycle {cycle}");
+        }
+    }
+
+    /// Equal weights, whatever their value, select exactly as the historical
+    /// cursor does, including across a removal from the set; so do weights
+    /// that only clamp to equal (`0` and `1`).
+    #[test]
+    fn round_robin_equal_weights_reproduce_the_cursor_sequence() {
+        let reference = weighted_backends(&[None, None, None, None]);
+        for weights in [
+            [Some(50); 4],
+            [Some(DEFAULT_WEIGHT); 4],
+            [Some(0), Some(1), Some(-3), Some(1)],
+        ] {
+            let mut reference = reference.clone();
+            let mut backends = weighted_backends(&weights);
+            let mut expected_policy = RoundRobin::new();
+            let mut policy = RoundRobin::new();
+            assert_eq!(
+                sequence(&mut policy, &backends, 9),
+                sequence(&mut expected_policy, &reference, 9),
+                "{weights:?}"
+            );
+            reference.remove(1);
+            backends.remove(1);
+            assert_eq!(
+                sequence(&mut policy, &backends, 7),
+                sequence(&mut expected_policy, &reference, 7),
+                "{weights:?} after a removal"
+            );
+        }
+    }
+
+    /// Equal weights keep the exact sequence the cursor-only `RoundRobin` of
+    /// `origin/main` (588c4e2f5) produced, across candidate membership
+    /// transitions. That `RoundRobin` picks view index `next_backend % len` and
+    /// then stores `(next_backend + 1) % len`; the expected literals below are
+    /// worked by hand from those two lines, not captured from this
+    /// implementation. Positions are list positions of a four-backend list:
+    ///
+    /// - view `[0, 1, 2, 3]`, six picks: `0 1 2 3 0 1`, cursor `2`;
+    /// - backend 1 leaves the view (`[0, 2, 3]`): `2 % 3 = 2` is list
+    ///   position 3, then `0 1 2 0` in view order: list `3 0 2 3 0`, cursor `1`;
+    /// - backend 1 re-enters (`[0, 1, 2, 3]`): `1 2 3 0 1`, cursor `2`;
+    /// - the view shrinks to `[0, 3]`: `2 % 2 = 0`, then `1 0 1`: list `0 3 0 3`.
+    ///
+    /// TO SEE THIS RED: let equal weights fall through to `smooth_weighted`;
+    /// its running weights ignore the cursor, so the removal leg moves.
+    #[test]
+    fn round_robin_equal_weights_match_the_origin_main_sequence_across_membership_changes() {
+        for weights in [
+            [None; 4],
+            [Some(50); 4],
+            [Some(DEFAULT_WEIGHT); 4],
+            [Some(0), Some(1), Some(-3), Some(1)],
+        ] {
+            for rebuild_on_change in [false, true] {
+                let backends = weighted_backends(&weights);
+                let mut policy = RoundRobin::new();
+                let now = Instant::now();
+                let positions = |policy: &mut RoundRobin, view: &[usize], count: usize| {
+                    (0..count)
+                        .map(|_| {
+                            let picked = policy
+                                .next_available_backend(None, Candidates::new(&backends, view, now))
+                                .expect("a non-empty view selects");
+                            backends
+                                .iter()
+                                .position(|backend| Rc::ptr_eq(backend, &picked))
+                                .expect("the pick is one of the candidates")
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let change = |policy: &mut RoundRobin| {
+                    if rebuild_on_change {
+                        policy.rebuild(&backends);
+                    }
+                };
+                let label = format!("{weights:?} rebuild={rebuild_on_change}");
+
+                assert_eq!(
+                    positions(&mut policy, &[0, 1, 2, 3], 6),
+                    [0, 1, 2, 3, 0, 1],
+                    "{label}"
+                );
+                change(&mut policy);
+                assert_eq!(
+                    positions(&mut policy, &[0, 2, 3], 5),
+                    [3, 0, 2, 3, 0],
+                    "{label} after a removal"
+                );
+                change(&mut policy);
+                assert_eq!(
+                    positions(&mut policy, &[0, 1, 2, 3], 5),
+                    [1, 2, 3, 0, 1],
+                    "{label} after a re-add"
+                );
+                change(&mut policy);
+                assert_eq!(
+                    positions(&mut policy, &[0, 3], 4),
+                    [0, 3, 0, 3],
+                    "{label} after shrinking to two"
+                );
+            }
+        }
+    }
+
+    /// With no client key, `HRW` and `MAGLEV` fall back to round robin, now
+    /// weighted like it.
+    #[test]
+    fn affinity_fallback_round_robin_honors_weight() {
+        let backends = weighted_backends(&[Some(3), Some(1)]);
+        let expected = vec![0, 0, 1, 0, 0, 0, 1, 0];
+        assert_eq!(
+            sequence(&mut Rendezvous::new(), &backends, 8),
+            expected,
+            "HRW"
+        );
+        let mut maglev = Maglev::new();
+        maglev.rebuild(&backends);
+        assert_eq!(sequence(&mut maglev, &backends, 8), expected, "MAGLEV");
+    }
+
+    /// `rebuild`, which the backend list runs when a weight changes, starts
+    /// the running weights afresh: the selection after a reweight is the one
+    /// a fresh policy makes over the new weights.
+    #[test]
+    fn round_robin_rebuild_resets_running_weights() {
+        use crate::{backends::BackendList, sozu_command::proto::command::LoadBalancingAlgorithms};
+
+        let address = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        let backend = |id: &str, port, weight| {
+            Backend::new(
+                id,
+                address(port),
+                None,
+                Some(LoadBalancingParams { weight }),
+                None,
+            )
+        };
+        let mut list = BackendList::with_seed(1);
+        list.set_load_balancing_policy(LoadBalancingAlgorithms::RoundRobin, None, 1);
+        list.add_backend(backend("a", 9200, 3));
+        list.add_backend(backend("b", 9201, 1));
+        let now = Instant::now();
+        let picked = |list: &mut BackendList| {
+            list.next_available_backend(now)
+                .expect("a healthy list selects")
+                .borrow()
+                .address
+        };
+        // Running weights after this pick: a = -1, b = 1.
+        assert_eq!(picked(&mut list), address(9200));
+        // Reweighted to (3, 2): kept running weights would make b win
+        // (a = 2, b = 3); reset ones make a win (a = 3, b = 2).
+        list.add_backend(backend("b", 9201, 2));
+        assert_eq!(picked(&mut list), address(9200));
+    }
+
+    /// `LEAST_LOADED` divides each load by its weight: `10` connections on
+    /// weight `100` is lighter than `4` on weight `10`.
+    ///
+    /// TO SEE THIS RED: compare the raw loads in `LeastLoaded`; the second
+    /// backend then wins.
+    #[test]
+    fn least_loaded_compares_load_per_unit_of_weight() {
+        for metric in [LoadMetric::Connections, LoadMetric::Requests] {
+            let backends = weighted_backends(&[Some(100), Some(10)]);
+            for (backend, load) in backends.iter().zip([10, 4]) {
+                let mut backend = backend.borrow_mut();
+                backend.active_connections = load;
+                backend.active_requests = load;
+            }
+            let mut policy = LeastLoaded { metric };
+            assert_eq!(sequence(&mut policy, &backends, 1), [0], "{metric:?}");
+
+            // Equal per-weight loads (10/100 against 1/10): the first wins.
+            backends[1].borrow_mut().active_connections = 1;
+            backends[1].borrow_mut().active_requests = 1;
+            assert_eq!(sequence(&mut policy, &backends, 1), [0], "{metric:?} tie");
+        }
+    }
+
+    /// Equal weights keep `LEAST_LOADED`'s raw-load order and first-minimum
+    /// tie-break.
+    #[test]
+    fn least_loaded_equal_weights_compare_raw_loads() {
+        let backends = weighted_backends(&[Some(7), Some(7), Some(7)]);
+        for (backend, load) in backends.iter().zip([5, 3, 3]) {
+            backend.borrow_mut().active_connections = load;
+        }
+        let mut policy = LeastLoaded {
+            metric: LoadMetric::Connections,
+        };
+        assert_eq!(sequence(&mut policy, &backends, 1), [1]);
+    }
+
+    /// `POWER_OF_TWO` divides each sample's load by its weight. With two
+    /// backends both are sampled on every selection, so the lighter per unit
+    /// of weight wins every time.
+    ///
+    /// TO SEE THIS RED: compare the raw loads in `PowerOfTwo`; the second
+    /// backend then wins every time.
+    #[test]
+    fn power_of_two_compares_load_per_unit_of_weight() {
+        for metric in [LoadMetric::Connections, LoadMetric::Requests] {
+            let backends = weighted_backends(&[Some(100), Some(10)]);
+            for (backend, load) in backends.iter().zip([10, 4]) {
+                let mut backend = backend.borrow_mut();
+                backend.active_connections = load;
+                backend.active_requests = load;
+            }
+            let mut policy = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, metric);
+            assert_eq!(
+                sequence(&mut policy, &backends, 64),
+                vec![0; 64],
+                "{metric:?}"
+            );
+        }
+    }
+
+    /// `POWER_OF_TWO` orders count loads as integers: two loads that differ by
+    /// one above 2^53 (where `f64` cannot tell them apart) still select the
+    /// lighter, every time, instead of falling to the coin flip.
+    ///
+    /// TO SEE THIS RED: convert the counts to `f64` in `PowerOfTwo::compare`;
+    /// both loads then round to the same value and the tie is a coin flip.
+    #[test]
+    fn power_of_two_orders_large_counts_exactly() {
+        let big = (1usize << 53) + 1;
+        for metric in [LoadMetric::Connections, LoadMetric::Requests] {
+            let backends = weighted_backends(&[None, None]);
+            for (backend, load) in backends.iter().zip([big, big - 1]) {
+                let mut backend = backend.borrow_mut();
+                backend.active_connections = load;
+                backend.active_requests = load;
+            }
+            let mut policy = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, metric);
+            assert_eq!(
+                sequence(&mut policy, &backends, 64),
+                vec![1; 64],
+                "{metric:?}"
+            );
+        }
+    }
+
+    /// The per-weight comparison is exact and, with equal weights, is the
+    /// raw comparison.
+    #[test]
+    fn per_weight_comparisons_are_exact() {
+        assert_eq!(cmp_count_per_weight(10, 100, 4, 10), Ordering::Less);
+        assert_eq!(cmp_count_per_weight(10, 100, 1, 10), Ordering::Equal);
+        assert_eq!(
+            cmp_count_per_weight(usize::MAX, 1, usize::MAX, 2),
+            Ordering::Greater
+        );
+        assert_eq!(cmp_count_per_weight(3, 7, 4, 7), Ordering::Less);
+        assert_eq!(
+            cmp_cost_per_weight(2.0, 200, 1.5, 100),
+            Some(Ordering::Less)
+        );
+        assert_eq!(cmp_cost_per_weight(1.0, 5, 1.0, 5), Some(Ordering::Equal));
+        assert_eq!(cmp_cost_per_weight(f64::NAN, 5, 1.0, 5), None);
+    }
+}

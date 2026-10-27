@@ -1,0 +1,1051 @@
+//! Timer based on timing wheels
+//!
+//! code imported from mio-extras
+//! License: MIT or Apache 2.0
+use std::{
+    cmp,
+    fmt::Display,
+    time::{Duration, Instant},
+};
+
+use mio::Token;
+use slab::Slab;
+
+use crate::server::TIMER;
+
+// Conversion utilities
+mod convert {
+    use std::time::Duration;
+
+    /// Convert a `Duration` to milliseconds, rounding up and saturating at
+    /// `u64::MAX`.
+    ///
+    /// The saturating is fine because `u64::MAX` milliseconds are still many
+    /// million years.
+    pub fn millis(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// A timer.
+///
+/// Typical usage goes like this:
+///
+/// * register the timer with a `mio::Poll`.
+/// * set a timeout, by calling `Timer::set_timeout`.  Here you provide some
+///   state to be associated with this timeout.
+/// * poll the `Poll`, to learn when a timeout has occurred.
+/// * retrieve state associated with the timeout by calling `Timer::poll`.
+///
+/// You can omit use of the `Poll` altogether, if you like, and just poll the
+/// `Timer` directly.
+pub struct Timer<T> {
+    // Size of each tick in milliseconds
+    tick_ms: u64,
+    // Slab of timeout entries
+    entries: Slab<Entry<T>>,
+    // Timeout wheel. Each tick, the timer will look at the next slot for
+    // timeouts that match the current tick.
+    wheel: Vec<WheelEntry>,
+    // Tick 0's time instant
+    start: Instant,
+    // The current tick
+    tick: Tick,
+    // The next entry to possibly timeout
+    next: Token,
+    // Masks the target tick to get the slot
+    mask: u64,
+}
+
+/// Used to create a `Timer`.
+pub struct Builder {
+    // Approximate duration of each tick
+    tick: Duration,
+    // Number of slots in the timer wheel
+    num_slots: usize,
+    // Max number of timeouts that can be in flight at a given time.
+    capacity: usize,
+}
+
+/// A timeout, as returned by `Timer::set_timeout`.
+///
+/// Use this as the argument to `Timer::cancel_timeout`, to cancel this timeout.
+#[derive(Clone, Debug)]
+pub struct Timeout {
+    // Reference into the timer entry slab
+    token: Token,
+    // Tick that it should match up with
+    tick: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct TimeoutContainer {
+    // mark it as an option, so we do not try to cancel a timeout multiple times
+    timeout: Option<Timeout>,
+    duration: Duration,
+    token: Option<Token>,
+    /// Absolute instant the currently armed wheel entry is meant to fire at,
+    /// recorded at arm time; `None` whenever no entry is armed.
+    ///
+    /// The wheel is duration-based and rounds a delay to the NEAREST tick
+    /// ([`duration_to_tick`]), so an entry armed for deadline `D` is delivered
+    /// from `tick * round(D / tick) - tick/2` onwards. With the default 100 ms
+    /// tick the earliness is `(D_ms + 50) mod 100`, i.e. up to **99 ms** — a
+    /// full tick minus a millisecond, not half a tick. A holder that wants to
+    /// distinguish "the deadline really elapsed"
+    /// from "the wheel rounded down" needs the absolute instant the wheel
+    /// itself does not keep. That is the whole purpose of this field: it is
+    /// the mirror of what the wheel holds, not a second clock, and it is
+    /// stamped with [`Instant::now`] at exactly the sites that touch the
+    /// wheel, so it cannot drift from the entry it describes.
+    ///
+    /// It is deliberately cleared by [`Self::triggered`]: the expiry that made
+    /// the caller run consumed the wheel entry, so the container holds nothing
+    /// until it is armed again. Callers that memoize on "the deadline has not
+    /// moved" depend on that clearing — without it, an early delivery is a
+    /// lost wakeup.
+    deadline: Option<Instant>,
+}
+
+/// `now + duration`, saturating at the far end of the [`Instant`] range
+/// instead of panicking. A duration large enough to overflow can only come
+/// from a configuration value, and a session that never times out is a far
+/// better outcome than a worker that aborts.
+fn deadline_from(duration: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(duration).unwrap_or(now)
+}
+
+impl TimeoutContainer {
+    pub fn new(duration: Duration, token: Token) -> TimeoutContainer {
+        let timeout = TIMER.with(|timer| timer.borrow_mut().set_timeout(duration, token));
+        TimeoutContainer {
+            timeout: Some(timeout),
+            duration,
+            token: Some(token),
+            deadline: Some(deadline_from(duration)),
+        }
+    }
+
+    pub fn new_empty(duration: Duration) -> TimeoutContainer {
+        TimeoutContainer {
+            timeout: None,
+            duration,
+            token: None,
+            deadline: None,
+        }
+    }
+
+    pub fn take(&mut self) -> TimeoutContainer {
+        TimeoutContainer {
+            timeout: self.timeout.take(),
+            duration: self.duration,
+            token: self.token.take(),
+            deadline: self.deadline.take(),
+        }
+    }
+
+    /// must be called when a timeout was triggered, to prevent errors when canceling
+    pub fn triggered(&mut self) {
+        let _ = self.timeout.take();
+        self.deadline = None;
+    }
+
+    pub fn set(&mut self, token: Token) {
+        if let Some(timeout) = self.timeout.take() {
+            TIMER.with(|timer| timer.borrow_mut().cancel_timeout(&timeout));
+        }
+
+        let timeout = TIMER.with(|timer| timer.borrow_mut().set_timeout(self.duration, token));
+
+        self.timeout = Some(timeout);
+        self.token = Some(token);
+        self.deadline = Some(deadline_from(self.duration));
+    }
+
+    /// Arm the entry so it fires at `deadline` rather than one full
+    /// [`Self::duration`] from now, leaving the configured duration untouched.
+    ///
+    /// This is what a holder uses to put an entry BACK after the wheel handed
+    /// it over early: re-arming with [`Self::set`] would push the deadline out
+    /// by a fresh full duration, so an entry delivered a few tens of
+    /// milliseconds before a 60 s timeout would fire at ~120 s — silently
+    /// doubling the operator's configured timeout on every early delivery.
+    ///
+    /// A deadline that has already passed arms the shortest entry the wheel
+    /// can express (`set_timeout_at` forces at least one tick ahead), so the
+    /// caller is called back promptly rather than never — and, because that
+    /// clamp exists, never spins: a zero-length delay still costs a whole tick.
+    pub fn set_at(&mut self, token: Token, deadline: Instant) {
+        if let Some(timeout) = self.timeout.take() {
+            TIMER.with(|timer| timer.borrow_mut().cancel_timeout(&timeout));
+        }
+
+        let delay = deadline.saturating_duration_since(Instant::now());
+        let timeout = TIMER.with(|timer| timer.borrow_mut().set_timeout(delay, token));
+
+        self.timeout = Some(timeout);
+        self.token = Some(token);
+        self.deadline = Some(deadline);
+    }
+
+    /// warning: this does not reset the timer
+    pub fn set_duration(&mut self, duration: Duration) {
+        self.duration = duration;
+
+        if let Some(timeout) = self.timeout.take() {
+            TIMER.with(|timer| timer.borrow_mut().cancel_timeout(&timeout));
+        }
+
+        if let Some(token) = self.token {
+            self.timeout =
+                Some(TIMER.with(|timer| timer.borrow_mut().set_timeout(self.duration, token)));
+            self.deadline = Some(deadline_from(self.duration));
+        } else {
+            self.deadline = None;
+        }
+    }
+
+    pub fn duration(&self) -> Duration {
+        self.duration
+    }
+
+    /// Adopt a new configured duration **without touching the armed entry**.
+    ///
+    /// [`Self::set_duration`] cancels and re-arms; an owner that drives arming
+    /// itself through [`Self::set_at`] must not pay that, and must not have its
+    /// entry moved behind its back. The duration still has to be kept current,
+    /// because a container handed on to another protocol state — the WebSocket
+    /// upgrade path hands the mux's containers to `Pipe`, which calls
+    /// [`Self::reset`] — re-arms from it.
+    pub fn retune(&mut self, duration: Duration) {
+        self.duration = duration;
+    }
+
+    /// Whether a wheel entry is currently held.
+    ///
+    /// Distinct from `deadline().is_some()` only while the two are out of step,
+    /// which is exactly the state an owner that memoizes on the deadline must
+    /// be able to see: after [`Self::triggered`] both are cleared together, but
+    /// an owner keeping its own deadline mirror can believe an entry is armed
+    /// when the wheel has already handed it over. That belief is the lost
+    /// wakeup, so the check is available rather than inferred.
+    pub fn is_armed(&self) -> bool {
+        self.timeout.is_some()
+    }
+
+    /// The absolute instant the armed entry is meant to fire at, or `None`
+    /// when nothing is armed. See the field documentation: this is the mirror
+    /// of the wheel entry, and the only way to tell an early delivery from a
+    /// real expiry.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn cancel(&mut self) -> bool {
+        self.deadline = None;
+        match self.timeout.take() {
+            None => {
+                //error!("cannot cancel non existing timeout");
+                //error!("self.duration was {:?}", self.duration);
+                false
+            }
+            Some(timeout) => {
+                TIMER.with(|timer| timer.borrow_mut().cancel_timeout(&timeout));
+                true
+            }
+        }
+    }
+
+    // Reset the timeout to its optional timeout, or to its defined duration
+    pub fn reset(&mut self) -> bool {
+        match self.timeout.take() {
+            None => {
+                if let Some(token) = self.token {
+                    self.timeout = Some(
+                        TIMER.with(|timer| timer.borrow_mut().set_timeout(self.duration, token)),
+                    );
+                } else {
+                    //error!("cannot reset non existing timeout");
+                    self.deadline = None;
+                    return false;
+                }
+            }
+            Some(timeout) => {
+                self.timeout =
+                    TIMER.with(|timer| timer.borrow_mut().reset_timeout(&timeout, self.duration));
+            }
+        };
+        self.deadline = self.timeout.is_some().then(|| deadline_from(self.duration));
+        self.timeout.is_some()
+    }
+}
+
+impl Display for TimeoutContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.duration)
+    }
+}
+
+impl std::ops::Drop for TimeoutContainer {
+    fn drop(&mut self) {
+        if self.cancel() {
+            debug!(
+                "Cancel a dangling timeout that haven't be handled in session lifecycle, token ({:?}), duration {}",
+                self.token, self
+            );
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct WheelEntry {
+    next_tick: Tick,
+    head: Token,
+}
+
+// Doubly linked list of timer entries. Allows for efficient insertion /
+// removal of timeouts.
+struct Entry<T> {
+    state: T,
+    links: EntryLinks,
+}
+
+#[derive(Copy, Clone)]
+struct EntryLinks {
+    tick: Tick,
+    prev: Token,
+    next: Token,
+}
+
+type Tick = u64;
+const TICK_MAX: Tick = u64::MAX;
+const EMPTY: Token = Token(usize::MAX);
+
+impl Builder {
+    /// Set the tick duration.  Default is 100ms.
+    pub fn tick_duration(mut self, duration: Duration) -> Builder {
+        self.tick = duration;
+        self
+    }
+
+    /// Set the number of slots.  Default is 256.
+    pub fn num_slots(mut self, num_slots: usize) -> Builder {
+        self.num_slots = num_slots;
+        self
+    }
+
+    /// Set the capacity.  Default is 65536.
+    pub fn capacity(mut self, capacity: usize) -> Builder {
+        self.capacity = capacity;
+        self
+    }
+
+    /// Build a `Timer` with the parameters set on this `Builder`.
+    pub fn build<T>(self) -> Timer<T> {
+        Timer::new(
+            convert::millis(self.tick),
+            self.num_slots,
+            self.capacity,
+            Instant::now(),
+        )
+    }
+}
+
+impl Default for Builder {
+    fn default() -> Builder {
+        Builder {
+            tick: Duration::from_millis(100),
+            num_slots: 1 << 8,
+            capacity: 1 << 16,
+        }
+    }
+}
+
+impl<T> Timer<T> {
+    fn new(tick_ms: u64, num_slots: usize, capacity: usize, start: Instant) -> Timer<T> {
+        let num_slots = num_slots.next_power_of_two();
+        let capacity = capacity.next_power_of_two();
+        let mask = (num_slots as u64) - 1;
+        let wheel = std::iter::repeat_n(
+            WheelEntry {
+                next_tick: TICK_MAX,
+                head: EMPTY,
+            },
+            num_slots,
+        )
+        .collect();
+
+        Timer {
+            tick_ms,
+            entries: Slab::with_capacity(capacity),
+            wheel,
+            start,
+            tick: 0,
+            next: EMPTY,
+            mask,
+        }
+    }
+
+    /// Set a timeout.
+    ///
+    /// When the timeout occurs, the given state becomes available via `poll`.
+    pub fn set_timeout(&mut self, delay_from_now: Duration, state: T) -> Timeout {
+        self.set_timeout_from(Instant::now(), delay_from_now, state)
+    }
+
+    /// [`Self::set_timeout`], counting `delay_from_now` from the caller's
+    /// `now` instead of re-reading the clock.
+    ///
+    /// A caller that already holds the instant its deadline was computed
+    /// against uses this so the entry lands on the grid point that deadline
+    /// maps to, however long ago `now` was read — and a test can place an
+    /// entry at an exact instant.
+    pub fn set_timeout_from(
+        &mut self,
+        now: Instant,
+        delay_from_now: Duration,
+        state: T,
+    ) -> Timeout {
+        let delay_from_start = now.saturating_duration_since(self.start) + delay_from_now;
+        self.set_timeout_at(delay_from_start, state)
+    }
+
+    fn set_timeout_at(&mut self, delay_from_start: Duration, state: T) -> Timeout {
+        let mut tick = duration_to_tick(delay_from_start, self.tick_ms);
+        trace!(
+            "setting timeout; delay={:?}; tick={:?}; current-tick={:?}",
+            delay_from_start, tick, self.tick
+        );
+
+        // Always target at least 1 tick in the future
+        if tick <= self.tick {
+            tick = self.tick + 1;
+        }
+
+        self.insert(tick, state)
+    }
+
+    fn insert(&mut self, tick: Tick, state: T) -> Timeout {
+        // Get the slot for the requested tick
+        let slot = (tick & self.mask) as usize;
+        let curr = self.wheel[slot];
+
+        // Insert the new entry
+        let entry = Entry::new(state, tick, curr.head);
+        let token = Token(self.entries.insert(entry));
+
+        if curr.head != EMPTY {
+            // If there was a previous entry, set its prev pointer to the new
+            // entry
+            self.entries[curr.head.into()].links.prev = token;
+        }
+
+        // Update the head slot
+        self.wheel[slot] = WheelEntry {
+            next_tick: cmp::min(tick, curr.next_tick),
+            head: token,
+        };
+
+        trace!("inserted timeout; slot={}; token={:?}", slot, token);
+
+        // Return the new timeout
+        Timeout { token, tick }
+    }
+
+    /// Resets a timeout.
+    ///
+    pub fn reset_timeout(
+        &mut self,
+        timeout: &Timeout,
+        delay_from_now: Duration,
+    ) -> Option<Timeout> {
+        self.cancel_timeout(timeout)
+            .map(|state| self.set_timeout(delay_from_now, state))
+    }
+
+    // TODO: return Result with context
+    /// Cancel a timeout.
+    ///
+    /// If the timeout has not yet occurred, the return value holds the
+    /// associated state.
+    pub fn cancel_timeout(&mut self, timeout: &Timeout) -> Option<T> {
+        let links = match self.entries.get(timeout.token.into()) {
+            Some(e) => e.links,
+            None => {
+                debug!("timeout token {:?} not found", timeout.token);
+                return None;
+            }
+        };
+
+        // Sanity check
+        if links.tick != timeout.tick {
+            return None;
+        }
+
+        self.unlink(&links, timeout.token);
+        Some(self.entries.remove(timeout.token.into()).state)
+    }
+
+    /// Poll for an expired timer.
+    ///
+    /// The return value holds the state associated with the first expired
+    /// timer, if any.
+    pub fn poll(&mut self) -> Option<T> {
+        let target_tick = current_tick(self.start, self.tick_ms);
+        self.poll_to(target_tick)
+    }
+
+    /// [`Self::poll`] as of `now` rather than the current instant, so a test
+    /// can drive the wheel from a simulated clock.
+    pub fn poll_at(&mut self, now: Instant) -> Option<T> {
+        let target_tick = duration_to_tick(now.saturating_duration_since(self.start), self.tick_ms);
+        self.poll_to(target_tick)
+    }
+
+    fn poll_to(&mut self, mut target_tick: Tick) -> Option<T> {
+        trace!(
+            "tick_to; target_tick={}; current_tick={}",
+            target_tick, self.tick
+        );
+
+        if target_tick < self.tick {
+            target_tick = self.tick;
+        }
+
+        while self.tick <= target_tick {
+            let curr = self.next;
+
+            //info!("ticking; curr={:?}", curr);
+
+            if curr == EMPTY {
+                self.tick += 1;
+
+                let slot = self.slot_for(self.tick);
+                self.next = self.wheel[slot].head;
+
+                // Handle the case when a slot has a single timeout which gets
+                // canceled before the timeout expires. In this case, the
+                // slot's head is EMPTY but there is a value for next_tick. Not
+                // resetting next_tick here causes the timer to get stuck in a
+                // loop.
+                if self.next == EMPTY {
+                    self.wheel[slot].next_tick = TICK_MAX;
+                }
+            } else {
+                let slot = self.slot_for(self.tick);
+
+                if curr == self.wheel[slot].head {
+                    self.wheel[slot].next_tick = TICK_MAX;
+                }
+
+                let links = self.entries[curr.into()].links;
+
+                if links.tick <= self.tick {
+                    trace!("triggering; token={:?}", curr);
+
+                    // Unlink will also advance self.next
+                    self.unlink(&links, curr);
+
+                    // Remove and return the token
+                    return Some(self.entries.remove(curr.into()).state);
+                } else {
+                    let next_tick = self.wheel[slot].next_tick;
+                    self.wheel[slot].next_tick = cmp::min(next_tick, links.tick);
+                    self.next = links.next;
+                }
+            }
+        }
+
+        None
+    }
+
+    fn unlink(&mut self, links: &EntryLinks, token: Token) {
+        trace!(
+            "unlinking timeout; slot={}; token={:?}",
+            self.slot_for(links.tick),
+            token
+        );
+
+        if links.prev == EMPTY {
+            let slot = self.slot_for(links.tick);
+            self.wheel[slot].head = links.next;
+        } else {
+            self.entries[links.prev.into()].links.next = links.next;
+        }
+
+        if links.next != EMPTY {
+            self.entries[links.next.into()].links.prev = links.prev;
+
+            if token == self.next {
+                self.next = links.next;
+            }
+        } else if token == self.next {
+            self.next = EMPTY;
+        }
+    }
+
+    // Next tick containing a timeout
+    fn next_tick(&self) -> Option<Tick> {
+        if self.next != EMPTY {
+            let slot = self.slot_for(self.entries[self.next.into()].links.tick);
+
+            if self.wheel[slot].next_tick == self.tick {
+                // There is data ready right now
+                return Some(self.tick);
+            }
+        }
+
+        self.wheel.iter().map(|e| e.next_tick).min()
+    }
+
+    pub fn next_poll_date(&self) -> Option<Instant> {
+        self.next_tick()
+            .map(|tick| self.start + Duration::from_millis(self.tick_ms.saturating_mul(tick)))
+    }
+
+    fn slot_for(&self, tick: Tick) -> usize {
+        (self.mask & tick) as usize
+    }
+}
+
+impl<T> Default for Timer<T> {
+    fn default() -> Timer<T> {
+        Builder::default().build()
+    }
+}
+
+/// Map a duration onto the wheel's tick grid, rounding to the NEAREST tick.
+///
+/// Not rounding UP: `elapsed` in `[tick_ms*N - tick_ms/2, tick_ms*N + tick_ms/2)`
+/// yields tick `N`, so a timeout can be delivered up to half a tick — 50 ms at
+/// the 100 ms default — BEFORE the caller asked for it *when the poll lands on
+/// the grid*, which is what [`Timer::next_poll_date`] schedules (it returns
+/// `start + tick_ms * tick`, the grid point itself).
+///
+/// The DELIVERY bound is wider, because `Timer::poll` recomputes
+/// `current_tick` from the real clock and fires everything whose tick has come:
+/// a poll anywhere in `[tick_ms*N - tick_ms/2, tick_ms*N)` already sees tick
+/// `N`. An event loop reaches that window routinely — another session's earlier
+/// entry plus loop latency, or a non-timer wakeup. Total earliness is therefore
+/// `(delay_ms + tick_ms/2) mod tick_ms`, spanning `[0, tick_ms - 1]`: up to
+/// **99 ms** at the default tick. Reason with 99 ms, not 50. That is deliberate (it
+/// halves the worst-case error instead of always overshooting), and it is why
+/// every consumer must treat an expiry as "my entry was consumed" rather than
+/// "my deadline arrived": `Timer::poll` removes the entry either way, and
+/// nothing re-arms it on the consumer's behalf. See
+/// `test_timeout_fires_up_to_half_a_tick_early` below, and the
+/// consume-then-reschedule rule in `lib/src/protocol/udp/LIFECYCLE.md` §7.
+fn duration_to_tick(elapsed: Duration, tick_ms: u64) -> Tick {
+    let elapsed_ms = convert::millis(elapsed);
+    elapsed_ms.saturating_add(tick_ms / 2) / tick_ms
+}
+
+fn current_tick(start: Instant, tick_ms: u64) -> Tick {
+    duration_to_tick(start.elapsed(), tick_ms)
+}
+
+impl<T> Entry<T> {
+    fn new(state: T, tick: u64, next: Token) -> Entry<T> {
+        Entry {
+            state,
+            links: EntryLinks {
+                tick,
+                prev: EMPTY,
+                next,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[test]
+    pub fn test_timeout_next_tick() {
+        let mut t = timer();
+
+        t.set_timeout_at(Duration::from_millis(100), "a");
+
+        let mut tick = ms_to_tick(&t, 50);
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 100);
+        assert_eq!(Some("a"), t.poll_to(tick));
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 150);
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 200);
+        assert_eq!(None, t.poll_to(tick));
+
+        assert_eq!(count(&t), 0);
+    }
+
+    /// The wheel rounds a requested delay to the NEAREST tick
+    /// ([`duration_to_tick`]) — it does not round up, despite what that
+    /// function's own comment says. With the default 100 ms tick a delay in
+    /// `[100N - 50, 100N + 50)` lands in tick `N`, so an entry can be delivered
+    /// up to 50 ms BEFORE the caller's deadline when the poll lands ON the grid
+    /// — which is what this test does and what [`Timer::next_poll_date`]
+    /// schedules. A poll inside `[100N - 50, 100N)` already sees tick `N`, so
+    /// the bound a CONSUMER must tolerate is up to 99 ms; see
+    /// [`duration_to_tick`]. Either way the delivery CONSUMES the slab entry.
+    ///
+    /// Every consumer of this wheel must therefore read a wakeup as "my entry
+    /// is gone", never as "my deadline has arrived", and re-arm on its own if
+    /// it still wants one. `UdpManager::handle_timeout`
+    /// (`lib/src/protocol/udp/manager.rs`) clears `armed_deadline` on entry for
+    /// exactly this reason; `early_expiry_that_finds_nothing_due_still_rearms`
+    /// there is this test's other half.
+    ///
+    /// This pins the rounding deliberately so nobody re-derives the intuitive
+    /// but wrong "a timer never fires early" assumption. The rounding itself is
+    /// a design choice and is NOT the bug.
+    ///
+    /// To SEE THIS RED: make the rounding round up in [`duration_to_tick`] —
+    /// replace `elapsed_ms.saturating_add(tick_ms / 2) / tick_ms` with
+    /// `elapsed_ms.div_ceil(tick_ms)`. The 149 ms entry then lands in tick 2,
+    /// `poll_to` at tick 1 returns `None`, and the first assertion fails with
+    /// `left: Some("early")  right: None`.
+    #[test]
+    pub fn test_timeout_fires_up_to_half_a_tick_early() {
+        let mut t = timer();
+
+        // 149 ms against a 100 ms tick: (149 + 50) / 100 == 1.
+        t.set_timeout_at(Duration::from_millis(149), "early");
+
+        // Tick 1 is 100 ms — 49 ms BEFORE the requested deadline — and it fires.
+        assert_eq!(
+            Some("early"),
+            t.poll_to(ms_to_tick(&t, 100)),
+            "a 149ms delay must be delivered at the 100ms tick"
+        );
+
+        // ...and the entry is gone. Polling again at the real deadline yields
+        // nothing: the wheel does not re-arm on the caller's behalf. This is the
+        // lost wakeup every consumer has to handle.
+        assert_eq!(None, t.poll_to(ms_to_tick(&t, 149)));
+        assert_eq!(0, count(&t));
+
+        // The complementary half: 150 ms rounds up to tick 2, so it is NOT
+        // early. 50 ms is the exact boundary for a poll that lands ON the grid,
+        // which is what this test does (`poll_to(ms_to_tick(..))`) and what
+        // `next_poll_date` schedules. A poll inside `[100N - 50, 100N)` already
+        // sees tick `N`, so the earliness a CONSUMER must tolerate is up to
+        // 99 ms — see `duration_to_tick`.
+        let mut late = timer();
+        late.set_timeout_at(Duration::from_millis(150), "late");
+        assert_eq!(None, late.poll_to(ms_to_tick(&late, 100)));
+        assert_eq!(Some("late"), late.poll_to(ms_to_tick(&late, 200)));
+    }
+
+    /// A DELIVERED `Timeout` handle can never cancel the entry that reuses its
+    /// slab slot. The slot really is reused — `poll_to` does
+    /// `self.entries.remove(...)` — so the only thing standing between a stale
+    /// handle and someone else's timeout is `cancel_timeout`'s tick guard, and
+    /// that guard is exact rather than probabilistic:
+    ///
+    /// - [`insert`](Timer::insert) has exactly one caller,
+    ///   [`set_timeout_at`](Timer::set_timeout_at), which clamps every new entry
+    ///   to `tick > self.tick`;
+    /// - `self.tick` never decreases (`poll_to` only increments it, and floors
+    ///   `target_tick` at it);
+    /// - delivery requires `links.tick <= self.tick`.
+    ///
+    /// So a delivered handle's tick is `<= self.tick`, and every entry created
+    /// afterwards has a tick `> self.tick` — they can never be equal, whatever
+    /// the slab does with the slot. `TIMER` is a thread-local shared by every
+    /// session in a worker, so this is what makes a forgotten handle merely
+    /// untidy rather than a cross-session cancel.
+    ///
+    /// To SEE THIS RED: delete the `if links.tick != timeout.tick { return
+    /// None; }` sanity check from [`Timer::cancel_timeout`]. The stale handle
+    /// then cancels the unrelated entry occupying its slot and this fails with
+    /// `a delivered handle must not cancel the entry that reused its slot`.
+    #[test]
+    pub fn test_a_delivered_timeout_handle_cannot_cancel_its_slot_successor() {
+        let mut t = timer();
+
+        let stale = t.set_timeout_at(Duration::from_millis(100), "first");
+        assert_eq!(Some("first"), t.poll_to(ms_to_tick(&t, 100)));
+        assert_eq!(0, count(&t), "delivery must free the slab slot");
+
+        // The successor lands in the very slot the delivered entry vacated...
+        let successor = t.set_timeout_at(Duration::from_millis(300), "second");
+        assert_eq!(
+            stale.token, successor.token,
+            "precondition: the slab must reuse the delivered entry's slot"
+        );
+        // ...but never at the same tick, because `set_timeout_at` clamps every
+        // new entry past `self.tick` and the delivered one was at or below it.
+        assert!(
+            successor.tick > stale.tick,
+            "a new entry must outrank a delivered one: {} > {}",
+            successor.tick,
+            stale.tick
+        );
+
+        assert_eq!(
+            None,
+            t.cancel_timeout(&stale),
+            "a delivered handle must not cancel the entry that reused its slot"
+        );
+        assert_eq!(
+            Some("second"),
+            t.poll_to(ms_to_tick(&t, 300)),
+            "the successor must survive the stale cancel and still fire"
+        );
+    }
+
+    /// The attained maximum earliness ON THE GRID is a full half-tick — 50 ms
+    /// at the 100 ms default — not 49 ms. The rounding interval
+    /// `[100N-50, 100N+50)` is closed on the EARLY side and open on the late
+    /// side, so a 50 ms delay lands in tick 1 and is delivered at 100 ms, while
+    /// 150 ms is pushed out to tick 2. Lateness is what is capped at 49 ms.
+    ///
+    /// "On the grid" is the scope of this test: it polls at grid points, as
+    /// [`Timer::next_poll_date`] schedules. A poll inside `[100N-50, 100N)`
+    /// already sees tick `N`, so the earliness a consumer must tolerate reaches
+    /// 99 ms — see [`duration_to_tick`].
+    ///
+    /// To SEE THIS RED: change the rounding in [`duration_to_tick`] from
+    /// `saturating_add(tick_ms / 2)` to `saturating_add(tick_ms / 2 - 1)`. The
+    /// 50 ms entry then lands in tick 0, is clamped to tick 1 by
+    /// `set_timeout_at`'s "at least one tick in the future" rule, and still
+    /// fires at 100 ms — so the first assertion holds; it is the 149 ms case in
+    /// `test_timeout_fires_up_to_half_a_tick_early` that goes red. Use that test
+    /// for the rounding and this one for the boundary.
+    #[test]
+    pub fn test_maximum_earliness_is_a_full_half_tick() {
+        let mut t = timer();
+
+        // 50 ms: (50 + 50) / 100 == 1. Delivered at 100 ms — exactly 50 ms early.
+        t.set_timeout_at(Duration::from_millis(50), "half-tick-early");
+        assert_eq!(
+            Some("half-tick-early"),
+            t.poll_to(ms_to_tick(&t, 100)),
+            "a 50ms delay must be delivered at the 100ms tick: 50ms early"
+        );
+
+        // 49 ms is the far side of the same interval for tick 0, which
+        // `set_timeout_at` clamps up to tick 1 — the wheel never fires in the
+        // past, so sub-half-tick delays are the one case that is always LATE.
+        let mut clamped = timer();
+        clamped.set_timeout_at(Duration::from_millis(49), "clamped");
+        assert_eq!(Some("clamped"), clamped.poll_to(ms_to_tick(&clamped, 100)));
+    }
+
+    #[test]
+    pub fn test_clearing_timeout() {
+        let mut t = timer();
+
+        let to = t.set_timeout_at(Duration::from_millis(100), "a");
+        assert_eq!("a", t.cancel_timeout(&to).unwrap());
+
+        let mut tick = ms_to_tick(&t, 100);
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 200);
+        assert_eq!(None, t.poll_to(tick));
+
+        assert_eq!(count(&t), 0);
+    }
+
+    #[test]
+    pub fn test_multiple_timeouts_same_tick() {
+        let mut t = timer();
+
+        t.set_timeout_at(Duration::from_millis(100), "a");
+        t.set_timeout_at(Duration::from_millis(100), "b");
+
+        let mut rcv = vec![];
+
+        let mut tick = ms_to_tick(&t, 100);
+        rcv.push(t.poll_to(tick).unwrap());
+        rcv.push(t.poll_to(tick).unwrap());
+
+        assert_eq!(None, t.poll_to(tick));
+
+        rcv.sort_unstable();
+        assert!(rcv == ["a", "b"], "actual={rcv:?}");
+
+        tick = ms_to_tick(&t, 200);
+        assert_eq!(None, t.poll_to(tick));
+
+        assert_eq!(count(&t), 0);
+    }
+
+    #[test]
+    pub fn test_multiple_timeouts_diff_tick() {
+        let mut t = timer();
+
+        t.set_timeout_at(Duration::from_millis(110), "a");
+        t.set_timeout_at(Duration::from_millis(220), "b");
+        t.set_timeout_at(Duration::from_millis(230), "c");
+        t.set_timeout_at(Duration::from_millis(440), "d");
+        t.set_timeout_at(Duration::from_millis(560), "e");
+
+        let mut tick = ms_to_tick(&t, 100);
+        assert_eq!(Some("a"), t.poll_to(tick));
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 200);
+        assert_eq!(Some("c"), t.poll_to(tick));
+        assert_eq!(Some("b"), t.poll_to(tick));
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 300);
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 400);
+        assert_eq!(Some("d"), t.poll_to(tick));
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 500);
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 600);
+        assert_eq!(Some("e"), t.poll_to(tick));
+        assert_eq!(None, t.poll_to(tick));
+    }
+
+    #[test]
+    pub fn test_catching_up() {
+        let mut t = timer();
+
+        t.set_timeout_at(Duration::from_millis(110), "a");
+        t.set_timeout_at(Duration::from_millis(220), "b");
+        t.set_timeout_at(Duration::from_millis(230), "c");
+        t.set_timeout_at(Duration::from_millis(440), "d");
+
+        let tick = ms_to_tick(&t, 600);
+        assert_eq!(Some("a"), t.poll_to(tick));
+        assert_eq!(Some("c"), t.poll_to(tick));
+        assert_eq!(Some("b"), t.poll_to(tick));
+        assert_eq!(Some("d"), t.poll_to(tick));
+        assert_eq!(None, t.poll_to(tick));
+    }
+
+    #[test]
+    pub fn test_timeout_hash_collision() {
+        let mut t = timer();
+
+        t.set_timeout_at(Duration::from_millis(100), "a");
+        t.set_timeout_at(Duration::from_millis(100 + TICK * SLOTS as u64), "b");
+
+        let mut tick = ms_to_tick(&t, 100);
+        assert_eq!(Some("a"), t.poll_to(tick));
+        assert_eq!(1, count(&t));
+
+        tick = ms_to_tick(&t, 200);
+        assert_eq!(None, t.poll_to(tick));
+        assert_eq!(1, count(&t));
+
+        tick = ms_to_tick(&t, 100 + TICK * SLOTS as u64);
+        assert_eq!(Some("b"), t.poll_to(tick));
+        assert_eq!(0, count(&t));
+    }
+
+    #[test]
+    pub fn test_clearing_timeout_between_triggers() {
+        let mut t = timer();
+
+        let a = t.set_timeout_at(Duration::from_millis(100), "a");
+        let _ = t.set_timeout_at(Duration::from_millis(100), "b");
+        let _ = t.set_timeout_at(Duration::from_millis(200), "c");
+
+        let mut tick = ms_to_tick(&t, 100);
+        assert_eq!(Some("b"), t.poll_to(tick));
+        assert_eq!(2, count(&t));
+
+        t.cancel_timeout(&a);
+        assert_eq!(1, count(&t));
+
+        assert_eq!(None, t.poll_to(tick));
+
+        tick = ms_to_tick(&t, 200);
+        assert_eq!(Some("c"), t.poll_to(tick));
+        assert_eq!(0, count(&t));
+    }
+
+    /// `TimeoutContainer` mirrors the absolute instant its armed wheel entry
+    /// is meant to fire at, because the wheel itself keeps only a rounded
+    /// tick. Three properties, all load-bearing for the mux timeout path:
+    ///
+    /// * arming records a deadline (`set` one duration out, `set_at` at the
+    ///   caller's instant, leaving `duration` alone);
+    /// * `triggered` CLEARS it — the expiry consumed the entry, so the
+    ///   container holds nothing. A holder that memoizes on "the deadline has
+    ///   not moved" depends on this clearing; without it, an early delivery is
+    ///   a lost wakeup;
+    /// * `cancel` clears it too.
+    ///
+    /// To SEE THIS RED: drop `self.deadline = None;` from
+    /// [`TimeoutContainer::triggered`] — the `triggered` assertion below then
+    /// still reports the stale deadline.
+    #[test]
+    fn timeout_container_mirrors_the_deadline_of_its_armed_entry() {
+        let token = Token(7);
+        let duration = Duration::from_secs(60);
+        let mut container = TimeoutContainer::new_empty(duration);
+        assert_eq!(
+            container.deadline(),
+            None,
+            "an empty container arms nothing"
+        );
+
+        let before = Instant::now();
+        container.set(token);
+        let armed = container.deadline().expect("set must record a deadline");
+        assert!(
+            armed >= before + duration,
+            "set must record now + duration, got {armed:?} against {before:?} + {duration:?}"
+        );
+
+        let explicit = before + Duration::from_secs(5);
+        container.set_at(token, explicit);
+        assert_eq!(
+            container.deadline(),
+            Some(explicit),
+            "set_at must record the caller's instant verbatim"
+        );
+        assert_eq!(
+            container.duration(),
+            duration,
+            "set_at must not disturb the configured duration"
+        );
+
+        container.triggered();
+        assert_eq!(
+            container.deadline(),
+            None,
+            "a consumed entry leaves the container holding nothing"
+        );
+
+        container.set(token);
+        assert!(container.deadline().is_some(), "re-armed after triggered");
+        container.cancel();
+        assert_eq!(container.deadline(), None, "cancel releases the deadline");
+    }
+
+    const TICK: u64 = 100;
+    const SLOTS: usize = 16;
+    const CAPACITY: usize = 32;
+
+    fn count<T>(timer: &Timer<T>) -> usize {
+        timer.entries.len()
+    }
+
+    fn timer() -> Timer<&'static str> {
+        Timer::new(TICK, SLOTS, CAPACITY, Instant::now())
+    }
+
+    fn ms_to_tick<T>(timer: &Timer<T>, ms: u64) -> u64 {
+        ms / timer.tick_ms
+    }
+}
